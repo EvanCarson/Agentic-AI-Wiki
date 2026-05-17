@@ -1,0 +1,638 @@
+<section class="phase">
+    <div class="phase-num">3.3</div>
+    <div class="week">Part III / Evaluate · The eval method that scales — and the one most teams get wrong</div>
+    <h2>LLM-as-judge: when it works, when it lies.</h2>
+    <p class="goal">Using a model to score another model's outputs is the only way to evaluate at scale. It's also the most common source of false confidence in agent evals: judge biases (position, length, self-preference, authority) silently shift your numbers in directions that have nothing to do with quality. This chapter teaches the four biases concretely, the two-orderings-and-cross-family disciplines that actually move the needle, and the calibration protocol that tells you when to trust the judge and when to fall back to humans. By the end you'll have a judge pipeline you can audit, with documented agreement against human raters and explicit policy on when judge-alone decisions are acceptable.</p>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Why you can't avoid LLM-as-judge.</h3>
+
+      <p>The first question to answer is whether you need a model judge at all. The honest answer is: it depends on what you're measuring, and for most agent metrics, yes.</p>
+
+      <p>The choice between three grading methods isn't a preference — it's determined by what you're checking:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>What you're checking</div>
+          <div>Right grader</div>
+          <div>Why</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Code correctness</div>
+          <div class="vector">Run the tests</div>
+          <div class="defense">Deterministic. No judge needed. <code class="inline">pass/fail</code> is the truth.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Citation / source-grounding</div>
+          <div class="vector">String match against source</div>
+          <div class="defense">If the claim quotes the source, it's grounded. Cheap, deterministic.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Retrieval recall</div>
+          <div class="vector">Compare to labeled doc IDs</div>
+          <div class="defense">You have the answer key. Set intersection.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Final answer quality</div>
+          <div class="vector">LLM-as-judge</div>
+          <div class="defense">"Did the agent give a good answer?" has no deterministic check. The judge is the scalable proxy for a human rater.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Faithfulness / hallucination</div>
+          <div class="vector">LLM-as-judge</div>
+          <div class="defense">"Does this claim follow from this source?" requires reading comprehension at scale.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Tool-use trajectory quality</div>
+          <div class="vector">LLM-as-judge (+ deterministic checks)</div>
+          <div class="defense">"Did the agent take a reasonable approach?" mixes structural checks with judgment.</div>
+        </div>
+      </div>
+
+      <p>The split that matters: <strong>use deterministic graders whenever you can</strong> (cheap, fast, exact); <strong>fall back to LLM-as-judge for everything else</strong> (scales, but stochastic and biased). The mistake is using LLM-as-judge for things a deterministic grader could check — paying judge cost and inheriting judge bias for a problem that doesn't need them.</p>
+
+      <h4>The math on why you can't just use humans</h4>
+
+      <p>Why not skip the judge and just have humans rate everything? Run the numbers for an active agent project.</p>
+
+      <p>50-question eval set. Two trajectories to rate per question (one from the candidate PR, one from main). Three quality dimensions per trajectory (correctness, faithfulness, helpfulness). Five PRs per week. That's:</p>
+
+      <pre class="standalone">50 × 2 × 3 × 5  =  1,500 human ratings / week</pre>
+
+      <p>At ~30 seconds per rating, that's about 12.5 hours of human-rater time per week — one engineer's day-and-a-half — to grade evals alone. That's already too expensive for most teams. And it's the lower bound; the moment you want to compare changes against multiple baselines, or run on a larger eval set, or rate more dimensions, it scales up linearly. There's no path where humans grade every output.</p>
+
+      <p>The alternative — use a model to grade — costs roughly $0.01–0.05 per rating with a small model, runs in seconds, scales to 50,000 ratings per week without anyone hating their life. The trade is exactly what you'd expect: cheaper, faster, less accurate. The whole chapter is about how to make "less accurate" mean "not so much less that the numbers stop mattering."</p>
+
+      <h4>The judge is also code that needs to be tested</h4>
+
+      <p>Here is the framing shift that turns LLM-as-judge from a trap into a working tool: <strong>the judge is a model. The judge has accuracy you can measure. You measure it against humans on a held-out calibration set, the same way you'd measure any classifier.</strong></p>
+
+      <p>This isn't a metaphor. The agreement rate between your judge and a small set of human-rated examples is a number. You can compute it. You can monitor it over time. You can fail-fast when it drops below threshold. And if you don't compute it, the judge is silently broken and your scoreboard is silently lying. This is the discipline most teams skip, which is why most teams' eval numbers are softer than they think.</p>
+
+      <p>The rest of this chapter teaches:</p>
+
+      <ul>
+        <li>The four biases that show up in every untreated judge pipeline (Step 2).</li>
+        <li>How to design the judge prompt — pointwise vs pairwise, what to put in the rubric — and how to validate it against humans (Step 3).</li>
+        <li>The production patterns that make judges robust over time: cross-family ensembles, both-orderings discipline, judge versioning, when to fall back to humans (Step 4).</li>
+      </ul>
+
+      <div class="callout warn">
+        <p>If you wired up an LLM judge twelve months ago and have never re-validated it against humans, your eval scores are not a quality signal — they are a measurement of how well your prompt has learned to game its own evaluator. The judge has biases; your prompt iteration is gradient descent on whatever it is the judge actually rewards. The two converge toward what the judge likes, not what users like. This is the failure mode the chapter exists to prevent.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Can't I just use a powerful model (Opus, GPT-5) as the judge and assume it's reliable?</div>
+        <div class="answer">
+          <p>You can use a powerful model as the judge — and you should, for the highest-stakes evals — but "reliable" is wrong framing. Even frontier models have measurable position bias (up to 40% inconsistency on identical pairwise comparisons with order swapped), verbosity bias (~15% inflation favoring longer answers), and self-preference (5–7% boost when the judge is the same family as the model being judged). These don't disappear with a better model; they shift in magnitude. Engineering around them is mandatory.</p>
+          <p>What a more powerful model buys you: better understanding of the rubric (so subtle quality differences are detected), better instruction-following (so structured output is more reliable), and slightly less of all the biases. It does not buy you "the biases go away."</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My judge is just a string-match check ("does the response contain the expected keyword?"). Do these biases apply to me?</div>
+        <div class="answer">
+          <p>No. A keyword check or string-match isn't an LLM judge — it's a deterministic grader, and that's the right tool when you can use it. The biases apply specifically when you're asking a model to make a quality judgment ("is this answer good?", "is A better than B?", "does this claim follow from this source?"). For binary checks you can express as code, code is more reliable and cheaper than any LLM. Don't let "we use LLM-as-judge" become a status symbol; it's a fallback for when deterministic doesn't work.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>The four biases in every untreated judge pipeline.</h3>
+
+      <p>Before you can fix the biases, you have to see them. Each of the four below is well-documented in the 2024–2026 literature, reproducible in your own pipeline in fifteen minutes, and quietly distorting your scores until you defend against it. Let me walk each one with a concrete demonstration.</p>
+
+      <h4>Bias 1: Position bias (the worst one)</h4>
+
+      <p>In a pairwise comparison — "which of these two answers is better, A or B?" — the option presented <em>first</em> wins more often than chance. Even frontier models in 2026 show 30–40% inconsistency rates when you swap the order and re-ask. The same two responses, same rubric, different ordering, different verdict.</p>
+
+      <p>The fifteen-minute demonstration:</p>
+
+<pre class="standalone"><span class="c-cm"># scripts/measure_position_bias.py</span>
+<span class="c-kw">import</span> random
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+client = Anthropic()
+
+JUDGE_PROMPT = <span class="c-st">"""Compare these two answers to the question. Reply with
+A, B, or TIE — single token, no explanation.
+
+Question: {q}
+
+Answer A: {a}
+
+Answer B: {b}"""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">judge</span>(q, a, b):
+    response = client.messages.create(
+        model=<span class="c-st">"claude-sonnet-4-5"</span>,
+        max_tokens=<span class="c-st">5</span>,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+                   <span class="c-st">"content"</span>: JUDGE_PROMPT.format(q=q, a=a, b=b)}],
+    )
+    <span class="c-kw">return</span> response.content[<span class="c-st">0</span>].text.strip().upper()
+
+<span class="c-cm"># Pull 50 pairs from your eval set (or any set of paired outputs).</span>
+<span class="c-cm"># For each pair, run BOTH orderings.</span>
+inconsistent = <span class="c-st">0</span>
+<span class="c-kw">for</span> q, x, y <span class="c-kw">in</span> pairs:
+    forward  = judge(q, x, y)   <span class="c-cm"># x is A, y is B</span>
+    reversed = judge(q, y, x)   <span class="c-cm"># y is A, x is B (so flipped verdict expected)</span>
+
+    <span class="c-cm"># If they agree, forward says "A wins" iff reversed says "B wins".</span>
+    consistent = (forward, reversed) <span class="c-kw">in</span> {(<span class="c-st">"A"</span>, <span class="c-st">"B"</span>), (<span class="c-st">"B"</span>, <span class="c-st">"A"</span>),
+                                       (<span class="c-st">"TIE"</span>, <span class="c-st">"TIE"</span>)}
+    <span class="c-kw">if not</span> consistent:
+        inconsistent += <span class="c-st">1</span>
+
+<span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"position inconsistency: {inconsistent}/{len(pairs)} = {inconsistent/len(pairs):.0%}"</span>)</pre>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/measure_position_bias.py
+position inconsistency: 17/50 = 34%</span></pre>
+
+      <p>34% of your "winner" verdicts depend on which option appeared first. That means on roughly one in three pairwise judgments, your judge isn't grading the content — it's grading position. If you ship a change based on a one-direction pairwise judgment without checking the reverse, there's a 17% chance the "improvement" is actually just position bias firing one way.</p>
+
+      <p><strong>The fix</strong> is the most impactful single change you can make to a judge pipeline: <em>run every pairwise comparison in both orderings and only count a winner if both agree</em>. Split verdicts become "tie" or "position-determined." This single discipline removes position bias entirely — at 2× judge cost.</p>
+
+<pre class="standalone"><span class="c-kw">def</span> <span class="c-fn">judge_both</span>(q, x, y):
+    fwd = judge(q, x, y)        <span class="c-cm"># x=A, y=B</span>
+    rev = judge(q, y, x)        <span class="c-cm"># y=A, x=B</span>
+    <span class="c-cm"># x wins iff "A" forward AND "B" reverse</span>
+    <span class="c-kw">if</span> fwd == <span class="c-st">"A"</span> <span class="c-kw">and</span> rev == <span class="c-st">"B"</span>: <span class="c-kw">return</span> <span class="c-st">"x_wins"</span>
+    <span class="c-kw">if</span> fwd == <span class="c-st">"B"</span> <span class="c-kw">and</span> rev == <span class="c-st">"A"</span>: <span class="c-kw">return</span> <span class="c-st">"y_wins"</span>
+    <span class="c-kw">return</span> <span class="c-st">"tie"</span>  <span class="c-cm"># includes "position-determined" disagreements</span></pre>
+
+      <h4>Bias 2: Verbosity bias (the sneaky one)</h4>
+
+      <p>Longer answers score higher. Not because they're better — because they're longer. Studies place the inflation at roughly 15% on average; on certain rubrics ("comprehensive", "thorough") it goes higher.</p>
+
+      <p>The mechanism: the judge interprets verbosity as a proxy for effort or completeness. When asked "which answer is more thorough," the judge picks the longer one almost regardless of substance. When asked simply "which is better," the bias still leaks in.</p>
+
+      <p>The demonstration: take any short, correct answer. Pad it with two extra sentences that restate the same content. Run the judge. Watch the padded version win.</p>
+
+<pre class="trace standalone"><span class="c-out">Question: What is the capital of France?
+
+Answer A: Paris.
+
+Answer B: The capital of France is Paris, a city located in
+the northern part of the country along the Seine river. Paris
+has been the capital since the 12th century and serves as the
+political and cultural center of the nation.
+
+[judge with default rubric]: B wins on "comprehensiveness"
+[judge with rubric tuned for correctness only]: tie
+
+Both answers are correct.  B's "win" is verbosity bias.</span></pre>
+
+      <p><strong>The fix</strong> is twofold: (1) state the bias in your judge prompt explicitly — "do not reward longer answers; concise correct answers should score equally with longer correct answers"; (2) use small numeric scales (1–4 rather than 1–10) that don't have room for "longer = nudge up." The combination shrinks verbosity bias substantially without eliminating it.</p>
+
+      <h4>Bias 3: Self-preference (the family effect)</h4>
+
+      <p>When you use Claude as a judge to compare two answers, and one of those answers was generated by Claude, the Claude-generated answer wins more often than chance. Same with GPT judging GPT outputs. The effect is small — 5–7% boost — but it composes with the others and is invisible if you don't look for it.</p>
+
+      <p>The cause is stylistic familiarity. Each model family has signature patterns — sentence structures, phrasings, ways of organizing information. The judge of the same family recognizes those patterns as "well-written" because they match what the judge's training rewarded. It's not preferential treatment in the moral sense; it's pattern matching.</p>
+
+      <p>The implication: <strong>never use the same family as both the agent's model and the judge</strong>. If your agent runs on Claude, judge with GPT or Gemini. If it runs on GPT, judge with Claude or Llama. The cross-family check defuses self-preference because no two providers share training distributions.</p>
+
+      <p>The other implication: when you do comparative analysis ("does our agent on Claude beat the same agent on GPT?"), you cannot use either Claude or GPT as the judge — both judges would systematically favor their own family. Use a third party (Gemini, Llama) or an ensemble (Step 4 below).</p>
+
+      <h4>Bias 4: Authority / confidence bias</h4>
+
+      <p>Confident-sounding answers beat hedged ones, even when the hedged answer is more accurate. "The answer is 47" beats "The answer is most likely 47, though if you're using the alternate definition it could be 42" — even when the alternate definition matters.</p>
+
+      <p>This bias is the one most often working against your users' interests. Hallucinations are confident; truthful answers are sometimes hedged. A judge that prefers confidence will systematically rank hallucinations above grounded uncertainty. Over enough iterations, your agent learns to sound more confident even when it shouldn't be.</p>
+
+      <p><strong>The fix</strong>: write the rubric to reward calibrated uncertainty explicitly. Not "is the answer confident?" but "does the confidence level match the strength of the evidence?" That phrasing forces the judge to evaluate the match, not the surface signal of confidence. The bias doesn't vanish — but it shrinks substantially.</p>
+
+      <h4>Watch all four compose</h4>
+
+      <p>Each individual bias is at most 5–15%. The danger is that they compose multiplicatively when the conditions align. A longer, more confident response from the same model family as the judge, presented first in pairwise comparison, can win 80%+ of the time against a shorter, hedged response from a different family — even if the shorter response is more correct.</p>
+
+      <p>This is the failure mode where teams converge over months on prompts that produce long, confident, judge-family-styled outputs that quietly underperform on real user queries. The scoreboard climbs; the user satisfaction doesn't. The eval has become a metric the agent is optimizing against rather than a measurement of quality.</p>
+
+      <div class="callout danger">
+        <p>If you take exactly one defense from this step, take the both-orderings discipline. It costs 2× judge spend, removes the largest single bias entirely, and is so cheap to implement (10 lines of code) that there is no defensible reason to skip it. Every other defense matters; that one is non-negotiable.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Some of these biases sound like they'd cancel out across many examples. Doesn't averaging fix them?</div>
+        <div class="answer">
+          <p>Position bias is the only one that arguably averages out — if your candidate is randomly assigned to position A 50% of the time and position B 50%, the bias adds noise but not directional bias. (The both-orderings fix is still much better, because you get the signal-to-noise improvement and remove the noise.)</p>
+          <p>The other three are <em>directional</em>. Verbosity bias always favors longer; self-preference always favors same-family; authority bias always favors confident-sounding. Averaging does nothing for any of these. They produce systematic shifts in your scores that look like real improvements when they aren't.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Is pointwise scoring (1–10 score per output) immune to position bias?</div>
+        <div class="answer">
+          <p>Mostly yes, since there's no "first" and "second" to swap. Pointwise has its own problems: scores drift between runs (the same response scores 7 today, 8 tomorrow), the scale is poorly anchored ("what's a 7 vs 8?"), and it's sensitive to whatever the judge saw most recently. Pairwise is more reliable when both orderings agree, less reliable when they don't.</p>
+          <p>The pragmatic choice: <strong>pointwise for cheap continuous monitoring (use small scales like 1–4), pairwise-with-both-orderings for the high-stakes evals that gate releases</strong>. Both methods have a place. They're not substitutes; they answer different questions.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Calibration: validate the judge against humans.</h3>
+
+      <p>Step 2 makes your judge robust against known biases. This step makes it auditable against the ground truth — humans. Without this step, you're trusting that the judge agrees with users on what "good" means. Sometimes it does; often it doesn't; without measurement you can't tell which.</p>
+
+      <p>The protocol is small. Build a calibration set of human-rated examples. Run your judge on them. Compute agreement. Decide whether the agreement rate is high enough to use the judge alone. Re-run this calibration whenever you change the judge (model, prompt, rubric) or when you suspect the agent's output distribution has shifted enough that the judge's accuracy might have shifted too.</p>
+
+      <h4>Build the calibration set</h4>
+
+      <p>50 examples is the smallest set that gives a reliable agreement-rate measurement. Each example is a triple: an input, an output (or pair of outputs for pairwise), and a human verdict. The cost: about 2–4 hours of focused rating time for one rater to do 50 examples. The yield: a permanent reference that lets you trust or distrust the judge for years.</p>
+
+      <p>What to include:</p>
+
+      <ul>
+        <li><strong>Clear wins.</strong> 15 examples where the right answer is obvious. The judge should get these all right; if it doesn't, the rubric is broken.</li>
+        <li><strong>Close calls.</strong> 25 examples where two reasonable raters might genuinely disagree. This is where judges fail most often, and where they need to fail close to humans rather than randomly.</li>
+        <li><strong>Adversarial examples.</strong> 10 examples designed to trigger the biases from Step 2. A verbose-but-wrong answer paired with a concise-correct one; a confident hallucination paired with a hedged truth; etc. The judge's verdicts on these tell you how well your bias mitigations are working.</li>
+      </ul>
+
+      <p>Two humans rate each example independently, you reconcile disagreements, and the reconciled label is the calibration truth. Two raters matter — a single rater's idiosyncrasies become baked into your reference. Doesn't have to be expensive; a 30-minute discussion between the two raters to resolve disagreements is usually enough.</p>
+
+<pre class="standalone"><span class="c-cm"># evals/calibration_set.jsonl — 50 lines, one per example</span>
+{<span class="c-st">"id"</span>: <span class="c-st">"cal_001"</span>,
+ <span class="c-st">"category"</span>: <span class="c-st">"clear_win"</span>,
+ <span class="c-st">"question"</span>: <span class="c-st">"What does VACUUM FULL do in Postgres?"</span>,
+ <span class="c-st">"answer_a"</span>: <span class="c-st">"VACUUM FULL rewrites the entire table, reclaiming all dead tuple space and returning it to the OS. It takes an exclusive lock."</span>,
+ <span class="c-st">"answer_b"</span>: <span class="c-st">"It vacuums."</span>,
+ <span class="c-st">"human_verdict"</span>: <span class="c-st">"a_wins"</span>,
+ <span class="c-st">"notes"</span>: <span class="c-st">"clear: a is correct and specific; b is uselessly terse"</span>}
+
+{<span class="c-st">"id"</span>: <span class="c-st">"cal_017"</span>,
+ <span class="c-st">"category"</span>: <span class="c-st">"close_call"</span>,
+ <span class="c-st">"question"</span>: <span class="c-st">"How do I configure autovacuum for a write-heavy table?"</span>,
+ <span class="c-st">"answer_a"</span>: <span class="c-st">"Lower autovacuum_vacuum_scale_factor on that table to 0.05 and autovacuum_vacuum_cost_limit to a higher value to allow more aggressive vacuuming."</span>,
+ <span class="c-st">"answer_b"</span>: <span class="c-st">"Use ALTER TABLE foo SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_vacuum_threshold = 1000) for per-table tuning."</span>,
+ <span class="c-st">"human_verdict"</span>: <span class="c-st">"tie"</span>,
+ <span class="c-st">"notes"</span>: <span class="c-st">"both are valid approaches; b shows the actual SQL but misses cost_limit"</span>}
+
+{<span class="c-st">"id"</span>: <span class="c-st">"cal_042"</span>,
+ <span class="c-st">"category"</span>: <span class="c-st">"adversarial_verbosity"</span>,
+ <span class="c-st">"question"</span>: <span class="c-st">"What's the default value of shared_buffers?"</span>,
+ <span class="c-st">"answer_a"</span>: <span class="c-st">"128MB."</span>,
+ <span class="c-st">"answer_b"</span>: <span class="c-st">"The default value of shared_buffers in PostgreSQL is 128 megabytes, though this is widely considered too small for production workloads. Most production deployments increase this to 25% of available RAM, though the optimal value depends on..."</span>,
+ <span class="c-st">"human_verdict"</span>: <span class="c-st">"tie"</span>,
+ <span class="c-st">"notes"</span>: <span class="c-st">"both correct on the literal question; b's extra context isn't asked for. testing verbosity bias."</span>}</pre>
+
+      <h4>Run the judge against it</h4>
+
+<pre class="standalone"><span class="c-cm"># scripts/calibrate_judge.py</span>
+<span class="c-kw">import</span> json, collections
+<span class="c-kw">from</span> agent.judge <span class="c-kw">import</span> judge_both  <span class="c-cm"># from Step 2, with both orderings</span>
+
+cases = [json.loads(line) <span class="c-kw">for</span> line <span class="c-kw">in</span> <span class="c-kw">open</span>(<span class="c-st">"evals/calibration_set.jsonl"</span>)]
+results = collections.Counter()
+
+<span class="c-kw">for</span> c <span class="c-kw">in</span> cases:
+    judge_verdict = judge_both(c[<span class="c-st">"question"</span>], c[<span class="c-st">"answer_a"</span>], c[<span class="c-st">"answer_b"</span>])
+    <span class="c-cm"># judge returns: x_wins / y_wins / tie</span>
+    <span class="c-cm"># map to the same vocabulary as human verdicts</span>
+    judge_label = {<span class="c-st">"x_wins"</span>: <span class="c-st">"a_wins"</span>, <span class="c-st">"y_wins"</span>: <span class="c-st">"b_wins"</span>, <span class="c-st">"tie"</span>: <span class="c-st">"tie"</span>}[judge_verdict]
+
+    agreed = (judge_label == c[<span class="c-st">"human_verdict"</span>])
+    results[(c[<span class="c-st">"category"</span>], agreed)] += <span class="c-st">1</span>
+
+    <span class="c-kw">if not</span> agreed:
+        <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"DISAGREE {c['id']}: human={c['human_verdict']} judge={judge_label}"</span>)
+        <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"  notes: {c['notes']}"</span>)
+
+<span class="c-cm"># Compute per-category agreement</span>
+<span class="c-kw">for</span> cat <span class="c-kw">in</span> [<span class="c-st">"clear_win"</span>, <span class="c-st">"close_call"</span>, <span class="c-st">"adversarial_verbosity"</span>, ...]:
+    total = results[(cat, <span class="c-kw">True</span>)] + results[(cat, <span class="c-kw">False</span>)]
+    rate = results[(cat, <span class="c-kw">True</span>)] / total <span class="c-kw">if</span> total <span class="c-kw">else</span> <span class="c-st">0</span>
+    <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"{cat:30s}  {results[(cat, True)]}/{total} = {rate:.0%}"</span>)</pre>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/calibrate_judge.py
+
+DISAGREE cal_017: human=tie judge=a_wins
+  notes: both are valid approaches; b shows the actual SQL but misses cost_limit
+
+DISAGREE cal_023: human=b_wins judge=tie
+  notes: b is significantly more specific; judge couldn't tell
+
+DISAGREE cal_042: human=tie judge=b_wins
+  notes: both correct; b's extra context isn't asked for. testing verbosity bias.
+
+DISAGREE cal_045: human=a_wins judge=b_wins
+  notes: a is correct concise; b is longer + WRONG. testing verbosity+confidence.
+
+clear_win                       15/15 = 100%
+close_call                      19/25 = 76%
+adversarial_verbosity            6/10 = 60%
+
+overall: 40/50 = 80%</span></pre>
+
+      <h4>Read the result</h4>
+
+      <p>80% overall is a real number. What it tells you:</p>
+
+      <ul>
+        <li><strong>Clear wins: 100%.</strong> Judge gets the easy ones right. Sanity check passed.</li>
+        <li><strong>Close calls: 76%.</strong> On genuinely ambiguous cases, judge agrees with humans about 3 out of 4. That's roughly the rate at which two <em>humans</em> agree with each other on close calls — so the judge is at human-rater quality on this category.</li>
+        <li><strong>Adversarial: 60%.</strong> The bias mitigations aren't strong enough. cal_042 (verbosity bias) and cal_045 (verbosity + confidence) both failed — the judge is still rewarding longer answers. Action item: tighten the rubric on conciseness, possibly add an explicit "longer is not better" sentence.</li>
+      </ul>
+
+      <p>The headline number doesn't matter as much as the per-category breakdown. 80% overall could be 100% on clear, 100% on close, 0% on adversarial — that's a different story than 100/76/60 — but both produce the same 80%. Always look at the breakdown.</p>
+
+      <h4>The 70% threshold</h4>
+
+      <p>What agreement rate is good enough to trust the judge alone?</p>
+
+      <p>The pragmatic rule that emerges from working teams: <strong>below 70% overall agreement, don't trust the judge as the sole signal</strong>. Use it as a screen, then have humans rate the top contested cases. Above 80% overall, judge-alone decisions are usually fine for non-critical metrics. Between 70 and 80 is a gray zone — judge alone for cheap continuous monitoring, humans for release-gating evals.</p>
+
+      <p>Also: <strong>require &gt;90% on the "clear win" category, no matter what the overall is</strong>. If the judge can't get the obvious cases right, the rubric or prompt is broken and the rest of the numbers don't matter. Fix that first.</p>
+
+      <h4>Rubric tuning when calibration fails</h4>
+
+      <p>The first time you run calibration, you'll almost certainly be below 80%. Fix in this order:</p>
+
+      <ol>
+        <li><strong>Read every disagreement.</strong> The judge's reasoning (if you asked for it) and the human's notes will usually surface the rubric ambiguity. The most common finding: the rubric doesn't say what you thought it said.</li>
+        <li><strong>Tighten the rubric.</strong> If verbosity bias is firing on adversarial cases, add a sentence: <em>"Conciseness is a virtue. Do not reward longer answers — concise correct answers should score as highly as longer correct answers."</em></li>
+        <li><strong>Add anchored examples.</strong> Best move for close-call accuracy: include 2–3 worked examples in the judge prompt showing the kind of judgment you want. "Example 1: input X, answer A, answer B, correct verdict: tie, reasoning: ..." Cost: ~300 prompt tokens. Benefit: typically 5–10 percentage-point lift on close calls.</li>
+        <li><strong>Re-run calibration.</strong> Same set. Same protocol. The number should move up. If it doesn't, your rubric edit didn't change behavior — figure out why before continuing.</li>
+      </ol>
+
+      <p>Repeat until you're above your threshold. Then freeze the judge (rubric, model, prompt) and version it.</p>
+
+      <h4>Anchored examples — the highest-leverage rubric improvement</h4>
+
+      <p>This single change deserves its own paragraph because it disproportionately improves calibration. A judge prompt with a rubric but no examples is asking the judge to interpolate from abstract rules. A judge prompt with 2–3 worked examples is showing the judge exactly what its job looks like.</p>
+
+<pre class="standalone"><span class="c-cm"># Judge prompt with anchored examples (the right shape)</span>
+JUDGE_PROMPT = <span class="c-st">"""You are an evaluator. Compare two answers to a technical
+question and decide which is better, or if they're tied.
+
+Rubric:
+1. Correctness: factually right matters more than anything.
+2. Specificity: prefers concrete details (commands, numbers) over vague
+   generalities.
+3. Conciseness: do not reward longer answers. A concise correct answer
+   scores equally with a longer correct answer.
+4. Calibrated confidence: confident wrong &lt; hedged right.
+
+Worked example:
+Question: How do I see Postgres connection count?
+Answer A: SELECT count(*) FROM pg_stat_activity;
+Answer B: You can check the number of connections by querying the
+          pg_stat_activity view, which contains one row per connection.
+Verdict: tie
+Reasoning: Both correct; A is more concise but B is more explanatory.
+Neither materially better.
+
+Now evaluate:
+Question: {q}
+Answer A: {a}
+Answer B: {b}
+
+Respond with one of: a_wins / b_wins / tie
+Reasoning (one sentence):"""</span></pre>
+
+      <p>The worked example shows the judge what calibrated judgment looks like, defuses verbosity bias (the example explicitly calls tie when the longer answer is just more explanatory), and reduces drift between runs. Three examples covering different scenarios (clear win, close call, adversarial) typically lifts agreement by 5–10 points.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">50 examples feels like a lot. Can I get away with 20?</div>
+        <div class="answer">
+          <p>Mathematically yes — but the per-category breakdowns become unreliable. 20 examples might be 6 clear, 10 close, 4 adversarial; if the judge gets 3/4 adversarial right, you have one data point on each side and no real signal on whether bias mitigation is working. The 50-example structure (15/25/10) is the smallest where each category has enough cases to draw conclusions.</p>
+          <p>If you can only spend 2 hours: 30 examples (10/15/5) is a reasonable starting point. Add to it over time as you encounter new failure modes; the calibration set grows alongside the eval set.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How often do I re-run calibration?</div>
+        <div class="answer">
+          <p>Three triggers, in order of urgency: (1) <strong>any judge change</strong> — model swap, rubric edit, prompt rewrite — recalibrate immediately, the change isn't done until the calibration says it is; (2) <strong>monthly drift check</strong> — providers update model snapshots quietly; the same judge code with a new snapshot is a different judge; (3) <strong>when the agent's output distribution shifts noticeably</strong> — new tool, new domain, new prompt pattern. The agent's distribution drifting can move the judge's accuracy on it.</p>
+          <p>The monthly check is the cheap one to skip and the most common cause of "we don't know why our scores moved." Make it a calendar event.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Production patterns: ensembles, versioning, fallback rules.</h3>
+
+      <p>You have a calibrated judge with both-orderings discipline. That's the substrate; this step covers the operational patterns that keep it working over months in production. Four practices, each cheap, each preventing a specific class of silent failure.</p>
+
+      <h4>Cross-family ensembles for release gates</h4>
+
+      <p>For the highest-stakes evals — the ones that gate releases or contractually-binding quality claims — run three judges from three different model families and take majority vote (or require 2-of-3 agreement). The cost is 3× judge spend; the benefit is that no single family's biases drive your decisions.</p>
+
+<pre class="standalone"><span class="c-cm"># evals/ensemble_judge.py</span>
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+<span class="c-kw">import</span> google.generativeai <span class="c-kw">as</span> genai
+
+claude = Anthropic()
+gpt = OpenAI()
+gemini = genai.GenerativeModel(<span class="c-st">"gemini-2.5-pro"</span>)
+
+<span class="c-kw">async def</span> <span class="c-fn">ensemble_judge</span>(q, a, b):
+    <span class="c-cm"># Run three judges in parallel. Each does both-orderings internally.</span>
+    verdicts = <span class="c-kw">await</span> asyncio.gather(
+        judge_with_claude_both_orderings(q, a, b),
+        judge_with_gpt_both_orderings(q, a, b),
+        judge_with_gemini_both_orderings(q, a, b),
+    )
+    counts = collections.Counter(verdicts)
+    most_common, n = counts.most_common(<span class="c-st">1</span>)[<span class="c-st">0</span>]
+
+    <span class="c-kw">if</span> n >= <span class="c-st">2</span>:           <span class="c-cm"># 2-of-3 or 3-of-3 agreement</span>
+        <span class="c-kw">return</span> most_common
+    <span class="c-kw">return</span> <span class="c-st">"contested"</span>    <span class="c-cm"># 1/1/1 split — escalate to human review</span></pre>
+
+      <p>A "contested" output is gold — it identifies the cases where judges genuinely disagree, which is exactly the set you want a human to look at. Over time, these are the examples that grow your calibration set and sharpen your rubric.</p>
+
+      <p>When to use the ensemble: <strong>release-gating evals only</strong>. For continuous PR-level evals (chapter 3.1's CI workflow), a single calibrated judge is fine; 3× judge spend on every PR is wasteful. Use ensembles for the eval suite that determines whether a version ships to production.</p>
+
+      <h4>Judge versioning</h4>
+
+      <p>The judge is code. Like any code, changes to it need to be tracked, reviewed, and tied to score deltas so you can tell whether a score change came from the agent or from the judge.</p>
+
+      <p>Three things to version together:</p>
+
+      <ul>
+        <li><strong>The judge model and snapshot.</strong> <code class="inline">claude-sonnet-4-5-20250929</code> not <code class="inline">claude-sonnet-4-5</code>. Provider aliases can resolve to different snapshots over time.</li>
+        <li><strong>The judge prompt.</strong> A SHA-256 hash of the prompt template, recorded with every score. Any prompt edit produces a new hash.</li>
+        <li><strong>The rubric.</strong> If the rubric is a separate file (and it should be), version it too.</li>
+      </ul>
+
+<pre class="standalone"><span class="c-cm"># scoreboard.csv extended with judge metadata</span>
+commit, ts, branch,
+  judge_model,                       <span class="c-cm"># claude-sonnet-4-5-20250929</span>
+  judge_prompt_hash,                 <span class="c-cm"># short SHA</span>
+  judge_calibration_agreement,       <span class="c-cm"># last measured: 0.84</span>
+  overall, retrieval_recall, ...</pre>
+
+      <p>The discipline: when you change the judge, the scoreboard row records the new hash. The delta tool from chapter 3.1 warns when comparing two rows with different judge_prompt_hash values — that's a sign you're comparing apples to oranges.</p>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/eval_delta.py --commit d1f5b88
+
+⚠ baseline and candidate differ on judge config:
+  - judge_prompt_hash: 7b2a1c → c1e8a3  (changed in this PR)
+
+  This score delta mixes agent changes AND a judge change.
+  The judge change alone may produce a 2-5 point shift.
+  Re-run the baseline with the new judge before drawing conclusions.
+
+  overall  0.768 → 0.781  +0.013  [REAL?]
+  ...</span></pre>
+
+      <p>The warning prevents the most insidious confusion: shipping an agent "improvement" that was actually a judge-prompt edit that made the judge nicer.</p>
+
+      <h4>When to fall back to deterministic graders</h4>
+
+      <p>Some metrics are tempting to grade with an LLM but shouldn't be. The rule: if the question has a deterministic answer, use a deterministic grader. The LLM judge is your fallback when no deterministic check works, not your default.</p>
+
+      <p>Concrete cases where teams reach for LLM judges and shouldn't:</p>
+
+      <ul>
+        <li><strong>Code correctness.</strong> Run the tests. A test that passes is correct; one that fails is wrong. No judge needed. (If you're using LLM-as-judge for code, you've designed your eval wrong; rebuild it around test execution.)</li>
+        <li><strong>Citation verification.</strong> Check whether the cited span actually contains the claim. String matching or sentence-embedding similarity will do this faster and more reliably than asking a model "does this claim follow from this source?"</li>
+        <li><strong>Schema conformance.</strong> Did the agent's output match the JSON schema? <code class="inline">jsonschema.validate()</code>. Done.</li>
+        <li><strong>Forbidden actions.</strong> Did the agent call any tool from the blocklist? Iterate the trace. No judge required.</li>
+      </ul>
+
+      <p>The pattern: a hybrid evaluator that runs deterministic checks first and falls back to LLM-judge only for the dimensions deterministic can't handle.</p>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">evaluate_trajectory</span>(traj):
+    score = {}
+
+    <span class="c-cm"># Deterministic checks first — cheap and exact</span>
+    score[<span class="c-st">"completed"</span>] = traj.stop_reason == <span class="c-st">"end_turn"</span>
+    score[<span class="c-st">"used_forbidden_tool"</span>] = <span class="c-kw">any</span>(
+        t.name <span class="c-kw">in</span> FORBIDDEN <span class="c-kw">for</span> t <span class="c-kw">in</span> traj.tool_calls)
+    score[<span class="c-st">"step_count_in_budget"</span>] = <span class="c-kw">len</span>(traj.tool_calls) <= <span class="c-st">20</span>
+    score[<span class="c-st">"cited_sources_exist"</span>] = all_citations_resolve(traj)
+
+    <span class="c-cm"># Judge for what determinism can't capture</span>
+    score[<span class="c-st">"answer_quality"</span>] = <span class="c-kw">await</span> judge_quality(traj)
+    score[<span class="c-st">"faithfulness"</span>] = <span class="c-kw">await</span> judge_faithfulness(traj)
+
+    <span class="c-kw">return</span> score</pre>
+
+      <h4>The judge-failure escalation path</h4>
+
+      <p>What happens when the judge is wrong and you know it? Two paths:</p>
+
+      <p><strong>Single-output disagreement (an engineer reads a trace and the score doesn't match their intuition):</strong> add it to the calibration set as a new disagreement case. Re-run calibration. If the overall agreement dropped, tighten the rubric and re-measure. If it didn't drop, that one case might be the engineer's read, not the judge's; reconcile with a second human rater.</p>
+
+      <p><strong>Systematic skew (you notice every PR for the last week has been judged favorably or unfavorably in a suspicious pattern):</strong> immediately switch to the ensemble judge for the next week's PRs while you investigate. Check the calibration agreement rate — has it dropped? If yes, the judge has drifted (often a model-snapshot change) and you need to recalibrate or revert. If no, the agent's output distribution may have shifted into territory the judge handles poorly; widen the calibration set with examples from the new distribution.</p>
+
+      <p>The principle: you should never be in a situation where you suspect the judge is broken but have no protocol for confirming or fixing it. The calibration set is the canonical resolution mechanism.</p>
+
+      <div class="callout tip">
+        <p>Treat the judge as a model you trained, even though you didn't actually train it. Models have validation sets, drift over time, need monitoring, and require explicit decisions about when to retire and replace. Your judge is no different. The teams that succeed long-term with LLM-as-judge are the ones that treat judge maintenance as a real engineering activity rather than a one-time setup.</p>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>Debugging a regression that turned out to be the judge.</h3>
+
+      <p>A real-shape story to make Step 4 concrete. A team's <code class="inline">trajectory_pass_rate</code> dropped from 0.764 to 0.712 over two weeks with no PRs to the agent code. Five days into investigating "what regressed?" they realized the agent hadn't.</p>
+
+      <h4>The symptom</h4>
+
+      <p>Monday morning scoreboard scan, two weeks after the last agent merge:</p>
+
+<pre class="trace standalone"><span class="c-out">commit         date         branch  trajectory_pass_rate
+e7b3c20        Wed Mar 4    main    0.764  ← last agent merge
+e7b3c20        Mon Mar 9    main    0.751  (nightly re-run)
+e7b3c20        Mon Mar 16   main    0.738  (nightly re-run)
+e7b3c20        Mon Mar 23   main    0.712  (nightly re-run)
+
+NO PRS TO main IN THIS PERIOD.</span></pre>
+
+      <p>Same commit, dropping scores. The team's first instinct: corpus drift. Maybe new community articles in the KB are degrading retrieval. They check; corpus hash hasn't changed. Second instinct: API-side regression. Maybe Anthropic shipped a quieter Sonnet snapshot. They check the response.model field — same snapshot.</p>
+
+      <p>Two days into investigation, someone notices: the judge_prompt_hash on the failing rows is different from the passing ones.</p>
+
+<pre class="trace standalone"><span class="c-out">commit    date     judge_prompt_hash  trajectory_pass_rate
+e7b3c20   Mar 4    7b2a1c             0.764  ← original
+e7b3c20   Mar 9    7b2a1c             0.751  ← same hash, ~noise
+e7b3c20   Mar 16   c1e8a3             0.738  ← HASH CHANGED
+e7b3c20   Mar 23   c1e8a3             0.712  ← still c1e8a3</span></pre>
+
+      <h4>What happened</h4>
+
+      <p>Three weeks earlier, an engineer had edited the judge rubric to add a "faithfulness" criterion. The PR was reviewed and merged. The scoreboard recorded the new hash. <em>Nobody recalibrated the judge against the calibration set after the rubric change.</em></p>
+
+      <p>The team runs the calibration check now, with the new judge prompt:</p>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/calibrate_judge.py
+
+clear_win                       15/15 = 100%
+close_call                      17/25 = 68%   ← was 76%
+adversarial_verbosity            5/10 = 50%   ← was 60%
+
+overall: 37/50 = 74%   ← was 80%</span></pre>
+
+      <p>The new rubric is stricter on faithfulness — which is fine — but it also accidentally tightened on close calls in a way that didn't match human judgment. The judge is now systematically calling more close calls as "wrong" than humans would. The agent didn't regress; the judge got pickier.</p>
+
+      <h4>The fix</h4>
+
+      <p>Three steps:</p>
+
+      <ol>
+        <li><strong>Document the finding.</strong> A short writeup in the team's eng-journal: "Trajectory pass rate dropped from 0.764 to 0.712 between Mar 4 and Mar 23. Root cause: judge rubric edit on Mar 10 without recalibration. Calibration agreement dropped from 0.80 to 0.74. Agent unchanged."</li>
+        <li><strong>Decide what to do with the judge.</strong> Two options: revert the rubric edit (preserves comparability of historical scores) or accept the stricter rubric and rebaseline (lower scores, but more discriminating). The team chose to keep the stricter rubric — the faithfulness criterion is genuinely valuable — but to add three anchored examples to fix the close-call regression. After this, calibration goes to 0.81 and trajectory_pass_rate stabilizes at 0.736 on the unchanged agent.</li>
+        <li><strong>Update CI.</strong> Add a calibration check to the judge-prompt change workflow: any PR that modifies a file under <code class="inline">evals/judge/</code> must run the calibration script as a status check, and the PR comment surfaces the agreement delta. A change that drops calibration agreement by &gt;3 points is a hard block; anything between -3 and 0 is a soft warning.</li>
+      </ol>
+
+      <div class="observe">
+        <div class="label">Why this matters more than the time it took to debug</div>
+        <p>This team's investigation took 5 days. The unwritten cost is everything they didn't ship in those 5 days because they were busy investigating a regression that wasn't real. The deeper cost is the trust hit: every subsequent score movement now triggers a "is this real?" reflex, and the team can't iterate as confidently.</p>
+        <p>The fix for the next time isn't better detective work. It's the CI rule that catches the problem at PR time. Any judge change without a calibration delta is now a failed status check; the rubric edit would have been flagged before merge, and the team would have addressed it then instead of three weeks later.</p>
+        <p>This is the discipline that makes LLM-as-judge sustainable at scale. The biases are real, the drift is real, the judge changes accumulate — and the only defense is treating the judge with the same rigor as any other piece of production code.</p>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 3.3</div>
+      <h3>Deliverable</h3>
+      <p>A calibrated, versioned, audited LLM-as-judge pipeline with documented agreement against human raters. Both-orderings discipline removing position bias. Rubric tuned to defuse verbosity and authority bias. Cross-family ensemble for release-gate evals. CI rule that calibration must hold whenever the judge changes. A team that knows when to trust the judge and when to fall back to humans, with an explicit policy rather than vibes. The substrate that makes the rest of Part III's eval methodology actually trustworthy.</p>
+      <ul class="checklist">
+        <li>Calibration set: 50 examples across clear / close / adversarial categories, double-rated by humans</li>
+        <li>Judge pipeline with both-orderings pairwise (position bias defeated)</li>
+        <li>Rubric with explicit conciseness and calibrated-confidence guidance</li>
+        <li>2-3 anchored worked examples inside the judge prompt</li>
+        <li>Measured agreement rate against humans; &gt;80% overall, &gt;90% on clear wins</li>
+        <li>Cross-family / cross-provider judge for release-gate evals (3-of-3 with contested escalation)</li>
+        <li>Judge versioning: model snapshot + prompt hash recorded with every score</li>
+        <li>Delta tool warns when comparing rows with different judge_prompt_hash</li>
+        <li>CI rule: judge-config change → calibration check required, &gt;3pt drop blocks merge</li>
+        <li>Monthly drift check on calendar; agreement re-measured against same calibration set</li>
+        <li>Documented fallback policy: deterministic graders where possible, judge for the rest</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('e2')">
+        <div class="dir">← prev</div>
+        <div class="title">3.2 Three layers of evals</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('e4')">
+        <div class="dir">next →</div>
+        <div class="title">3.4 Benchmarks &amp; CI</div>
+      </button>
+    </div>
+  </section>

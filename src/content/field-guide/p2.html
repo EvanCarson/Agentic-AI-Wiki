@@ -1,0 +1,681 @@
+<section class="phase">
+    <div class="phase-num">1.2</div>
+    <div class="week">Part I / Build · Week 2</div>
+    <h2>Replace the toy search with a real stack.</h2>
+    <p class="goal">Three layers, built in order: lexical baseline, dense semantic, rerank. Then a grounding verifier on top. By the end, every claim is traceable and verifiable.</p>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Chunk the corpus. Boringly.</h3>
+
+      <p>Before we can do anything smarter than substring matching, we need to split documents into searchable units. This is "chunking." It's tempting to overthink — semantic chunking, late chunking, recursive AST splitting — but for now, do the boring thing. We'll improve it only if evals say we should.</p>
+
+      <h4>The rule of thumb</h4>
+
+      <ul>
+        <li><strong>Target size:</strong> ~500 tokens per chunk (roughly 2000 characters of English).</li>
+        <li><strong>Overlap:</strong> ~50 tokens between adjacent chunks. Catches cases where the answer straddles a chunk boundary.</li>
+        <li><strong>Split on natural boundaries:</strong> paragraph breaks first, then sentences. Don't cut mid-sentence.</li>
+        <li><strong>Preserve metadata:</strong> each chunk knows its <code class="inline">doc_id</code> and an in-document <code class="inline">chunk_idx</code>. We'll need these to cite back.</li>
+      </ul>
+
+      <p>Note: this code is provider-agnostic. Chunking is just Python.</p>
+
+<pre class="standalone"><span class="c-cm"># retrieval/chunk.py</span>
+<span class="c-kw">import</span> tiktoken  <span class="c-cm"># works for both providers as a counter</span>
+<span class="c-kw">from</span> dataclasses <span class="c-kw">import</span> dataclass
+
+enc = tiktoken.get_encoding(<span class="c-st">"cl100k_base"</span>)
+
+<span class="c-kw">def</span> <span class="c-fn">n_tokens</span>(s: <span class="c-kw">str</span>) -> <span class="c-kw">int</span>:
+    <span class="c-kw">return</span> <span class="c-kw">len</span>(enc.encode(s))
+
+<span class="c-fn">@dataclass</span>
+<span class="c-kw">class</span> <span class="c-fn">Chunk</span>:
+    chunk_id: <span class="c-kw">str</span>   <span class="c-cm"># f"{doc_id}::{idx}"</span>
+    doc_id: <span class="c-kw">str</span>
+    idx: <span class="c-kw">int</span>
+    text: <span class="c-kw">str</span>
+    n_tok: <span class="c-kw">int</span>
+
+<span class="c-kw">def</span> <span class="c-fn">chunk_doc</span>(doc_id: <span class="c-kw">str</span>, text: <span class="c-kw">str</span>,
+              target: <span class="c-kw">int</span> = <span class="c-st">500</span>,
+              overlap: <span class="c-kw">int</span> = <span class="c-st">50</span>) -> <span class="c-kw">list</span>[Chunk]:
+    paragraphs = [p.strip() <span class="c-kw">for</span> p <span class="c-kw">in</span> text.split(<span class="c-st">"\n\n"</span>) <span class="c-kw">if</span> p.strip()]
+    chunks, buf, buf_tok = [], [], <span class="c-st">0</span>
+
+    <span class="c-kw">def</span> <span class="c-fn">flush</span>():
+        <span class="c-kw">nonlocal</span> buf, buf_tok
+        <span class="c-kw">if</span> <span class="c-kw">not</span> buf: <span class="c-kw">return</span>
+        joined = <span class="c-st">"\n\n"</span>.join(buf)
+        chunks.append(Chunk(
+            chunk_id=<span class="c-kw">f</span><span class="c-st">"{doc_id}::{len(chunks)}"</span>,
+            doc_id=doc_id,
+            idx=<span class="c-kw">len</span>(chunks),
+            text=joined,
+            n_tok=n_tokens(joined),
+        ))
+        <span class="c-cm"># Keep last paragraph for overlap</span>
+        buf = [buf[-<span class="c-st">1</span>]] <span class="c-kw">if</span> overlap <span class="c-kw">and</span> n_tokens(buf[-<span class="c-st">1</span>]) <= overlap <span class="c-kw">else</span> []
+        buf_tok = n_tokens(buf[<span class="c-st">0</span>]) <span class="c-kw">if</span> buf <span class="c-kw">else</span> <span class="c-st">0</span>
+
+    <span class="c-kw">for</span> p <span class="c-kw">in</span> paragraphs:
+        t = n_tokens(p)
+        <span class="c-kw">if</span> buf_tok + t > target <span class="c-kw">and</span> buf:
+            flush()
+        buf.append(p)
+        buf_tok += t
+    flush()
+    <span class="c-kw">return</span> chunks</pre>
+
+      <h4>Run it and inspect</h4>
+
+<pre class="standalone">>>> <span class="c-kw">from</span> retrieval.chunk <span class="c-kw">import</span> chunk_doc
+>>> <span class="c-kw">from</span> pathlib <span class="c-kw">import</span> Path
+>>> text = Path(<span class="c-st">"corpus/pgbouncer-modes.md"</span>).read_text()
+>>> chunks = chunk_doc(<span class="c-st">"pgbouncer-modes"</span>, text)
+>>> <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks[:<span class="c-st">3</span>]:
+...     <span class="c-kw">print</span>(c.chunk_id, c.n_tok, c.text[:<span class="c-st">50</span>])</pre>
+
+<pre class="trace"><span class="c-out">pgbouncer-modes::0 487 # PgBouncer Pool Modes\n\nPgBouncer supports
+pgbouncer-modes::1 503 ## Session Pooling\n\nIn session pooling mode,
+pgbouncer-modes::2 491 ## Transaction Pooling\n\nThis is the most c</span></pre>
+
+      <p>Three chunks, all near 500 tokens, each preserving section headers. Good shape.</p>
+
+      <h4>The contextual chunks trick</h4>
+
+      <p>Before embedding chunks, prepend a one-sentence summary describing what each chunk is about within its parent document. This makes retrieval significantly better — Anthropic's contextual retrieval research reports ~35% improvement.</p>
+
+      <p>The cost is small: one cheap-model call per chunk, done once at index time. Use Haiku or GPT-4o-mini and batch them.</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># retrieval/contextualize.py</span>
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+client = Anthropic()
+
+CTX_PROMPT = <span class="c-st">"""Document title: {doc_id}
+Full document:
+&lt;document&gt;{full_text}&lt;/document&gt;
+
+Here is a chunk from the document:
+&lt;chunk&gt;{chunk_text}&lt;/chunk&gt;
+
+In one sentence, situate this chunk in the document
+(what section, what topic, what role). No preamble.
+Output just the sentence."""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">contextualize</span>(chunk_text, doc_id, full_text):
+    response = client.messages.create(
+        model=<span class="c-st">"claude-haiku-4-5"</span>,
+        max_tokens=<span class="c-st">100</span>,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+                   <span class="c-st">"content"</span>: CTX_PROMPT.format(
+                       doc_id=doc_id,
+                       full_text=full_text,
+                       chunk_text=chunk_text)}],
+    )
+    <span class="c-kw">return</span> response.content[<span class="c-st">0</span>].text.strip()</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># retrieval/contextualize.py</span>
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+client = OpenAI()
+
+CTX_PROMPT = <span class="c-st">"""Document title: {doc_id}
+Full document:
+&lt;document&gt;{full_text}&lt;/document&gt;
+
+Here is a chunk from the document:
+&lt;chunk&gt;{chunk_text}&lt;/chunk&gt;
+
+In one sentence, situate this chunk in the document
+(what section, what topic, what role). No preamble.
+Output just the sentence."""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">contextualize</span>(chunk_text, doc_id, full_text):
+    response = client.responses.create(
+        model=<span class="c-st">"gpt-5-mini"</span>,
+        input=CTX_PROMPT.format(
+            doc_id=doc_id,
+            full_text=full_text,
+            chunk_text=chunk_text),
+    )
+    <span class="c-kw">return</span> response.output_text.strip()</pre>
+      </div>
+
+      <p>What does the output look like? For a chunk from the PgBouncer transaction pooling section:</p>
+
+<pre class="trace"><span class="c-out">"This chunk explains transaction pooling in PgBouncer,
+describing how server connections are released after
+each transaction commits — a constraint that breaks
+features requiring session state."</span></pre>
+
+      <p>That one sentence now travels with every chunk through retrieval. When a user asks "why does my prepared statement break in PgBouncer?", the embedding includes "constraint that breaks features requiring session state" — which is semantically close to the question even if the exact word "prepared" isn't in the chunk.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why ~500 tokens? Why not 1000 or 2000?</div>
+        <div class="answer">
+          <p>Two competing pressures. <strong>Larger chunks</strong> preserve more context — useful for the model when it actually reads them. <strong>Smaller chunks</strong> are more precise in retrieval — a 2000-token chunk can be the top match because of one paragraph that happens to be similar, while the other 90% is irrelevant.</p>
+          <p>500 tokens is a sweet spot for technical docs. For code repos you might go smaller (250) since signal is denser. For literary or narrative text, larger (800–1200) keeps narrative flow.</p>
+          <p>Don't guess — measure in Phase 4. Try 300, 500, 1000; pick the one with best recall@5 on your eval set.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How much does contextual chunking actually cost?</div>
+        <div class="answer">
+          <p>One small-model call per chunk at index time. For a 200-document corpus producing ~3000 chunks: roughly $1–3 of API spend total, completed in ~10 minutes if you parallelize. Index-time cost. At query time, retrieval is the same speed as without it.</p>
+          <p>The ROI is significant. If your evals show recall@5 going from 0.62 to 0.84 (a typical lift from contextual retrieval on technical docs), you've turned $2 of index-time spend into an agent that needs noticeably fewer follow-up searches at query time — saving model tokens forever.</p>
+        </div>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Build hybrid search: BM25 + dense + RRF.</h3>
+
+      <p>Now we replace the toy <code class="inline">search_docs</code> with something that actually understands what we're asking. Three components, built separately and then fused.</p>
+
+      <h4>BM25 — the lexical baseline</h4>
+
+      <p>BM25 is a statistical keyword-matching algorithm from the 1990s that, on technical docs, often beats fancy embedding-based search alone. Read that twice. People reach for embeddings reflexively and skip BM25 — that's a mistake. BM25 is your floor: it should never lose on queries where the user uses the same words the docs use.</p>
+
+<pre class="shell standalone">pip install bm25s</pre>
+
+<pre class="standalone"><span class="c-cm"># retrieval/bm25_index.py</span>
+<span class="c-kw">import</span> bm25s
+
+<span class="c-kw">class</span> <span class="c-fn">BM25Index</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, chunks):
+        self.chunks = chunks
+        corpus = [c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks]
+        self.retriever = bm25s.BM25()
+        self.retriever.index(bm25s.tokenize(corpus, stopwords=<span class="c-st">"en"</span>))
+
+    <span class="c-kw">def</span> <span class="c-fn">search</span>(self, query: <span class="c-kw">str</span>, top_k: <span class="c-kw">int</span> = <span class="c-st">50</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>]:
+        q_tok = bm25s.tokenize(query, stopwords=<span class="c-st">"en"</span>)
+        results, scores = self.retriever.retrieve(q_tok, k=top_k)
+        <span class="c-kw">return</span> [self.chunks[i].chunk_id <span class="c-kw">for</span> i <span class="c-kw">in</span> results[<span class="c-st">0</span>]]</pre>
+
+      <h4>Dense embeddings — the semantic layer</h4>
+
+      <p>Dense retrieval embeds chunks and queries into the same vector space, then finds chunks closest to the query. Catches paraphrases ("how to vacuum a table" matches "running VACUUM on a relation") that BM25 misses.</p>
+
+      <p>For embedding models, both providers offer good options. We'll use Voyage AI (Anthropic's recommended embedding partner) and OpenAI's text-embedding-3-large. The vector database is the same either way — we'll use ChromaDB locally.</p>
+
+<pre class="shell standalone">pip install chromadb voyageai</pre>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># retrieval/dense_index.py — Voyage embeddings</span>
+<span class="c-kw">import</span> chromadb, voyageai
+voyage = voyageai.Client()
+chroma = chromadb.PersistentClient(path=<span class="c-st">".chroma"</span>)
+
+<span class="c-kw">def</span> <span class="c-fn">embed</span>(texts, input_type=<span class="c-st">"document"</span>):
+    r = voyage.embed(texts, model=<span class="c-st">"voyage-3"</span>,
+                     input_type=input_type)
+    <span class="c-kw">return</span> r.embeddings
+
+<span class="c-kw">class</span> <span class="c-fn">DenseIndex</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, chunks, name=<span class="c-st">"corpus"</span>):
+        self.col = chroma.get_or_create_collection(name)
+        <span class="c-kw">if</span> self.col.count() == <span class="c-st">0</span>:
+            embeddings = embed([c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks])
+            self.col.add(
+                ids=[c.chunk_id <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+                embeddings=embeddings,
+                documents=[c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+            )
+
+    <span class="c-kw">def</span> <span class="c-fn">search</span>(self, query, top_k=<span class="c-st">50</span>):
+        q_emb = embed([query], input_type=<span class="c-st">"query"</span>)[<span class="c-st">0</span>]
+        r = self.col.query(query_embeddings=[q_emb],
+                           n_results=top_k)
+        <span class="c-kw">return</span> r[<span class="c-st">"ids"</span>][<span class="c-st">0</span>]</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># retrieval/dense_index.py — OpenAI embeddings</span>
+<span class="c-kw">import</span> chromadb
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+oai = OpenAI()
+chroma = chromadb.PersistentClient(path=<span class="c-st">".chroma"</span>)
+
+<span class="c-kw">def</span> <span class="c-fn">embed</span>(texts):
+    r = oai.embeddings.create(
+        model=<span class="c-st">"text-embedding-3-large"</span>,
+        input=texts,
+    )
+    <span class="c-kw">return</span> [e.embedding <span class="c-kw">for</span> e <span class="c-kw">in</span> r.data]
+
+<span class="c-kw">class</span> <span class="c-fn">DenseIndex</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, chunks, name=<span class="c-st">"corpus"</span>):
+        self.col = chroma.get_or_create_collection(name)
+        <span class="c-kw">if</span> self.col.count() == <span class="c-st">0</span>:
+            embeddings = embed([c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks])
+            self.col.add(
+                ids=[c.chunk_id <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+                embeddings=embeddings,
+                documents=[c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+            )
+
+    <span class="c-kw">def</span> <span class="c-fn">search</span>(self, query, top_k=<span class="c-st">50</span>):
+        q_emb = embed([query])[<span class="c-st">0</span>]
+        r = self.col.query(query_embeddings=[q_emb],
+                           n_results=top_k)
+        <span class="c-kw">return</span> r[<span class="c-st">"ids"</span>][<span class="c-st">0</span>]</pre>
+      </div>
+
+      <h4>Reciprocal Rank Fusion — combining the two</h4>
+
+      <p>BM25 and dense both return ranked lists of chunk IDs. RRF combines them into a single ranking using a simple formula: for each result, score it as <code class="inline">1 / (k + rank)</code> across all rankings, sum the scores, sort descending. <code class="inline">k=60</code> is the standard default.</p>
+
+<pre class="standalone"><span class="c-cm"># retrieval/hybrid.py</span>
+<span class="c-kw">def</span> <span class="c-fn">rrf</span>(rankings: <span class="c-kw">list</span>[<span class="c-kw">list</span>[<span class="c-kw">str</span>]], k: <span class="c-kw">int</span> = <span class="c-st">60</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>]:
+    scores: <span class="c-kw">dict</span>[<span class="c-kw">str</span>, <span class="c-kw">float</span>] = {}
+    <span class="c-kw">for</span> ranking <span class="c-kw">in</span> rankings:
+        <span class="c-kw">for</span> rank, cid <span class="c-kw">in</span> <span class="c-kw">enumerate</span>(ranking):
+            scores[cid] = scores.get(cid, <span class="c-st">0.0</span>) + <span class="c-st">1.0</span> / (k + rank + <span class="c-st">1</span>)
+    <span class="c-kw">return</span> <span class="c-kw">sorted</span>(scores, key=scores.get, reverse=<span class="c-kw">True</span>)
+
+<span class="c-kw">class</span> <span class="c-fn">HybridSearch</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, bm25: BM25Index, dense: DenseIndex):
+        self.bm25 = bm25
+        self.dense = dense
+
+    <span class="c-kw">def</span> <span class="c-fn">search</span>(self, query: <span class="c-kw">str</span>, top_k: <span class="c-kw">int</span> = <span class="c-st">20</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>]:
+        bm = self.bm25.search(query, top_k=<span class="c-st">50</span>)
+        ds = self.dense.search(query, top_k=<span class="c-st">50</span>)
+        <span class="c-kw">return</span> rrf([bm, ds])[:top_k]</pre>
+
+      <h4>Quick comparison: what improves?</h4>
+
+      <p>Run the same query — "when to use VACUUM versus VACUUM FULL" — through each retrieval method:</p>
+
+<pre class="trace"><span class="c-out">SUBSTRING (Phase 1):  found 0 docs ─ phrase doesn't appear literally
+
+BM25 alone:
+  1. routine-vacuuming::3     0.71   (contains "VACUUM FULL")
+  2. sql-vacuum::0            0.65
+  3. runtime-config-vacuum::1 0.41
+
+DENSE alone:
+  1. routine-vacuuming::3     0.89   (matches semantically)
+  2. routine-vacuuming::4     0.86
+  3. sql-vacuum::2            0.81
+
+HYBRID (RRF):
+  1. routine-vacuuming::3     0.0328
+  2. routine-vacuuming::4     0.0163
+  3. sql-vacuum::0            0.0162
+  4. sql-vacuum::2            0.0161</span></pre>
+
+      <div class="observe">
+        <div class="label">What to notice</div>
+        <p>BM25 finds <code class="inline">routine-vacuuming::3</code> at rank 1 because "VACUUM FULL" appears literally. Dense also ranks it first, but for a different reason — semantic similarity to the question.</p>
+        <p>Both being right doesn't make this query a great test of hybrid value. But on a paraphrased query like "how do I reclaim disk space after deleting rows" — dense will surface VACUUM FULL docs (the answer) while BM25 might miss entirely because "reclaim" and "disk space" don't appear in those docs.</p>
+        <p>Hybrid catches both cases. The cost is two index lookups instead of one — negligible.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Do I really need both BM25 and dense? Can't dense embeddings do everything?</div>
+        <div class="answer">
+          <p>No. Dense embeddings have a specific failure mode: <strong>exact-term sensitivity</strong>. If the user types "PostgreSQL" and your docs say "Postgres", BM25 misses (different tokens) and dense usually catches (similar embeddings). Good. But if the user types "voyage-3" — the specific embedding model name — dense might surface chunks about "embedding models" generally, while BM25 nails the exact mention.</p>
+          <p>Production retrieval almost always wants both. The rule of thumb: BM25 when the user knows the right words; dense when they describe the thing in their own words; hybrid when you don't know which it is.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why <code class="inline">k=60</code> in RRF?</div>
+        <div class="answer">
+          <p>It's the value from the original RRF paper (Cormack et al., 2009). The intuition: <code class="inline">k</code> controls how much rank position matters. Small <code class="inline">k</code> means top results dominate; large <code class="inline">k</code> means more uniform weighting. 60 has been the default for fifteen years because it works well across many datasets — not because it's optimal for any specific one.</p>
+          <p>You can tune it, but don't bother until evals tell you it matters.</p>
+        </div>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Add a reranker over the top 20.</h3>
+
+      <p>Hybrid search gets you decent recall — the right chunk is usually in the top 20. But it might be at position 8 when you only have time to show the agent 5. A reranker fixes this by re-scoring the top 20 using a more expensive but more precise model.</p>
+
+      <p>The architecture is two-stage: hybrid search runs cheap and broad (top 20 candidates from across the corpus), then the reranker runs slow and precise (re-orders those 20 into the best top 5). This is a standard pattern called "retrieve-then-rerank."</p>
+
+      <h4>How rerankers differ from embeddings</h4>
+
+      <p>An embedding model encodes query and chunk <em>separately</em> into vectors, then compares — fast but loses cross-attention between them. A reranker (a "cross-encoder") encodes <em>both together</em> and produces a score — slower per pair but much more accurate, because it can see exactly how each chunk matches each part of the query.</p>
+
+      <p>Three options for the reranker — pick one:</p>
+
+      <ul>
+        <li><strong>Cohere Rerank</strong> — managed API, ~50ms per 20 chunks. Most popular choice in production.</li>
+        <li><strong>Voyage rerank-2</strong> — managed API, similar quality and price.</li>
+        <li><strong>BGE-reranker-v2</strong> — open-weights model you run locally. Slower to set up; free at inference time.</li>
+      </ul>
+
+<pre class="shell standalone">pip install cohere</pre>
+
+<pre class="standalone"><span class="c-cm"># retrieval/rerank.py — Cohere</span>
+<span class="c-kw">import</span> cohere
+co = cohere.Client()
+
+<span class="c-kw">def</span> <span class="c-fn">rerank</span>(query: <span class="c-kw">str</span>, chunks: <span class="c-kw">list</span>[Chunk],
+           top_k: <span class="c-kw">int</span> = <span class="c-st">5</span>) -> <span class="c-kw">list</span>[Chunk]:
+    <span class="c-kw">if</span> <span class="c-kw">not</span> chunks: <span class="c-kw">return</span> []
+    response = co.rerank(
+        model=<span class="c-st">"rerank-english-v3.0"</span>,
+        query=query,
+        documents=[c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+        top_n=top_k,
+    )
+    <span class="c-kw">return</span> [chunks[r.index] <span class="c-kw">for</span> r <span class="c-kw">in</span> response.results]</pre>
+
+      <h4>Putting it all together</h4>
+
+      <p>The full retrieval pipeline, behind a single function the agent calls:</p>
+
+<pre class="standalone"><span class="c-cm"># retrieval/__init__.py</span>
+<span class="c-kw">from</span> retrieval.bm25_index <span class="c-kw">import</span> BM25Index
+<span class="c-kw">from</span> retrieval.dense_index <span class="c-kw">import</span> DenseIndex
+<span class="c-kw">from</span> retrieval.hybrid <span class="c-kw">import</span> HybridSearch
+<span class="c-kw">from</span> retrieval.rerank <span class="c-kw">import</span> rerank
+<span class="c-kw">from</span> retrieval.chunk <span class="c-kw">import</span> chunk_doc
+
+<span class="c-cm"># Built once at import time</span>
+ALL_CHUNKS = load_or_build_chunks()
+BY_ID = {c.chunk_id: c <span class="c-kw">for</span> c <span class="c-kw">in</span> ALL_CHUNKS}
+hybrid = HybridSearch(BM25Index(ALL_CHUNKS), DenseIndex(ALL_CHUNKS))
+
+<span class="c-kw">def</span> <span class="c-fn">retrieve</span>(query: <span class="c-kw">str</span>, top_k: <span class="c-kw">int</span> = <span class="c-st">5</span>) -> <span class="c-kw">list</span>[Chunk]:
+    candidate_ids = hybrid.search(query, top_k=<span class="c-st">20</span>)
+    candidates = [BY_ID[cid] <span class="c-kw">for</span> cid <span class="c-kw">in</span> candidate_ids]
+    <span class="c-kw">return</span> rerank(query, candidates, top_k=top_k)</pre>
+
+      <h4>Now wire it back into the agent</h4>
+
+      <p>Replace the toy <code class="inline">search_docs</code> in <code class="inline">agent/tools.py</code>:</p>
+
+<pre class="standalone"><span class="c-kw">from</span> retrieval <span class="c-kw">import</span> retrieve
+
+<span class="c-kw">def</span> <span class="c-fn">search_docs</span>(query: <span class="c-kw">str</span>) -> <span class="c-kw">list</span>[<span class="c-kw">dict</span>]:
+    chunks = retrieve(query, top_k=<span class="c-st">5</span>)
+    <span class="c-kw">return</span> [
+        {
+            <span class="c-st">"chunk_id"</span>: c.chunk_id,
+            <span class="c-st">"doc_id"</span>: c.doc_id,
+            <span class="c-st">"snippet"</span>: c.text[:<span class="c-st">300</span>],
+        }
+        <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks
+    ]
+
+<span class="c-kw">def</span> <span class="c-fn">fetch_doc</span>(chunk_id: <span class="c-kw">str</span>) -> <span class="c-kw">dict</span>:
+    <span class="c-cm"># Now we fetch a CHUNK, not a whole document.</span>
+    <span class="c-cm"># Chunks are bounded ~500 tokens — safe for context.</span>
+    c = BY_ID.get(chunk_id)
+    <span class="c-kw">if</span> <span class="c-kw">not</span> c: <span class="c-kw">return</span> {<span class="c-st">"error"</span>: <span class="c-st">"not found"</span>}
+    <span class="c-kw">return</span> {<span class="c-st">"chunk_id"</span>: chunk_id,
+            <span class="c-st">"doc_id"</span>: c.doc_id,
+            <span class="c-st">"text"</span>: c.text}</pre>
+
+      <p>Note the change: <code class="inline">fetch_doc</code> now returns a single chunk instead of an entire document. We chose 500-token chunks for a reason — they're small enough to fit comfortably in context without dominating it. The agent can fetch several chunks across a multi-step investigation.</p>
+
+      <h4>Now run the same VACUUM query from Phase 1</h4>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"When should I VACUUM versus VACUUM FULL?"</span></pre>
+
+<pre class="trace"><span class="c-out">──────────────────── Step 0 ────────────────────
+→ search_docs({'query': 'VACUUM versus VACUUM FULL'})
+   returned: [
+     {chunk_id: 'routine-vacuuming::3', snippet: 'VACUUM
+       FULL rewrites the entire table and indexes,
+       reclaiming disk space but requiring an ACCESS
+       EXCLUSIVE lock. Regular VACUUM cannot...' },
+     {chunk_id: 'routine-vacuuming::4', snippet: '...'},
+     {chunk_id: 'sql-vacuum::0', snippet: '...'},
+     ...
+   ]
+
+──────────────────── Step 1 ────────────────────
+┌─ thinking ─────────────────────────────────────┐
+│ The first snippet has the core distinction.    │
+│ I'll fetch the full chunk for detail.          │
+└────────────────────────────────────────────────┘
+→ fetch_doc({'chunk_id': 'routine-vacuuming::3'})
+
+──────────────────── Step 2 ────────────────────
+→ submit_answer({...})
+
+status: answered (3 steps)</span></pre>
+
+      <div class="observe">
+        <div class="label">Same question, dramatically different behavior</div>
+        <p>Phase 1: 5 steps, 3 redundant searches, lucky recovery. Phase 2: 3 steps, one search returned exactly the right chunk at rank 1.</p>
+        <p>The agent didn't get smarter. The retrieval got smarter, so the agent had less work to do. This is the right lesson: <strong>most "agent quality" improvements are actually retrieval improvements.</strong></p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Do I really need a reranker? Hybrid search is already pretty good.</div>
+        <div class="answer">
+          <p>On clean queries with obvious answers, hybrid alone is often enough. The reranker earns its keep on three cases:</p>
+          <ul>
+            <li><strong>Long-tail queries</strong> where the right chunk is at rank 8–15 in hybrid output. Reranker promotes it to top 3.</li>
+            <li><strong>Ambiguous queries</strong> where multiple chunks look superficially relevant. Reranker is better at picking the one that actually answers the question vs ones that just share keywords.</li>
+            <li><strong>Multi-aspect queries</strong> like "Performance impact of X on Y under condition Z" — embeddings score on overall similarity, rerankers can balance multiple aspects.</li>
+          </ul>
+          <p>Measure with evals. If recall@5 stays flat when you add a reranker, your queries don't need one — skip it and save the latency.</p>
+        </div>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Add a grounding verifier.</h3>
+
+      <p>Retrieval gives the agent the right material to work with. But the agent might still hallucinate — claim something that's <em>plausibly related</em> to its citations but not actually supported by them. A grounding verifier catches this.</p>
+
+      <p>The verifier is a second model call that runs <em>before</em> <code class="inline">submit_answer</code> finalizes. It takes the answer's claims and the cited chunks, and returns a verdict: supported, partially supported, or not supported. Unsupported claims either get rewritten, get a citation correction, or trigger a retry.</p>
+
+      <h4>The verifier prompt</h4>
+
+      <p>Same prompt for both providers; only the API call differs.</p>
+
+<pre class="standalone">VERIFIER_PROMPT = <span class="c-st">"""You are a strict fact-checker.
+
+Given an answer and the sources it cited, decide for each
+factual claim in the answer whether the sources SUPPORT,
+PARTIALLY support, or DO NOT SUPPORT the claim.
+
+Output JSON only:
+{
+  "claims": [
+    {
+      "claim": "the exact claim from the answer",
+      "verdict": "SUPPORT" | "PARTIAL" | "NOT_SUPPORTED",
+      "evidence": "quote from a source, or empty",
+      "reasoning": "one sentence"
+    }
+  ]
+}
+
+Be strict. If a claim is more specific than what
+sources actually say, mark it PARTIAL. If a claim
+isn't mentioned in sources, mark it NOT_SUPPORTED."""</span></pre>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># grounding/verify.py</span>
+<span class="c-kw">import</span> json
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+client = Anthropic()
+
+<span class="c-kw">def</span> <span class="c-fn">verify</span>(answer: <span class="c-kw">str</span>, sources: <span class="c-kw">list</span>[<span class="c-kw">dict</span>]) -> <span class="c-kw">dict</span>:
+    sources_block = <span class="c-st">"\n\n"</span>.join(
+        <span class="c-kw">f</span><span class="c-st">"[{s['chunk_id']}]\n{s['text']}"</span>
+        <span class="c-kw">for</span> s <span class="c-kw">in</span> sources
+    )
+    response = client.messages.create(
+        model=<span class="c-st">"claude-haiku-4-5"</span>,
+        max_tokens=<span class="c-st">1024</span>,
+        system=VERIFIER_PROMPT,
+        messages=[{
+            <span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+            <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"ANSWER:\n{answer}\n\n"</span>
+                       <span class="c-kw">f</span><span class="c-st">"SOURCES:\n{sources_block}"</span>,
+        }],
+    )
+    <span class="c-kw">return</span> json.loads(response.content[<span class="c-st">0</span>].text)</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># grounding/verify.py</span>
+<span class="c-kw">import</span> json
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+client = OpenAI()
+
+<span class="c-kw">def</span> <span class="c-fn">verify</span>(answer: <span class="c-kw">str</span>, sources: <span class="c-kw">list</span>[<span class="c-kw">dict</span>]) -> <span class="c-kw">dict</span>:
+    sources_block = <span class="c-st">"\n\n"</span>.join(
+        <span class="c-kw">f</span><span class="c-st">"[{s['chunk_id']}]\n{s['text']}"</span>
+        <span class="c-kw">for</span> s <span class="c-kw">in</span> sources
+    )
+    response = client.responses.create(
+        model=<span class="c-st">"gpt-5-mini"</span>,
+        instructions=VERIFIER_PROMPT,
+        input=<span class="c-kw">f</span><span class="c-st">"ANSWER:\n{answer}\n\n"</span>
+              <span class="c-kw">f</span><span class="c-st">"SOURCES:\n{sources_block}"</span>,
+        text={<span class="c-st">"format"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"json_object"</span>}},
+    )
+    <span class="c-kw">return</span> json.loads(response.output_text)</pre>
+      </div>
+
+      <h4>What the verifier returns</h4>
+
+<pre class="trace"><span class="c-out">{
+  "claims": [
+    {
+      "claim": "Transaction pooling rotates server
+                connections between transactions",
+      "verdict": "SUPPORT",
+      "evidence": "transaction pooling releases server
+                   connections back to the pool after
+                   each transaction commits",
+      "reasoning": "Source directly states this."
+    },
+    {
+      "claim": "Prepared statements are scoped to a
+                session",
+      "verdict": "SUPPORT",
+      "evidence": "PREPARE creates a prepared statement
+                   for the current session only",
+      "reasoning": "Source explicitly states session scope."
+    },
+    {
+      "claim": "This conflict is the most common cause
+                of PgBouncer migration failures",
+      "verdict": "NOT_SUPPORTED",
+      "evidence": "",
+      "reasoning": "Sources discuss the conflict but
+                    make no claim about migration
+                    failures or their frequency."
+    }
+  ]
+}</span></pre>
+
+      <div class="observe">
+        <div class="label">What just happened</div>
+        <p>The agent's answer had three claims. Two were directly supported by the cited chunks. One — "the most common cause of migration failures" — was an embellishment the model added on its own, not actually present in the sources.</p>
+        <p>Without the verifier, that hallucination would have shipped. With it, we can either drop the unsupported claim, mark it as speculative, or send the agent back to find a source.</p>
+      </div>
+
+      <h4>Wiring it into the loop</h4>
+
+      <p>Modify the loop to verify before returning a successful answer:</p>
+
+<pre class="standalone"><span class="c-cm"># in agent/loop.py, when submit_answer is called:</span>
+<span class="c-kw">if</span> tool_name == <span class="c-st">"submit_answer"</span>:
+    sources = [BY_ID[cid] <span class="c-kw">for</span> cid <span class="c-kw">in</span> citations
+               <span class="c-kw">if</span> cid <span class="c-kw">in</span> BY_ID]
+    verdict = verify(answer, [{
+        <span class="c-st">"chunk_id"</span>: s.chunk_id,
+        <span class="c-st">"text"</span>: s.text,
+    } <span class="c-kw">for</span> s <span class="c-kw">in</span> sources])
+
+    unsupported = [c <span class="c-kw">for</span> c <span class="c-kw">in</span> verdict[<span class="c-st">"claims"</span>]
+                   <span class="c-kw">if</span> c[<span class="c-st">"verdict"</span>] == <span class="c-st">"NOT_SUPPORTED"</span>]
+
+    <span class="c-kw">return</span> {
+        <span class="c-st">"status"</span>: <span class="c-st">"answered"</span>,
+        <span class="c-st">"answer"</span>: answer,
+        <span class="c-st">"citations"</span>: citations,
+        <span class="c-st">"verification"</span>: verdict,
+        <span class="c-st">"unsupported_claims"</span>: <span class="c-kw">len</span>(unsupported),
+    }</pre>
+
+      <p>For now we just attach the verdict to the result — we can decide what to do with it (retry, warn, strip) based on what evals show in Phase 4.</p>
+
+      <div class="callout">
+        <p>The verifier is your first <em>primitive</em>, not feature. You'll reuse it in Phase 3 (verifying subagent outputs) and Phase 4 (it's basically a per-claim eval). Build it well.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Doesn't running a verifier on every answer double my API costs?</div>
+        <div class="answer">
+          <p>Roughly: it adds one extra call per successful answer, with input bounded by (answer + cited chunks) ≈ 2–3k tokens. Using Haiku or gpt-5-mini, that's a fraction of a cent per query.</p>
+          <p>Compare to the cost of <em>not</em> verifying: a user trusts a hallucinated answer, makes a bad decision, and never trusts the agent again. The verifier is cheap insurance.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What if the verifier itself hallucinates?</div>
+        <div class="answer">
+          <p>It can. The verifier is also an LLM. But its task is much narrower — does this claim appear in these sources? — and that's a task where models are surprisingly reliable, especially when prompted to quote evidence.</p>
+          <p>You'll measure the verifier itself in Phase 4 by hand-labeling 30 (claim, sources, verdict) triples and checking agreement. Below ~80% agreement with humans, the verifier is doing harm rather than good and you tune the prompt until it improves.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of week 2</div>
+      <h3>Deliverable</h3>
+      <p>An agent whose answers cite specific chunks, with a verifier that confirms each citation actually supports its claim. Side-by-side comparison: same 10 questions from Phase 1, dramatically different behavior.</p>
+      <ul class="checklist">
+        <li>Chunker with contextual one-line summaries</li>
+        <li>BM25 + dense + RRF hybrid search</li>
+        <li>Cross-encoder reranker on top-20 → top-5</li>
+        <li>Grounding verifier with claim-level verdicts</li>
+        <li>A/B trace comparison: Phase 1 vs Phase 2</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('p1')">
+        <div class="dir">← prev</div>
+        <div class="title">1.1 The loop</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('p3')">
+        <div class="dir">next →</div>
+        <div class="title">1.3 The real loop</div>
+      </button>
+    </div>
+  </section>

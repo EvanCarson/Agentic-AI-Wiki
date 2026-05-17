@@ -1,0 +1,873 @@
+<section class="phase">
+    <div class="phase-num">4.3</div>
+    <div class="week">Part IV / Specialize · The category where capability ceiling is highest and reliability floor is hardest to engineer</div>
+    <h2>Research agents: open-ended search, citation-required outputs.</h2>
+    <p class="goal">A research agent takes an under-specified question — "what's happening in semiconductor export policy?", "summarize the state of fast-charging EV batteries", "is our competitor going to ship X before us?" — and runs a long autonomous loop to produce a synthesized answer with citations. This is the agent shape behind Anthropic's Research feature, OpenAI's Deep Research, Perplexity's research mode, and the bulk of "AI research assistant" products that have shipped since 2024. The capability is real and the value is genuine — but the architecture that makes them <em>reliably</em> useful is not what most teams initially build. This chapter teaches the four properties that distinguish research agents from chat and code agents, the orchestrator-subagent decomposition pattern that emerged as the production default (and why it works), the tools that actually matter, and the evaluation problem that's stickier than anywhere else in this guide.</p>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>What a research agent is — and what it isn't.</h3>
+
+      <p>The category gets used loosely. "AI research" can mean anything from "summarize a single PDF" to "spend 30 minutes investigating a competitive landscape and produce a 4,000-word report with citations." These need very different architectures. The chapter is about the harder end: <strong>open-ended questions, autonomous multi-step exploration, synthesis across many sources, and outputs that need to be defensible</strong>.</p>
+
+      <p>Four properties together define this shape, distinguishing research agents from the categories Build, Ship, and earlier Specialize chapters covered.</p>
+
+      <h4>Property 1: open-ended questions and divergent search</h4>
+
+      <p>A chat agent answers a question. A code agent converges a project to a target state. A research agent does something different: it <em>explores</em>. The question "what's happening in semiconductor export policy?" doesn't have a single correct answer to converge to. The agent has to decide what aspects to investigate, which sources to pull, how deep to go on each thread, and when to stop. Different reasonable runs of the same question may surface different (but each useful) answers.</p>
+
+      <p>This is divergent search by design. Where a code agent's success is binary (tests pass / fail), a research agent's success is a continuous quality space. Where a code agent should narrow as it works, a research agent often <em>broadens</em> as it works — discovering that the question implicates angles it didn't initially consider, following leads that emerge from early findings.</p>
+
+      <p>This shape has consequences. The agent can't have a closed-form definition of "done." Stop conditions become a design problem (Step 4). Quality has to be measured statistically rather than mechanically. And the agent's plan has to be capable of revision as it learns.</p>
+
+      <h4>Property 2: citation-required outputs</h4>
+
+      <p>The output of a research agent isn't just text — it's text where every substantive claim is attributable to a source. The reader of a research report wants to know <em>where each fact came from</em> so they can verify, dig deeper, or weigh credibility. A research agent that produces beautifully-written prose without citations has produced something less useful than one that produces less polished prose <em>with</em> them.</p>
+
+      <p>This requirement changes everything about how the agent operates. Internally, it has to track which source each claim came from, propagate that through the synthesis step without losing it, and emit the final output with the attribution intact. Most failures of research agents in practice are failures here — the agent did good research but lost source-attribution by the time it wrote the report, or confabulated citations to claims it actually got from somewhere else, or worst of all, made up sources entirely.</p>
+
+      <p>Citation discipline is the research-agent analog of the verification loop from chapter 4.1. It's the structural commitment that turns "plausible-sounding text" into "claims a human can check." Step 3 covers how to implement it concretely.</p>
+
+      <h4>Property 3: broad tool surface and high tool-call counts</h4>
+
+      <p>A chat agent might have 3 tools. A code agent has the six from chapter 4.1. A research agent often has 8–15 tools and uses them <em>a lot</em> — Anthropic's research system documented effort-scaling rules embedding "complex research problems may require 10+ sub-agents, each making 10–15 tool calls" — so a single user query can involve hundreds of tool calls across the system.</p>
+
+      <p>The tools are heterogeneous: web search (often multiple search engines), web fetch, PDF/document readers, code execution for data analysis, sometimes API access to specific data sources (Bloomberg, PubMed, SEC EDGAR), and increasingly MCP server connections to internal corpora. Each tool has its own failure modes, latency characteristics, and cost. The agent has to choose well, sequence well, and recover well across all of them.</p>
+
+      <p>This breadth is part of what makes research agents powerful and also what makes them brittle. A code agent failing one tool call usually surfaces a clear error and a clear next step. A research agent failing a search-engine call has to decide: try a different search engine? Reformulate the query? Try a direct URL fetch? Move on? The decision is contextual and the wrong choice cascades into more wasted tool calls.</p>
+
+      <h4>Property 4: long-running and expensive</h4>
+
+      <p>The combination of broad tool surface, high tool-call counts, and large accumulated context (every search result, every fetched page, every PDF excerpt the agent has read) makes research agents the most expensive agent type by far. Anthropic's published numbers: their research system uses <strong>about 15× more tokens than chat interactions</strong> on equivalent-sounding queries. Their reported eval found multi-agent setups with Opus lead + Sonnet sub-agents outperformed single-agent Opus by 90.2% — but the cost multiplier is the price of admission.</p>
+
+      <p>The implication: research agents aren't free, and their economics only work when the question is worth the cost. A typical research run might cost $0.50–$3.00 in tokens for a single query (compare to $0.01–0.05 for a chat turn from chapter 2.2). The user has to be willing to wait minutes for the answer rather than seconds. These constraints are real and shape what research agents are good for: <em>questions that justify minutes of compute</em>, not "what's the weather."</p>
+
+      <h4>The shape these properties produce</h4>
+
+      <p>Together, these four properties define a category that's genuinely distinct:</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  RESEARCH AGENT vs. OTHER AGENTS                            │
+│                                                             │
+│  Question shape:    open-ended ("explore X")                │
+│  Run length:        minutes to tens of minutes              │
+│  Output shape:      synthesized text + citations            │
+│  Tool count:        8-15 tools, hundreds of calls           │
+│  Cost per run:      $0.50 – $3.00 typical                  │
+│  Quality grading:   continuous, requires judge or human     │
+│  Stop condition:    by design problem, not by truth         │
+│                                                             │
+│  Best for: questions worth minutes of compute,              │
+│           where citation-backed synthesis adds value        │
+│  Worst for: simple lookups, real-time information needs,    │
+│           anything an API call would answer directly        │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <h4>The current product lineup</h4>
+
+      <p>For context as of mid-2026, the research-agent products that have shipped:</p>
+
+      <ul>
+        <li><strong>Anthropic's Research (in Claude.ai)</strong> — multi-agent research with web + Google Workspace + connectors. Public since mid-2025, with the architecture detailed in the "How we built our multi-agent research system" engineering post.</li>
+        <li><strong>OpenAI Deep Research</strong> — single-agent (initially) extended-thinking research mode, with browsing tool. Targeted at longer-form synthesis tasks.</li>
+        <li><strong>Perplexity Pro Search / Research</strong> — search-first research with multi-source aggregation. Shorter typical runs, more cited-snippets shape.</li>
+        <li><strong>Google's "Deep Research" in Gemini</strong> — similar shape to OpenAI Deep Research.</li>
+        <li><strong>Open-source frameworks</strong> — GPT Researcher, LangChain research agents, custom implementations on the Agent SDK.</li>
+      </ul>
+
+      <p>The convergence across these products is striking: nearly all use some form of orchestrator-plus-workers, all require citations, all are positioned for questions that justify minutes of compute. The architecture that follows in Step 2 is the consensus design, not an Anthropic-specific quirk.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Aren't "research agents" just RAG with extra steps? Why isn't a good retrieval system enough?</div>
+        <div class="answer">
+          <p>RAG and research agents solve overlapping but distinct problems. RAG (chapter 1.2) is single-shot: take the user's query, retrieve relevant chunks, generate a response. The retrieval is static — what got fetched gets used. This works well when the right chunks are <em>findable from the user's initial query</em>.</p>
+          <p>Research agents handle the case where they aren't. Open-ended questions require <em>iterative</em> exploration — the initial search reveals new angles to investigate, which require new searches, which reveal more. The agent decides what to search for next based on what it's already found. Static RAG can't do this; it makes one retrieval call and lives with what came back.</p>
+          <p>The pragmatic rule: <strong>RAG for known-corpus question-answering, research agents for open-web exploration</strong>. They're complementary — a research agent often uses RAG-style retrieval against specific corpora as one of its tools, then layers iterative exploration on top.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">If they're 15× more expensive than chat, when does the cost actually justify itself?</div>
+        <div class="answer">
+          <p>Roughly: when the question's <em>value of an answer</em> exceeds the cost of the run by an order of magnitude. Some honest categories where it does:</p>
+          <ul>
+            <li><strong>Professional knowledge work</strong>: an analyst would otherwise spend an hour. A $2 research run that produces what would take an hour is a great deal.</li>
+            <li><strong>Investment / market research</strong>: decisions worth thousands of dollars informed by $2-10 of synthesis. Trivial ROI.</li>
+            <li><strong>Pre-meeting briefings</strong>: the agent assembles relevant context that a human couldn't gather in the same time.</li>
+            <li><strong>Comprehensive surveys of a literature</strong>: the agent reads more papers than a human would.</li>
+          </ul>
+          <p>Categories where it doesn't:</p>
+          <ul>
+            <li>Casual curiosity (a free chat answer is fine)</li>
+            <li>Single-source lookups (an API or basic search would do it)</li>
+            <li>Real-time anything (the latency would lose to a stale-but-fast answer)</li>
+          </ul>
+          <p>The honest framing: research agents aren't a general-purpose UI; they're a specific category of high-leverage tool for high-value questions. Product UX should expose this — make it obvious when the user is requesting an expensive research run vs. a chat answer.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How is this different from chapter 1.2's research-shaped agent project?</div>
+        <div class="answer">
+          <p>Chapter 1.2 walked you through building a research-style agent end-to-end as a teaching example — a single-agent loop with retrieval, with tools, with citation handling. That covered the foundations. This chapter is about the next layer up: <em>how the production category of research agents has evolved</em> from "single agent with tools" to "orchestrator with sub-agents," what tools turn out to matter most in practice, and how teams shipping these systems handle the harder problems (citation fidelity, evaluation, stop conditions). Chapter 1.2 is the floor; chapter 4.3 is where current best practice lives.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>The orchestrator-subagent architecture.</h3>
+
+      <p>If you build a research agent as one giant prompt with many tools, you can get demos working. You can even get individual queries answering well. What you don't get is consistency at scale across diverse queries. The single-agent design has specific weaknesses that show up in production, and the fix that's emerged across nearly every major research-agent product is the same: <strong>decompose into a lead orchestrator and a fleet of specialized sub-agents</strong>.</p>
+
+      <p>This step explains <em>why</em> the decomposition wins, what each role does, and the cost/quality math that justifies the architecture.</p>
+
+      <h4>The problems with a single-agent design</h4>
+
+      <p>Three specific failure modes show up reliably in single-agent research systems, and they're hard to engineer around without decomposition:</p>
+
+      <p><strong>Context pollution.</strong> A single agent investigating a complex question accumulates every search result, every page fetched, every PDF excerpt into one ever-growing context window. By turn 30, the context has gigabytes of mostly-irrelevant search snippets. Performance degrades — lost-in-the-middle (chapter 0.1) kicks in, the agent forgets earlier findings, and synthesis suffers because the relevant material is buried.</p>
+
+      <p><strong>Serial bottleneck.</strong> A single agent has to do one tool call at a time, weight the results, decide what's next, do another call. Even with parallel tool dispatch (chapter 0.3), the structural decisions are serial. A research run that could run 10 independent investigation threads in parallel becomes a 10× longer sequential walk through them.</p>
+
+      <p><strong>Lack of role specialization.</strong> The single agent is simultaneously: planner (deciding what to investigate), searcher (formulating queries and reading results), evaluator (judging which sources are credible), and synthesizer (writing the final answer). Each is a different cognitive task with different prompt-engineering needs. Trying to optimize a single prompt for all of them produces a mediocre prompt at each.</p>
+
+      <h4>The decomposition</h4>
+
+      <p>Production research systems converge on this shape:</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────┐
+│  ORCHESTRATOR-SUBAGENT RESEARCH ARCHITECTURE                 │
+│                                                              │
+│                  ┌─────────────────────┐                     │
+│   user query  →  │  LEAD RESEARCHER    │                     │
+│                  │  (orchestrator)     │                     │
+│                  │                     │                     │
+│                  │  • analyzes query   │                     │
+│                  │  • plans approach   │                     │
+│                  │  • spawns subagents │                     │
+│                  │  • synthesizes final│                     │
+│                  └──────────┬──────────┘                     │
+│                             │                                │
+│           ┌─────────────────┼─────────────────┐              │
+│           ▼                 ▼                 ▼              │
+│      ┌─────────┐       ┌─────────┐       ┌─────────┐         │
+│      │ SUBAGENT│       │ SUBAGENT│       │ SUBAGENT│   ...   │
+│      │   #1    │       │   #2    │       │   #3    │         │
+│      │         │       │         │       │         │         │
+│      │ scope:  │       │ scope:  │       │ scope:  │         │
+│      │ thread A│       │ thread B│       │ thread C│         │
+│      │         │       │         │       │         │         │
+│      │ tools:  │       │ tools:  │       │ tools:  │         │
+│      │ search, │       │ search, │       │ pdf,    │         │
+│      │ fetch   │       │ fetch   │       │ fetch   │         │
+│      └────┬────┘       └────┬────┘       └────┬────┘         │
+│           │                 │                 │              │
+│           └─────────────────┼─────────────────┘              │
+│                             ▼                                │
+│              compressed findings + sources                   │
+│                             │                                │
+│                  ┌──────────▼──────────┐                     │
+│                  │  LEAD RESEARCHER    │                     │
+│                  │  (synthesis phase)  │                     │
+│                  │                     │                     │
+│                  │  • merges findings  │                     │
+│                  │  • resolves conflict│                     │
+│                  │  • writes report    │                     │
+│                  │  • preserves cites  │                     │
+│                  └─────────────────────┘                     │
+│                             │                                │
+│                             ▼                                │
+│                        final answer                          │
+└──────────────────────────────────────────────────────────────┘</div>
+
+      <p>The lead researcher acts as a planner and synthesizer. Each subagent owns one investigation thread — a specific sub-question with a bounded scope and a small toolkit. Subagents return <em>compressed findings</em> (their analyzed conclusions plus the source citations that support them), not raw search results. The lead does the cross-thread synthesis with a manageable context.</p>
+
+      <h4>Why this works</h4>
+
+      <p>The decomposition addresses all three of the single-agent failure modes:</p>
+
+      <p><strong>Context isolation prevents pollution.</strong> Each subagent has its own context window dedicated to its thread. Search results that subagent #1 gathered never enter subagent #2's context, and the lead only sees the <em>compressed</em> findings from each. This is the key architectural insight — sub-agents act as <em>context-isolating filters</em>. They consume raw information and emit summaries.</p>
+
+      <p><strong>Parallelism is structural.</strong> Subagents run concurrently. If a complex question has 5 independent investigation threads, all 5 subagents can be working at once. Wall-clock time drops to roughly the longest single thread, not the sum. For research questions where threads truly are independent, this is a 3–5× speedup with no quality loss.</p>
+
+      <p><strong>Role specialization improves each step.</strong> The lead researcher's prompt can be optimized for planning and synthesis. Subagents' prompts can be optimized for focused investigation. Each role has its own model choice — Anthropic's documented configuration uses Opus as lead and Sonnet as subagents (their finding: this combination outperformed single-agent Opus by 90.2% on internal evals). The lead does the harder cognitive work (planning, judgment, synthesis) on the more capable model; subagents do the parallelizable, narrower work on the cheaper one.</p>
+
+      <h4>The lead researcher's job, concretely</h4>
+
+      <p>The lead researcher is doing three distinct things, sequenced:</p>
+
+<pre class="standalone"><span class="c-cm"># Sketch of the lead researcher's lifecycle</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">run_research</span>(user_query: <span class="c-kw">str</span>):
+    <span class="c-cm"># 1. PLAN. Analyze the query and decompose into sub-questions.</span>
+    plan = <span class="c-kw">await</span> lead_call(
+        model=<span class="c-st">"claude-opus-4-7"</span>,
+        system=PLANNER_SYSTEM_PROMPT,
+        message=user_query,
+        <span class="c-cm"># Output: structured plan with sub-questions and tool guidance per</span>
+    )
+    save_to_memory(plan)   <span class="c-cm"># persist; large research tasks can exceed context</span>
+
+    <span class="c-cm"># 2. DELEGATE. Spawn sub-agents in parallel, one per sub-question.</span>
+    findings = <span class="c-kw">await</span> asyncio.gather(*[
+        run_subagent(
+            sub_question=sq.question,
+            tools=sq.allowed_tools,        <span class="c-cm"># narrow per sub-agent</span>
+            tool_budget=sq.budget,         <span class="c-cm"># 3-15 calls depending on task</span>
+            output_schema=COMPRESSED_FINDING_SCHEMA,
+        )
+        <span class="c-kw">for</span> sq <span class="c-kw">in</span> plan.sub_questions
+    ])
+
+    <span class="c-cm"># 3. SYNTHESIZE. Combine findings into a coherent answer with citations.</span>
+    <span class="c-cm"># Lead receives the compressed findings, NOT the raw search results.</span>
+    <span class="c-kw">return</span> <span class="c-kw">await</span> lead_call(
+        model=<span class="c-st">"claude-opus-4-7"</span>,
+        system=SYNTHESIZER_SYSTEM_PROMPT,
+        message=build_synthesis_input(user_query, plan, findings),
+    )</pre>
+
+      <p>Three things are subtle in this sketch and earn their place:</p>
+
+      <p><strong>Memory persistence.</strong> Long research tasks can exceed the model's context window. The plan is saved to durable storage at the start; if the lead needs to be rehydrated mid-run, it can recover. Anthropic's documented system uses this pattern explicitly because complex queries routinely exceed even 200K-token contexts.</p>
+
+      <p><strong>Structured per-subagent task specifications.</strong> Each subagent's task isn't just "investigate this." It's "investigate this specific sub-question, using these specific tools, with this budget of tool calls, and return findings in this exact schema." Anthropic's published findings: without this level of specification, subagents either duplicated each other's work or left gaps. Their cited example — one subagent looked into the 2021 semiconductor shortage while two others independently investigated 2025 supply chains — is exactly what poor task delegation produces.</p>
+
+      <p><strong>Effort-scaling rules embedded in the lead's system prompt.</strong> The lead needs to know how to size the effort to the question. Anthropic's documented rules:</p>
+
+      <ul>
+        <li>Simple fact check: 1 sub-agent, 3–10 tool calls.</li>
+        <li>Direct comparison: 2–4 sub-agents, 10–15 calls each.</li>
+        <li>Complex research: 10+ sub-agents, with clearly divided responsibilities.</li>
+      </ul>
+
+      <p>Without these rules, agents either over-invest in trivial questions (wasted cost) or under-invest in complex ones (poor answers). The rules in the prompt anchor the lead's planning step.</p>
+
+      <h4>The subagent's job, concretely</h4>
+
+      <p>Each subagent is given a narrow task and runs a bounded investigation loop:</p>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">run_subagent</span>(sub_question: <span class="c-kw">str</span>, tools: <span class="c-kw">list</span>,
+                       tool_budget: <span class="c-kw">int</span>, output_schema: <span class="c-kw">dict</span>):
+    <span class="c-cm"># Subagent has its own conversation context, isolated from peers</span>
+    messages = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: sub_question}]
+    calls_made = <span class="c-st">0</span>
+
+    <span class="c-kw">while</span> calls_made < tool_budget:
+        response = <span class="c-kw">await</span> client.messages.create(
+            model=<span class="c-st">"claude-sonnet-4-5"</span>,        <span class="c-cm"># cheaper than lead</span>
+            system=SUBAGENT_SYSTEM_PROMPT,    <span class="c-cm"># narrow, focused</span>
+            tools=tools,                      <span class="c-cm"># narrow, per-task</span>
+            messages=messages,
+        )
+        <span class="c-kw">if</span> response.stop_reason == <span class="c-st">"end_turn"</span>:
+            <span class="c-kw">break</span>
+
+        <span class="c-cm"># Tool use; track calls against the budget</span>
+        results = <span class="c-kw">await</span> dispatch_tools(response.content)
+        calls_made += <span class="c-kw">len</span>(results)
+        messages.extend(append_turn(response, results))
+
+    <span class="c-cm"># Final step: produce structured findings (NOT raw chat)</span>
+    findings = <span class="c-kw">await</span> client.messages.create(
+        model=<span class="c-st">"claude-sonnet-4-5"</span>,
+        system=COMPRESSION_PROMPT,
+        messages=messages + [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+            <span class="c-st">"content"</span>: <span class="c-st">"Produce structured findings per the schema."</span>}],
+        tools=[{<span class="c-st">"name"</span>: <span class="c-st">"emit_findings"</span>, <span class="c-st">"input_schema"</span>: output_schema}],
+    )
+    <span class="c-kw">return</span> findings.content[<span class="c-st">0</span>].<span class="c-kw">input</span></pre>
+
+      <p>The structured output at the end is critical. Subagents don't return chat-style text — they return a typed object: claims, with the source URL each claim came from, plus a confidence indicator. This is what makes citation propagation possible. The lead gets findings already mapped to sources, and synthesis preserves the mapping rather than reconstructing it.</p>
+
+      <h4>The cost trade-off, honestly</h4>
+
+      <p>Multi-agent research is expensive. The cost components, roughly:</p>
+
+      <ul>
+        <li>Lead's planning call: 1 call, mid-sized context, expensive model (Opus)</li>
+        <li>N subagents × M tool calls each, with growing context inside each subagent's window</li>
+        <li>Lead's synthesis call: 1 call, large context from N compressed findings, expensive model</li>
+      </ul>
+
+      <p>For a "complex research" run with 10 subagents at 12 tool calls each plus the lead's two calls, total token usage is on the order of 500K–2M tokens. At Sonnet pricing for subagents and Opus pricing for the lead, you're looking at $2-5 per run. Prompt caching (chapter 2.2) helps but doesn't fundamentally change the order of magnitude.</p>
+
+      <p>This is why the architecture is reserved for genuinely-hard questions. For a simple lookup, the single-agent or even single-call path is much cheaper and works fine. The orchestrator-subagent architecture is the right answer when the marginal quality is worth the marginal cost — and your effort-scaling rules need to capture which questions are which.</p>
+
+      <div class="callout tip">
+        <p>If you're building your first research agent, don't start with the multi-agent architecture. Start with a single-agent loop (chapter 1.3's pattern, extended with web search and citation tracking). Get a feel for what works and what fails. <em>Then</em> introduce orchestrator-subagent decomposition for the specific failure modes you actually hit. The multi-agent shape has real engineering complexity — task specs, structured findings, parallel coordination, memory persistence — and shipping it without first feeling the single-agent pain often leads to over-engineered systems that don't actually outperform the simpler version.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Can subagents spawn their own subagents? Recursive decomposition?</div>
+        <div class="answer">
+          <p>Technically yes, in practice it almost always goes wrong. Two failure modes: (1) cost blows up exponentially — three levels of fan-out at 5× each is 125× the single-agent cost; (2) coordination becomes impossible — the lead has no visibility into what sub-sub-agents are doing, can't enforce budgets, and synthesis gets messy.</p>
+          <p>Production research systems generally stop at one level of subagent delegation. If a single subagent's task seems too complex for it to handle, the right move is to <em>decompose at the lead level</em> into multiple subagents, not to allow that subagent to recurse. This keeps the call graph shallow and the budgets predictable.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How do subagents avoid duplicating work?</div>
+        <div class="answer">
+          <p>Three mechanisms, with diminishing returns:</p>
+          <ul>
+            <li><strong>Clear task scoping by the lead</strong> — the most important mechanism. The lead's planning step explicitly carves up the question into non-overlapping sub-questions. The example from Anthropic's published findings (one subagent on 2021 chip crisis, two on 2025 supply chains) is what happens when the lead's task decomposition is sloppy. Tight per-subagent task descriptions prevent most overlap.</li>
+            <li><strong>Shared search-result memo</strong> (optional, costly) — some implementations have subagents post their search queries (not results) to a shared memo, so other subagents can see "subagent #3 already searched for 'NVIDIA Q3 earnings' — no need to repeat." Adds coordination overhead.</li>
+            <li><strong>Synthesis-time deduplication</strong> — the lead, at synthesis, notices when multiple subagents reported the same source citing the same fact and reports it once. Cheap, but doesn't recover the wasted upstream effort.</li>
+          </ul>
+          <p>The first one does most of the work. The other two are diminishing-return safety nets.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should the lead be a reasoning model (extended thinking) or a regular model?</div>
+        <div class="answer">
+          <p>Reasoning model, in production. The lead is doing two of the cognitive tasks where extended thinking helps most (chapter 0.1): complex planning (which sub-questions, with what scope, in what order) and multi-source synthesis (reconciling potentially-conflicting findings from multiple sub-agents). Both benefit measurably from the model "thinking" before committing.</p>
+          <p>The subagents are doing more focused investigations where reasoning is less critical — they're doing search + read + summarize, and the search itself provides the deliberation. Most production systems use a non-reasoning model (or a model with thinking turned off) for subagents to save cost. The single biggest cost-optimization in research agents is using cheap subagent models, since the bulk of token spend is on the subagent side.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>The tools that actually matter, and citation discipline.</h3>
+
+      <p>Research agents have many tools available. The temptation when building one is to wire up everything that might be useful — multiple search engines, every data API, code execution, image generation, the kitchen sink. Don't. <strong>Tool surface area is a cost</strong>: each additional tool makes the agent slower at decision-making, more likely to misroute, and more expensive to evaluate. The discipline is to ship the smallest tool set that does the job.</p>
+
+      <p>This step covers the tools that earn their place, the patterns for each, and the citation infrastructure that makes the output trustworthy.</p>
+
+      <h4>The five tools that cover most research-agent work</h4>
+
+      <p>The set that emerges in production, in rough order of how heavily they're used:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Tool</div>
+          <div>What it does</div>
+          <div>When it matters</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">web_search</div>
+          <div class="vector">Search the open web; returns titles, URLs, snippets</div>
+          <div class="defense">The default entry point. Most threads start with one or more web searches to identify relevant sources.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">web_fetch</div>
+          <div class="vector">Fetch the full content of a URL and return it as text</div>
+          <div class="defense">After search identifies a URL worth reading. Snippets are usually too brief for substantive claims.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">read_document</div>
+          <div class="vector">Parse PDF / Word / etc. and return text + structure</div>
+          <div class="defense">Academic papers, government reports, SEC filings — the high-quality sources are usually PDFs.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">code_execution</div>
+          <div class="vector">Run sandboxed Python for data analysis</div>
+          <div class="defense">Numerical claims — calculating growth rates, joining data from tables, plotting trends. Essential when claims involve math.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">specialized data APIs</div>
+          <div class="vector">SEC EDGAR, PubMed, internal knowledge base, etc.</div>
+          <div class="defense">Domain-specific. Higher-quality than web search for the domains they cover. Add per use case.</div>
+        </div>
+      </div>
+
+      <p>Notice what's <em>not</em> on this list. No image generation. No file writing. No email/communication tools. Research agents are read-only — they investigate and synthesize, they don't take actions in the world. This is a deliberate design discipline: keeping the action space restricted makes the agent dramatically safer (no exfiltration paths, no irreversible mistakes) and tighter to evaluate.</p>
+
+      <h4>Why web_search and web_fetch are usually separate</h4>
+
+      <p>It's tempting to combine these into one tool ("search + auto-fetch top result"). Don't. Two tools for two reasons:</p>
+
+      <p><strong>The agent should choose which results to read.</strong> A search returns 10 candidates with snippets. The agent reads the snippets and identifies the most promising 2–3 to actually fetch. Fetching all 10 wastes 7× the tokens and clutters the context with low-relevance content. Separating search from fetch puts the choice in the agent's hands.</p>
+
+      <p><strong>Tool descriptions can be optimized separately.</strong> The search tool's description teaches the agent how to formulate good queries (keywords, not natural language; 3–6 words; include time markers when relevant). The fetch tool's description teaches the agent when to fetch (snippet insufficient; primary source needed) vs not (snippet already answers the question). These are different skills with different prompt-engineering.</p>
+
+      <h4>The compress-as-you-read pattern</h4>
+
+      <p>One of the highest-leverage patterns in research-agent design: <strong>compress information as soon as you read it, not at synthesis time</strong>.</p>
+
+      <p>The naive design: each subagent fetches sources, accumulates their full text in context, and at the end summarizes for the lead. Three problems: (1) context bloat across many sources, (2) the lead receives summaries that the subagent had to write at the end of a polluted-context turn, (3) attribution is messy because by the time of synthesis, the connection between specific claims and specific source URLs has weakened.</p>
+
+      <p>The better design: as the subagent reads each source, it immediately extracts the relevant claims and the URL that supports each, and discards (or moves out of context) the raw text. The subagent's working context contains a growing list of (claim, source URL) pairs, not raw documents.</p>
+
+<pre class="standalone"><span class="c-cm"># Inside a subagent — the compress-as-you-read pattern</span>
+
+<span class="c-cm"># Step 1: search to find candidates</span>
+search_results = <span class="c-kw">await</span> web_search(<span class="c-st">"semiconductor export controls 2025"</span>)
+
+<span class="c-cm"># Step 2: pick most promising 2-3 URLs</span>
+chosen_urls = pick_best(search_results, n=<span class="c-st">3</span>)
+
+<span class="c-cm"># Step 3: fetch and IMMEDIATELY extract claims</span>
+claims = []
+<span class="c-kw">for</span> url <span class="c-kw">in</span> chosen_urls:
+    text = <span class="c-kw">await</span> web_fetch(url)
+    extracted = <span class="c-kw">await</span> extract_claims(   <span class="c-cm"># a separate model call</span>
+        text=text,
+        source_url=url,
+        sub_question=current_sub_question,
+    )
+    <span class="c-cm"># extracted is a list of {claim, source_url, confidence, quote}</span>
+    claims.extend(extracted)
+    <span class="c-cm"># text is discarded; only the structured claims live on</span>
+
+<span class="c-cm"># Step 4: the subagent's "memory" is the growing claims list</span>
+<span class="c-cm">#         not the raw fetched documents</span></pre>
+
+      <p>This pattern has three benefits: (1) the subagent's context stays compact, so the agent can read many sources before context pressure builds; (2) the claim-to-URL mapping is established at extraction time, when both are fresh, rather than reconstructed at synthesis; (3) the extraction step itself is a focused, evaluable subtask — you can measure "does the extractor produce accurate claims from a given source?" separately from "does the synthesizer write a good report?"</p>
+
+      <h4>Citation discipline: the structural commitment</h4>
+
+      <p>Every substantive claim in the final output should have an attributable source. This is non-negotiable. The mechanism to make it happen:</p>
+
+      <p><strong>Claims and sources are stored together, structurally.</strong> A claim is never a piece of text; it's an object with the claim's content and the source URL that supports it. The structured-output schema for subagent findings enforces this:</p>
+
+<pre class="standalone">COMPRESSED_FINDING_SCHEMA = {
+    <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+    <span class="c-st">"properties"</span>: {
+        <span class="c-st">"sub_question"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+        <span class="c-st">"summary"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+                     <span class="c-st">"description"</span>: <span class="c-st">"2-3 sentence overview of findings"</span>},
+        <span class="c-st">"claims"</span>: {
+            <span class="c-st">"type"</span>: <span class="c-st">"array"</span>,
+            <span class="c-st">"items"</span>: {
+                <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+                <span class="c-st">"properties"</span>: {
+                    <span class="c-st">"claim"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+                              <span class="c-st">"description"</span>: <span class="c-st">"single substantive fact"</span>},
+                    <span class="c-st">"source_url"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+                    <span class="c-st">"source_title"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+                    <span class="c-st">"confidence"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+                                   <span class="c-st">"enum"</span>: [<span class="c-st">"high"</span>, <span class="c-st">"medium"</span>, <span class="c-st">"low"</span>]},
+                    <span class="c-st">"quote"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+                              <span class="c-st">"description"</span>: <span class="c-st">"short verbatim from source"</span>},
+                },
+                <span class="c-st">"required"</span>: [<span class="c-st">"claim"</span>, <span class="c-st">"source_url"</span>, <span class="c-st">"confidence"</span>],
+            },
+        },
+        <span class="c-st">"gaps"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"array"</span>,
+                  <span class="c-st">"items"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+                  <span class="c-st">"description"</span>: <span class="c-st">"questions raised but not answered"</span>},
+    },
+}</pre>
+
+      <p>The structure is doing real work: claims are typed objects that always include their source. There's no path in the data shape for a claim to lose its source. The synthesis step receives these objects and emits final text where every claim still has its citation attached.</p>
+
+      <p><strong>The synthesizer's prompt instructs citation preservation.</strong> The lead's synthesis prompt explicitly says: every substantive claim in the final output must include an inline citation. Claims without citations should either be removed or paraphrased to remove the substantive claim. Adding extra citations (the same source for multiple sentences in the same paragraph) is fine; <em>removing</em> citations from substantive claims is not allowed.</p>
+
+      <p><strong>A post-synthesis verifier (optional but valuable).</strong> A separate model call after synthesis checks that every substantive claim in the output has a citation that the claim genuinely follows from. This is the chapter 3.3 LLM-as-judge applied specifically to citation faithfulness. Catches the cases where the synthesizer drifted (added a claim from training data without source backing, or applied a citation to the wrong claim). For high-stakes outputs, run this as a hard gate.</p>
+
+      <h4>The "no source, no claim" rule</h4>
+
+      <p>The strict version, used by the most disciplined research-agent products: <strong>if there's no source supporting a claim, the claim doesn't go in the output</strong>. The agent will sometimes know things from its training data — but training-data knowledge has no audit trail, and including it undermines the trust the citation system creates.</p>
+
+      <p>The discipline is to either find a source (search for one explicitly) or remove the claim. The agent acquires the habit through system-prompt instruction: "Do not include claims you cannot cite. If a claim seems important but you have no source, search for one. If no source exists, omit the claim and note the gap."</p>
+
+      <p>This is the equivalent of "authorize 'I don't know'" from chapter 0.1 — the agent has explicit permission, even instruction, to <em>leave things out</em>. Without that, the synthesizer will pad with general-knowledge claims that aren't sourced and that erode reader trust.</p>
+
+      <h4>Source quality vs source quantity</h4>
+
+      <p>One subtle point: more sources is not always better. The agent should prefer:</p>
+
+      <ul>
+        <li><strong>Primary over secondary.</strong> The SEC filing over the journalist's summary of it. The press release over the news article reporting on the press release. Primary sources have higher fidelity and fewer game-of-telephone errors.</li>
+        <li><strong>Recent over old (for current-state questions).</strong> 2026 data on a 2026 question, not 2022 data being interpolated forward.</li>
+        <li><strong>Specific over generic.</strong> A page that addresses the exact question over a general article that mentions the topic in passing.</li>
+        <li><strong>Authoritative over aggregator.</strong> The company blog over the aggregator that reposted it. Aggregators add error-prone summaries and often lose source citation themselves.</li>
+      </ul>
+
+      <p>Encoding these preferences into the system prompt of each subagent measurably improves the credibility of the final output. Without these instructions, agents default to taking whatever search returns first — which is often optimized for SEO, not for accuracy.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My research agent's web_search returns 10 results, but the relevant info is buried in result #7. How do I get the agent to read past the top results?</div>
+        <div class="answer">
+          <p>The fix is in how the agent ranks results, not in always-reading-all. Three patterns:</p>
+          <ul>
+            <li><strong>Read all snippets before picking.</strong> The agent should look at all 10 snippets before deciding which 2–3 to fetch. Snippets are cheap; reading them all is one prompt turn, and it surfaces buried-but-relevant results that the title alone wouldn't show.</li>
+            <li><strong>Reformulate the query if no result looks promising.</strong> If the agent reads 10 snippets and none look directly relevant, the right move is a new search with a refined query, not blindly fetching the top result anyway.</li>
+            <li><strong>Use site-restricted searches for known sources.</strong> If a sub-question is about regulatory matters, searching with <code class="inline">site:sec.gov</code> or similar focuses the result set on authoritative sources.</li>
+          </ul>
+          <p>For very long-tail questions where good answers are deep in search results, the right fix is usually that the question itself needs to be decomposed into more specific sub-questions — that's a lead-researcher task, not a subagent fix.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about paywalled sources? The best research lives behind paywalls.</div>
+        <div class="answer">
+          <p>Three honest positions to hold simultaneously:</p>
+          <ul>
+            <li><strong>Don't circumvent paywalls.</strong> Anthropic's policies (and most providers') treat this as off-limits. Beyond the policy, the engineering reality is that anti-circumvention triggers anti-bot detection, kills your search quality, and creates legal exposure.</li>
+            <li><strong>Use legitimate access where you have it.</strong> If your organization has a Bloomberg subscription, surface that to the agent as an authenticated tool. Many enterprise research agents have access to internal corpora and licensed databases this way.</li>
+            <li><strong>Note the gap explicitly.</strong> When the best information is behind a paywall, the agent should say so in its output — "additional detail available in [source], which is behind a paywall." The user can then choose to access it themselves. Pretending the gap doesn't exist is worse than naming it.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should the agent verify claims against multiple independent sources?</div>
+        <div class="answer">
+          <p>For high-stakes claims, yes — and the architecture supports it naturally. The lead researcher's synthesis prompt can include: "For claims marked as critical to the user's question, cite at least 2 independent sources." The compressed findings already include source URLs, so the synthesizer can check whether any given claim has multi-source backing.</p>
+          <p>Multi-source verification catches a specific failure: a claim that's actually from one source which got repeated across many aggregators. Those look like "everyone agrees" but really aren't. A good research agent identifies when 8 cited sources are all upstream-linked to one primary, and treats that as one source not eight.</p>
+          <p>This is sophisticated discipline; not every research agent needs it. For most queries, single-source citation is fine. For investment, medical, or legal-adjacent questions, multi-source becomes important.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Evaluation, ground truth, and knowing when to stop.</h3>
+
+      <p>Chapter 3.1 made the case that evals are the discipline that lets agent quality improve over time. Chapter 3.3 covered LLM-as-judge as the scalable grading mechanism. Both apply to research agents, but research agents force you to confront the hardest version of the eval problem: <strong>research output has no ground truth</strong>. There's no test that runs. There's no canonical correct answer for "what's happening in semiconductor export policy?" — there's a continuous quality space.</p>
+
+      <p>This step is about how to grade research agent outputs anyway, and the related problem of how the agent itself decides when its investigation is done.</p>
+
+      <h4>The four dimensions of research output quality</h4>
+
+      <p>"Was the answer good?" is too vague to measure. Decompose into dimensions that can each be graded independently:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Dimension</div>
+          <div>What it asks</div>
+          <div>How to measure</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Factual accuracy</div>
+          <div class="vector">Are the claims true?</div>
+          <div class="defense">Citation-faithfulness check: does each cited source actually support the claim it's cited for? Programmable.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Comprehensiveness</div>
+          <div class="vector">Are important angles covered?</div>
+          <div class="defense">Coverage check against a hand-curated topic checklist for that query type. Or LLM judge with a rubric.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Source quality</div>
+          <div class="vector">Are the sources credible?</div>
+          <div class="defense">Domain-list check (gov / academic / press / aggregator); diversity check (multi-source on key claims).</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Calibration</div>
+          <div class="vector">Is uncertainty acknowledged?</div>
+          <div class="defense">Does the output flag gaps, disputed claims, and limits of the analysis? LLM judge with rubric.</div>
+        </div>
+      </div>
+
+      <p>Four dimensions, each independently gradable. Aggregate them with weights based on what your product values most. A general-purpose research agent might weight them equally; a high-stakes investment-research agent might weight accuracy and source-quality 2× the others.</p>
+
+      <h4>Factual accuracy: the one dimension you can grade mechanically</h4>
+
+      <p>The most important property of the architecture from Step 3 (claims and sources stored together as structured objects) is what it enables here: <strong>citation-faithfulness can be checked programmatically</strong>.</p>
+
+      <p>The check: for each claim with its cited source URL, fetch the source, and ask an LLM judge "does this source actually support this claim?" Binary: yes / no / partially. A research output where 95%+ of claims are faithfully cited is very different from one where 60% are — and the difference is invisible to the casual reader unless someone checks.</p>
+
+<pre class="standalone"><span class="c-cm"># Citation-faithfulness check, sketch</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">check_citation_faithfulness</span>(claim: <span class="c-kw">str</span>, source_url: <span class="c-kw">str</span>) -> <span class="c-kw">dict</span>:
+    source_text = <span class="c-kw">await</span> web_fetch(source_url)
+
+    response = <span class="c-kw">await</span> judge_client.messages.create(
+        model=<span class="c-st">"claude-sonnet-4-5"</span>,
+        max_tokens=<span class="c-st">300</span>,
+        system=<span class="c-st">"You are a strict fact-checker."</span>,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"""
+Does the following source EXPLICITLY support the claim?
+Reply with one of: supported / partial / unsupported / contradicted.
+Then give one sentence of reasoning.
+
+Claim: {claim}
+
+Source ({source_url}):
+{source_text[:8000]}
+"""</span>}],
+    )
+    <span class="c-kw">return</span> parse_verdict(response)
+
+<span class="c-cm"># Run across every (claim, source) pair in the output</span>
+<span class="c-kw">async def</span> <span class="c-fn">grade_research_output</span>(output: <span class="c-kw">dict</span>) -> <span class="c-kw">dict</span>:
+    verdicts = <span class="c-kw">await</span> asyncio.gather(*[
+        check_citation_faithfulness(c[<span class="c-st">"claim"</span>], c[<span class="c-st">"source_url"</span>])
+        <span class="c-kw">for</span> c <span class="c-kw">in</span> output[<span class="c-st">"claims"</span>]
+    ])
+    supported = <span class="c-kw">sum</span>(<span class="c-st">1</span> <span class="c-kw">for</span> v <span class="c-kw">in</span> verdicts <span class="c-kw">if</span> v[<span class="c-st">"verdict"</span>] == <span class="c-st">"supported"</span>)
+    <span class="c-kw">return</span> {<span class="c-st">"faithfulness"</span>: supported / <span class="c-kw">len</span>(verdicts), <span class="c-st">"verdicts"</span>: verdicts}</pre>
+
+      <p>This is the same chapter 3.3 LLM-as-judge methodology applied to a specific, narrow question (does X support Y?), which judges handle reliably. Run it on your eval set; track <code class="inline">faithfulness</code> as a top-level metric in your scoreboard (chapter 3.1); regress if it drops.</p>
+
+      <h4>Comprehensiveness: hand-curated checklists per query type</h4>
+
+      <p>"Did the agent cover all the important angles?" is harder to measure mechanically, but tractable with effort. The approach: <strong>for each major query type your agent handles, build a small checklist of topics that a good answer should cover</strong>. A finance-research eval might check that an "is X a buy?" output covers earnings, valuation, competition, key risks, and recent news. A scientific-research eval might check methodology, prior work, and limitations.</p>
+
+      <p>The checklist itself is built by hand (with domain expertise) and lives in your eval set, not in the agent's runtime prompt. When grading an output: an LLM judge checks each checklist item against the output ("does this output address X?"), reports the per-item coverage, and rolls up to a comprehensiveness score.</p>
+
+      <p>This is more labor-intensive than faithfulness checking, and the checklists need maintenance as query types evolve. But it's the only way to catch the failure mode where an agent confidently produces a citation-faithful output that <em>misses the main thing the user wanted to know</em>.</p>
+
+      <h4>Stop conditions: when does the agent know to stop investigating?</h4>
+
+      <p>A research agent without explicit stop conditions tends toward two failure modes: stopping too early (the lead synthesizes after 3 subagent calls when 7 would have produced a much better answer) or stopping too late (the agent spirals into ever-more-specific investigations until token budget is exhausted, producing a bloated low-signal output).</p>
+
+      <p>Production research agents use a combination of these stop signals:</p>
+
+      <p><strong>Budget-based.</strong> A hard ceiling on tool calls per run (e.g., 50) and total token spend. When the budget is hit, the agent must synthesize from what it has — no new investigations allowed. Simple, prevents pathological runs. The risk: the cap fires on questions where more investigation was genuinely warranted.</p>
+
+      <p><strong>Diminishing-returns detection.</strong> The lead periodically reflects: "given the findings so far, do additional subagents materially improve the answer?" If new searches keep surfacing the same sources or claims already covered, that's a sign to stop. The agent's own assessment of marginal value is a softer but more adaptive signal.</p>
+
+      <p><strong>Coverage-based.</strong> If the question was decomposed into N sub-questions at planning time, the agent stops when all N have been investigated to acceptable depth — even if the budget remains. Don't keep digging just because you can.</p>
+
+      <p><strong>User-defined.</strong> Some products surface the depth choice to the user: "quick scan" (5-minute, 1-2 subagents, ~$0.50) vs "deep research" (30-minute, 10+ subagents, ~$5). The user picks their stop condition based on what the question is worth to them. Most production research-agent products are converging on this UX shape.</p>
+
+      <p>The hybrid in practice: budget as hard ceiling, coverage as primary signal, diminishing-returns as the secondary check, user-defined depth as the override. Each captures a different reason to stop; together they avoid the two failure modes above.</p>
+
+      <h4>The eval set for research agents, specifically</h4>
+
+      <p>What does an eval set for a research agent look like? Different from the chapter 3.1 examples in two ways: query diversity matters more, and per-query grading is more expensive.</p>
+
+      <p><strong>Cover diverse query shapes.</strong> Easy fact-check queries, medium comparison queries, hard open-ended exploration queries, edge cases (paywalled-heavy topics, contested topics, recent events). Maybe 30–50 queries total, hand-selected to span the question space. Each query gets its own ideal-answer rubric (the checklist for comprehensiveness, plus expected source quality patterns).</p>
+
+      <p><strong>Run the eval less often.</strong> Each query in the eval set costs $1–$5 to run. A 50-query eval is $50–$250 per run. Compare to chapter 3.1's eval suites that might cost $1-5 per full run. You can't afford to run this on every PR — schedule it weekly, or run it on a fast subset (10 queries, $10–$50) per PR and the full suite on a release cadence.</p>
+
+      <p><strong>Don't expect tight reproducibility.</strong> Web content changes daily. The same query run yesterday and today may surface different sources. Your eval grading needs to handle this — don't compare against fixed expected URLs; compare against expected <em>properties</em> (faithfulness ratio, coverage of expected topics, source quality distribution). Sampling noise is real; multi-run averaging matters more than for deterministic agents.</p>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>An open-ended research query, traced through the system.</h3>
+
+      <p>To make all of Steps 2–4 concrete, here's a trace through an example query — the kind that motivates the multi-agent shape. Not a toy. The kind of question a sales rep at a startup might ask before a meeting with a new prospect.</p>
+
+      <h4>The query</h4>
+
+      <p><em>"We're meeting with the head of platform engineering at Acme Corp next Tuesday. What's their current technical stack, what have they shipped recently, and what initiatives are they likely focused on?"</em></p>
+
+      <p>Notice the shape: under-specified, multi-faceted, requires synthesis across many sources, has no fixed correct answer. The user wants 5–10 minutes of preparation reading, not a chat response.</p>
+
+      <h4>The lead's planning step</h4>
+
+<pre class="trace standalone"><span class="c-out">══ Lead (Opus): planning ══════════════════════════════════════════
+[reasoning] This is a comprehensive briefing request. The user needs
+context across three rough threads: (1) Acme's current tech stack, (2)
+their recent shipped work, (3) likely current focus areas. Each can be
+investigated independently. Complex-research tier per scaling rules.
+
+[plan emitted]
+{
+  "sub_questions": [
+    {
+      "question": "What is Acme Corp's current technical stack?
+                   Languages, frameworks, infrastructure, cloud provider.",
+      "tools": ["web_search", "web_fetch"],
+      "budget": 12,
+      "expected_sources": ["engineering blog", "job postings",
+                          "github org", "talks/conferences"]
+    },
+    {
+      "question": "What has Acme Corp's engineering shipped in the last
+                   6 months? Notable launches, open-source projects.",
+      "tools": ["web_search", "web_fetch"],
+      "budget": 10,
+      "expected_sources": ["engineering blog", "press", "github releases"]
+    },
+    {
+      "question": "What is Acme Corp's platform team likely focused on
+                   now? Hiring patterns, conference talks, public roadmap.",
+      "tools": ["web_search", "web_fetch", "read_document"],
+      "budget": 12,
+      "expected_sources": ["job postings", "conference schedules",
+                          "team blog", "leadership talks"]
+    }
+  ],
+  "synthesis_focus": "Briefing for sales meeting — emphasize concrete,
+                     verifiable claims over speculation."
+}
+[plan persisted to memory key: research_run_8c1e]</span></pre>
+
+      <h4>Subagent #1 runs</h4>
+
+<pre class="trace standalone"><span class="c-out">══ Subagent 1 (Sonnet): "What is Acme Corp's current tech stack?" ══
+[budget: 12 tool calls]
+
+→ web_search "Acme Corp engineering blog 2025"
+   8 results; top: acme.com/blog (acme's own blog, primary)
+
+→ web_fetch "https://acme.com/blog/posts/scaling-our-microservices-2025"
+   [reads ~3500 tokens of content about their move from monolith to
+    microservices, mentions Go, Kafka, Kubernetes, PostgreSQL, AWS]
+
+→ extract_claims (internal subagent step)
+   → 5 claims extracted with verbatim quotes and source_url
+
+→ web_search "Acme Corp site:github.com"
+   Their GitHub org. Several open-source projects.
+
+→ web_fetch "https://github.com/acme-corp"
+   [organization page; lists languages and notable repos]
+
+→ extract_claims
+   → 3 more claims about languages used in OSS
+
+→ web_search "Acme Corp engineering jobs platform"
+   LinkedIn + Greenhouse postings.
+
+→ web_fetch [a senior platform engineer JD]
+   [JD lists "experience with Go, Kubernetes, Pulumi, Datadog"]
+
+→ extract_claims
+   → 2 claims (with the JD as source); confidence "medium"
+     since JDs can be aspirational, not actual
+
+→ web_fetch [a "Staff SRE" JD]
+   [similar stack list, plus "experience with eBPF" — new info]
+
+→ extract_claims
+   → 1 claim, confidence medium
+
+[stop: enough sources for the sub-question; remaining budget unused]
+
+[compress and emit findings]
+{
+  "sub_question": "Current technical stack",
+  "summary": "Acme uses Go as primary backend language, Kubernetes
+              on AWS for orchestration, PostgreSQL and Kafka for data,
+              Pulumi for IaC, Datadog for observability. Recently
+              migrated from monolith to microservices.",
+  "claims": [
+    {"claim": "Acme migrated from monolith to microservices in 2024",
+     "source_url": "https://acme.com/blog/posts/scaling-our-microservices-2025",
+     "confidence": "high",
+     "quote": "completed our migration from the monolith in Q3 2024"},
+    {"claim": "Primary backend language is Go",
+     "source_url": "https://acme.com/blog/posts/scaling-our-microservices-2025",
+     "confidence": "high",
+     "quote": "...rewrote core services in Go..."},
+    ... 9 more ...
+  ],
+  "gaps": ["Front-end stack not investigated — out of scope",
+           "Database scale unknown"]
+}</span></pre>
+
+      <p>The other two subagents run similarly in parallel — different sub-questions, different focused investigations, each emitting structured findings with claims and sources.</p>
+
+      <h4>The lead's synthesis</h4>
+
+<pre class="trace standalone"><span class="c-out">══ Lead (Opus): synthesis ═════════════════════════════════════════
+[input: 3 compressed-findings objects, each with summary + claims]
+[reasoning] Three subagents returned solid material. Notable signal:
+subagent 3 identified that they're hiring heavily for "AI platform"
+roles, which suggests their current focus. This connects with the
+tech-stack subagent's note that they recently adopted Pulumi (IaC
+maturity) and the recent-shipping subagent's note that they shipped
+"Acme Workflows" (a new product surface in Sept 2025).
+
+[output drafted with citation discipline]
+
+# Acme Corp — Pre-Meeting Briefing
+
+## Technical stack at a glance
+
+Acme runs primarily on Go services orchestrated by Kubernetes on AWS,
+with PostgreSQL and Kafka as data infrastructure [1]. They completed
+their migration from a monolith to microservices in Q3 2024 [1], and
+have standardized on Pulumi for infrastructure-as-code [2]. Recent
+job postings indicate growing depth in eBPF-based observability [3],
+suggesting platform maturity beyond standard Kubernetes patterns.
+
+## What they've shipped recently
+
+In the last six months, Acme launched Acme Workflows (Sept 2025) [4],
+their first product surface beyond their original SaaS — described in
+their announcement as "a new layer for embedded automation" [4]. The
+engineering blog highlights two notable infrastructure ships: a custom
+deployment system replacing Spinnaker [5] and an internal developer
+platform initiative called "Voyager" [6].
+
+## Likely current focus
+
+Three signals converge on AI infrastructure as a top initiative:
+- 14 of their 23 active engineering openings are AI-platform-coded
+  roles ("ML platform", "AI infrastructure", "agent systems") [7]
+- Their CTO gave a talk at QCon SF 2025 titled "Building reliable
+  AI-driven products" [8], previewing internal tooling
+- The Acme Workflows launch [4] explicitly mentions AI integration
+  as a "near-term roadmap item"
+
+This is consistent with broader industry positioning but Acme's
+combination of recent microservices maturity + active AI hiring +
+public CTO commitment suggests AI platform is genuinely the
+priority for the next 6-12 months, not just messaging.
+
+---
+Sources:
+[1] https://acme.com/blog/posts/scaling-our-microservices-2025
+[2] https://github.com/acme-corp/infrastructure
+... [8 sources total]</span></pre>
+
+      <h4>What the trace shows</h4>
+
+      <p>Read the trace for content, then read it again for shape. Several things deserve naming:</p>
+
+      <p><strong>The lead planned before delegating.</strong> Turn 1 isn't "spawn a subagent that does the whole thing." It's an explicit decomposition into three independent threads with per-thread tool grants and budgets. The downstream subagents have narrow, executable charters.</p>
+
+      <p><strong>Each subagent's context stays small.</strong> Subagent 1 read 4 sources, but at any moment its context contained the claim-list it was building plus the current source — not the full text of all four. Compress-as-you-read.</p>
+
+      <p><strong>Citations propagated structurally.</strong> Every claim in the final output traces back to a specific source URL. The lead never had to "remember" which source supported which claim — the structured-output objects carried that mapping through. No confabulation possible.</p>
+
+      <p><strong>The synthesis added something the individual findings didn't.</strong> The "three signals converge on AI infrastructure" point is a synthesis insight — it triangulates findings from three different subagents. None of the individual findings produced this conclusion. This is the value the lead adds, and it's why the synthesis step uses the most capable model.</p>
+
+      <p><strong>The output flagged uncertainty.</strong> The job-posting evidence has confidence "medium" because JDs can be aspirational. The synthesis preserves this — phrasing the AI focus as "likely" rather than "definitely" — calibration that earns the reader's trust.</p>
+
+      <div class="observe">
+        <div class="label">The shape of useful research-agent output</div>
+        <p>This trace runs for ~5 minutes and costs ~$2.50 in API spend. It produces a briefing that would have taken a human 30–60 minutes to assemble — and one a human might miss the synthesis insight on, because the human would have time to read fewer sources. The economics work because the alternative (a salesperson reading by hand or showing up unprepared) is much more expensive. This is the category where research agents are genuinely valuable: high-leverage knowledge work that justifies minutes of compute.</p>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 4.3</div>
+      <h3>Deliverable</h3>
+      <p>A working understanding of research agents as a distinct architecture: open-ended exploration, citation-required outputs, broad tool surface, expensive long-running compute. The orchestrator-subagent decomposition pattern that wins in production — and the failure modes of single-agent designs that motivate it. The five tools that earn their place, the compress-as-you-read pattern that prevents context bloat, and the citation discipline that makes outputs trustworthy. The four-dimensional eval methodology that grades research output without ground truth, and the stop-condition design that prevents both premature termination and infinite spirals. The economics: when research agents are worth their cost and when they aren't.</p>
+      <ul class="checklist">
+        <li>Lead-researcher / subagent decomposition implemented; persistent memory for the plan</li>
+        <li>Lead's system prompt includes effort-scaling rules (1 / 2-4 / 10+ subagents by complexity)</li>
+        <li>Per-subagent task specs are concrete: scope, tools, budget, output schema</li>
+        <li>Subagents return structured COMPRESSED_FINDING objects, not raw chat text</li>
+        <li>Compress-as-you-read pattern: extract claims at fetch time, discard raw text</li>
+        <li>Tool surface is small: search, fetch, read_document, code_execution + specialized APIs</li>
+        <li>Citation discipline: every substantive claim attaches to a source URL structurally</li>
+        <li>Post-synthesis citation-faithfulness check on high-stakes outputs</li>
+        <li>"No source, no claim" rule encoded in synthesizer's system prompt</li>
+        <li>Stop conditions layered: hard budget + coverage check + diminishing-returns + user depth</li>
+        <li>Eval set: 30–50 diverse queries, four-dimensional grading (faithfulness, coverage, source quality, calibration)</li>
+        <li>Per-query cost tracking; user-facing depth selection (quick vs deep)</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('x2')">
+        <div class="dir">← prev</div>
+        <div class="title">4.2 Computer use</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('x4')">
+        <div class="dir">next →</div>
+        <div class="title">4.4 Multi-agent</div>
+      </button>
+    </div>
+  </section>

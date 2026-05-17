@@ -1,0 +1,819 @@
+<section class="phase">
+    <div class="phase-num">0.3</div>
+    <div class="week">Part 0 / Foundations · The chapter that demystifies tool use</div>
+    <h2>Tool use, at the protocol level.</h2>
+    <p class="goal">Most tutorials treat tool use as "and then the SDK calls your function." That's not the abstraction — it's a lie of convenience. The real picture: the model emits a structured request, your code interprets it, your code returns a structured result, the model continues. Once this clicks, every weird tool-use bug becomes obvious. This chapter walks the protocol below the SDK, in both Anthropic and OpenAI shapes, with every field named and every common bug surfaced. After it you'll be the person on the team who can debug a "the model called my tool wrong" issue in under a minute.</p>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Anatomy of a tool definition.</h3>
+
+      <p>A tool definition is three things in a trench coat: a <strong>name</strong>, a <strong>description</strong>, and an <strong>input schema</strong>. Together they constitute the entire contract between your code and the model. There is no other channel through which the model learns how to use your tool. No docstrings. No source code. Just those three fields, plus whatever you say in the system prompt.</p>
+
+      <p>That's the first surprising thing to internalize. The model isn't introspecting your Python. It cannot see your function body. Everything it knows about <code class="inline">search_docs</code> comes from this:</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre>{
+  <span class="c-st">"name"</span>: <span class="c-st">"search_docs"</span>,
+  <span class="c-st">"description"</span>: <span class="c-st">"Search the indexed documentation corpus for chunks relevant to a query. Returns the top 5 chunks by relevance. Use this when the user asks about technical topics, API usage, configuration, or anything that might be in the docs. Do NOT use for casual conversation or questions about the user's personal data."</span>,
+  <span class="c-st">"input_schema"</span>: {
+    <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+    <span class="c-st">"properties"</span>: {
+      <span class="c-st">"query"</span>: {
+        <span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+        <span class="c-st">"description"</span>: <span class="c-st">"A search query in natural language. Should be specific enough to retrieve relevant chunks. Example: 'how to configure autovacuum naptime' rather than just 'vacuum'."</span>
+      },
+      <span class="c-st">"section"</span>: {
+        <span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+        <span class="c-st">"enum"</span>: [<span class="c-st">"admin"</span>, <span class="c-st">"developer"</span>, <span class="c-st">"reference"</span>],
+        <span class="c-st">"description"</span>: <span class="c-st">"Optional. Restrict search to one section."</span>
+      }
+    },
+    <span class="c-st">"required"</span>: [<span class="c-st">"query"</span>]
+  }
+}</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre>{
+  <span class="c-st">"type"</span>: <span class="c-st">"function"</span>,
+  <span class="c-st">"name"</span>: <span class="c-st">"search_docs"</span>,
+  <span class="c-st">"description"</span>: <span class="c-st">"Search the indexed documentation corpus for chunks relevant to a query. Returns the top 5 chunks by relevance. Use this when the user asks about technical topics, API usage, configuration, or anything that might be in the docs. Do NOT use for casual conversation or questions about the user's personal data."</span>,
+  <span class="c-st">"parameters"</span>: {
+    <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+    <span class="c-st">"properties"</span>: {
+      <span class="c-st">"query"</span>: {
+        <span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+        <span class="c-st">"description"</span>: <span class="c-st">"A search query in natural language. Should be specific enough to retrieve relevant chunks. Example: 'how to configure autovacuum naptime' rather than just 'vacuum'."</span>
+      },
+      <span class="c-st">"section"</span>: {
+        <span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+        <span class="c-st">"enum"</span>: [<span class="c-st">"admin"</span>, <span class="c-st">"developer"</span>, <span class="c-st">"reference"</span>],
+        <span class="c-st">"description"</span>: <span class="c-st">"Optional. Restrict search to one section."</span>
+      }
+    },
+    <span class="c-st">"required"</span>: [<span class="c-st">"query"</span>],
+    <span class="c-st">"additionalProperties"</span>: <span class="c-kw">false</span>
+  },
+  <span class="c-st">"strict"</span>: <span class="c-kw">true</span>
+}</pre>
+      </div>
+
+      <p>Two providers, the same three ideas, slightly different shapes. Anthropic puts the JSON Schema under <code class="inline">input_schema</code>; OpenAI puts it under <code class="inline">parameters</code> and requires <code class="inline">additionalProperties: false</code> when <code class="inline">strict: true</code> is set. Other than that, identical contract.</p>
+
+      <h4>The description is doing 90% of the work</h4>
+
+      <p>The most common mistake people make with tool definitions is treating the description as a label. It isn't. The description is the prompt for that tool — it's what the model reads when deciding whether to call this tool, with what arguments, and how. A bad description is the single most common cause of tools being used wrong.</p>
+
+      <p>Look at the difference. Here's the same tool with a description written carelessly:</p>
+
+<pre class="attack standalone">{
+  <span class="c-st">"name"</span>: <span class="c-st">"search_docs"</span>,
+  <span class="c-st">"description"</span>: <span class="c-st">"Searches the docs"</span>,
+  <span class="c-st">"input_schema"</span>: { ... <span class="c-cm">"query": {"type": "string"}</span> ... }
+}</pre>
+
+      <p>That description does two harmful things: it tells the model when to use the tool (always, because nothing forbids it), and it tells the model how to format the query (no guidance, so the model will sometimes pass <code class="inline">"vacuum"</code> and sometimes <code class="inline">"PostgreSQL vacuum autovacuum tuning configuration"</code> with no consistency). Compare the verbose version above, which establishes <em>when</em> ("technical topics, API usage..."), <em>when not</em> ("not for casual conversation"), and <em>how</em> ("specific enough to retrieve relevant chunks, example: ...").</p>
+
+      <p>Per the Anthropic docs: "Unlike other prompts for Claude which rely on examples to guide Claude, when using tools, the description is one of the most important pieces of information." That's literal — descriptions absorb the prompt-engineering effort you'd normally put into a system prompt for plain text generation.</p>
+
+      <div class="observe">
+        <div class="label">A useful rule of thumb</div>
+        <p>If you can write your tool's description in fewer than 50 words, you probably haven't written it carefully enough. A good description usually has three pieces: <em>what the tool does</em> (one sentence), <em>when to use it</em> (positive and negative examples), and <em>how to format the inputs</em> (per-parameter, in their own description fields). All three matter; skip any one and you'll see bad calls.</p>
+      </div>
+
+      <h4>Parameter descriptions matter just as much</h4>
+
+      <p>The same principle applies one level down. Every parameter in the schema has its own <code class="inline">description</code> field, and the model reads it. If your <code class="inline">query</code> field has no description, the model has to guess what a good query looks like. If it has a description that includes a concrete example ("e.g., 'how to configure autovacuum naptime'"), the model anchors on that example and produces queries shaped like it.</p>
+
+      <p>This is the single biggest leverage point for tool quality. Carefully written parameter descriptions reduce the rate of malformed arguments by an order of magnitude.</p>
+
+      <h4>Strict mode (both providers now have it)</h4>
+
+      <p>Both Anthropic and OpenAI support a <code class="inline">strict</code> mode that guarantees the model's tool-call arguments will exactly match your JSON Schema. Set it on whenever the schema is well-defined. The OpenAI version requires <code class="inline">additionalProperties: false</code> and every property in <code class="inline">required</code>; Anthropic's is more lenient. When strict mode is on, you don't have to validate the arguments your handler receives — the API has already done it.</p>
+
+      <p>The case for strict mode is simple: it eliminates a whole class of bugs (the model returning <code class="inline">"limit": "5"</code> as a string when you wanted an int). The case against: it sometimes constrains the model into worse behavior on truly ambiguous cases. The default should be <strong>strict on</strong>; turn it off only if you have a specific reason.</p>
+
+      <h4>Naming</h4>
+
+      <p>Tool names appear in the model's context and in your code. The conventions that don't bite later:</p>
+
+      <ul>
+        <li><strong>snake_case, verb_noun.</strong> <code class="inline">search_docs</code>, <code class="inline">fetch_user</code>, <code class="inline">send_email</code>. Not <code class="inline">DocsSearch</code> or <code class="inline">searchDocs</code> or <code class="inline">search</code> (too generic).</li>
+        <li><strong>Distinct prefixes for related tools.</strong> <code class="inline">user_get</code>, <code class="inline">user_create</code>, <code class="inline">user_delete</code>. The prefix helps the model group them mentally and helps you organize handlers.</li>
+        <li><strong>No abbreviations.</strong> <code class="inline">retrieve_documents</code> rather than <code class="inline">ret_docs</code>. The model handles full words better and your future self will thank you.</li>
+        <li><strong>Match the handler name exactly.</strong> If the tool is called <code class="inline">search_docs</code>, the Python function is also <code class="inline">search_docs</code>. Avoid translation layers between names; they make debugging harder.</li>
+      </ul>
+
+      <h4>One advanced feature worth mentioning: input_examples</h4>
+
+      <p>As of late 2025 Anthropic added <code class="inline">input_examples</code> to tool definitions — concrete examples of how to call the tool, in the same shape as the arguments. This is useful when the schema can't express a usage pattern that the description alone can't fully communicate (e.g., "this optional field correlates with that one").</p>
+
+<pre class="standalone">{
+  <span class="c-st">"name"</span>: <span class="c-st">"create_ticket"</span>,
+  <span class="c-st">"input_schema"</span>: { ... <span class="c-cm">/* schema */</span> ... },
+  <span class="c-st">"input_examples"</span>: [
+    {
+      <span class="c-st">"title"</span>: <span class="c-st">"Login page returns 500 error"</span>,
+      <span class="c-st">"priority"</span>: <span class="c-st">"critical"</span>,
+      <span class="c-st">"labels"</span>: [<span class="c-st">"bug"</span>, <span class="c-st">"production"</span>],
+      <span class="c-st">"escalation"</span>: { <span class="c-st">"level"</span>: <span class="c-st">2</span>, <span class="c-st">"sla_hours"</span>: <span class="c-st">4</span> }
+    },
+    {
+      <span class="c-st">"title"</span>: <span class="c-st">"Add dark mode support"</span>,
+      <span class="c-st">"labels"</span>: [<span class="c-st">"feature-request"</span>, <span class="c-st">"ui"</span>]
+      <span class="c-cm">// no priority, no escalation — that's the pattern</span>
+    }
+  ]
+}</pre>
+
+      <p>Examples typically cost 50–200 prompt tokens. Worth it for tools with complex shapes. Not worth it for simple tools where the description and schema are unambiguous.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why not just trust the model to figure out how to use my tool from a short description?</div>
+        <div class="answer">
+          <p>The model will figure it out... sometimes. The question is what failure rate you'll accept. With a careless description, expect 5-15% of tool calls to be malformed, irrelevant, or skipped when they should have been made. With a careful description, expect &lt;1%. The economics: spending 20 minutes on a careful description saves you hundreds of debugging sessions over the tool's lifetime. It's the highest-leverage 20 minutes you can spend on agent quality.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Tool descriptions are limited to 1024 chars on some Azure deployments. Won't long descriptions hit that?</div>
+        <div class="answer">
+          <p>The 1024-char limit is Azure-specific (last we checked). Direct Anthropic and OpenAI APIs have much higher effective limits — what bites you first is your context budget, not a hard cap. The careful descriptions in this chapter are 200–500 characters; the careless ones are under 50. Fit easily. If you're on Azure and hitting the 1024 cap, your descriptions are likely too long anyway.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should I generate JSON schemas from Pydantic models, or write them by hand?</div>
+        <div class="answer">
+          <p>Generate them. Pydantic models give you a single source of truth: handler signature, runtime validation, and schema all stay in sync. The Anthropic SDK and OpenAI SDK both accept Pydantic-generated schemas directly. The 20 lines of boilerplate to do this once is the right investment — hand-written schemas drift from handler signatures within a week.</p>
+          <p>The one case to write by hand: when you want the parameter descriptions and tool description to be different from what Pydantic would generate from docstrings (often you do — Pydantic field descriptions are usually too terse for tool use).</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>The on-the-wire shape.</h3>
+
+      <p>Now we zoom into what actually flies over HTTP when the model decides to call a tool. Understanding this is the difference between treating the SDK as magic and being able to fix it when it breaks. Every tool-use bug you'll ever encounter manifests at this level.</p>
+
+      <p>The trip is a round trip. You send the model a request that includes tools and a user message. The model sends back a response that may contain one or more tool-call blocks. You execute those calls, package up the results, and send them back as a follow-up turn. The model then either calls more tools or produces a final answer. The structure of <strong>tool-call blocks</strong> and <strong>tool-result blocks</strong> is where the two providers diverge cosmetically but agree conceptually.</p>
+
+      <h4>Anthropic: tool_use and tool_result content blocks</h4>
+
+      <p>In Anthropic's Messages API, the model's response has a <code class="inline">content</code> array. Each entry has a <code class="inline">type</code>. Plain text is <code class="inline">{"type": "text", "text": "..."}</code>. When the model wants to call a tool, you get one or more <code class="inline">tool_use</code> blocks interleaved with the text:</p>
+
+<pre class="trace standalone"><span class="c-out">// Response from messages.create when the model calls a tool
+{
+  "id": "msg_01ABCdef...",
+  "model": "claude-sonnet-4-5",
+  "role": "assistant",
+  "stop_reason": "tool_use",       <span class="c-cm">// ← key signal</span>
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll search the docs for that."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01XyzAbc...",     <span class="c-cm">// ← critical: the call ID</span>
+      "name": "search_docs",
+      "input": {
+        "query": "autovacuum naptime configuration"
+      }
+    }
+  ],
+  "usage": { "input_tokens": 1842, "output_tokens": 47 }
+}</span></pre>
+
+      <p>Three fields matter on a <code class="inline">tool_use</code> block: <code class="inline">id</code> (the call ID, used to correlate the result), <code class="inline">name</code> (which tool), and <code class="inline">input</code> (the arguments, already parsed into a dict). To respond, you append an assistant message containing that exact content array, then append a user message that contains a <code class="inline">tool_result</code> block for each <code class="inline">tool_use</code>:</p>
+
+<pre class="trace standalone"><span class="c-out">// Your follow-up turn
+messages.append({
+  "role": "assistant",
+  "content": response.content    <span class="c-cm">// ← echo back the original blocks unchanged</span>
+})
+messages.append({
+  "role": "user",
+  "content": [
+    {
+      "type": "tool_result",
+      "tool_use_id": "toolu_01XyzAbc...",  <span class="c-cm">// ← MUST match the tool_use.id</span>
+      "content": "Found 5 results: [chunk_id=routine-vacuuming::5, text=...]"
+    }
+  ]
+})</span></pre>
+
+      <p>The <code class="inline">tool_use_id</code> on the result must match the <code class="inline">id</code> on the original <code class="inline">tool_use</code>. This pairing is how Anthropic correlates "you asked me to call X, here's the result of X" across the round trip. Get it wrong and the API returns an error.</p>
+
+      <h4>OpenAI: function_call items and function_call_output items in the Responses API</h4>
+
+      <p>OpenAI's modern API is Responses (Chat Completions is on a deprecation curve as of 2026). In Responses, the analog of a content block is an <strong>item</strong>. The model's response has an <code class="inline">output</code> array of items. Function calls are items of type <code class="inline">function_call</code>:</p>
+
+<pre class="trace standalone"><span class="c-out">// Response from responses.create when the model calls a tool
+{
+  "id": "resp_5g2a...",
+  "model": "gpt-5.5",
+  "output": [
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "I'll search the docs for that."}]
+    },
+    {
+      "type": "function_call",
+      "id":      "fc_67d2e3...",          <span class="c-cm">// ← item ID (rarely used)</span>
+      "call_id": "call_Co8dkB8h7N...",    <span class="c-cm">// ← CRITICAL: the correlation ID</span>
+      "name": "search_docs",
+      "arguments": "{\"query\":\"autovacuum naptime configuration\"}"
+                                       <span class="c-cm">// ← STRING. you must JSON.parse it.</span>
+    }
+  ],
+  "usage": { "input_tokens": 1842, "output_tokens": 47 }
+}</span></pre>
+
+      <p>Two things that catch people. First, <code class="inline">arguments</code> is a <strong>JSON-encoded string</strong>, not a parsed object. You need to <code class="inline">json.loads(call.arguments)</code> before you can use it. Second, there are <em>two</em> IDs: <code class="inline">id</code> (item ID, used internally) and <code class="inline">call_id</code> (correlation ID, the one you actually need). Mixing these up is the most common OpenAI tool-use bug and produces the cryptic <code class="inline">400 No tool call found for function call output with call_id</code> error.</p>
+
+      <p>To return the result, you send a <code class="inline">function_call_output</code> item back as input, keyed by <code class="inline">call_id</code>:</p>
+
+<pre class="trace standalone"><span class="c-out">// Your follow-up turn in OpenAI Responses
+client.responses.create(
+    model="gpt-5.5",
+    previous_response_id=response.id,    <span class="c-cm">// ← stateful threading</span>
+    input=[
+        {
+            "type": "function_call_output",
+            "call_id": "call_Co8dkB8h7N...",   <span class="c-cm">// ← MUST match function_call.call_id</span>
+            "output": "Found 5 results: [chunk_id=routine-vacuuming::5, text=...]"
+        }
+    ],
+    tools=TOOLS,
+)</span></pre>
+
+      <p>The Responses API maintains conversation state server-side via <code class="inline">previous_response_id</code>, so you don't replay the full message history. You just send the new function output and the model resumes from where it left off.</p>
+
+      <h4>Side-by-side: the field correspondence</h4>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Concept</div>
+          <div>Anthropic</div>
+          <div>OpenAI Responses</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Call block type</div>
+          <div class="vector"><code class="inline">{"type": "tool_use", ...}</code></div>
+          <div class="defense"><code class="inline">{"type": "function_call", ...}</code></div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Correlation ID</div>
+          <div class="vector"><code class="inline">id</code> (on tool_use)</div>
+          <div class="defense"><code class="inline">call_id</code> (NOT <code class="inline">id</code>)</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Arguments</div>
+          <div class="vector"><code class="inline">input</code> — parsed dict</div>
+          <div class="defense"><code class="inline">arguments</code> — JSON string</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Result block type</div>
+          <div class="vector"><code class="inline">{"type": "tool_result", ...}</code></div>
+          <div class="defense"><code class="inline">{"type": "function_call_output", ...}</code></div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Result correlation</div>
+          <div class="vector"><code class="inline">tool_use_id</code></div>
+          <div class="defense"><code class="inline">call_id</code></div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Result payload field</div>
+          <div class="vector"><code class="inline">content</code></div>
+          <div class="defense"><code class="inline">output</code></div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Continuation</div>
+          <div class="vector">resend full <code class="inline">messages[]</code></div>
+          <div class="defense"><code class="inline">previous_response_id</code></div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Stop reason for tool</div>
+          <div class="vector"><code class="inline">stop_reason: "tool_use"</code></div>
+          <div class="defense">presence of function_call items</div>
+        </div>
+      </div>
+
+      <h4>The three bugs at this level</h4>
+
+      <p>Almost every tool-use bug is one of three.</p>
+
+      <p><strong>Bug 1: orphan tool results.</strong> You returned a <code class="inline">tool_result</code> (Anthropic) or <code class="inline">function_call_output</code> (OpenAI) whose ID doesn't match any tool call in the prior turn. The API rejects the request with a 400. Cause is usually one of: you mutated the assistant message before resending it; you accidentally dropped a tool_use block; you used <code class="inline">id</code> instead of <code class="inline">call_id</code> in OpenAI.</p>
+
+      <p><strong>Bug 2: missing tool result for a tool call.</strong> The model called three tools in one turn and you only returned two results. Anthropic and OpenAI both require <em>every</em> call to be answered before the next turn. Cause is usually one of: you only iterated over the first tool_use block; you filtered out a call you didn't recognize.</p>
+
+      <p><strong>Bug 3: malformed arguments.</strong> The model produced JSON that doesn't fit your schema — a string where a number was expected, a typo in an enum value. Without strict mode, this happens occasionally and your handler has to validate. With strict mode on, this is supposed to be impossible — but if you see it anyway, it's almost always because <code class="inline">additionalProperties: false</code> isn't set or <code class="inline">required</code> doesn't list every field (the OpenAI strict requirements are <em>strict</em>).</p>
+
+      <div class="callout warn">
+        <p>When you see <code class="inline">400 No tool call found for function call output</code> on OpenAI, 99% of the time it's because you used <code class="inline">function_call.id</code> when you should have used <code class="inline">function_call.call_id</code>. The two IDs look similar (<code class="inline">fc_abc...</code> vs <code class="inline">call_abc...</code>) and the field name <em>id</em> feels like the obvious choice. It isn't.</p>
+      </div>
+
+      <h4>The minimal correct dispatcher, both providers</h4>
+
+      <p>For reference. The 30 lines of code that handle the round trip correctly. You'll write this exactly once per agent.</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># agent/dispatch.py — Anthropic</span>
+<span class="c-kw">async def</span> <span class="c-fn">handle_turn</span>(messages, response):
+    <span class="c-st">"""Given an assistant response with tool_use blocks, run handlers
+    and return the next user message with tool_results."""</span>
+    <span class="c-kw">if</span> response.stop_reason != <span class="c-st">"tool_use"</span>:
+        <span class="c-kw">return</span> <span class="c-kw">None</span>  <span class="c-cm"># no tools called; agent is done</span>
+
+    <span class="c-cm"># 1. Echo back the assistant content unchanged</span>
+    messages.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>, <span class="c-st">"content"</span>: response.content})
+
+    <span class="c-cm"># 2. Run EVERY tool_use block and collect results</span>
+    results = []
+    <span class="c-kw">for</span> block <span class="c-kw">in</span> response.content:
+        <span class="c-kw">if</span> block.<span class="c-kw">type</span> != <span class="c-st">"tool_use"</span>:
+            <span class="c-kw">continue</span>
+        <span class="c-kw">try</span>:
+            result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+            results.append({
+                <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                <span class="c-st">"tool_use_id"</span>: block.id,
+                <span class="c-st">"content"</span>: <span class="c-kw">str</span>(result),
+            })
+        <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+            <span class="c-cm"># Return errors as tool_results, not raises. The model can recover.</span>
+            results.append({
+                <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                <span class="c-st">"tool_use_id"</span>: block.id,
+                <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"Error: {type(e).__name__}: {e}"</span>,
+                <span class="c-st">"is_error"</span>: <span class="c-kw">True</span>,
+            })
+
+    <span class="c-cm"># 3. Send all results back as one user message</span>
+    messages.append({<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: results})
+    <span class="c-kw">return</span> messages</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># agent/dispatch.py — OpenAI Responses</span>
+<span class="c-kw">async def</span> <span class="c-fn">handle_turn</span>(previous_response_id, response):
+    <span class="c-st">"""Given a response with function_call items, run handlers
+    and return inputs for the next responses.create() call."""</span>
+    function_calls = [item <span class="c-kw">for</span> item <span class="c-kw">in</span> response.output
+                      <span class="c-kw">if</span> item.<span class="c-kw">type</span> == <span class="c-st">"function_call"</span>]
+    <span class="c-kw">if</span> <span class="c-kw">not</span> function_calls:
+        <span class="c-kw">return</span> <span class="c-kw">None</span>  <span class="c-cm"># no tools called; agent is done</span>
+
+    <span class="c-cm"># Run EVERY function_call and collect outputs</span>
+    outputs = []
+    <span class="c-kw">for</span> call <span class="c-kw">in</span> function_calls:
+        args = json.loads(call.arguments)  <span class="c-cm"># ← string → dict</span>
+        <span class="c-kw">try</span>:
+            result = <span class="c-kw">await</span> HANDLERS[call.name](**args)
+            outputs.append({
+                <span class="c-st">"type"</span>: <span class="c-st">"function_call_output"</span>,
+                <span class="c-st">"call_id"</span>: call.call_id,  <span class="c-cm"># ← NOT call.id</span>
+                <span class="c-st">"output"</span>: <span class="c-kw">str</span>(result),
+            })
+        <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+            outputs.append({
+                <span class="c-st">"type"</span>: <span class="c-st">"function_call_output"</span>,
+                <span class="c-st">"call_id"</span>: call.call_id,
+                <span class="c-st">"output"</span>: <span class="c-kw">f</span><span class="c-st">"Error: {type(e).__name__}: {e}"</span>,
+            })
+
+    <span class="c-cm"># Send outputs as input to the next turn. Server holds state via</span>
+    <span class="c-cm"># previous_response_id, so you don't replay history.</span>
+    <span class="c-kw">return</span> outputs</pre>
+      </div>
+
+      <p>This is the heart of any agent loop. Memorize the shape. The rest of the agent is just deciding what tools to expose and what handlers to write.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why does Anthropic pre-parse <code class="inline">input</code> but OpenAI leaves <code class="inline">arguments</code> as a string?</div>
+        <div class="answer">
+          <p>Historical reasons. OpenAI's function calling launched with arguments-as-string when the streaming story was less mature; the string form lets you see partial arguments as they stream in. Anthropic launched later with pre-parsed inputs because by then streaming-of-partial-JSON was a solved problem. The OpenAI shape is now legacy weight — it would break too many integrations to change. Just remember to <code class="inline">json.loads()</code>.</p>
+          <p>Also note: for fine-grained tool streaming on Anthropic (the feature that streams partial arguments), you get arguments as text deltas and need to assemble them yourself. Same situation, exposed only when you opt in.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">If the model calls a tool that doesn't exist (typo in name), what happens?</div>
+        <div class="answer">
+          <p>Strict mode prevents this — the model can only call tools defined in the request. Without strict mode it's still rare because the model is conditioned on the tool list, but it can happen on edge cases. Your dispatcher should treat unknown tool names as an error and return a tool_result with <code class="inline">is_error: true</code> and a clear message like <code class="inline">"Error: unknown tool 'sarch_docs'. Available tools: search_docs, fetch_doc, send_email."</code> The model can read this and self-correct on the next turn.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Can I respond with a tool_result for some calls and not others?</div>
+        <div class="answer">
+          <p>No. Both APIs require every tool call in a turn to be answered with a result (or error) in the next turn. The reason: the model's next response is conditioned on the assumption that all calls completed; an absent result is a protocol violation. If you genuinely can't run a tool, return an error result. That's what error results are <em>for</em>.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Parallel calls, errors, and the edge cases that bite.</h3>
+
+      <p>Steps 1 and 2 give you the happy path. Production is where the edges show up. This step walks through the four most common patterns that break naive implementations: parallel tool calls, tool errors, repeated calls, and malformed arguments. Each has a specific shape and a specific fix.</p>
+
+      <h4>Parallel tool calls</h4>
+
+      <p>The model can call multiple tools in a single turn. This is good — when the user asks "what's the weather in SF and the time in Tokyo," the model can issue both calls in one round trip instead of two sequential ones, halving latency.</p>
+
+      <p>The shape is exactly what you'd expect. Multiple <code class="inline">tool_use</code> blocks in the response content (Anthropic) or multiple <code class="inline">function_call</code> items in the output (OpenAI). Your dispatcher must handle all of them in one turn. The minimal dispatcher in Step 2 already does this correctly (the <code class="inline">for ... in</code> loop), but there's a question of <em>how</em>: sequentially or in parallel?</p>
+
+      <p>The default for naive code is sequential — your <code class="inline">for</code> loop awaits each handler before starting the next. For independent tools (search and another search; weather and time) this is wasted latency. The fix is <code class="inline">asyncio.gather</code>:</p>
+
+<pre class="standalone"><span class="c-cm"># Sequential — naive</span>
+<span class="c-kw">for</span> block <span class="c-kw">in</span> tool_use_blocks:
+    result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+    results.append(<span class="c-cm"># ...</span>)
+<span class="c-cm"># 3 tool calls of 400ms each = 1.2s</span>
+
+<span class="c-cm"># Parallel — production</span>
+<span class="c-kw">async def</span> <span class="c-fn">run_one</span>(block):
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+        <span class="c-kw">return</span> {<span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>, <span class="c-st">"tool_use_id"</span>: block.id, <span class="c-st">"content"</span>: <span class="c-kw">str</span>(result)}
+    <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+        <span class="c-kw">return</span> {<span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>, <span class="c-st">"tool_use_id"</span>: block.id,
+                <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"Error: {e}"</span>, <span class="c-st">"is_error"</span>: <span class="c-kw">True</span>}
+
+results = <span class="c-kw">await</span> asyncio.gather(*[run_one(b) <span class="c-kw">for</span> b <span class="c-kw">in</span> tool_use_blocks])
+<span class="c-cm"># 3 tool calls of 400ms each ≈ 450ms (longest one + overhead)</span></pre>
+
+      <p>The win is roughly linear in the number of parallel calls. For a tool-heavy agent that fires off 5 retrievals in a research turn, this is the difference between a 5-second wait and a 1-second wait. Free latency.</p>
+
+      <div class="callout warn">
+        <p>One subtlety: tools with side effects (writes, sends, deletes) should <em>not</em> be parallelized blindly. If the model fires two <code class="inline">delete_record</code> calls in one turn and you run both at once, you might get race conditions. The safe pattern is to run read-only tools in parallel and state-changing tools sequentially. Easy to encode: keep two lists.</p>
+      </div>
+
+      <h4>Errors as data, not exceptions</h4>
+
+      <p>The single biggest mindset shift for tool-using agents: <strong>tool errors are not failures, they are information the model can act on.</strong> When your <code class="inline">search_docs</code> handler can't reach the database, the right thing to do is not to crash the agent — it's to return an error result and let the model decide what to do.</p>
+
+      <p>The dispatcher from Step 2 already does this: it catches exceptions and returns a tool_result with <code class="inline">is_error: true</code> and a human-readable message. What the model sees:</p>
+
+<pre class="trace standalone"><span class="c-out">[turn 3]
+[assistant]: I'll fetch that document.
+→ fetch_doc(doc_id="invoices-2025-q3")
+
+[tool_result for fetch_doc]:
+{"is_error": true, "content": "Error: DatabaseTimeout:
+ connection to docs-db timed out after 5s. Retry may succeed."}
+
+[turn 4]
+[assistant]: That document fetch timed out. Let me try search
+instead and see if I can find it that way.
+→ search_docs(query="Q3 2025 invoices")
+
+[tool_result for search_docs]:
+[5 chunks returned, including invoices-2025-q3 as top result]
+
+[turn 5]
+[assistant]: Found it. Your Q3 invoices...</span></pre>
+
+      <p>This is the agent recovering on its own. Without error-as-data, your code would have raised an exception, the run would have aborted, and the user would have seen "an error occurred." With error-as-data, the model gets a chance to try a different approach. Modern models are good at this kind of recovery — give them the chance.</p>
+
+      <p>What makes error messages useful to the model:</p>
+
+      <ul>
+        <li><strong>Be specific.</strong> "Error: DatabaseTimeout: connection to docs-db timed out after 5s" is actionable. "Error: tool failed" is not.</li>
+        <li><strong>Include suggested alternatives.</strong> "Retry may succeed" or "try search_docs instead" or "the document_id 'foo' was not found; valid IDs start with 'INV-'" — these guide the model toward recovery.</li>
+        <li><strong>Don't include stack traces.</strong> They consume tokens, don't help the model, and may leak implementation details. The exception type and message are enough.</li>
+        <li><strong>Use <code class="inline">is_error: true</code> on Anthropic.</strong> It's a structural hint that this result is an error. OpenAI doesn't have an equivalent flag — just put "Error:" at the start of the output string.</li>
+      </ul>
+
+      <h4>The "model called the same tool 5 times" failure</h4>
+
+      <p>You'll see this in production. The model calls <code class="inline">search_docs</code>, gets a result, calls it again with a slightly different query, gets another result, calls it a third time... and a fourth, and a fifth. The trace looks like an agent that lost its mind.</p>
+
+      <p>This is almost always one of two causes:</p>
+
+      <p><strong>Cause 1: the tool description doesn't include a stop condition.</strong> The model doesn't know when to stop searching. Your description says "search the docs for relevant chunks" — it doesn't say "you should rarely need to call this more than twice; if two searches haven't found what you need, the document probably doesn't exist." Add the stop condition to the description; the behavior will change.</p>
+
+      <p><strong>Cause 2: the results aren't actually answering the model's question and it doesn't know what else to do.</strong> The model is in a loop because it's stuck. The fix is upstream — your retrieval is bad, your corpus is missing the document, the query reformulation isn't helping. The dispatch loop isn't the problem; the loop is a symptom.</p>
+
+      <p>The defense in either case is your step budget (chapter 1.1) — your agent loop caps total tool calls at some number (20 is common) and bails out if exceeded. The budget catches the symptom; the description-fix or corpus-fix solves the cause.</p>
+
+      <h4>Malformed arguments</h4>
+
+      <p>The model can produce JSON that doesn't fit your schema. With strict mode on, this is rare to the point of being a bug. Without strict mode it happens regularly enough that your handler should be defensive.</p>
+
+      <p>The two patterns that work:</p>
+
+<pre class="standalone"><span class="c-cm"># Pattern 1: validate explicitly in the handler</span>
+<span class="c-kw">async def</span> <span class="c-fn">search_docs</span>(query: <span class="c-kw">str</span>, section: <span class="c-kw">str</span> | <span class="c-kw">None</span> = <span class="c-kw">None</span>):
+    <span class="c-kw">if</span> <span class="c-kw">not</span> <span class="c-kw">isinstance</span>(query, <span class="c-kw">str</span>) <span class="c-kw">or</span> <span class="c-kw">not</span> query.strip():
+        <span class="c-kw">raise</span> ValueError(<span class="c-st">"query must be a non-empty string"</span>)
+    <span class="c-kw">if</span> section <span class="c-kw">and</span> section <span class="c-kw">not</span> <span class="c-kw">in</span> {<span class="c-st">"admin"</span>, <span class="c-st">"developer"</span>, <span class="c-st">"reference"</span>}:
+        <span class="c-kw">raise</span> ValueError(<span class="c-kw">f</span><span class="c-st">"section must be one of admin|developer|reference, got {section!r}"</span>)
+    <span class="c-cm"># ... real work</span>
+
+<span class="c-cm"># Pattern 2: use Pydantic models as the handler signature</span>
+<span class="c-kw">from</span> pydantic <span class="c-kw">import</span> BaseModel, Field
+
+<span class="c-kw">class</span> <span class="c-fn">SearchDocsArgs</span>(BaseModel):
+    query: <span class="c-kw">str</span> = Field(min_length=<span class="c-st">1</span>)
+    section: Literal[<span class="c-st">"admin"</span>, <span class="c-st">"developer"</span>, <span class="c-st">"reference"</span>] | <span class="c-kw">None</span> = <span class="c-kw">None</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">search_docs</span>(**raw):
+    args = SearchDocsArgs(**raw)  <span class="c-cm"># raises if bad</span>
+    <span class="c-cm"># ... use args.query, args.section</span></pre>
+
+      <p>Either way, validation errors become exception messages that the dispatcher catches and returns as tool errors — which the model can then read and self-correct on the next turn. The pattern is the same as for any tool error: return information, let the model recover.</p>
+
+      <h4>One subtle thing: max_tokens cutoff during tool argument generation</h4>
+
+      <p>If the model is generating arguments for a tool and you've set <code class="inline">max_tokens</code> too low, the response can end mid-argument with invalid JSON. Both providers warn about this on fine-grained streaming. Symptoms: <code class="inline">stop_reason: "max_tokens"</code> instead of <code class="inline">"tool_use"</code>; <code class="inline">arguments</code> string that doesn't parse as JSON.</p>
+
+      <p>The fix is to set <code class="inline">max_tokens</code> high enough to comfortably exceed your largest expected tool argument plus the surrounding text. For most agents 4096 is generous; for agents that pass large structured payloads through tools (rare), more.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How does the model decide when to call multiple tools in parallel vs sequentially?</div>
+        <div class="answer">
+          <p>It depends on the model's reading of dependency. If the model thinks the inputs of one call depend on the output of another (e.g., "first look up the user ID, then fetch that user's invoices"), it'll do them sequentially. If it thinks they're independent ("look up the weather in SF and the time in Tokyo"), it'll do them in parallel. You can nudge this with prompt-level guidance — "if calls are independent, batch them in one turn" — but mostly the model gets it right.</p>
+          <p>One thing that confuses the model is when calls <em>look</em> independent but actually aren't (because of side effects or ordering constraints you didn't tell it about). The fix is to make the constraint explicit in the tool descriptions.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about tool calls with truly huge results — say, 100KB of retrieved chunks?</div>
+        <div class="answer">
+          <p>Three options, in order of preference:</p>
+          <ul>
+            <li><strong>Summarize before returning.</strong> The tool handler does the work of compressing 100KB of raw output into 5KB of the most relevant excerpts. The model rarely needs the raw 100KB; it needs the answer that's <em>in</em> the 100KB.</li>
+            <li><strong>Return a handle, let the model fetch by ID.</strong> Tool returns "saved 100 chunks, IDs are chunk_001..chunk_100"; the model calls <code class="inline">fetch_chunk(id)</code> on the specific ones it wants. Costs an extra round trip but saves enormous context.</li>
+            <li><strong>Programmatic tool calling (Anthropic, late 2025).</strong> The model writes a small Python program that calls tools, processes results, and only returns the final summary to the model's context. Best for cases where the intermediate data is large and the final answer is small.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Build intuition by reading traces.</h3>
+
+      <p>You can read all of the above and still not have working intuition. Intuition comes from reading actual traces and recognizing what each pattern means. This step walks through three traces, increasing in complexity, with annotations that show what to look at and why. By the end you should be able to triage a tool-use bug by reading the trace in 30 seconds.</p>
+
+      <h4>Trace A: the clean call</h4>
+
+      <p>The simplest possible interaction: one tool call, one result, final answer. The shape every other case is a variation on.</p>
+
+<pre class="trace standalone"><span class="c-out">══ TURN 1 ══════════════════════════════════════════════════════════
+[user]: how do I tune autovacuum naptime?
+
+══ MODEL RESPONSE ═══════════════════════════════════════════════════
+stop_reason: tool_use
+content:
+  [0] text "I'll check the documentation for that."
+  [1] tool_use
+      id:    toolu_01ABc...
+      name:  search_docs
+      input: {"query": "autovacuum naptime tuning"}
+
+══ DISPATCH ═════════════════════════════════════════════════════════
+→ HANDLERS["search_docs"](query="autovacuum naptime tuning")
+← 5 chunks, top result: routine-vacuuming::5 (score 0.87)
+
+══ TURN 2 (sent to model) ═══════════════════════════════════════════
+[assistant]: &lt;echo of turn 1 content unchanged&gt;
+[user]: tool_result
+       tool_use_id: toolu_01ABc...
+       content: "Found 5 chunks: [{...routine-vacuuming::5..."
+
+══ MODEL RESPONSE ═══════════════════════════════════════════════════
+stop_reason: end_turn
+content:
+  [0] text "Autovacuum naptime is controlled by the
+            autovacuum_naptime config setting. Default is 1 minute..."</span></pre>
+
+      <div class="observe">
+        <div class="label">What to look at in trace A</div>
+        <p>Three things you scan every clean trace for: (1) does <code class="inline">stop_reason</code> match what you expect — <code class="inline">tool_use</code> for the call turn, <code class="inline">end_turn</code> for the final turn; (2) does the tool_use_id on the result match the id from the call turn (this is the orphan-result bug); (3) is the tool input shape what you expected — query is a non-empty string, no surprises. If all three pass, the trace is clean.</p>
+      </div>
+
+      <h4>Trace B: parallel calls with one error</h4>
+
+      <p>Two tools fired at once, one of them errors, the model recovers. This is the recovery loop in action.</p>
+
+<pre class="trace standalone"><span class="c-out">══ TURN 1 ══════════════════════════════════════════════════════════
+[user]: what's the weather in Tokyo and the current time there?
+
+══ MODEL RESPONSE ═══════════════════════════════════════════════════
+stop_reason: tool_use
+content:
+  [0] text "I'll get both."
+  [1] tool_use  id=toolu_W1...  name=get_weather    input={"location":"Tokyo"}
+  [2] tool_use  id=toolu_T1...  name=get_time       input={"location":"Tokyo"}
+
+══ DISPATCH (parallel) ══════════════════════════════════════════════
+asyncio.gather(
+  get_weather("Tokyo"),  → "62°F, partly cloudy"
+  get_time("Tokyo"),     → ✗ TimeAPIError: rate limit exceeded
+)
+
+══ TURN 2 ═══════════════════════════════════════════════════════════
+[user]: [
+  tool_result  tool_use_id=toolu_W1...  content="62°F, partly cloudy"
+  tool_result  tool_use_id=toolu_T1...  content="Error: TimeAPIError:
+              rate limit exceeded. Retry in 30s recommended."
+              is_error: true
+]
+
+══ MODEL RESPONSE ═══════════════════════════════════════════════════
+stop_reason: tool_use
+content:
+  [0] text "Weather is in; time API is rate-limited. Let me try
+           an alternative."
+  [1] tool_use  id=toolu_T2...  name=get_time
+                input={"location":"Asia/Tokyo"}
+                                <span class="c-cm">// the model tried a different format</span>
+
+══ DISPATCH ═════════════════════════════════════════════════════════
+→ get_time(location="Asia/Tokyo")  → "11:42 PM JST"
+
+══ TURN 3 ═══════════════════════════════════════════════════════════
+[user]: tool_result  tool_use_id=toolu_T2...  content="11:42 PM JST"
+
+══ MODEL RESPONSE ═══════════════════════════════════════════════════
+stop_reason: end_turn
+"It's 62°F and partly cloudy in Tokyo, currently 11:42 PM local time."</span></pre>
+
+      <div class="observe">
+        <div class="label">What this trace teaches</div>
+        <p>The model used the error message ("rate limit exceeded, retry in 30s") to decide what to do — it didn't retry immediately (smart, it heeded the 30s suggestion), it tried a different input format instead. That's a recovery the agent could only make because the error was returned as data with useful context. If your handler had raised an exception that aborted the run, the user would have seen "an error occurred." Instead they got the right answer with a tiny extra latency.</p>
+        <p>The lesson: every minute you spend writing better error messages compounds over thousands of runs. The model uses what you give it.</p>
+      </div>
+
+      <h4>Trace C: the malformed call you'll see in production</h4>
+
+      <p>Without strict mode, this is the pattern that catches teams off guard. The model produces an argument that looks valid but isn't.</p>
+
+<pre class="attack standalone"><span class="c-out">══ TURN 1 ══════════════════════════════════════════════════════════
+[user]: search for the top 5 admin docs about backups
+
+══ MODEL RESPONSE ═══════════════════════════════════════════════════
+stop_reason: tool_use
+content:
+  [1] tool_use
+      id:    toolu_5_X1...
+      name:  search_docs
+      input: {
+        "query": "backups",
+        "section": "administrator",    <span class="c-cm">// schema enum is ["admin","developer","reference"]</span>
+        "limit": "5"                   <span class="c-cm">// schema doesn't define this; type is string anyway</span>
+      }
+
+══ DISPATCH ═════════════════════════════════════════════════════════
+search_docs(query="backups", section="administrator", limit="5")
+→ ✗ ValueError: section must be one of admin|developer|reference,
+                got 'administrator'
+
+══ TURN 2 ═══════════════════════════════════════════════════════════
+[user]: tool_result
+       tool_use_id: toolu_5_X1...
+       content: "Error: ValueError: section must be one of
+                admin|developer|reference, got 'administrator'.
+                Did you mean 'admin'?"
+       is_error: true
+
+══ MODEL RESPONSE ═══════════════════════════════════════════════════
+stop_reason: tool_use
+content:
+  [0] text "Right, the enum is 'admin'. Retrying."
+  [1] tool_use  id=toolu_5_X2...  name=search_docs
+                input={"query":"backups","section":"admin"}
+
+══ DISPATCH ═════════════════════════════════════════════════════════
+search_docs(query="backups", section="admin")  → 5 chunks
+
+══ TURN 3 ═══════════════════════════════════════════════════════════
+[end_turn answer with the backup docs]</span></pre>
+
+      <div class="observe">
+        <div class="label">Three things to notice</div>
+        <p>First, the model expanded "admin" to "administrator" — a reasonable natural-language inflation that violated the strict enum. Without strict mode, the API let this through; the validation happened in the handler.</p>
+        <p>Second, the model also tried to pass <code class="inline">"limit": "5"</code> — a parameter not defined in the schema, with a value that's a string instead of a number. This is the kind of thing that often goes unnoticed (the handler just ignores unknown kwargs) but can cause subtle bugs.</p>
+        <p>Third, the recovery worked because the error message was good. "Did you mean 'admin'?" is the single most useful phrase in a tool error. Add it whenever you have a small set of valid values; the model picks up on it.</p>
+        <p>The fix at the source: turn on strict mode and add <code class="inline">additionalProperties: false</code> to the schema. Both problems disappear at the protocol level.</p>
+      </div>
+
+      <h4>The five-second triage protocol</h4>
+
+      <p>When you get pinged with "the agent did something weird," here's the order to scan a trace. Practiced agent engineers do this in under a minute.</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────────┐
+│  1. What was the stop_reason on the FINAL turn?                 │
+│     - end_turn       → agent finished. Read the final text.     │
+│     - max_tokens     → answer truncated. Raise max_tokens.      │
+│     - tool_use       → agent stuck in loop. Check step budget.  │
+│     - refusal        → safety triggered. Read the refusal text. │
+│                                                                 │
+│  2. For each tool_use block in the trace:                       │
+│     - Does the input match the schema?  No → fix description    │
+│       or turn on strict mode.                                   │
+│     - Does the tool_result/function_call_output ID match?       │
+│       No → orphan bug. Check your dispatcher's ID handling.     │
+│     - Was the result is_error: true?  Yes → check the message.  │
+│       If it's actionable, did the model recover well next turn? │
+│                                                                 │
+│  3. Look at the tool_use names in order. Does the sequence make │
+│     sense?                                                      │
+│     - Same tool called >3 times → description has no stop       │
+│       condition, or retrieval is failing upstream.              │
+│     - Tool sequence doesn't match user intent → tool            │
+│       descriptions are ambiguous; the model picked the wrong    │
+│       one.                                                      │
+│     - Expected tool never called → its description didn't       │
+│       trigger; rewrite to be more specific about when to use.   │
+└─────────────────────────────────────────────────────────────────┘</div>
+
+      <p>That's the chapter. The protocol-level mental model — what a tool definition contains, what flies over HTTP, how parallel and error cases work, and how to read a trace fast — is the unlock for every later chapter. When chapter 1.1 walks you through building "the smallest possible agent," you'll now understand <em>why</em> the loop is shaped the way it is. When chapter 2.1 wraps spans around tool_use blocks, you'll know what every span attribute means. When chapter 2.3 talks about tool-result injection, you'll understand exactly what the attack surface is.</p>
+
+      <div class="callout tip">
+        <p>The fastest way to internalize this material is to spend an afternoon reading traces from your own agent. Pick 10 successful runs and 10 failed runs. For each, run through the 3-step triage above. The fifth or sixth trace will start clicking. By the tenth you'll be triaging in seconds.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">I keep using SDKs that hide all this. Do I really need to understand the wire format?</div>
+        <div class="answer">
+          <p>For day-to-day work, no — the SDK abstractions are good. For debugging, yes. The SDK gives you objects with nice attribute access; the moment something goes wrong, you'll be looking at raw JSON from the API response trying to understand why the SDK is throwing. The thirty minutes you spend internalizing the wire shape pays back the first time you're staring at a 400 error at 11pm.</p>
+          <p>The other reason: SDKs differ. The Anthropic SDK and OpenAI SDK have different ergonomics, and tools like Vercel AI SDK / LangChain / LiteLLM add their own layers. Knowing the underlying protocol means you can debug any of them without having to learn each SDK's idiosyncrasies.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How does this map to MCP (Model Context Protocol)?</div>
+        <div class="answer">
+          <p>MCP is one layer above. The on-the-wire shape we covered is between your code and the model API. MCP is between your code (acting as an MCP client) and an MCP server (which provides the tools). MCP servers expose tools to your code; your code then forwards those tools' definitions to the model API in the shape we covered.</p>
+          <p>The relationship: MCP gives you a way to consume tools that someone else maintains. The model API gives you a way to let the model call those tools. They're complementary, not alternatives. We touch this lightly in chapter 4.x; the full MCP story would be its own chapter.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Anthropic has tool_search and programmatic tool calling now. Do I need to learn those?</div>
+        <div class="answer">
+          <p>Eventually, but not yet. Both are recent additions (late 2025) optimized for specific scaling problems: <strong>tool_search</strong> is for agents with hundreds or thousands of tools where shipping all the definitions in every request would blow your context budget; <strong>programmatic tool calling</strong> is for cases where tool I/O is huge and you want intermediate data to stay out of the model's context entirely.</p>
+          <p>If your agent has &lt;50 tools and you're not passing megabytes through them, the basic patterns in this chapter are what you need. Learn the advanced features when you hit the specific scaling problem they solve, not preemptively.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 0.3</div>
+      <h3>Deliverable</h3>
+      <p>A working mental model of tool use at the protocol level — the shape that every later chapter assumes. You can debug a "tool was called wrong" issue from a trace alone. You write tool definitions where the description and parameter docs do most of the work, with strict mode on by default. You know the difference between Anthropic's <code class="inline">tool_use_id</code> and OpenAI's <code class="inline">call_id</code> and won't confuse the two at 2am. You treat tool errors as data the model can recover from, not as exceptions that abort the run. The protocol below the SDK is now visible to you.</p>
+      <ul class="checklist">
+        <li>Tool definitions with careful descriptions (&ge;3 sentences) and per-parameter docs with examples</li>
+        <li>Pydantic models or hand-written schemas; strict mode enabled by default</li>
+        <li>Dispatcher that runs all tool calls in a turn, returns errors as is_error tool_results</li>
+        <li>Parallel execution for independent tools via asyncio.gather; sequential for state-changing ones</li>
+        <li>Validation in handler signatures (Pydantic) that produces actionable error messages</li>
+        <li>Awareness of the three common bugs: orphan results, missing results, malformed args</li>
+        <li>Triage protocol practiced on 10+ real traces from your own agent</li>
+        <li>Mental side-by-side of Anthropic vs OpenAI shapes; you can swap providers in &lt;30 min</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('f2')">
+        <div class="dir">← prev</div>
+        <div class="title">0.2 Prompts</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('f4')">
+        <div class="dir">next →</div>
+        <div class="title">0.4 Async Python</div>
+      </button>
+    </div>
+  </section>

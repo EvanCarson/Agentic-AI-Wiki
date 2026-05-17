@@ -1,0 +1,830 @@
+<section class="phase">
+    <div class="phase-num">3.1</div>
+    <div class="week">Part III / Evaluate · The discipline that compounds</div>
+    <h2>Eval-driven development.</h2>
+    <p class="goal">You built your first eval suite in chapter 1.4. This chapter turns that one-off into a daily practice. Score deltas as the unit of progress. Regression budgets that let you trade subscore movements honestly. A PR-comment workflow that puts eval results in front of every code review. The cadence that keeps you from optimizing on vibes. By the end you'll have an agent codebase where no change ships without numbers, and the numbers will compound in your favor over months instead of drifting backwards.</p>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Deltas, not scores.</h3>
+
+      <p>The first thing to internalize about eval-driven development is that the unit of progress is not the score — it's the score <em>delta</em> across a specific change. If you remember nothing else from this chapter, remember this. The number 73.4% means nothing on its own. The number "+1.8 vs main" means something useful. And the number "+1.8 on retrieval recall but -3.1 on grounding faithfulness" tells you exactly what to do next.</p>
+
+      <p>Teams new to evals routinely make the same mistake. They run the suite once, read the headline number, and either celebrate ("we're at 78%, that's pretty good") or despair ("we're at 41%, we're not ready"). Both reactions miss the point. Without a comparison baseline, the score is just a number. Without a per-subscore breakdown, you can't decide whether a change was good. And without a reproducible baseline you can re-measure against, you can't even compute the delta reliably.</p>
+
+      <h4>The minimum viable scoreboard</h4>
+
+      <p>What you actually need is a small piece of infrastructure: a CSV (or table, or scoreboard.jsonl) that records, for every meaningful change, the full subscore breakdown alongside the commit SHA. From chapter 1.4 you already have <code class="inline">scoreboard.csv</code> — we're going to extend it.</p>
+
+<pre class="standalone"><span class="c-cm"># scoreboard.csv — what e-d-d depends on</span>
+commit,timestamp,branch,
+  overall,
+  retrieval_recall_at_5,
+  retrieval_mrr,
+  verifier_agreement,
+  trajectory_pass_rate,
+  trajectory_steps_avg,
+  cost_per_run_usd,
+  notes
+b3a1f7e,2026-04-12T08:14:22Z,main,
+  0.732, 0.81, 0.74, 0.88, 0.69, 4.2, 0.041, baseline
+c9e2a44,2026-04-12T10:33:01Z,feat/rerank,
+  0.768, 0.86, 0.79, 0.87, 0.71, 4.4, 0.044, add cross-encoder rerank
+d1f5b88,2026-04-12T14:22:18Z,feat/judge-prompt,
+  0.745, 0.81, 0.74, 0.92, 0.71, 4.1, 0.041, tighter verifier prompt</pre>
+
+      <p>This is everything. Three commits, three rows, every subscore captured. The two changes don't both move the same dial — the rerank change improves retrieval (good) at the cost of slightly more steps and slightly higher cost (bad-ish). The judge-prompt change leaves retrieval alone but raises verifier agreement substantially (good). These are different stories. A single weighted average would have hidden both.</p>
+
+      <h4>The diff command</h4>
+
+      <p>Now write the smallest possible delta computer. It takes a commit SHA and shows you what changed since main. Five minutes of code, used a hundred times a week:</p>
+
+<pre class="standalone"><span class="c-cm"># scripts/eval_delta.py</span>
+<span class="c-kw">import</span> argparse, csv, sys
+<span class="c-kw">from</span> pathlib <span class="c-kw">import</span> Path
+
+p = argparse.ArgumentParser()
+p.add_argument(<span class="c-st">"--against"</span>, default=<span class="c-st">"main"</span>)
+p.add_argument(<span class="c-st">"--commit"</span>, required=<span class="c-kw">True</span>)
+args = p.parse_args()
+
+rows = <span class="c-kw">list</span>(csv.DictReader(<span class="c-kw">open</span>(<span class="c-st">"scoreboard.csv"</span>)))
+
+<span class="c-cm"># most recent row on baseline branch</span>
+baseline = next(r <span class="c-kw">for</span> r <span class="c-kw">in</span> <span class="c-kw">reversed</span>(rows) <span class="c-kw">if</span> r[<span class="c-st">"branch"</span>] == args.against)
+<span class="c-cm"># row for the candidate commit</span>
+candidate = next(r <span class="c-kw">for</span> r <span class="c-kw">in</span> rows <span class="c-kw">if</span> r[<span class="c-st">"commit"</span>] == args.commit)
+
+<span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"baseline:  {baseline['commit']} ({baseline['branch']})"</span>)
+<span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"candidate: {candidate['commit']} ({candidate['branch']})"</span>)
+<span class="c-kw">print</span>()
+
+METRICS = [<span class="c-st">"overall"</span>, <span class="c-st">"retrieval_recall_at_5"</span>, <span class="c-st">"retrieval_mrr"</span>,
+           <span class="c-st">"verifier_agreement"</span>, <span class="c-st">"trajectory_pass_rate"</span>,
+           <span class="c-st">"trajectory_steps_avg"</span>, <span class="c-st">"cost_per_run_usd"</span>]
+
+<span class="c-kw">for</span> m <span class="c-kw">in</span> METRICS:
+    b = <span class="c-kw">float</span>(baseline[m])
+    c = <span class="c-kw">float</span>(candidate[m])
+    delta = c - b
+    sign = <span class="c-st">"+"</span> <span class="c-kw">if</span> delta >= <span class="c-st">0</span> <span class="c-kw">else</span> <span class="c-st">""</span>
+    arrow = <span class="c-st">"↑"</span> <span class="c-kw">if</span> delta > <span class="c-st">0</span> <span class="c-kw">else</span> (<span class="c-st">"↓"</span> <span class="c-kw">if</span> delta < <span class="c-st">0</span> <span class="c-kw">else</span> <span class="c-st">"·"</span>)
+    <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"  {m:32s}  {b:6.3f} → {c:6.3f}  {sign}{delta:+.3f} {arrow}"</span>)</pre>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/eval_delta.py --commit c9e2a44
+
+baseline:  b3a1f7e (main)
+candidate: c9e2a44 (feat/rerank)
+
+  overall                           0.732 → 0.768  +0.036 ↑
+  retrieval_recall_at_5             0.810 → 0.860  +0.050 ↑
+  retrieval_mrr                     0.740 → 0.790  +0.050 ↑
+  verifier_agreement                0.880 → 0.870  -0.010 ↓
+  trajectory_pass_rate              0.690 → 0.710  +0.020 ↑
+  trajectory_steps_avg              4.200 → 4.400  +0.200 ↓ (worse)
+  cost_per_run_usd                  0.041 → 0.044  +0.003 ↓ (worse)</span></pre>
+
+      <p>You can ship this change. Retrieval got better in two dimensions, verifier agreement barely dropped (within noise), trajectory pass rate improved, cost rose by ~7%. The trade looks favorable if your cost ceiling has headroom. If your cost ceiling is binding, this is a debate worth having on the PR — which is exactly where this conversation should happen.</p>
+
+      <h4>Noise floor: how big is "real"?</h4>
+
+      <p>Here's the next question, and it's the one teams skip: a delta of +0.036 looks real, but <em>is</em> it real, or is it within run-to-run noise? The honest answer is you don't know until you've measured the noise floor of your suite.</p>
+
+      <p>Measure it once. Run the same eval against the same commit, 5 times. Look at the variance of each metric.</p>
+
+<pre class="standalone"><span class="c-cm"># scripts/noise_floor.py</span>
+<span class="c-kw">import</span> statistics, subprocess, csv
+
+runs = []
+<span class="c-kw">for</span> i <span class="c-kw">in</span> <span class="c-kw">range</span>(<span class="c-st">5</span>):
+    subprocess.run([<span class="c-st">"make"</span>, <span class="c-st">"eval-full"</span>], check=<span class="c-kw">True</span>)
+    <span class="c-cm"># reads the row just appended for this commit</span>
+    rows = <span class="c-kw">list</span>(csv.DictReader(<span class="c-kw">open</span>(<span class="c-st">"scoreboard.csv"</span>)))
+    runs.append(rows[-<span class="c-st">1</span>])
+
+<span class="c-kw">for</span> metric <span class="c-kw">in</span> METRICS:
+    vals = [<span class="c-kw">float</span>(r[metric]) <span class="c-kw">for</span> r <span class="c-kw">in</span> runs]
+    mean, stdev = statistics.mean(vals), statistics.stdev(vals)
+    <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"{metric:32s}  μ={mean:.3f}  σ={stdev:.3f}  noise=±{2*stdev:.3f}"</span>)</pre>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/noise_floor.py
+
+overall                           μ=0.732  σ=0.008  noise=±0.016
+retrieval_recall_at_5             μ=0.810  σ=0.003  noise=±0.006  ← stable
+retrieval_mrr                     μ=0.740  σ=0.005  noise=±0.010
+verifier_agreement                μ=0.880  σ=0.018  noise=±0.036  ← noisy!
+trajectory_pass_rate              μ=0.690  σ=0.022  noise=±0.044  ← noisy!
+trajectory_steps_avg              μ=4.200  σ=0.150  noise=±0.300
+cost_per_run_usd                  μ=0.041  σ=0.001  noise=±0.002</span></pre>
+
+      <div class="observe">
+        <div class="label">What this tells you</div>
+        <p>Retrieval metrics are stable — they're computed against fixed labels, so they vary only with retrieval randomness (which you can seed). They're trustworthy as small-delta signals. Verifier agreement and trajectory pass rate are far noisier because they involve LLM-as-judge calls and stochastic agent paths. A +0.02 change on trajectory pass rate is well within noise; you cannot interpret it as a real improvement from a single run.</p>
+        <p>The fix isn't to despair, it's to <strong>require multi-run measurement for noisy metrics</strong>. Run the suite 3 times for any candidate that targets a noisy metric. Report the mean. Reject single-run "improvements" smaller than 2σ.</p>
+      </div>
+
+      <h4>Encode the noise floor in your delta tool</h4>
+
+      <p>Update <code class="inline">eval_delta.py</code> to mark each delta as "real" or "within noise" using the measured σ. The version you'll actually use:</p>
+
+<pre class="standalone">NOISE = {
+    <span class="c-st">"overall"</span>:                 <span class="c-st">0.016</span>,
+    <span class="c-st">"retrieval_recall_at_5"</span>:   <span class="c-st">0.006</span>,
+    <span class="c-st">"retrieval_mrr"</span>:           <span class="c-st">0.010</span>,
+    <span class="c-st">"verifier_agreement"</span>:      <span class="c-st">0.036</span>,
+    <span class="c-st">"trajectory_pass_rate"</span>:    <span class="c-st">0.044</span>,
+    <span class="c-st">"trajectory_steps_avg"</span>:    <span class="c-st">0.300</span>,
+    <span class="c-st">"cost_per_run_usd"</span>:        <span class="c-st">0.002</span>,
+}
+
+<span class="c-kw">for</span> m <span class="c-kw">in</span> METRICS:
+    b, c = <span class="c-kw">float</span>(baseline[m]), <span class="c-kw">float</span>(candidate[m])
+    delta = c - b
+    real = <span class="c-kw">abs</span>(delta) > NOISE[m]
+    flag = <span class="c-st">"REAL"</span> <span class="c-kw">if</span> real <span class="c-kw">else</span> <span class="c-st">"noise"</span>
+    <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"  {m:32s}  {b:.3f} → {c:.3f}  {delta:+.3f}  [{flag}]"</span>)</pre>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/eval_delta.py --commit c9e2a44
+
+  overall                           0.732 → 0.768  +0.036  [REAL]
+  retrieval_recall_at_5             0.810 → 0.860  +0.050  [REAL]
+  retrieval_mrr                     0.740 → 0.790  +0.050  [REAL]
+  verifier_agreement                0.880 → 0.870  -0.010  [noise]
+  trajectory_pass_rate              0.690 → 0.710  +0.020  [noise]
+  trajectory_steps_avg              4.200 → 4.400  +0.200  [noise]
+  cost_per_run_usd                  0.041 → 0.044  +0.003  [REAL]</span></pre>
+
+      <p>Suddenly the picture is sharper. The rerank change <em>really</em> improved retrieval, and <em>really</em> raised cost slightly. Everything else is within noise — the apparent verifier drop is meaningless, the apparent trajectory improvement is also meaningless. You'd want a multi-run measurement on those before concluding anything.</p>
+
+      <p>This is the discipline. Without it, teams spend weeks "improving" things that were never actually different from the baseline. With it, your eval gets quieter — you stop reading patterns into noise — and the real signals stand out clearly.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Two-sigma is a 95% confidence threshold. Isn't this just stats?</div>
+        <div class="answer">
+          <p>Yes — and saying it plainly: this is just hypothesis testing dressed up for engineers. The reason it's worth labeling rather than assuming everyone knows is that ML teams routinely report single-run improvements as if they were definitive, and the discipline of saying <code class="inline">[noise]</code> next to a delta forces the conversation to happen. The math is undergraduate stats; the practice is rare.</p>
+          <p>You can do this more rigorously (proper t-tests, bootstrap confidence intervals) and people who care should. The 2σ rule is the minimum that catches the most common mistake.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My eval suite takes 20 minutes to run. Running it 3× per candidate isn't feasible.</div>
+        <div class="answer">
+          <p>Three answers, in order of effort:</p>
+          <ul>
+            <li><strong>Split the suite.</strong> Most teams have a fast subset (cheap unit/retrieval checks, run on every commit) and a slow subset (full trajectories with judge calls, run nightly or on PR-to-main). Chapter 1.4 already touched this. Fast suite runs once; slow suite runs three times overnight, mean reported.</li>
+            <li><strong>Parallelize.</strong> Eval cases are embarrassingly parallel. With <code class="inline">asyncio.gather</code> (chapter 0.4 if it existed, or Anthropic's Message Batches API) you can run 50 trajectories in the time it takes to run one. Suddenly 3× becomes 3× something fast.</li>
+            <li><strong>Lower the bar.</strong> Use 1.5σ instead of 2σ if you accept more false positives. Use single-run for cheap metrics (retrieval) and multi-run only for the LLM-judge ones. Engineering trade-off, not a moral failing.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Regression budgets: making the trade-off explicit.</h3>
+
+      <p>Step 1 gave you a way to read a delta honestly. Step 2 is about what to do when the delta is mixed — when a change makes some metrics go up and others go down, and you have to decide whether to ship it.</p>
+
+      <p>The naive answer is "compute a weighted average and look at the overall score." The reason this is wrong: weighted averages hide tradeoffs you'd rather have explicit conversations about. A change that boosts retrieval by 5 points and tanks faithfulness by 4 points might net out to +1 on a weighted overall, but you almost certainly do <em>not</em> want to ship "your agent retrieves better but makes things up more." Faithfulness is non-negotiable for most products; retrieval is something to optimize within that constraint.</p>
+
+      <p>The better mental model is <strong>regression budgets</strong>. Per metric, decide in advance: this metric must never drop by more than X points; this metric can drop slightly if others rise enough; this metric is free to fluctuate. Encode the budgets as a config. Let the diff tool tell you whether a change fits within them.</p>
+
+      <h4>Define the budgets</h4>
+
+<pre class="standalone"><span class="c-cm"># evals/budgets.yaml</span>
+<span class="c-cm"># Per-metric regression budget. Negative numbers are allowed drops.</span>
+<span class="c-cm"># "hard" means the merge gate fails if exceeded.</span>
+<span class="c-cm"># "soft" means warn but allow.</span>
+
+budgets:
+  retrieval_recall_at_5:
+    direction: maximize
+    hard_floor: -0.01     <span class="c-cm"># never drop by more than 1 point</span>
+    soft_floor: -0.005
+
+  verifier_agreement:
+    direction: maximize
+    hard_floor: -0.005    <span class="c-cm"># faithfulness is non-negotiable</span>
+    soft_floor: 0.0       <span class="c-cm"># even noise-level drops get flagged</span>
+
+  trajectory_pass_rate:
+    direction: maximize
+    hard_floor: -0.02
+    soft_floor: -0.01
+
+  trajectory_steps_avg:
+    direction: minimize
+    hard_ceiling: +0.5    <span class="c-cm"># never run >0.5 more steps on average</span>
+    soft_ceiling: +0.2
+
+  cost_per_run_usd:
+    direction: minimize
+    hard_ceiling: +0.010  <span class="c-cm"># never raise per-run cost by &gt;$0.01</span>
+    soft_ceiling: +0.003</pre>
+
+      <p>The labels matter. <strong>Hard floors/ceilings block the merge.</strong> CI runs the eval, computes deltas, and if any metric breaks a hard threshold the PR can't ship without an explicit override. <strong>Soft floors/ceilings warn.</strong> CI annotates the PR with "verifier dropped 0.4 points (within budget but worth a look)" but doesn't block. The distinction matters because some metrics deserve veto power and others don't.</p>
+
+      <h4>The budget-aware diff</h4>
+
+      <p>Extend the delta tool one more time:</p>
+
+<pre class="standalone"><span class="c-cm"># scripts/eval_delta.py (with budgets)</span>
+<span class="c-kw">import</span> yaml
+
+budgets = yaml.safe_load(<span class="c-kw">open</span>(<span class="c-st">"evals/budgets.yaml"</span>))[<span class="c-st">"budgets"</span>]
+
+<span class="c-kw">def</span> <span class="c-fn">verdict</span>(metric, delta):
+    b = budgets.get(metric)
+    <span class="c-kw">if</span> <span class="c-kw">not</span> b: <span class="c-kw">return</span> <span class="c-st">""</span>
+    <span class="c-kw">if</span> b[<span class="c-st">"direction"</span>] == <span class="c-st">"maximize"</span>:
+        <span class="c-kw">if</span> delta &lt; b[<span class="c-st">"hard_floor"</span>]:  <span class="c-kw">return</span> <span class="c-st">"❌ HARD"</span>
+        <span class="c-kw">if</span> delta &lt; b[<span class="c-st">"soft_floor"</span>]:  <span class="c-kw">return</span> <span class="c-st">"⚠ SOFT"</span>
+    <span class="c-kw">else</span>:  <span class="c-cm"># minimize</span>
+        <span class="c-kw">if</span> delta > b[<span class="c-st">"hard_ceiling"</span>]:  <span class="c-kw">return</span> <span class="c-st">"❌ HARD"</span>
+        <span class="c-kw">if</span> delta > b[<span class="c-st">"soft_ceiling"</span>]:  <span class="c-kw">return</span> <span class="c-st">"⚠ SOFT"</span>
+    <span class="c-kw">return</span> <span class="c-st">"✓"</span>
+
+violations_hard = <span class="c-st">0</span>
+<span class="c-kw">for</span> m <span class="c-kw">in</span> METRICS:
+    b, c = <span class="c-kw">float</span>(baseline[m]), <span class="c-kw">float</span>(candidate[m])
+    delta = c - b
+    v = verdict(m, delta)
+    <span class="c-kw">if</span> <span class="c-st">"HARD"</span> <span class="c-kw">in</span> v: violations_hard += <span class="c-st">1</span>
+    <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"  {m:32s}  {delta:+.3f}  {v}"</span>)
+
+sys.exit(<span class="c-st">1</span> <span class="c-kw">if</span> violations_hard > <span class="c-st">0</span> <span class="c-kw">else</span> <span class="c-st">0</span>)</pre>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/eval_delta.py --commit c9e2a44
+
+  retrieval_recall_at_5             +0.050  ✓
+  retrieval_mrr                     +0.050  ✓
+  verifier_agreement                -0.010  ❌ HARD
+  trajectory_pass_rate              +0.020  ✓
+  trajectory_steps_avg              +0.200  ⚠ SOFT
+  cost_per_run_usd                  +0.003  ⚠ SOFT
+
+❌ 1 hard violation. PR cannot merge until resolved.</span></pre>
+
+      <p>Now the PR conversation has structure. The CI tells the author: <em>your change broke a non-negotiable invariant on faithfulness — discuss with the team before merging, or improve the change so it doesn't regress that metric.</em> Two outcomes are healthy: the author fixes the regression, or the team explicitly decides the budget is wrong and updates it (which is itself a separate PR, separately reviewed). What does <em>not</em> happen is silently shipping a change that drops faithfulness.</p>
+
+      <h4>The Pareto frontier in your head</h4>
+
+      <p>Budgets handle the simple cases. The harder cases are when a change crosses a soft threshold but you want to ship it anyway because the gain on another metric is large. This is where you start thinking about Pareto frontiers explicitly.</p>
+
+      <div class="diagram">                  faithfulness  ↑
+                       |
+                  1.0  | ·
+                       |          • A: rerank (current)
+                  0.90 | ·       •
+                       |       • • B: rerank + tighter judge
+                       |     • •
+                  0.80 |     •      • C: bigger model (cost+++)
+                       |   •
+                  0.70 |  •
+                       | •_____________________________  retrieval recall
+                         0.6  0.7  0.8  0.9  1.0     ↑
+
+   On the frontier: A, B, C — no other option dominates them.
+   Off the frontier: every other point — strictly worse than something on it.</div>
+
+      <p>For two metrics you can literally draw this. For five metrics you can't, but the principle still applies: a change is <em>Pareto-improving</em> if at least one metric improves and none gets worse beyond noise. Pareto-improving changes are unambiguous — ship them. A change that improves some metrics and worsens others is a Pareto trade-off — it sits on the frontier, and shipping it means moving the frontier in a direction the team has chosen.</p>
+
+      <p>The discipline this enforces: every non-Pareto-improving merge should require a one-line justification in the PR description. Not a long memo. One line. "Shipping despite the +0.003 cost increase because the +0.05 retrieval gain unblocks the Q3 use cases." If you can't write that line, the change isn't ready.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How do I pick the initial budgets? Won't I just set them around the current values?</div>
+        <div class="answer">
+          <p>That's exactly what you do — and that's fine. The budgets are not aspirational targets; they're <em>"don't slide backwards from here without consciously deciding to."</em> Set hard floors at "current value minus a small margin that comfortably exceeds noise" for everything non-negotiable. Set soft floors slightly tighter.</p>
+          <p>Once a budget gets violated and the team decides to relax it, that's a signal: either the metric is genuinely less important than thought, or the team is rationalizing a regression. The friction of editing the budget config makes the second case visible.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What if I have 12 metrics and budgets feel overwhelming?</div>
+        <div class="answer">
+          <p>You probably don't need 12 budgets. Pick the 3–5 metrics that genuinely matter to your product. The rest can be soft-tracked (recorded, not budgeted). A common starting set:</p>
+          <ul>
+            <li>One end-to-end <strong>task success</strong> metric (trajectory_pass_rate or similar). Hard floor.</li>
+            <li>One <strong>faithfulness/correctness</strong> metric (verifier_agreement, grounding rate). Hard floor.</li>
+            <li>One <strong>cost</strong> ceiling. Hard.</li>
+            <li>One <strong>latency</strong> ceiling. Hard.</li>
+            <li>One <strong>retrieval quality</strong> metric. Soft.</li>
+          </ul>
+          <p>Five budgets, four of them hard. That's enough discipline to prevent silent regression without drowning every PR in red ❌ marks.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Doesn't this just slow down iteration? Some of my best changes had a small regression somewhere.</div>
+        <div class="answer">
+          <p>Probably the opposite. Without budgets, teams discover after weeks of "improvements" that some metric they weren't watching dropped by 8 points and they don't know which change caused it. Bisecting that mess is the time sink. Catching the regression in the PR that caused it, with the author still in context, takes seconds.</p>
+          <p>And: the budget overrides are not bureaucratic. A one-line PR comment is enough. "Override: +0.003 cost is within Q3 plan." Done. The friction is calibrated to the cost of the decision.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>The PR-comment workflow.</h3>
+
+      <p>Step 1 gave you honest deltas. Step 2 gave you budgets. Both are useless unless they show up where decisions actually get made — which is the pull request, not your terminal. This step wires the eval into your version control workflow so every code review includes an eval review, automatically.</p>
+
+      <p>The shape: a developer opens a PR. CI fires up, runs the eval against the PR branch, runs it again against main, computes the delta with budget verdicts, posts the result as a comment on the PR. The comment updates on every push so reviewers always see the current state. Hard violations show up as a failed status check; soft violations show up as a warning in the comment. Code review and eval review happen in the same conversation.</p>
+
+      <h4>The CI workflow</h4>
+
+      <p>Concretely, with GitHub Actions. The same shape works on GitLab, CircleCI, Buildkite — the only differences are syntactic.</p>
+
+<pre class="standalone"><span class="c-cm"># .github/workflows/eval-pr.yml</span>
+name: eval-pr
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   <span class="c-cm"># need history for baseline lookup</span>
+
+      - uses: actions/setup-python@v5
+        with: { python-version: <span class="c-st">"3.12"</span> }
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run fast eval suite (always)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: make eval-fast
+
+      - name: Run full suite if labeled 'eval-full'
+        <span class="c-kw">if</span>: contains(github.event.pull_request.labels.*.name, <span class="c-st">'eval-full'</span>)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: make eval-full
+
+      - name: Compute delta vs main
+        id: delta
+        run: |
+          python scripts/eval_delta.py \
+            --against main \
+            --commit ${{ github.event.pull_request.head.sha }} \
+            --format markdown \
+            > delta.md
+
+      - name: Post PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: delta.md
+          header: eval-results   <span class="c-cm"># sticky: replaces previous comment</span>
+
+      - name: Fail on hard violations
+        run: python scripts/eval_delta.py --check-hard \
+             --commit ${{ github.event.pull_request.head.sha }}</pre>
+
+      <p>Two things in this YAML earn their keep. First, the <strong>label-gated full suite</strong>: most PRs only run the fast suite (retrieval + unit checks, &lt;2 minutes); PRs that touch the agent loop, prompts, or model selection get the <code class="inline">eval-full</code> label and run the slow trajectory suite too. The label-as-trigger is much better than running everything always (slow, expensive) or only on merge (catches regressions too late).</p>
+
+      <p>Second, the <strong>sticky comment</strong>. Every push updates the same comment instead of creating a new one. Reviewers see only the current state, not a history of "the eval got better, then worse, then better as the author iterated." That history is in the scoreboard.csv; the PR comment is a snapshot.</p>
+
+      <h4>The comment format</h4>
+
+      <p>This is what a reviewer should see. Tuned over many iterations — the goal is "glanceable in 3 seconds, drill-down for the curious":</p>
+
+<pre class="trace standalone"><span class="c-out">## 📊 eval-results
+
+vs main (b3a1f7e)
+**overall: 0.732 → 0.768 (+0.036) ↑ [REAL]**
+
+|  metric                   |  base  |   pr   |  delta  | verdict |
+| ------------------------- | ------ | ------ | ------- | ------- |
+|  retrieval_recall_at_5    | 0.810  | 0.860  | +0.050  |   ✓     |
+|  retrieval_mrr            | 0.740  | 0.790  | +0.050  |   ✓     |
+|  verifier_agreement       | 0.880  | 0.870  | -0.010  | ⚠ SOFT  |
+|  trajectory_pass_rate     | 0.690  | 0.710  | +0.020  |   ✓     |
+|  trajectory_steps_avg     | 4.200  | 4.400  | +0.200  | ⚠ SOFT  |
+|  cost_per_run_usd         | 0.041  | 0.044  | +0.003  | ⚠ SOFT  |
+
+cost: $1.84 (full suite, 50 trajectories)
+runtime: 14m 22s
+
+— [scoreboard.csv](link) · [full results](link)</span></pre>
+
+      <p>What's worth noting about this format. The headline metric is at the top with the biggest signal. Every metric has a tabular row with the verdict column on the right — reviewers scan that column. Soft violations appear without scaring anyone; hard violations would appear as ❌ in the verdict column and would also fire the failing status check at the top of the PR.</p>
+
+      <p>The runtime and cost lines exist for the same reason: they're metadata the reviewer might want, and one of them is itself a budgeted metric (cost). Don't bury them; they belong next to the deltas.</p>
+
+      <h4>What this actually changes</h4>
+
+      <p>Eval-driven development isn't a tool, it's a habit. The habit is: I will not merge a change to the agent without seeing its eval delta, and the team will not approve a change to the agent without reading the eval delta. The CI infrastructure exists to make this habit cheap. Without CI, the habit dies — people forget, get rushed, ship without measuring. With CI, the habit is automatic: the eval result is sitting right there in the PR every time.</p>
+
+      <p>The first time a teammate's clever-looking refactor gets rejected because evals dropped 4 points on faithfulness — that's the chapter earning its keep. The first time someone explores 5 prompt variations in a draft PR and you can <em>see</em> which one was actually better — that's the chapter earning its keep. The first time a junior engineer ships their first change with confidence because the numbers say it's an improvement — that's the chapter earning its keep.</p>
+
+      <div class="callout tip">
+        <p>If you do <em>only one thing</em> from this chapter: get the PR-comment workflow set up before anything else. Budgets, Pareto thinking, multi-run measurement — all of those are downstream of "do my teammates see eval results when reviewing my code." Without that, the rest doesn't happen.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Running the full eval on every PR is going to cost real money. How do I budget for that?</div>
+        <div class="answer">
+          <p>Realistic numbers: a 50-question trajectory suite with judge calls runs $1–5 per execution depending on your agent's average tokens and the judge model. With label-gated full runs, you're paying that maybe 5 times a week instead of 50 — so $25/week, $100/month. For most teams that's well inside the experimentation budget. For early-stage projects, a $50/month line item is invisible.</p>
+          <p>The numbers that <em>do</em> add up: running the full suite on every push of every PR (×10–20 pushes per PR), running on commits to feature branches that aren't ready, running on PRs that touch nothing relevant. The label gate is what keeps the bill sane.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My team doesn't use GitHub Actions / our CI is locked down / we can't easily run external eval workflows. What's the minimum viable version?</div>
+        <div class="answer">
+          <p>The minimum viable version is a script and a Slack/Discord webhook. Developer runs <code class="inline">make eval-pr</code> locally before pushing. The script posts the delta to a team channel. Reviewers read it before approving.</p>
+          <p>This is meaningfully worse than CI — the discipline rests on humans remembering — but it's meaningfully better than nothing. Most teams I've seen with this manual workflow eventually graduate to CI, but the workflow that matters is "every change has a visible delta," not "CI runs it." Start with what you can build today.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How does this work for monorepos with non-agent code in the same PR?</div>
+        <div class="answer">
+          <p>Path-filter the workflow. Only run the eval if the PR touches files under <code class="inline">agent/</code>, <code class="inline">prompts/</code>, <code class="inline">retrieval/</code>, <code class="inline">tools/</code>, or <code class="inline">evals/</code> itself. GitHub Actions supports <code class="inline">paths:</code> filters at the workflow trigger level. PRs that only touch the frontend or unrelated services skip the eval, saving cost and CI time. PRs that touch any agent code get the full treatment.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Versioning &amp; cadence: what a day actually looks like.</h3>
+
+      <p>The last piece is the one teams almost always learn the hard way: <strong>your eval score is meaningless if the underlying model changed under you.</strong> A score of 0.732 on Sonnet 4.5 is not comparable to a score of 0.741 on Sonnet 4.6 — but if you compare them anyway, you'll conclude that something you did improved the agent when in fact the model provider made it better while you slept. Worse, you might conclude that something you did <em>regressed</em> the agent when the provider quietly switched a checkpoint.</p>
+
+      <p>This is the reproducibility problem, and it has a partial answer: version everything that contributes to the score, alongside the score itself.</p>
+
+      <h4>The four versioned axes</h4>
+
+      <p>Every eval row needs to record, at minimum, these four things:</p>
+
+      <ul>
+        <li><strong>Code SHA</strong> — your agent code at the moment the eval ran. You already have this from <code class="inline">git rev-parse HEAD</code>.</li>
+        <li><strong>Prompt version</strong> — your system prompts and tool descriptions hashed or version-tagged. Prompts change independently of code in fast iteration.</li>
+        <li><strong>Model identifier</strong> — including any version suffix the provider exposes. <code class="inline">claude-sonnet-4-5</code> is not enough; <code class="inline">claude-sonnet-4-5-20250929</code> is.</li>
+        <li><strong>Corpus version</strong> — the document set the agent retrieved from. A corpus refresh changes scores; pretending it didn't is the source of many "mysterious" regressions.</li>
+      </ul>
+
+<pre class="standalone"><span class="c-cm"># Updated scoreboard schema with versioning</span>
+commit, timestamp, branch,
+  prompt_hash,     <span class="c-cm"># sha256 of prompts/ directory</span>
+  model_id,        <span class="c-cm"># claude-sonnet-4-5-20250929 (full string)</span>
+  corpus_version,  <span class="c-cm"># git tag of corpus repo, or DVC hash</span>
+  overall, retrieval_recall_at_5, ...</pre>
+
+      <h4>Computing the version stamps</h4>
+
+<pre class="standalone"><span class="c-cm"># evals/version.py</span>
+<span class="c-kw">import</span> hashlib, subprocess
+<span class="c-kw">from</span> pathlib <span class="c-kw">import</span> Path
+
+<span class="c-kw">def</span> <span class="c-fn">prompt_hash</span>() -> <span class="c-kw">str</span>:
+    <span class="c-st">"""Hash every file in prompts/ — order-stable."""</span>
+    h = hashlib.sha256()
+    <span class="c-kw">for</span> p <span class="c-kw">in</span> <span class="c-kw">sorted</span>(Path(<span class="c-st">"prompts"</span>).rglob(<span class="c-st">"*.txt"</span>)):
+        h.update(p.read_bytes())
+    <span class="c-kw">return</span> h.hexdigest()[:<span class="c-st">12</span>]
+
+<span class="c-kw">def</span> <span class="c-fn">model_id</span>(response) -> <span class="c-kw">str</span>:
+    <span class="c-st">"""Pull the resolved model ID from a real API response.
+    Providers may resolve aliases to a specific dated snapshot;
+    record what we actually got, not what we asked for."""</span>
+    <span class="c-kw">return</span> response.model  <span class="c-cm"># Anthropic/OpenAI both return this</span>
+
+<span class="c-kw">def</span> <span class="c-fn">corpus_version</span>() -> <span class="c-kw">str</span>:
+    <span class="c-st">"""Whatever your corpus uses for versioning."""</span>
+    <span class="c-cm"># If your corpus is a git submodule:</span>
+    <span class="c-kw">return</span> subprocess.check_output(
+        [<span class="c-st">"git"</span>, <span class="c-st">"-C"</span>, <span class="c-st">"corpus"</span>, <span class="c-st">"rev-parse"</span>, <span class="c-st">"--short"</span>, <span class="c-st">"HEAD"</span>]
+    ).decode().strip()
+    <span class="c-cm"># If you use DVC: return dvc.api.read_metadata("corpus.dvc")["md5"]</span></pre>
+
+      <h4>What this lets you do</h4>
+
+      <p>Now the delta tool can be smarter. Before computing a delta, it checks the version stamps. If any non-code axis differs, it flags the comparison:</p>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/eval_delta.py --commit d1f5b88
+
+⚠ baseline and candidate differ on non-code axes:
+  - model_id:   claude-sonnet-4-5-20250929 → claude-sonnet-4-5-20251015
+  - corpus_v:   a3f2c1d → a3f2c1d  (same)
+  - prompts:    7b2a... → c1e8...  (changed in this PR)
+
+  This delta mixes prompt changes AND a model snapshot change.
+  Re-run baseline on the new model_id before drawing conclusions.
+
+  overall                           0.732 → 0.768  +0.036
+  ...</span></pre>
+
+      <p>This single warning saves you from the most common false-conclusion in agent development. When a model snapshot ships under your feet, your old baseline is stale — you have to re-measure the baseline on the new snapshot before any candidate delta means anything.</p>
+
+      <p>The fix is mechanical: nightly, re-run the eval against <code class="inline">main</code> with the current model_id and add a fresh baseline row to the scoreboard. Then daytime PR comparisons always use a recent baseline on the same model snapshot. Cheap, automatic, eliminates the class of bug.</p>
+
+      <h4>The daily cadence</h4>
+
+      <p>This is what eval-driven development actually looks like as a working practice. Day-shaped, written so you can compare to your current Tuesday.</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────────┐
+│  MORNING                                                        │
+│                                                                 │
+│   1. Check last night's nightly run                             │
+│      → baseline refreshed?  any silent drift?                   │
+│   2. Open scoreboard.csv, scan last 7 days of main              │
+│      → any metric drifting in a direction you don't like?       │
+│   3. Pick today's work from the queue                           │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  AFTERNOON: one change at a time                                │
+│                                                                 │
+│   1. Hypothesis: "I think doing X will improve metric Y"        │
+│      → write the hypothesis in the PR description NOW.          │
+│                                                                 │
+│   2. Implement the smallest version of X.                       │
+│      → not the cleanest, not the prettiest. The smallest        │
+│        possible change that lets you measure.                   │
+│                                                                 │
+│   3. Push. Wait ~5 min for fast eval, ~20 min for full.         │
+│      → if labeled eval-full.                                    │
+│                                                                 │
+│   4. Read the delta.                                            │
+│      ─ Hypothesis confirmed AND no soft violations?             │
+│             → polish the code, get review, merge.               │
+│      ─ Hypothesis confirmed but with regressions?               │
+│             → decide: is the trade worth it?  Discuss on PR.    │
+│      ─ Hypothesis not confirmed?                                │
+│             → close the PR.  Open a new one with hypothesis 2.  │
+│             → write what you learned in the closed PR's notes.  │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  END OF DAY                                                     │
+│                                                                 │
+│   1. Look at the day's PRs that got merged.                     │
+│      → did the aggregate move overall in the right direction?   │
+│   2. If multiple PRs in a row had "hypothesis not confirmed"    │
+│      → pause.  Your priors might be wrong.  Read traces, talk   │
+│        to a colleague, change strategy before iterating more.   │
+└─────────────────────────────────────────────────────────────────┘</div>
+
+      <p>The most important part of this cadence is the bit that looks like a footnote: <strong>write the hypothesis in the PR description before implementing.</strong> This is the discipline that distinguishes eval-driven from eval-decorated development. If you write the hypothesis after you see the result, you'll rationalize whatever you find. If you write it before, you have an honest record of what you predicted and whether you were right. Over time, this is how you learn what your priors are good at and what they're bad at.</p>
+
+      <h4>One last anti-pattern to call out</h4>
+
+      <p>The most common failure mode in teams adopting EDD: <em>tweaking the eval suite to make the score go up</em>. This happens innocuously — someone notices that case 17 is a known weird edge case, removes it from the suite, the overall score goes up, everyone feels good. Multiply by a few months and your eval is measuring nothing useful because every hard case got removed.</p>
+
+      <p>The rule: <strong>the eval suite is append-only by default.</strong> You can add cases freely. You cannot remove or modify cases without a separate PR, separately reviewed, with an explicit justification. Removing a hard case is a serious decision; making it into a separate PR with its own review surfaces the decision so it gets the scrutiny it deserves.</p>
+
+      <div class="callout warn">
+        <p>Watch for this pattern: a team's overall eval score climbs steadily for three months, everyone celebrates. Then they ship a major release and users complain about exactly the failure modes the team was no longer testing. The score went up; the agent didn't. Append-only eval discipline is what prevents this.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What if my hypothesis is too vague to write down in advance?</div>
+        <div class="answer">
+          <p>That's a signal. If you can't articulate what metric should move in what direction, you don't have a hypothesis yet — you have a hunch. Hunches are fine, but they should be explored in a "spike" — a throwaway branch where you poke around without expectation. Once you have a hypothesis you can write down ("if I increase retrieval top_k from 5 to 8, recall should improve by ≥0.02 with at most +0.003 cost increase"), open the real PR.</p>
+          <p>The discipline of writing it down forces you to know what you're trying to do before you do it. That's the entire point.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My team is one person (me). Is all this overkill?</div>
+        <div class="answer">
+          <p>The CI infrastructure is overkill for one person. The hypothesis-first discipline is not. Even solo, write the hypothesis in the commit message. Even solo, refuse to convince yourself that a regression is "fine." Even solo, look at deltas before deciding a change worked. The reason: you're going to forget what you did and why in three months. The notes are for future-you, not for a teammate.</p>
+          <p>The lightweight solo version: scoreboard.csv + a script that prints deltas + the hypothesis-in-commit-message habit. Maybe 100 lines of code total. Pays for itself in two weeks.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How do I deal with model drift across providers if I'm benchmarking Anthropic vs OpenAI?</div>
+        <div class="answer">
+          <p>Treat them as different products. They are. Don't try to compute "this change is +0.02 on Anthropic and -0.01 on OpenAI, net positive" — that calculation is incoherent. Instead, maintain two scoreboard files (or two columns), report deltas for each independently, and let the team decide separately whether each direction is acceptable. Most teams converge on a primary provider for production and use the other as a probe for "is our agent design biased to one provider's behaviors?" Different question, different answer.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>Three PRs from 73% to 81%, with the cadence visible.</h3>
+
+      <p>The cadence diagram in Step 4 describes the rhythm. Here's a worked sequence — three consecutive days on the same agent — showing how it plays out as PRs land. The agent is the research assistant from Part I. Starting point: <code class="inline">overall = 0.732</code> on the 50-question eval set. Goal: get above 0.80 within the week.</p>
+
+      <h4>Monday: hypothesis-driven, confirmed</h4>
+
+      <p><strong>Morning scoreboard scan.</strong> The agent's <code class="inline">trajectory_pass_rate</code> has been flat at 0.69 for two weeks. The <code class="inline">retrieval_recall_at_5</code> is at 0.81 — decent but with room. The hunch: retrieval is the bottleneck. If the model can't see the right chunks, it can't synthesize a good answer.</p>
+
+      <p><strong>The PR description, written before any code:</strong></p>
+
+<pre class="standalone"><span class="c-st">"""
+Add cross-encoder reranking to retrieval.
+
+HYPOTHESIS: Initial BM25 + embedding fusion gets the right document
+into the top 20 results in ~95% of cases (measured), but the right
+chunk only makes top-5 in ~81%. A cross-encoder rerank on the
+top-20 should push more of those right chunks into the top 5.
+
+PREDICTION:
+- retrieval_recall_at_5: +0.04 to +0.06  (real, above 2σ noise)
+- retrieval_mrr:         +0.04 to +0.05
+- trajectory_pass_rate:  +0.02 (downstream of retrieval improvement)
+- cost_per_run_usd:      +0.002 to +0.004 (one extra small-model call)
+- trajectory_steps_avg:  no change
+
+REJECTION CRITERION: if retrieval_recall_at_5 doesn't beat baseline
+by at least 2σ (≥0.012), the hypothesis is wrong and I close this PR.
+"""</span></pre>
+
+      <p><strong>Afternoon: implement, push, wait.</strong> 45 minutes to add a Cohere rerank call on the top-20 candidates. Push. The fast eval suite runs in CI (3 minutes); the full suite is gated behind the <code class="inline">eval-full</code> label, which the PR template auto-applied because the diff touches <code class="inline">retrieval/</code>. Full suite takes 18 minutes.</p>
+
+      <p><strong>The sticky PR comment that lands:</strong></p>
+
+<pre class="trace standalone"><span class="c-out">## 📊 eval-results
+
+vs main (b3a1f7e)
+**overall: 0.732 → 0.768 (+0.036) ↑ [REAL]**
+
+|  metric                   |  base  |   pr   |  delta  | verdict |
+| ------------------------- | ------ | ------ | ------- | ------- |
+|  retrieval_recall_at_5    | 0.810  | 0.860  | +0.050  |   ✓ REAL|
+|  retrieval_mrr            | 0.740  | 0.790  | +0.050  |   ✓ REAL|
+|  verifier_agreement       | 0.880  | 0.870  | -0.010  | noise   |
+|  trajectory_pass_rate     | 0.690  | 0.710  | +0.020  | noise   |
+|  trajectory_steps_avg     | 4.200  | 4.400  | +0.200  | noise   |
+|  cost_per_run_usd         | 0.041  | 0.044  | +0.003  | ⚠ SOFT  |
+
+cost: $1.84 (full suite)  ·  runtime: 18m 12s</span></pre>
+
+      <div class="observe">
+        <div class="label">Reading this</div>
+        <p>The prediction landed almost exactly in the predicted band. Retrieval moved REAL and substantially; the trajectory and verifier moves are within noise (a single run isn't enough to tell, would need 3× to be sure); cost rose by exactly the predicted amount, hitting the soft ceiling but not the hard one. The PR description's rejection criterion was &ge;0.012 on retrieval recall; the actual move is +0.050, comfortably above. The hypothesis held.</p>
+        <p>The soft cost violation prompts a quick PR conversation: a reviewer asks whether $0.003/run × ~3000 runs/day = ~$270/month is worth +0.05 retrieval recall. The author writes a one-line justification: "Yes — this unblocks Q3 product use cases that needed the recall lift." Reviewer approves. Merge.</p>
+      </div>
+
+      <p>End-of-day note in the project journal: <em>"Retrieval rerank: confirmed hypothesis. +0.036 overall. The trajectory and verifier noise floors made it impossible to tell if there were downstream effects from one run — should re-measure after 2-3 more changes land or with a 3× multi-run."</em></p>
+
+      <h4>Tuesday: hypothesis-driven, rejected</h4>
+
+      <p><strong>Morning.</strong> Yesterday's win is now main. Today's hypothesis: the verifier prompt is too lenient — it's marking claims as "SUPPORT" when the evidence is only tangential. A tighter prompt should raise <code class="inline">verifier_agreement</code> with the hand-labeled set.</p>
+
+      <p><strong>PR description:</strong></p>
+
+<pre class="standalone"><span class="c-st">"""
+Tighten verifier prompt to require explicit evidence.
+
+HYPOTHESIS: Current prompt asks "is the claim supported?" which
+the judge interprets loosely. Asking "does the source contain a
+sentence that explicitly states the claim, or that the claim
+follows from by a single inference step?" should reduce false-
+positive SUPPORT verdicts.
+
+PREDICTION:
+- verifier_agreement:    +0.03 to +0.05 (REAL)
+- trajectory_pass_rate:  no change (verifier is downstream)
+- retrieval_recall_at_5: no change (orthogonal)
+
+REJECTION: if verifier_agreement is below the noise floor (0.036)
+above baseline, the new prompt isn't actually tighter, just
+different. Close.
+"""</span></pre>
+
+      <p><strong>Result:</strong></p>
+
+<pre class="trace standalone"><span class="c-out">## 📊 eval-results
+
+vs main (c9e2a44)
+**overall: 0.768 → 0.766 (-0.002) · noise**
+
+|  metric                   |  base  |   pr   |  delta  | verdict |
+| ------------------------- | ------ | ------ | ------- | ------- |
+|  verifier_agreement       | 0.870  | 0.882  | +0.012  | noise   |
+|  retrieval_recall_at_5    | 0.860  | 0.858  | -0.002  | noise   |
+|  trajectory_pass_rate     | 0.710  | 0.705  | -0.005  | noise   |
+|  cost_per_run_usd         | 0.044  | 0.044  | +0.000  | ✓       |</span></pre>
+
+      <p>The hypothesis predicted +0.03 to +0.05 on verifier_agreement; actual is +0.012, which is below the noise floor (0.036). By the PR's own rejection criterion, the hypothesis is not confirmed. The author has a choice:</p>
+
+      <ul>
+        <li><strong>Option A:</strong> Run the eval 3× to get a tighter measurement, since verifier_agreement is one of the noisy metrics. Possibly the +0.012 is the bottom of a real +0.04 effect that didn't surface in one run.</li>
+        <li><strong>Option B:</strong> Close the PR. Hypothesis was specific; it failed by its own rejection criterion. Don't move the goalpost.</li>
+      </ul>
+
+      <p>The disciplined answer is B unless there's a specific reason to suspect this run is unrepresentative. The author writes a closing comment: <em>"Hypothesis not confirmed (+0.012, below 0.036 noise). The new prompt may be slightly better, may be noise. Closing to avoid hindsight rationalization. The lesson: verifier prompt changes don't show up reliably in single-run evals — next time go straight to 3× measurement."</em> Close.</p>
+
+      <div class="observe">
+        <div class="label">Why this matters</div>
+        <p>Tuesday is the day eval-driven development really earns its keep. Without the rejection criterion in the PR description, the natural pull is to look at +0.012 and think "the new prompt is a little better, let's ship it." The criterion makes the decision mechanical: <em>did the prediction hold or not?</em> Not "is the new code defensible?" — engineers can defend almost anything. <em>Did the prediction hold?</em></p>
+        <p>And the closing comment is doing real work: it's a note to future-self ("3× measurement is needed for noisy metrics"). Over months, these notes are how priors get sharper. Without them, you make the same mistake again in three weeks.</p>
+      </div>
+
+      <h4>Wednesday: planned multi-run + small Pareto trade-off</h4>
+
+      <p><strong>Morning.</strong> Yesterday taught the lesson. Today's hypothesis is more careful — and the PR explicitly plans for 3× measurement:</p>
+
+<pre class="standalone"><span class="c-st">"""
+Use Sonnet for synthesis step instead of Haiku.
+
+HYPOTHESIS: The synthesis step (final answer generation) currently
+runs on Haiku for cost reasons. Several hand-reviewed failures
+trace to the synthesis dropping or distorting facts from retrieved
+chunks. Upgrading just this step (not retrieval ranking or
+verifier) should raise trajectory_pass_rate.
+
+PREDICTION:
+- trajectory_pass_rate:  +0.04 to +0.06 (REAL, above 0.044 noise)
+- cost_per_run_usd:      +0.008 to +0.012 (Sonnet vs Haiku, 1 call)
+- verifier_agreement:    +0.01 to +0.02 (downstream — Sonnet
+                         produces more faithful synthesis)
+
+MEASUREMENT PLAN: 3× run on trajectory_pass_rate (it's noisy), 1×
+on the deterministic metrics. Report mean and σ.
+
+PARETO TRADE: cost will rise, possibly hitting soft ceiling. If
+trajectory delta lands &gt;+0.04, the trade is favorable. If
+&lt;+0.02, close.
+"""</span></pre>
+
+      <p>The CI runs 3× as requested (the eval-full label triggers a multi-run on the noisy metrics). 55 minutes total.</p>
+
+<pre class="trace standalone"><span class="c-out">## 📊 eval-results  (n=3 for noisy metrics)
+
+vs main (c9e2a44)
+**overall: 0.768 → 0.812 (+0.044) ↑ [REAL]**
+
+|  metric                 |  base  |  pr (μ ± σ)        |  delta  | verdict |
+| ----------------------- | ------ | ------------------ | ------- | ------- |
+|  trajectory_pass_rate   | 0.710  | 0.764 ± 0.018      | +0.054  | ✓ REAL  |
+|  verifier_agreement     | 0.870  | 0.891 ± 0.014      | +0.021  | ✓ REAL  |
+|  retrieval_recall_at_5  | 0.860  | 0.860              | +0.000  | ✓       |
+|  trajectory_steps_avg   | 4.400  | 4.350              | -0.050  | ✓       |
+|  cost_per_run_usd       | 0.044  | 0.053              | +0.009  | ⚠ SOFT  |
+
+cost: $4.42 (3× full suite)  ·  runtime: 55m</span></pre>
+
+      <p>Both predictions landed inside their bands. The Pareto trade is genuinely favorable: +0.054 on the highest-leverage metric (trajectory pass rate), +0.021 on faithfulness as a bonus, at a cost of ~$0.009/run extra. The reviewer asks whether $0.009 × 3000 runs/day ≈ $810/month is justified. Author: <em>"Yes — the synthesis-failure rate was the biggest contributor to user-reported quality issues last sprint. The Pareto frontier moved in exactly the right direction."</em> Approved. Merge.</p>
+
+      <h4>End-of-week scoreboard</h4>
+
+      <p>Three PRs, three different outcomes — confirmed, rejected, confirmed. Aggregate movement on overall: <code class="inline">0.732 → 0.812 (+0.080)</code>. Above the 0.80 goal in three days. The story the scoreboard tells:</p>
+
+<pre class="standalone">commit, timestamp, branch, overall, retrieval, verifier, trajectory, cost
+b3a1f7e, Mon  8:14, main,      0.732,  0.810, 0.880, 0.690, 0.041  <span class="c-cm"># baseline</span>
+c9e2a44, Mon 14:33, main,      0.768,  0.860, 0.870, 0.710, 0.044  <span class="c-cm"># +rerank</span>
+<span class="c-cm"># tue: hypothesis closed (verifier prompt) — no merge, no scoreboard row</span>
+e7b3c20, Wed 16:20, main,      0.812,  0.860, 0.891, 0.764, 0.053  <span class="c-cm"># +Sonnet syn</span></pre>
+
+      <p>The cadence visible in the data: two real merges, one explicit close. Costs visible. Subscore movements visible. Score deltas were the unit of decision throughout. Predictions were written before code each time, and verdicts were mechanical.</p>
+
+      <div class="callout tip">
+        <p>The thing that's not visible in the scoreboard but is the most important part of the practice: <strong>Tuesday's closed PR is just as much progress as Monday's and Wednesday's.</strong> A team that ships only confirmed-hypothesis PRs is learning faster than a team that ships every PR regardless of result. The closing PR built knowledge that informed Wednesday's measurement plan. That's the compounding effect.</p>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 3.1</div>
+      <h3>Deliverable</h3>
+      <p>An agent codebase where no change merges without a visible eval delta — the discipline that lets your numbers compound upward instead of drifting. Multi-run measurement for noisy metrics; budgets that gate merges on the metrics that matter; a sticky PR comment that reviewers actually read; version stamps that catch silent model drift; a daily cadence built around hypothesis-first development. Chapter 3.2 splits these evals into the three layers (unit, integration, end-to-end); chapter 3.3 hardens the LLM-as-judge that produces some of the trickiest metrics; chapter 3.4 ties it all into CI and external benchmarks.</p>
+      <ul class="checklist">
+        <li>scoreboard.csv with subscore breakdown, version stamps on every row</li>
+        <li>eval_delta.py with noise-floor labels (REAL vs noise based on 2σ)</li>
+        <li>budgets.yaml with hard/soft thresholds for the 3–5 metrics that matter</li>
+        <li>Multi-run protocol for noisy metrics (median of 3, with σ flagged)</li>
+        <li>CI workflow posting sticky PR comments with delta tables</li>
+        <li>Label-gated full suite ('eval-full' triggers the slow run)</li>
+        <li>Nightly baseline re-run against current model snapshot</li>
+        <li>Hypothesis-first PR template, with a "what I expected" field</li>
+        <li>Append-only eval suite policy in CONTRIBUTING.md</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('s4')">
+        <div class="dir">← prev</div>
+        <div class="title">2.4 Deployment</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('e2')">
+        <div class="dir">next →</div>
+        <div class="title">3.2 Three layers of evals</div>
+      </button>
+    </div>
+  </section>

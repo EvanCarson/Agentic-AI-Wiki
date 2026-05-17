@@ -1,0 +1,606 @@
+<section class="phase">
+    <div class="phase-num">1.3</div>
+    <div class="week">Part I / Build · Week 3</div>
+    <h2>Make it steerable, parallel, interruptible.</h2>
+    <p class="goal">Now add features deliberately skipped in Phase 1. Each one solves a specific failure mode you saw in traces — not a hypothetical one. Parallel tool calls, subagents for context isolation, planning, interrupts.</p>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Enable parallel tool calls.</h3>
+
+      <p>Look back at your Phase 1 traces. How often did the agent run searches sequentially when they were obviously independent? "Find docs about X" → wait → "find docs about Y" → wait. Each wait is a round-trip to the model plus a round-trip to your tools. Parallel tool calls cut that to one round-trip total.</p>
+
+      <p>Both APIs support multiple tool calls per turn — the model returns several <code class="inline">tool_use</code> (or <code class="inline">function_call</code>) blocks in a single response. Your loop just needs to execute them concurrently and pair each result to the right call ID.</p>
+
+      <h4>The change: async execution</h4>
+
+      <p>We use Python's <code class="inline">asyncio</code> to run tool handlers concurrently. Handlers don't need to be async themselves — we wrap synchronous ones with <code class="inline">asyncio.to_thread</code>.</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># agent/loop.py — parallel-capable</span>
+<span class="c-kw">import</span> asyncio
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> AsyncAnthropic
+
+client = AsyncAnthropic()
+
+<span class="c-kw">async def</span> <span class="c-fn">run_one_tool</span>(block):
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> asyncio.to_thread(
+            HANDLERS[block.name], **block.input
+        )
+        <span class="c-kw">return</span> {
+            <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+            <span class="c-st">"tool_use_id"</span>: block.id,
+            <span class="c-st">"content"</span>: <span class="c-kw">str</span>(result),
+        }
+    <span class="c-kw">except</span> <span class="c-kw">Exception</span> <span class="c-kw">as</span> e:
+        <span class="c-kw">return</span> {
+            <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+            <span class="c-st">"tool_use_id"</span>: block.id,
+            <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"error: {e}"</span>,
+            <span class="c-st">"is_error"</span>: <span class="c-kw">True</span>,
+        }
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_query, max_steps=<span class="c-st">10</span>):
+    messages = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_query}]
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(max_steps):
+        response = <span class="c-kw">await</span> client.messages.create(
+            model=<span class="c-st">"claude-sonnet-4-5"</span>,
+            max_tokens=<span class="c-st">4096</span>,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+        )
+        messages.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>,
+                         <span class="c-st">"content"</span>: response.content})
+
+        tool_blocks = [b <span class="c-kw">for</span> b <span class="c-kw">in</span> response.content
+                       <span class="c-kw">if</span> b.type == <span class="c-st">"tool_use"</span>]
+        <span class="c-kw">if</span> <span class="c-kw">not</span> tool_blocks:
+            <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"halted"</span>}
+
+        <span class="c-cm"># Check for submit_answer first (don't run others)</span>
+        <span class="c-kw">for</span> b <span class="c-kw">in</span> tool_blocks:
+            <span class="c-kw">if</span> b.name == <span class="c-st">"submit_answer"</span>:
+                <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"answered"</span>, **b.input}
+
+        <span class="c-cm"># PARALLEL: run all tool blocks at once</span>
+        results = <span class="c-kw">await</span> asyncio.gather(
+            *[run_one_tool(b) <span class="c-kw">for</span> b <span class="c-kw">in</span> tool_blocks]
+        )
+        messages.append({<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: results})
+
+    <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"step_limit"</span>}</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># agent/loop.py — parallel-capable</span>
+<span class="c-kw">import</span> asyncio, json
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> AsyncOpenAI
+
+client = AsyncOpenAI()
+
+<span class="c-kw">async def</span> <span class="c-fn">run_one_tool</span>(call):
+    args = json.loads(call.arguments)
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> asyncio.to_thread(
+            HANDLERS[call.name], **args
+        )
+        output = <span class="c-kw">str</span>(result)
+    <span class="c-kw">except</span> <span class="c-kw">Exception</span> <span class="c-kw">as</span> e:
+        output = <span class="c-kw">f</span><span class="c-st">"error: {e}"</span>
+    <span class="c-kw">return</span> {
+        <span class="c-st">"type"</span>: <span class="c-st">"function_call_output"</span>,
+        <span class="c-st">"call_id"</span>: call.call_id,
+        <span class="c-st">"output"</span>: output,
+    }
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_query, max_steps=<span class="c-st">10</span>):
+    input_items = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+                    <span class="c-st">"content"</span>: user_query}]
+
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(max_steps):
+        response = <span class="c-kw">await</span> client.responses.create(
+            model=<span class="c-st">"gpt-5.5"</span>,
+            instructions=SYSTEM_PROMPT,
+            tools=TOOLS,
+            input=input_items,
+        )
+        <span class="c-kw">for</span> item <span class="c-kw">in</span> response.output:
+            input_items.append(item.model_dump())
+
+        calls = [i <span class="c-kw">for</span> i <span class="c-kw">in</span> response.output
+                 <span class="c-kw">if</span> i.type == <span class="c-st">"function_call"</span>]
+        <span class="c-kw">if</span> <span class="c-kw">not</span> calls:
+            <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"halted"</span>}
+
+        <span class="c-kw">for</span> call <span class="c-kw">in</span> calls:
+            <span class="c-kw">if</span> call.name == <span class="c-st">"submit_answer"</span>:
+                <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"answered"</span>,
+                        **json.loads(call.arguments)}
+
+        <span class="c-cm"># PARALLEL: run all calls at once</span>
+        results = <span class="c-kw">await</span> asyncio.gather(
+            *[run_one_tool(c) <span class="c-kw">for</span> c <span class="c-kw">in</span> calls]
+        )
+        input_items.extend(results)
+
+    <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"step_limit"</span>}</pre>
+      </div>
+
+      <h4>Watch the behavior change</h4>
+
+      <p>Re-run the multi-hop question from Phase 1. The model knows it can fan out now (the API tells it parallel calls are available), so it tends to use that capacity automatically.</p>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"How does PgBouncer transaction pooling
+   interact with prepared statements?"</span></pre>
+
+<pre class="trace"><span class="c-out">──────────────────── Step 0 ────────────────────
+┌─ thinking ─────────────────────────────────────┐
+│ I need info on two separate topics. I'll       │
+│ search for both in parallel.                   │
+└────────────────────────────────────────────────┘
+→ search_docs({'query': 'PgBouncer transaction pooling'})
+→ search_docs({'query': 'prepared statements PostgreSQL'})
+
+[both run concurrently, ~180ms total]
+
+──────────────────── Step 1 ────────────────────
+→ fetch_doc({'chunk_id': 'pgbouncer-modes::1'})
+→ fetch_doc({'chunk_id': 'sql-prepare::0'})
+
+[both run concurrently, ~40ms total]
+
+──────────────────── Step 2 ────────────────────
+→ submit_answer({...})
+
+status: answered (3 steps)</span></pre>
+
+      <div class="observe">
+        <div class="label">What changed</div>
+        <p>5 steps → 3 steps. The same work got done, but in half the round-trips. For a real production agent doing 20–50 tool calls per investigation, parallelization compresses runtime dramatically — often 3–5x for retrieval-heavy workflows.</p>
+        <p>The cost: handlers must be safe to run concurrently. <code class="inline">search_docs</code> and <code class="inline">fetch_doc</code> are pure reads — fine. If you had a <code class="inline">save_note</code> tool that wrote to a shared file, you'd need a lock.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Does the model always parallelize, or do I need to prompt it?</div>
+        <div class="answer">
+          <p>Both models will parallelize when the calls are clearly independent (different searches on different topics). For ambiguous cases, you can nudge the model with system-prompt language like "When you need information on multiple unrelated topics, search for them in parallel rather than sequentially."</p>
+          <p>Don't over-prompt for parallelism — sometimes sequential is correct. "First search for X. Then based on what you find, search for Y." is a legitimate plan that parallelism would break.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My handler does I/O (HTTP calls). Is <code class="inline">asyncio.to_thread</code> wrong?</div>
+        <div class="answer">
+          <p>It works, but isn't optimal. <code class="inline">to_thread</code> moves the synchronous function to a worker thread, which is fine for blocking I/O but uses a thread per call. If you have native async handlers (e.g., <code class="inline">httpx.AsyncClient</code>), call them directly with <code class="inline">await</code> instead.</p>
+          <p>For Phase 1's substring-scan handlers, <code class="inline">to_thread</code> is correct because they're CPU-bound, single-threaded Python.</p>
+        </div>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Add subagents for context isolation.</h3>
+
+      <p>This is the single most important pattern in modern agent design, and the hardest one to get right. The problem: the main agent's context window is precious. Fill it with raw search results, fetched documents, and verbose tool outputs, and quality collapses. The model loses track of the original question, struggles to keep facts straight, starts repeating itself.</p>
+
+      <p>The solution: <strong>delegate research to subagents</strong>. A subagent has its own context window. It does deep research on a narrow task, accumulates whatever intermediate state it needs, then returns a compressed summary to the parent. The parent never sees the raw work.</p>
+
+<div class="diagram">┌──────────────────────────────────────────────────────────┐
+│  MAIN AGENT (~10k context)                               │
+│                                                          │
+│  query: "Compare PgBouncer and HAProxy for Postgres      │
+│          connection pooling, with version notes"         │
+│                                                          │
+│  ├── spawn("research PgBouncer modes")     ─→  50k ctx   │
+│  │     └─ returns: 1500-token summary + citations        │
+│  │                                                       │
+│  ├── spawn("research HAProxy with Postgres") ─→ 40k ctx  │
+│  │     └─ returns: 1200-token summary + citations        │
+│  │                                                       │
+│  └── synthesize comparison + check version notes         │
+└──────────────────────────────────────────────────────────┘</div>
+
+      <p>This pattern is exactly how Claude's Research feature, Perplexity's deep research, and OpenAI's research agents work under the hood.</p>
+
+      <h4>Implementation: a subagent is just recursion</h4>
+
+      <p>Add a new tool: <code class="inline">spawn_subagent(task, focus)</code>. The handler calls <code class="inline">run_agent</code> recursively with the task as its query, but with a different system prompt and the spawn tool removed (to prevent runaway recursion).</p>
+
+<pre class="standalone"><span class="c-cm"># agent/tools.py — add to TOOLS list</span>
+{
+    <span class="c-st">"name"</span>: <span class="c-st">"spawn_subagent"</span>,
+    <span class="c-st">"description"</span>: (
+        <span class="c-st">"Delegate a focused research task to a subagent. "</span>
+        <span class="c-st">"The subagent has its own context window, runs its "</span>
+        <span class="c-st">"own retrieval, and returns a concise summary with "</span>
+        <span class="c-st">"citations. Use when researching multiple topics "</span>
+        <span class="c-st">"that would each require many sources."</span>
+    ),
+    <span class="c-st">"input_schema"</span>: {  <span class="c-cm"># or "parameters" for OpenAI</span>
+        <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+        <span class="c-st">"properties"</span>: {
+            <span class="c-st">"task"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+                     <span class="c-st">"description"</span>: <span class="c-st">"the question to research"</span>},
+            <span class="c-st">"focus"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+                      <span class="c-st">"description"</span>: <span class="c-st">"what aspect matters most"</span>},
+        },
+        <span class="c-st">"required"</span>: [<span class="c-st">"task"</span>],
+    },
+}</pre>
+
+<pre class="standalone"><span class="c-cm"># agent/subagent.py</span>
+SUBAGENT_PROMPT = <span class="c-st">"""You are a research subagent.
+Your task: {task}
+Focus on: {focus}
+
+You have search_docs, fetch_doc, and submit_answer.
+You cannot spawn further subagents.
+
+Return a summary under 1500 tokens with citations.
+Be dense — the parent agent only sees what you submit."""</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">spawn_subagent</span>(task: <span class="c-kw">str</span>, focus: <span class="c-kw">str</span> = <span class="c-st">""</span>) -> <span class="c-kw">dict</span>:
+    <span class="c-cm"># Same loop, different prompt, restricted tools</span>
+    sub_tools = [t <span class="c-kw">for</span> t <span class="c-kw">in</span> TOOLS
+                 <span class="c-kw">if</span> t.get(<span class="c-st">"name"</span>) != <span class="c-st">"spawn_subagent"</span>]
+    sub_prompt = SUBAGENT_PROMPT.format(task=task, focus=focus)
+    result = <span class="c-kw">await</span> run_agent(
+        user_query=task,
+        system_prompt=sub_prompt,
+        tools=sub_tools,
+        max_steps=<span class="c-st">15</span>,
+    )
+    <span class="c-kw">return</span> {
+        <span class="c-st">"summary"</span>: result.get(<span class="c-st">"answer"</span>, <span class="c-st">""</span>),
+        <span class="c-st">"citations"</span>: result.get(<span class="c-st">"citations"</span>, []),
+        <span class="c-st">"steps_used"</span>: result.get(<span class="c-st">"steps_used"</span>, <span class="c-st">0</span>),
+    }</pre>
+
+      <h4>Now watch what happens on a comparison query</h4>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"Compare PgBouncer modes for use with
+   prepared statements and ORM features"</span></pre>
+
+<pre class="trace"><span class="c-out">──────────────────── Step 0 ────────────────────
+┌─ thinking ─────────────────────────────────────┐
+│ This needs deep research on (1) PgBouncer      │
+│ modes and (2) prepared statements / ORM         │
+│ implications. I'll spawn two subagents in      │
+│ parallel to keep my context lean.              │
+└────────────────────────────────────────────────┘
+→ spawn_subagent(task='Explain all three PgBouncer
+    pool modes in detail',
+    focus='which features each mode breaks')
+→ spawn_subagent(task='How do prepared statements
+    and ORM features interact with connection pooling',
+    focus='session vs transaction scoping')
+
+   [each subagent runs its own ~10-step investigation
+    in its own context window, in parallel]
+
+──────────────────── Step 1 ────────────────────
+   subagent A returned: 1400-token summary citing
+     pgbouncer-modes::0, pgbouncer-modes::1,
+     pgbouncer-modes::2, pgbouncer-features::3
+   subagent B returned: 1200-token summary citing
+     sql-prepare::0, libpq-prepare::1,
+     pgbouncer-features::4
+
+┌─ thinking ─────────────────────────────────────┐
+│ I have both research summaries. Synthesizing.  │
+└────────────────────────────────────────────────┘
+→ submit_answer({
+    'answer': 'PgBouncer offers three pool modes...
+    Session pooling is safe for all features but
+    limits concurrency. Transaction pooling breaks
+    prepared statements, SET LOCAL, advisory locks...
+    ORMs that rely on prepared statement caches
+    (SQLAlchemy, Django ORM) require session mode
+    or PREPARE workarounds...',
+    'citations': ['pgbouncer-modes::0', ...]
+  })
+
+status: answered (2 steps, but subagents ran 18 internal steps)</span></pre>
+
+      <div class="observe">
+        <div class="label">Why this is a different agent architecture</div>
+        <p>The main agent made <em>2 visible steps</em>. But underneath, two subagents did 9 steps each. The total work was 20 model calls — yet the main context window saw only ~3000 tokens of summaries, not the 80,000 tokens of raw research.</p>
+        <p>Without subagents, that same investigation would have either hit context limits or produced a degraded answer because the model was overwhelmed by intermediate results. With subagents, the main agent stays sharp because it only ever reads <em>final answers</em>, never working notes.</p>
+      </div>
+
+      <div class="callout warn">
+        <p><strong>Bound the recursion depth.</strong> The subagent's tool list explicitly excludes <code class="inline">spawn_subagent</code>. Without this, a misbehaving model can spawn subagents that spawn subagents, and you'll learn this at 3am when your API credits hit zero. Depth=1 is enough for almost all cases.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">When should the main agent <em>not</em> spawn subagents?</div>
+        <div class="answer">
+          <p>For simple lookups, spawning is pure overhead — you pay an extra model call and the orchestration of a subagent for what a single search would have answered. The agent should only spawn when the task has substructure that benefits from isolation:</p>
+          <ul>
+            <li>Comparing two or more things (each thing → one subagent)</li>
+            <li>Investigations that need many tool calls on a narrow topic</li>
+            <li>Tasks where intermediate results are bulky and you want to summarize them</li>
+          </ul>
+          <p>You can encode this in the system prompt: "Use subagents only when researching topics that would each require 4+ tool calls. For simple lookups, search directly."</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How does this differ from just running multiple searches in parallel?</div>
+        <div class="answer">
+          <p>Parallel tool calls let the agent fan out at the <em>tool-call level</em>. Subagents let it fan out at the <em>investigation level</em>. Two different layers of parallelism that compose:</p>
+          <ul>
+            <li>Parallel tool calls: one model decides "search for X, Y, Z at once" and reads all three results itself.</li>
+            <li>Subagents: the main model delegates "research X" to a copy of itself that runs its own multi-step investigation with its own parallel searches.</li>
+          </ul>
+          <p>Use both. Subagents internally use parallel tool calls. The main agent uses both subagents and parallel tool calls. The combination is what makes deep-research agents fast.</p>
+        </div>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Add a planning step (user-editable).</h3>
+
+      <p>For complex queries — multi-hop, comparative, ambiguous — it helps to generate a plan before executing. Two reasons. First, the model is better at producing a good investigation when it commits to one upfront. Second, the user can edit the plan before the agent burns tokens going down the wrong path. That edit step is what "steerable" actually means in practice.</p>
+
+      <h4>The planner: a focused model call</h4>
+
+<pre class="standalone">PLANNER_PROMPT = <span class="c-st">"""You are planning an investigation.
+Given a user's question, produce a numbered plan of
+3-5 steps describing how an agent should research
+the answer.
+
+Each step should be one of:
+- SEARCH: a specific keyword search
+- COMPARE: comparing two things found via search
+- VERIFY: confirming a claim with a second source
+- SYNTHESIZE: combining findings into the answer
+
+For simple lookups (one fact, one doc), output
+exactly the word: SIMPLE
+
+Output the plan or SIMPLE, nothing else."""</span></pre>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># agent/planner.py</span>
+<span class="c-kw">async def</span> <span class="c-fn">make_plan</span>(query: <span class="c-kw">str</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>] | <span class="c-kw">None</span>:
+    response = <span class="c-kw">await</span> client.messages.create(
+        model=<span class="c-st">"claude-sonnet-4-5"</span>,
+        max_tokens=<span class="c-st">512</span>,
+        system=PLANNER_PROMPT,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: query}],
+    )
+    text = response.content[<span class="c-st">0</span>].text.strip()
+    <span class="c-kw">if</span> text == <span class="c-st">"SIMPLE"</span>: <span class="c-kw">return</span> <span class="c-kw">None</span>
+    <span class="c-kw">return</span> [line <span class="c-kw">for</span> line <span class="c-kw">in</span> text.split(<span class="c-st">"\n"</span>) <span class="c-kw">if</span> line.strip()]</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># agent/planner.py</span>
+<span class="c-kw">async def</span> <span class="c-fn">make_plan</span>(query: <span class="c-kw">str</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>] | <span class="c-kw">None</span>:
+    response = <span class="c-kw">await</span> client.responses.create(
+        model=<span class="c-st">"gpt-5.5"</span>,
+        instructions=PLANNER_PROMPT,
+        input=query,
+    )
+    text = response.output_text.strip()
+    <span class="c-kw">if</span> text == <span class="c-st">"SIMPLE"</span>: <span class="c-kw">return</span> <span class="c-kw">None</span>
+    <span class="c-kw">return</span> [line <span class="c-kw">for</span> line <span class="c-kw">in</span> text.split(<span class="c-st">"\n"</span>) <span class="c-kw">if</span> line.strip()]</pre>
+      </div>
+
+      <h4>The user-editing loop</h4>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">run_with_plan</span>(query: <span class="c-kw">str</span>):
+    plan = <span class="c-kw">await</span> make_plan(query)
+    <span class="c-kw">if</span> plan <span class="c-kw">is</span> <span class="c-kw">None</span>:
+        <span class="c-cm"># Simple query — skip planning</span>
+        <span class="c-kw">return</span> <span class="c-kw">await</span> run_agent(query)
+
+    console.print(<span class="c-st">"\n[bold]Proposed plan:[/]"</span>)
+    <span class="c-kw">for</span> i, step <span class="c-kw">in</span> <span class="c-kw">enumerate</span>(plan, <span class="c-st">1</span>):
+        console.print(<span class="c-kw">f</span><span class="c-st">"  {i}. {step}"</span>)
+    console.print(<span class="c-st">"\n[Enter] approve  [e] edit  [s] skip plan"</span>)
+    choice = <span class="c-kw">input</span>(<span class="c-st">"> "</span>).strip().lower()
+
+    <span class="c-kw">if</span> choice == <span class="c-st">"e"</span>:
+        plan = edit_plan_interactive(plan)
+    <span class="c-kw">elif</span> choice == <span class="c-st">"s"</span>:
+        <span class="c-kw">return</span> <span class="c-kw">await</span> run_agent(query)
+
+    plan_block = <span class="c-st">"\n"</span>.join(<span class="c-kw">f</span><span class="c-st">"{i+1}. {s}"</span>
+                            <span class="c-kw">for</span> i, s <span class="c-kw">in</span> <span class="c-kw">enumerate</span>(plan))
+    enriched = <span class="c-kw">f</span><span class="c-st">"{query}\n\nFollow this plan:\n{plan_block}"</span>
+    <span class="c-kw">return</span> <span class="c-kw">await</span> run_agent(enriched)</pre>
+
+      <h4>What it looks like in practice</h4>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"Compare auth approaches in Postgres
+   for a web app, focused on changes since version 14"</span></pre>
+
+<pre class="trace"><span class="c-out">Proposed plan:
+  1. SEARCH: authentication methods PostgreSQL pg_hba
+  2. SEARCH: scram-sha-256 vs md5 password auth
+  3. SEARCH: PostgreSQL 14 15 16 release notes auth
+  4. COMPARE: trade-offs of each method for web apps
+  5. SYNTHESIZE: recommendation with version caveats
+
+[Enter] approve  [e] edit  [s] skip plan
+> e
+
+Editing plan. Current step 1: SEARCH: authentication...
+[Enter] keep  [r] replace  [d] delete  [a] add after
+> r
+New step 1: SEARCH: pg_hba.conf authentication methods
+
+[Enter] keep  [r] replace  [d] delete  [a] add after
+> [Enter] (keeps step 2)
+...
+
+Approved plan:
+  1. SEARCH: pg_hba.conf authentication methods
+  2. SEARCH: scram-sha-256 vs md5 password auth
+  3. SEARCH: PostgreSQL 14 15 16 release notes auth
+  4. COMPARE: trade-offs for web apps
+  5. SYNTHESIZE: recommendation with version caveats
+
+──────────────── starting agent ────────────────
+→ search_docs({'query': 'pg_hba.conf authentication
+                          methods'})
+...</span></pre>
+
+      <div class="observe">
+        <div class="label">Why letting the user edit matters</div>
+        <p>The model's first plan was reasonable, but a real Postgres user might know that "pg_hba.conf" is the specific term to search for, not "authentication methods." Editing step 1 saves 1–2 follow-up searches the agent would have needed to realize it should look at pg_hba.</p>
+        <p>This is the steerability handle. Without it, the agent's plan is a black box that you can only critique <em>after</em> it spends 10 model calls. With it, you can correct the trajectory before any expensive work happens.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Doesn't always asking the user to approve a plan slow them down?</div>
+        <div class="answer">
+          <p>That's why the planner outputs <code class="inline">SIMPLE</code> for queries that don't need a plan. "What port does Postgres use?" gets <code class="inline">SIMPLE</code>; "Compare three things across versions" gets a plan. The user never sees a plan for trivial questions.</p>
+          <p>For non-trivial queries, the plan-approval step takes ~10 seconds and saves dozens of API calls when it catches a misdirected investigation early. Net win for everyone except the simplest cases — which the planner skips automatically.</p>
+        </div>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Make runs interruptible and resumable.</h3>
+
+      <p>Long investigations might take minutes. You want to be able to pause one, inspect what the agent has decided so far, edit a tool result that looks wrong, and resume from that point. This is what real Agent SDKs give you. Building it yourself teaches you exactly what state matters.</p>
+
+      <p>The trick: <strong>persist messages to disk after every iteration</strong>. The message history <em>is</em> the agent's state. If you have the history, you can resume.</p>
+
+<pre class="standalone"><span class="c-cm"># agent/state.py</span>
+<span class="c-kw">import</span> json, uuid
+<span class="c-kw">from</span> pathlib <span class="c-kw">import</span> Path
+
+<span class="c-kw">class</span> <span class="c-fn">RunState</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, run_id: <span class="c-kw">str</span> = <span class="c-kw">None</span>):
+        self.run_id = run_id <span class="c-kw">or</span> <span class="c-kw">str</span>(uuid.uuid4())[:<span class="c-st">8</span>]
+        self.path = Path(<span class="c-kw">f</span><span class="c-st">"runs/{self.run_id}.jsonl"</span>)
+        self.path.parent.mkdir(exist_ok=<span class="c-kw">True</span>)
+
+    <span class="c-kw">def</span> <span class="c-fn">checkpoint</span>(self, step: <span class="c-kw">int</span>, history: <span class="c-kw">list</span>):
+        <span class="c-kw">with</span> self.path.<span class="c-kw">open</span>(<span class="c-st">"a"</span>) <span class="c-kw">as</span> f:
+            f.write(json.dumps({
+                <span class="c-st">"step"</span>: step,
+                <span class="c-st">"history"</span>: history,
+            }, default=<span class="c-kw">str</span>) + <span class="c-st">"\n"</span>)
+
+    <span class="c-kw">def</span> <span class="c-fn">resume</span>(self) -> <span class="c-kw">list</span>:
+        <span class="c-kw">if</span> <span class="c-kw">not</span> self.path.exists():
+            <span class="c-kw">return</span> []
+        last = <span class="c-kw">None</span>
+        <span class="c-kw">with</span> self.path.<span class="c-kw">open</span>() <span class="c-kw">as</span> f:
+            <span class="c-kw">for</span> line <span class="c-kw">in</span> f:
+                last = json.loads(line)
+        <span class="c-kw">return</span> last[<span class="c-st">"history"</span>] <span class="c-kw">if</span> last <span class="c-kw">else</span> []</pre>
+
+      <h4>Wire it into the loop</h4>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(query, max_steps=<span class="c-st">10</span>, run_id=<span class="c-kw">None</span>):
+    state = RunState(run_id)
+    history = state.resume() <span class="c-kw">or</span> [
+        {<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: query}
+    ]
+    start_step = (<span class="c-kw">len</span>(state.resume()) // <span class="c-st">2</span>) <span class="c-kw">if</span> state.resume() <span class="c-kw">else</span> <span class="c-st">0</span>
+
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(start_step, max_steps):
+        response = <span class="c-kw">await</span> client.messages.create(...)
+        history.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>, ...})
+        <span class="c-cm"># ... dispatch tools, append results ...</span>
+        state.checkpoint(step, history)  <span class="c-cm"># persist every step</span>
+
+    <span class="c-kw">return</span> {<span class="c-st">"run_id"</span>: state.run_id, ...}</pre>
+
+      <h4>What you can now do</h4>
+
+      <p>Stop a run mid-flight (Ctrl-C). Resume it later:</p>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"Compare auth methods..."</span>
+   <span class="c-cm"># ... runs for a few steps, you hit Ctrl-C ...</span>
+   ^C  Interrupted at step 3. Run ID: a4f7c2e1
+
+$ python scripts/run.py --resume a4f7c2e1
+   <span class="c-cm"># resumes from step 4, history intact</span></pre>
+
+      <p>Or inspect a run and edit a tool result:</p>
+
+<pre class="shell standalone">$ python scripts/inspect.py a4f7c2e1
+
+Step 2: search_docs({'query': 'auth methods'})
+  → returned 5 chunks, but the top one is wrong
+  → press [e] to edit the result before resuming
+  > e
+  
+  Editing tool_result at step 2...
+  [edit in your editor]
+  
+  Resumed. Re-running from step 3 with edited result.</pre>
+
+      <div class="callout tip">
+        <p>This is the foundation of "time-travel debugging" for agents. When evals in Phase 4 find a failing query, you'll want to inspect <em>exactly where the agent went wrong</em> and try fixes — different prompts, different tool results, different parameters — without re-running expensive steps before the failure point.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Isn't this what real Agent SDKs do?</div>
+        <div class="answer">
+          <p>Yes. Both Anthropic's Agent SDK and OpenAI's Agents SDK ship with run-state persistence and the ability to resume from any checkpoint. You've now built a minimal version of that mechanism.</p>
+          <p>Now if you adopt an SDK, you'll know exactly what the abstraction is doing under the hood — and you'll know when its choices don't fit your needs and you need to build something custom instead.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why JSONL instead of a database?</div>
+        <div class="answer">
+          <p>JSONL is append-only, human-readable, and survives every kind of crash. You can <code class="inline">cat</code> a run file, grep for specific tool calls, diff two runs. SQLite would also work and gives you easier queries — switch when you have hundreds of runs and want to analyze across them.</p>
+          <p>At this scale, JSONL is the right starting point.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of week 3</div>
+      <h3>Deliverable</h3>
+      <p>An agent that plans before complex queries, fans out searches in parallel, isolates deep research in subagents, and can be paused and resumed. The same 10 questions from Phase 1 should show qualitatively different (faster, cleaner) behavior.</p>
+      <ul class="checklist">
+        <li>Async parallel tool execution</li>
+        <li>Subagent spawning with depth bound</li>
+        <li>Planner with user-editable plans</li>
+        <li>JSONL checkpoint + resume from any step</li>
+        <li>Trace diff: phase 2 vs phase 3 on the test set</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('p2')">
+        <div class="dir">← prev</div>
+        <div class="title">1.2 Retrieval &amp; grounding</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('p4')">
+        <div class="dir">next →</div>
+        <div class="title">1.4 First eval suite</div>
+      </button>
+    </div>
+  </section>

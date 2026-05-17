@@ -1,0 +1,1044 @@
+<section class="phase">
+    <div class="phase-num">2.4</div>
+    <div class="week">Part II / Ship · From laptop to cloud</div>
+    <h2>Deployment: agents don't fit normal web APIs.</h2>
+    <p class="goal">Your agent works in a REPL. Now it needs to serve real users, survive crashes, scale under uneven load, and degrade gracefully when things go wrong. Agents have unusual shape — long-running, stateful, expensive per request, prone to surprise — and the standard advice for normal web services breaks against them in specific ways. This chapter teaches the patterns that work: synchronous endpoints with SSE streaming for fast runs, queue-backed workers for long runs, the state store split, and the operational guardrails that keep your bill from blowing up at 3am.</p>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>The shape problem.</h3>
+
+      <p>Normal web services have predictable shape. A request comes in. Some code runs. A response goes out. Latency is usually under a second; if it isn't, you've done something wrong. CPU is the bottleneck. Sessions are stateless. Horizontal scaling means "add more replicas." None of this describes an agent.</p>
+
+      <p>Agents are I/O-bound (waiting on model APIs), can run for minutes or hours, hold conversation state across turns, cost real money per request, and exhibit failure modes — model outages, rate limits, runaway tool loops — that don't show up in conventional services. If you take the standard playbook ("wrap your code in Flask, put it behind nginx, scale on CPU") and apply it directly, you get a stack that's wrong in three specific ways before you've even shipped.</p>
+
+      <h4>Three things that break</h4>
+
+      <p><strong>Break 1: HTTP timeouts during long runs.</strong> Browsers, load balancers, and CDNs all have request timeouts — typically 30 seconds for browsers, 60 seconds for ALB, 100 seconds for Cloudflare's free tier. Your agent might run for 5 minutes on a deep research task. If you hold an HTTP connection open that whole time, the connection drops mid-run and the user gets nothing. The standard "synchronous request/response" pattern is not compatible with multi-minute agent runs.</p>
+
+      <p><strong>Break 2: WSGI workers blocked on model calls.</strong> Flask, Django, Rails — all WSGI-based — assign one OS thread per request. That thread sits blocked while you wait for the model API. Four workers, four concurrent users; user number five waits in a queue. For a typical agent that spends 95% of its time in <code class="inline">await client.messages.create(...)</code>, this means 95% of your worker capacity is idle while the queue grows. The standard "more workers" answer doesn't help because each worker is still blocking on a network call.</p>
+
+      <p><strong>Break 3: Autoscaling on CPU never fires.</strong> CPU utilization on an agent server is typically under 10%. The bottleneck isn't compute — it's concurrent in-flight model calls, latency-budget consumption, and queue depth. Standard CPU-based autoscaling never triggers. You either hand-tune fixed replica counts (and over-provision to handle peaks) or you find a different scaling signal.</p>
+
+      <h4>The decision tree</h4>
+
+      <p>The fix for all three is the same idea: <em>match your deployment shape to your agent's expected duration</em>. Three patterns cover almost every case.</p>
+
+      <div class="diagram">┌────────────────────────────────────────────────────────────────┐
+│  WHICH PATTERN DO I NEED?                                      │
+│                                                                │
+│  Q1: How long does a typical agent run take?                   │
+│                                                                │
+│      &lt; 30 seconds                                              │
+│       ↓                                                        │
+│      Pattern A: SYNCHRONOUS WITH STREAMING                     │
+│      Single FastAPI endpoint, async/await, stream tokens       │
+│      back over SSE.  HTTP stays open the whole time.           │
+│      Q2 below.                                                 │
+│                                                                │
+│      30 seconds – 5 minutes                                    │
+│       ↓                                                        │
+│      Still works synchronously — IF you control the whole      │
+│      network path (no Cloudflare, no aggressive timeouts) and  │
+│      tune your reverse proxy.  Otherwise → Pattern B.          │
+│                                                                │
+│      &gt; 5 minutes (deep research, multi-stage workflows)        │
+│       ↓                                                        │
+│      Pattern B: SUBMIT / POLL with a QUEUE                     │
+│      POST /runs returns immediately with a run_id.             │
+│      Worker pulls from queue, executes, streams updates to     │
+│      Redis/Postgres.  Client subscribes to updates by run_id.  │
+│                                                                │
+│  Q2: Do I need server-side state across multiple requests?     │
+│      (Conversation history, user preferences, mid-run memory)  │
+│                                                                │
+│      Stateless (one-shot questions)                            │
+│       ↓                                                        │
+│      Done.  Each request is self-contained.                    │
+│                                                                │
+│      Stateful (conversations, sessions)                        │
+│       ↓                                                        │
+│      Pattern C: STATE STORE SPLIT                              │
+│      Postgres for durability (the truth).                      │
+│      Redis for hot path (sub-millisecond reads on each turn).  │
+│      See Step 4 for the schema.                                │
+└────────────────────────────────────────────────────────────────┘</div>
+
+      <p>Most production agents end up with some combination — Pattern A for short interactive runs and Pattern B for long background runs, sharing the same Pattern C state store. The chapter walks each in order.</p>
+
+      <h4>The async-from-the-start commitment</h4>
+
+      <p>Before any of the patterns: pick FastAPI (or Starlette, or any ASGI framework), not Flask. This is non-negotiable for agents. The reason is the I/O-bound nature: a FastAPI worker can hold thousands of in-flight <code class="inline">await client.messages.create(...)</code> calls concurrently in a single process, because each one yields control while waiting. The same workload on Flask would require thousands of OS threads, which is not viable.</p>
+
+      <p>The mental model: with ASGI, your concurrency limit is set by your <em>API provider's rate limit</em>, not by your server's worker count. That's the correct shape.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My agent is currently in a Flask app that's working fine for low traffic. Do I really need to migrate?</div>
+        <div class="answer">
+          <p>If you have &lt;5 concurrent users and runs are under a few seconds, Flask is fine. The migration becomes urgent at the point where any one of these is true: you exceed ~20 concurrent users; your runs occasionally take &gt;30 seconds; you start streaming tokens back to clients; you need to do parallel tool calls efficiently. Below that threshold, the engineering cost of migrating exceeds the gain.</p>
+          <p>The honest version: most teams discover they need ASGI sooner than they expected, because traffic grows or run length grows or both. Doing the migration once at 5 users is cheaper than doing it under fire at 50.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Do I need Kubernetes for any of this?</div>
+        <div class="answer">
+          <p>Almost certainly not for a starting deployment. Fly.io, Railway, Render, Modal, AWS App Runner — all of these let you deploy a containerized FastAPI app with one command, and they handle the boring parts (HTTPS, load balancing, basic autoscaling). For a single-team agent serving up to several thousand users a day, this is the right level of abstraction.</p>
+          <p>Reach for Kubernetes when you genuinely need: multiple agent services that share infrastructure, control over networking between services, complex deployment topologies (canary, blue/green), or your company already runs on it. Don't reach for it because it's the default answer at scale-up companies.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Pattern A: synchronous endpoint with SSE streaming.</h3>
+
+      <p>For runs that complete in under 30 seconds, the simplest production-shaped deployment is a FastAPI endpoint that runs the agent and streams updates back over Server-Sent Events. The client sees output as it's generated; the HTTP connection stays open until the agent finishes; no queues, no workers, no extra moving parts.</p>
+
+      <p>Why SSE and not WebSockets: agent output is unidirectional — server pushes to client. SSE handles unidirectional streaming with less complexity, works through corporate proxies and HTTP/1.1 infrastructure without special configuration, and supports automatic reconnection at the protocol level via the <code class="inline">Last-Event-ID</code> header. WebSockets buy you bidirectional communication you almost never need for agent output. Save them for the "stop" button, which can be its own tiny endpoint.</p>
+
+      <h4>The full endpoint</h4>
+
+      <p>This is the production-shaped version — async throughout, semaphore-limited concurrency, request-scoped tracing, structured errors, clean cancellation. The single file you'd actually deploy.</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># app/main.py</span>
+<span class="c-kw">import</span> asyncio, json, uuid
+<span class="c-kw">from</span> contextlib <span class="c-kw">import</span> asynccontextmanager
+<span class="c-kw">from</span> fastapi <span class="c-kw">import</span> FastAPI, HTTPException, Request
+<span class="c-kw">from</span> sse_starlette.sse <span class="c-kw">import</span> EventSourceResponse
+<span class="c-kw">from</span> pydantic <span class="c-kw">import</span> BaseModel
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> AsyncAnthropic
+
+<span class="c-cm"># Cap concurrent in-flight agent runs.  Don't let a traffic spike</span>
+<span class="c-cm"># issue 10,000 simultaneous model calls and blow your rate limit.</span>
+AGENT_SEMAPHORE = asyncio.Semaphore(<span class="c-st">50</span>)
+
+<span class="c-fn">@asynccontextmanager</span>
+<span class="c-kw">async def</span> <span class="c-fn">lifespan</span>(app: FastAPI):
+    <span class="c-cm"># Share one AsyncAnthropic client across all requests.</span>
+    <span class="c-cm"># Has internal connection pool; creating per-request is wasteful.</span>
+    app.state.anthropic = AsyncAnthropic()
+    <span class="c-kw">yield</span>
+    <span class="c-kw">await</span> app.state.anthropic.close()
+
+app = FastAPI(lifespan=lifespan)
+
+<span class="c-kw">class</span> <span class="c-fn">ChatRequest</span>(BaseModel):
+    message: <span class="c-kw">str</span>
+    user_id: <span class="c-kw">str</span>
+
+<span class="c-fn">@app.post</span>(<span class="c-st">"/chat/stream"</span>)
+<span class="c-kw">async def</span> <span class="c-fn">chat_stream</span>(req: ChatRequest, request: Request):
+    run_id = <span class="c-kw">str</span>(uuid.uuid4())
+
+    <span class="c-kw">async def</span> <span class="c-fn">event_stream</span>():
+        <span class="c-cm"># Hold the semaphore for the duration of the run.</span>
+        <span class="c-kw">async with</span> AGENT_SEMAPHORE:
+            <span class="c-kw">try</span>:
+                <span class="c-kw">yield</span> {<span class="c-st">"event"</span>: <span class="c-st">"start"</span>,
+                       <span class="c-st">"data"</span>: json.dumps({<span class="c-st">"run_id"</span>: run_id})}
+
+                <span class="c-cm"># Drive the agent loop; emit events as the run progresses.</span>
+                <span class="c-kw">async for</span> event <span class="c-kw">in</span> run_agent_streaming(
+                    request.app.state.anthropic,
+                    req.message,
+                    req.user_id,
+                ):
+                    <span class="c-cm"># Client disconnected?  Stop generating tokens (and stop paying).</span>
+                    <span class="c-kw">if</span> <span class="c-kw">await</span> request.is_disconnected():
+                        <span class="c-kw">break</span>
+                    <span class="c-kw">yield</span> {<span class="c-st">"event"</span>: event[<span class="c-st">"type"</span>],
+                           <span class="c-st">"data"</span>: json.dumps(event[<span class="c-st">"payload"</span>])}
+
+                <span class="c-kw">yield</span> {<span class="c-st">"event"</span>: <span class="c-st">"done"</span>, <span class="c-st">"data"</span>: <span class="c-st">""</span>}
+
+            <span class="c-kw">except</span> asyncio.CancelledError:
+                <span class="c-cm"># Client disconnected mid-run; clean up and don't re-raise the cancellation</span>
+                <span class="c-cm"># as an error event (the connection is gone anyway).</span>
+                <span class="c-kw">return</span>
+            <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+                <span class="c-kw">yield</span> {<span class="c-st">"event"</span>: <span class="c-st">"error"</span>,
+                       <span class="c-st">"data"</span>: json.dumps({<span class="c-st">"type"</span>: <span class="c-kw">type</span>(e).__name__,
+                                          <span class="c-st">"message"</span>: <span class="c-kw">str</span>(e)})}
+
+    <span class="c-kw">return</span> EventSourceResponse(event_stream())
+
+<span class="c-fn">@app.get</span>(<span class="c-st">"/health"</span>)
+<span class="c-kw">async def</span> <span class="c-fn">health</span>():
+    <span class="c-kw">return</span> {<span class="c-st">"ok"</span>: <span class="c-kw">True</span>,
+            <span class="c-st">"in_flight"</span>: <span class="c-st">50</span> - AGENT_SEMAPHORE._value}</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># app/main.py</span>
+<span class="c-kw">import</span> asyncio, json, uuid
+<span class="c-kw">from</span> contextlib <span class="c-kw">import</span> asynccontextmanager
+<span class="c-kw">from</span> fastapi <span class="c-kw">import</span> FastAPI, HTTPException, Request
+<span class="c-kw">from</span> sse_starlette.sse <span class="c-kw">import</span> EventSourceResponse
+<span class="c-kw">from</span> pydantic <span class="c-kw">import</span> BaseModel
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> AsyncOpenAI
+
+AGENT_SEMAPHORE = asyncio.Semaphore(<span class="c-st">50</span>)
+
+<span class="c-fn">@asynccontextmanager</span>
+<span class="c-kw">async def</span> <span class="c-fn">lifespan</span>(app: FastAPI):
+    app.state.openai = AsyncOpenAI()
+    <span class="c-kw">yield</span>
+    <span class="c-kw">await</span> app.state.openai.close()
+
+app = FastAPI(lifespan=lifespan)
+
+<span class="c-kw">class</span> <span class="c-fn">ChatRequest</span>(BaseModel):
+    message: <span class="c-kw">str</span>
+    user_id: <span class="c-kw">str</span>
+
+<span class="c-fn">@app.post</span>(<span class="c-st">"/chat/stream"</span>)
+<span class="c-kw">async def</span> <span class="c-fn">chat_stream</span>(req: ChatRequest, request: Request):
+    run_id = <span class="c-kw">str</span>(uuid.uuid4())
+
+    <span class="c-kw">async def</span> <span class="c-fn">event_stream</span>():
+        <span class="c-kw">async with</span> AGENT_SEMAPHORE:
+            <span class="c-kw">try</span>:
+                <span class="c-kw">yield</span> {<span class="c-st">"event"</span>: <span class="c-st">"start"</span>,
+                       <span class="c-st">"data"</span>: json.dumps({<span class="c-st">"run_id"</span>: run_id})}
+
+                <span class="c-kw">async for</span> event <span class="c-kw">in</span> run_agent_streaming(
+                    request.app.state.openai,
+                    req.message,
+                    req.user_id,
+                ):
+                    <span class="c-kw">if</span> <span class="c-kw">await</span> request.is_disconnected():
+                        <span class="c-kw">break</span>
+                    <span class="c-kw">yield</span> {<span class="c-st">"event"</span>: event[<span class="c-st">"type"</span>],
+                           <span class="c-st">"data"</span>: json.dumps(event[<span class="c-st">"payload"</span>])}
+
+                <span class="c-kw">yield</span> {<span class="c-st">"event"</span>: <span class="c-st">"done"</span>, <span class="c-st">"data"</span>: <span class="c-st">""</span>}
+
+            <span class="c-kw">except</span> asyncio.CancelledError:
+                <span class="c-kw">return</span>
+            <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+                <span class="c-kw">yield</span> {<span class="c-st">"event"</span>: <span class="c-st">"error"</span>,
+                       <span class="c-st">"data"</span>: json.dumps({<span class="c-st">"type"</span>: <span class="c-kw">type</span>(e).__name__,
+                                          <span class="c-st">"message"</span>: <span class="c-kw">str</span>(e)})}
+
+    <span class="c-kw">return</span> EventSourceResponse(event_stream())
+
+<span class="c-fn">@app.get</span>(<span class="c-st">"/health"</span>)
+<span class="c-kw">async def</span> <span class="c-fn">health</span>():
+    <span class="c-kw">return</span> {<span class="c-st">"ok"</span>: <span class="c-kw">True</span>,
+            <span class="c-st">"in_flight"</span>: <span class="c-st">50</span> - AGENT_SEMAPHORE._value}</pre>
+      </div>
+
+      <p>Four things in this code are non-obvious and earn their place. Let me walk them.</p>
+
+      <h4>The semaphore</h4>
+
+      <p><code class="inline">AGENT_SEMAPHORE = asyncio.Semaphore(50)</code> is the most important line in the file. It caps concurrent agent runs at 50 per replica. Why this matters: without it, a traffic spike issues 10,000 simultaneous calls to the model provider, you blow your rate limit, every call returns 429, and the cascade takes the whole service down. With it, the 51st request waits (gracefully) for one of the first 50 to finish.</p>
+
+      <p>The right number: divide your provider rate limit by your average tokens per run, then leave 30% headroom for retries and the occasional long run. For Anthropic Tier 4 with 8k tokens/minute per organization and an average run of 3k tokens with 4 turns = 12k tokens per run, you can sustain about... actually do the math for your specific setup; the principle is to <em>have a number</em>, not to copy mine.</p>
+
+      <h4>Client disconnect detection</h4>
+
+      <p><code class="inline">if await request.is_disconnected(): break</code> is the line that saves you money. Without it, if the user closes their browser tab mid-run, your agent keeps generating tokens, keeps calling tools, keeps spending money — to nobody. With it, the loop breaks at the next iteration and the run terminates. The check happens between events, so it adds zero latency to the normal path.</p>
+
+      <p>Be careful: <code class="inline">is_disconnected()</code> is sometimes flaky on certain reverse proxies — it may not detect the disconnect for a few seconds. That's usually fine; you'll just pay for a few extra tokens. Don't try to detect disconnects more aggressively than this; you'll create more bugs than you fix.</p>
+
+      <h4>The asynccontextmanager lifespan</h4>
+
+      <p>The Anthropic/OpenAI clients have internal connection pools. Creating one per request would be wasteful. Creating one global instance is the right move — but it has to be cleaned up on shutdown. The <code class="inline">lifespan</code> context manager is FastAPI's idiomatic way to do this: it gives you setup and teardown hooks tied to the app's lifecycle. Use it for any shared resource (HTTP clients, DB pools, model clients).</p>
+
+      <p>Anti-pattern: putting the client creation at module import time and never closing it. The connection pool will be orphaned on shutdown, file descriptors leak, and your container's graceful-shutdown probe times out. Costs you ten minutes of debugging the first time it bites.</p>
+
+      <h4>The agent-as-async-generator</h4>
+
+      <p>This is the design that makes streaming feel natural. <code class="inline">run_agent_streaming</code> is an <code class="inline">async def</code> function that <code class="inline">yield</code>s events as the run progresses. The endpoint consumes those events and forwards them to the client. The agent doesn't know it's behind an HTTP endpoint; it just yields events. This separation makes the agent testable in isolation and makes the endpoint a thin adapter.</p>
+
+<pre class="standalone"><span class="c-cm"># agent/streaming.py</span>
+<span class="c-kw">async def</span> <span class="c-fn">run_agent_streaming</span>(client, user_msg: <span class="c-kw">str</span>, user_id: <span class="c-kw">str</span>):
+    <span class="c-cm"># Initial: emit a status event so the client knows we got the message</span>
+    <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"status"</span>, <span class="c-st">"payload"</span>: {<span class="c-st">"message"</span>: <span class="c-st">"thinking..."</span>}}
+
+    messages = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_msg}]
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(<span class="c-st">20</span>):  <span class="c-cm"># step budget from chapter 1.1</span>
+        <span class="c-cm"># Stream the model's response token by token (or block by block)</span>
+        <span class="c-kw">async with</span> client.messages.stream(
+            model=<span class="c-st">"claude-sonnet-4-5"</span>,
+            max_tokens=<span class="c-st">4096</span>,
+            tools=TOOLS,
+            messages=messages,
+        ) <span class="c-kw">as</span> stream:
+            <span class="c-kw">async for</span> text <span class="c-kw">in</span> stream.text_stream:
+                <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"token"</span>, <span class="c-st">"payload"</span>: {<span class="c-st">"text"</span>: text}}
+            response = <span class="c-kw">await</span> stream.get_final_message()
+
+        messages.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>, <span class="c-st">"content"</span>: response.content})
+
+        <span class="c-kw">if</span> response.stop_reason == <span class="c-st">"end_turn"</span>:
+            <span class="c-kw">return</span>
+
+        <span class="c-cm"># Tool calls: emit per-call events so client can show "Searching docs..."</span>
+        results = []
+        <span class="c-kw">for</span> block <span class="c-kw">in</span> response.content:
+            <span class="c-kw">if</span> block.<span class="c-kw">type</span> == <span class="c-st">"tool_use"</span>:
+                <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"tool_start"</span>,
+                       <span class="c-st">"payload"</span>: {<span class="c-st">"name"</span>: block.name, <span class="c-st">"args"</span>: block.<span class="c-kw">input</span>}}
+                <span class="c-kw">try</span>:
+                    result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+                    <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"tool_end"</span>,
+                           <span class="c-st">"payload"</span>: {<span class="c-st">"name"</span>: block.name, <span class="c-st">"ok"</span>: <span class="c-kw">True</span>}}
+                    results.append({<span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                                    <span class="c-st">"tool_use_id"</span>: block.id, <span class="c-st">"content"</span>: <span class="c-kw">str</span>(result)})
+                <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+                    <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"tool_end"</span>,
+                           <span class="c-st">"payload"</span>: {<span class="c-st">"name"</span>: block.name, <span class="c-st">"ok"</span>: <span class="c-kw">False</span>, <span class="c-st">"error"</span>: <span class="c-kw">str</span>(e)}}
+                    results.append({<span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                                    <span class="c-st">"tool_use_id"</span>: block.id, <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"Error: {e}"</span>,
+                                    <span class="c-st">"is_error"</span>: <span class="c-kw">True</span>})
+        messages.append({<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: results})</pre>
+
+      <h4>What the client sees</h4>
+
+      <p>The shape of the SSE stream as observed by the browser. Real wire format, useful for debugging:</p>
+
+<pre class="trace standalone"><span class="c-out">event: start
+data: {"run_id": "8c1e..."}
+
+event: status
+data: {"message": "thinking..."}
+
+event: token
+data: {"text": "I'll search"}
+
+event: token
+data: {"text": " the documentation"}
+
+event: tool_start
+data: {"name": "search_docs", "args": {"query": "autovacuum"}}
+
+event: tool_end
+data: {"name": "search_docs", "ok": true}
+
+event: token
+data: {"text": "Autovacuum naptime is..."}
+
+event: done
+data: </span></pre>
+
+      <p>The client (browser, mobile app, CLI) consumes these events with the standard SSE API. In JavaScript, an <code class="inline">EventSource</code> with event listeners per event name. The display logic — show a spinner during <code class="inline">tool_start</code>, animate tokens, show errors on <code class="inline">error</code> — is up to the front-end, but the events are designed to make a polished UI cheap.</p>
+
+      <h4>Deploying it</h4>
+
+      <p>Two-line Dockerfile, deploy to anywhere that runs containers. Production tuning is just configuring uvicorn appropriately:</p>
+
+<pre class="standalone"><span class="c-cm"># Dockerfile</span>
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD [<span class="c-st">"uvicorn"</span>, <span class="c-st">"app.main:app"</span>,
+     <span class="c-st">"--host"</span>, <span class="c-st">"0.0.0.0"</span>,
+     <span class="c-st">"--port"</span>, <span class="c-st">"8000"</span>,
+     <span class="c-st">"--workers"</span>, <span class="c-st">"4"</span>,            <span class="c-cm"># one per CPU core</span>
+     <span class="c-st">"--timeout-keep-alive"</span>, <span class="c-st">"120"</span>]   <span class="c-cm"># long enough for SSE</span></pre>
+
+      <p>Note <code class="inline">--workers 4</code> — even though each worker can hold thousands of concurrent in-flight requests, you still want multiple OS-level processes so that one crashing or stuck doesn't take down the whole service. Roughly one worker per CPU core is the rule of thumb. <code class="inline">--timeout-keep-alive 120</code> keeps the HTTP/1.1 connection open long enough for long-streaming runs without aggressive teardowns.</p>
+
+      <div class="callout warn">
+        <p>Behind Cloudflare, ALB, nginx, or any reverse proxy: <strong>turn off proxy buffering</strong>. Most reverse proxies buffer responses by default to optimize throughput, which means SSE events get held up and delivered in chunks instead of streaming. Set <code class="inline">X-Accel-Buffering: no</code> in response headers (sse-starlette does this for you), and configure your reverse proxy to honor it. Skip this and your "streaming" UI updates in 30-second bursts.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why a semaphore and not a thread pool / process pool?</div>
+        <div class="answer">
+          <p>Thread/process pools are for CPU-bound work. Agent runs are I/O-bound — they're mostly <code class="inline">await</code>ing on the model API. A semaphore on async code is the right primitive: it limits concurrent in-flight tasks without spawning threads. Same effect (bounded concurrency), much lower overhead.</p>
+          <p>Where threads come back: if you have a synchronous library you can't avoid (e.g., a vendor SDK that doesn't ship an async version), wrap its calls in <code class="inline">asyncio.to_thread(...)</code> so they don't block the event loop. The semaphore still applies at the agent-run level above it.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What if a single run blocks the semaphore for 60 seconds and others wait?</div>
+        <div class="answer">
+          <p>That's a sign you're hitting the upper end of Pattern A's range and should consider Pattern B. The semaphore-wait is acceptable for tens of seconds of queueing under load spikes; it becomes a UX problem if the wait routinely exceeds 10 seconds. Three responses, in order:</p>
+          <ul>
+            <li>Add a separate semaphore for "long" runs (detected by step count or elapsed time) so they don't starve "short" runs.</li>
+            <li>Move long-running paths to Pattern B (queue + worker).</li>
+            <li>Scale horizontally — more replicas, each with its own semaphore. The math: total concurrent capacity = replicas × per-replica semaphore.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Pattern B: queue-backed worker for long runs.</h3>
+
+      <p>Pattern A is right for chat-style interactions where the agent runs for seconds. It breaks for the cases that actually showcase agentic AI — deep research that takes 10 minutes, batch processing of 100 documents, multi-stage workflows that pause for user review. For these, the HTTP request-response model is wrong on its face: you can't hold a connection open for that long, and even if you could, the user shouldn't have to keep their browser tab open the whole time.</p>
+
+      <p>The fix is a submit/poll architecture. The client POSTs a request; the server immediately returns a <code class="inline">run_id</code> and queues the work; a worker picks up the queued job and executes it; the client subscribes to updates by <code class="inline">run_id</code> over a separate SSE connection. The user can close their browser and come back later — the run keeps going server-side, and updates are streamed from where they left off.</p>
+
+      <h4>The shape</h4>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  client                  fastapi              redis queue       │
+│    │                        │                      │            │
+│    │  POST /runs            │                      │            │
+│    │ ──────────────────────►│                      │            │
+│    │                        │  XADD runs           │            │
+│    │                        │ ────────────────────►│            │
+│    │  202  {run_id}         │                      │            │
+│    │ ◄──────────────────────│                      │            │
+│    │                        │                      │  XREAD     │
+│    │                        │                      │◄─────────┐ │
+│    │                        │                      │          │ │
+│    │  GET /runs/{id}/events │                      │       worker│
+│    │ ──────────────────────►│                      │  XADD events│
+│    │  (SSE connection)      │  XREAD events:{id}   │◄─────────│ │
+│    │                        │ ◄────────────────────│          │ │
+│    │  event: token …        │                      │  ...     │ │
+│    │ ◄──────────────────────│                      │          │ │
+│    │                        │                      │  XADD done│ │
+│    │  event: done           │                      │◄─────────┘ │
+│    │ ◄──────────────────────│                      │            │
+│                                                                 │
+│  Two-process architecture: API server (fast, never blocks) +    │
+│  worker process (slow, runs agents).  Connected by Redis        │
+│  streams.  Client subscribes by run_id, can reconnect at any    │
+│  time using Last-Event-ID.                                      │
+└─────────────────────────────────────────────────────────────────┘</div>
+
+      <p>Three independent things to set up: the submission endpoint that returns immediately, the worker that consumes from the queue and emits events, and the streaming endpoint that subscribes by <code class="inline">run_id</code>. We'll use Redis Streams for both the queue and the event log — it's the right primitive (durable, ordered, supports pub/sub with last-id resumption).</p>
+
+      <h4>The submission endpoint</h4>
+
+<pre class="standalone"><span class="c-cm"># app/routes/runs.py</span>
+<span class="c-kw">import</span> uuid, json
+<span class="c-kw">from</span> fastapi <span class="c-kw">import</span> APIRouter, Request
+<span class="c-kw">from</span> redis.asyncio <span class="c-kw">import</span> Redis
+
+router = APIRouter()
+
+<span class="c-fn">@router.post</span>(<span class="c-st">"/runs"</span>, status_code=<span class="c-st">202</span>)
+<span class="c-kw">async def</span> <span class="c-fn">submit_run</span>(req: ChatRequest, request: Request):
+    redis: Redis = request.app.state.redis
+    run_id = <span class="c-kw">str</span>(uuid.uuid4())
+
+    <span class="c-cm"># Persist run metadata so client can poll status at any time</span>
+    <span class="c-kw">await</span> redis.hset(<span class="c-kw">f</span><span class="c-st">"run:{run_id}"</span>, mapping={
+        <span class="c-st">"status"</span>: <span class="c-st">"queued"</span>,
+        <span class="c-st">"user_id"</span>: req.user_id,
+        <span class="c-st">"message"</span>: req.message,
+        <span class="c-st">"created_at"</span>: <span class="c-kw">int</span>(time.time()),
+    })
+    <span class="c-kw">await</span> redis.expire(<span class="c-kw">f</span><span class="c-st">"run:{run_id}"</span>, <span class="c-st">86400</span>)  <span class="c-cm"># 24h TTL</span>
+
+    <span class="c-cm"># Enqueue.  XADD is atomic; the worker will pick it up.</span>
+    <span class="c-kw">await</span> redis.xadd(<span class="c-st">"queue:runs"</span>, {
+        <span class="c-st">"run_id"</span>: run_id,
+        <span class="c-st">"user_id"</span>: req.user_id,
+        <span class="c-st">"message"</span>: req.message,
+    })
+
+    <span class="c-kw">return</span> {<span class="c-st">"run_id"</span>: run_id, <span class="c-st">"status"</span>: <span class="c-st">"queued"</span>}</pre>
+
+      <p>The endpoint returns in milliseconds. The 202 status code tells clients "accepted but not finished" — they should expect to poll or subscribe for results.</p>
+
+      <h4>The worker</h4>
+
+      <p>A separate process (separate Docker container, separate Kubernetes pod, separate Fly.io machine — whatever your deployment substrate calls it). It loops forever, pulling from the queue.</p>
+
+<pre class="standalone"><span class="c-cm"># worker/main.py</span>
+<span class="c-kw">import</span> asyncio, json, time, signal
+<span class="c-kw">from</span> redis.asyncio <span class="c-kw">import</span> Redis
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> AsyncAnthropic
+
+<span class="c-kw">async def</span> <span class="c-fn">worker_loop</span>(name: <span class="c-kw">str</span>):
+    redis = Redis(host=<span class="c-st">"redis"</span>, decode_responses=<span class="c-kw">True</span>)
+    anthropic = AsyncAnthropic()
+    shutdown = asyncio.Event()
+    signal.signal(signal.SIGTERM, <span class="c-kw">lambda</span> *_: shutdown.set())
+
+    <span class="c-cm"># Consumer group: multiple workers can share one queue with</span>
+    <span class="c-cm"># at-least-once delivery and automatic re-claim on crash.</span>
+    <span class="c-kw">try</span>:
+        <span class="c-kw">await</span> redis.xgroup_create(<span class="c-st">"queue:runs"</span>, <span class="c-st">"workers"</span>, id=<span class="c-st">"0"</span>, mkstream=<span class="c-kw">True</span>)
+    <span class="c-kw">except</span>:
+        <span class="c-kw">pass</span>  <span class="c-cm"># already exists</span>
+
+    <span class="c-kw">while not</span> shutdown.is_set():
+        <span class="c-cm"># Block for up to 5 seconds waiting for new work</span>
+        msgs = <span class="c-kw">await</span> redis.xreadgroup(
+            <span class="c-st">"workers"</span>, name, {<span class="c-st">"queue:runs"</span>: <span class="c-st">">"</span>},
+            count=<span class="c-st">1</span>, block=<span class="c-st">5000</span>,
+        )
+        <span class="c-kw">if not</span> msgs:
+            <span class="c-kw">continue</span>
+
+        <span class="c-kw">for</span> _, items <span class="c-kw">in</span> msgs:
+            <span class="c-kw">for</span> msg_id, data <span class="c-kw">in</span> items:
+                run_id = data[<span class="c-st">"run_id"</span>]
+                <span class="c-kw">try</span>:
+                    <span class="c-kw">await</span> execute_run(redis, anthropic, run_id, data)
+                    <span class="c-kw">await</span> redis.xack(<span class="c-st">"queue:runs"</span>, <span class="c-st">"workers"</span>, msg_id)
+                <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+                    <span class="c-cm"># Mark run as failed but ack so we don't infinite-loop</span>
+                    <span class="c-kw">await</span> mark_failed(redis, run_id, e)
+                    <span class="c-kw">await</span> redis.xack(<span class="c-st">"queue:runs"</span>, <span class="c-st">"workers"</span>, msg_id)
+
+<span class="c-kw">async def</span> <span class="c-fn">execute_run</span>(redis, anthropic, run_id: <span class="c-kw">str</span>, data: <span class="c-kw">dict</span>):
+    <span class="c-st">"""Run the agent.  Each event also gets appended to a Redis</span>
+<span class="c-st">    Stream that streaming clients can subscribe to."""</span>
+    events_key = <span class="c-kw">f</span><span class="c-st">"events:{run_id}"</span>
+    <span class="c-kw">await</span> redis.hset(<span class="c-kw">f</span><span class="c-st">"run:{run_id}"</span>, <span class="c-st">"status"</span>, <span class="c-st">"running"</span>)
+    <span class="c-kw">await</span> redis.xadd(events_key,
+                       {<span class="c-st">"event"</span>: <span class="c-st">"start"</span>, <span class="c-st">"data"</span>: <span class="c-st">""</span>})
+
+    <span class="c-kw">async for</span> event <span class="c-kw">in</span> run_agent_streaming(anthropic, data[<span class="c-st">"message"</span>], data[<span class="c-st">"user_id"</span>]):
+        <span class="c-kw">await</span> redis.xadd(events_key, {
+            <span class="c-st">"event"</span>: event[<span class="c-st">"type"</span>],
+            <span class="c-st">"data"</span>: json.dumps(event[<span class="c-st">"payload"</span>]),
+        })
+
+    <span class="c-kw">await</span> redis.xadd(events_key, {<span class="c-st">"event"</span>: <span class="c-st">"done"</span>, <span class="c-st">"data"</span>: <span class="c-st">""</span>})
+    <span class="c-kw">await</span> redis.hset(<span class="c-kw">f</span><span class="c-st">"run:{run_id}"</span>, <span class="c-st">"status"</span>, <span class="c-st">"complete"</span>)
+    <span class="c-kw">await</span> redis.expire(events_key, <span class="c-st">3600</span>)  <span class="c-cm"># 1h TTL on event log</span>
+
+<span class="c-kw">if</span> __name__ == <span class="c-st">"__main__"</span>:
+    asyncio.run(worker_loop(name=os.environ.get(<span class="c-st">"WORKER_NAME"</span>, <span class="c-st">"worker-1"</span>)))</pre>
+
+      <p>Three things worth pausing on. <strong>Consumer groups</strong> (<code class="inline">XREADGROUP</code>) give you at-least-once delivery across multiple workers: if a worker crashes mid-run, the message is unacked, and another worker can claim it via <code class="inline">XPENDING</code> + <code class="inline">XCLAIM</code>. This is the property that makes the queue resilient. <strong>SIGTERM handling</strong> matters for graceful shutdown — when your platform tells the worker to terminate, you finish the current run before exiting. <strong>The events:{run_id} stream</strong> is what the streaming endpoint will subscribe to; it's also a complete audit log of every run, persisted with a 1-hour TTL.</p>
+
+      <h4>The streaming endpoint</h4>
+
+      <p>This is what the client connects to after submitting a run. It subscribes to the events stream for the given <code class="inline">run_id</code> and forwards events as SSE.</p>
+
+<pre class="standalone"><span class="c-fn">@router.get</span>(<span class="c-st">"/runs/{run_id}/events"</span>)
+<span class="c-kw">async def</span> <span class="c-fn">stream_events</span>(run_id: <span class="c-kw">str</span>, request: Request,
+                         last_event_id: <span class="c-kw">str</span> = Header(default=<span class="c-st">"0"</span>)):
+    <span class="c-st">"""Subscribe to a run's event stream.  Supports resumption via</span>
+<span class="c-st">    Last-Event-ID — drop the connection and reconnect, no events lost."""</span>
+    redis = request.app.state.redis
+    events_key = <span class="c-kw">f</span><span class="c-st">"events:{run_id}"</span>
+
+    <span class="c-kw">async def</span> <span class="c-fn">subscribe</span>():
+        last_id = last_event_id <span class="c-kw">or</span> <span class="c-st">"0"</span>
+        <span class="c-kw">while</span> <span class="c-kw">True</span>:
+            <span class="c-kw">if</span> <span class="c-kw">await</span> request.is_disconnected():
+                <span class="c-kw">break</span>
+
+            <span class="c-cm"># Read events newer than last_id.  Block up to 5s.</span>
+            msgs = <span class="c-kw">await</span> redis.xread({events_key: last_id}, count=<span class="c-st">20</span>, block=<span class="c-st">5000</span>)
+            <span class="c-kw">if not</span> msgs:
+                <span class="c-cm"># Periodic keepalive comment so proxies don't time out</span>
+                <span class="c-kw">yield</span> {<span class="c-st">"comment"</span>: <span class="c-st">"keepalive"</span>}
+                <span class="c-kw">continue</span>
+
+            <span class="c-kw">for</span> _, items <span class="c-kw">in</span> msgs:
+                <span class="c-kw">for</span> msg_id, data <span class="c-kw">in</span> items:
+                    last_id = msg_id
+                    <span class="c-kw">yield</span> {
+                        <span class="c-st">"id"</span>: msg_id,           <span class="c-cm"># client tracks this for resume</span>
+                        <span class="c-st">"event"</span>: data[<span class="c-st">"event"</span>],
+                        <span class="c-st">"data"</span>: data[<span class="c-st">"data"</span>],
+                    }
+                    <span class="c-kw">if</span> data[<span class="c-st">"event"</span>] == <span class="c-st">"done"</span>:
+                        <span class="c-kw">return</span>
+
+    <span class="c-kw">return</span> EventSourceResponse(subscribe())</pre>
+
+      <p>The <code class="inline">Last-Event-ID</code> header is SSE's built-in resumption mechanism. When a client reconnects after a dropped connection, the browser automatically sends back the last event ID it received. We use that as the starting point in the Redis stream — the client picks up exactly where it left off, no duplicates, no gaps. Without this, every flaky network or browser tab change would force the user to start over.</p>
+
+      <h4>The lifecycle, end-to-end</h4>
+
+<pre class="trace standalone"><span class="c-out">  t=0       client POSTs /runs
+            server enqueues, returns 202 {run_id: "8c1e..."}
+  t=0.05    worker picks up message from queue
+  t=0.06    client opens /runs/8c1e.../events SSE connection
+  t=0.10    worker emits "start" event → Redis stream
+  t=0.10    server forwards "start" to client over SSE
+  ...
+  t=180     worker emits "tool_start: search_web (query=Q3 GDP)"
+  t=183     worker emits "tool_end" + tokens
+  t=240     CLIENT'S WIFI DROPS — SSE connection closes
+            but the worker keeps running.  Events keep landing
+            in Redis stream.
+  t=247     client reconnects, sends Last-Event-ID: 240-3
+  t=247.1   server resumes stream from event 240-3+1
+            client receives all events from t=240 onward
+  ...
+  t=412     worker emits "done"
+            server closes connection
+            run record persists in Redis for 24h</span></pre>
+
+      <p>This is the experience users expect from an agent. Submit a long task, close your laptop, come back, see the result. The submit/poll architecture is what makes that possible.</p>
+
+      <div class="callout tip">
+        <p>For a starting deployment, run both the API server and the worker as separate processes <em>in the same Docker container</em> using a process manager like supervisord. You get the architectural separation without the operational overhead of two services. Split into separate deployments later if traffic patterns demand it (different scaling profiles, or the worker needs different resources).</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why Redis Streams and not Celery / RQ / SQS?</div>
+        <div class="answer">
+          <p>All of these work. Redis Streams is the choice if (a) you're already running Redis for caching / sessions, so you don't add a new piece of infrastructure, (b) you want the event log to also serve as the streaming-subscription backend (one mechanism instead of two), and (c) consumer groups give you the durability and re-claim semantics you need.</p>
+          <p>Celery is heavier and has more features (scheduled jobs, complex workflows, retries with backoff). Pick it if you need those features. RQ is simpler than Celery. SQS is the right choice if you're on AWS and want managed infrastructure. The patterns are similar across all of them — submission endpoint, worker loop, ack/retry — only the API differs.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about idempotency? If the worker crashes mid-run and another picks it up, the agent runs twice.</div>
+        <div class="answer">
+          <p>This is the at-least-once problem. Three approaches, in order of effort:</p>
+          <ul>
+            <li><strong>Make tools idempotent.</strong> If <code class="inline">send_email</code> has a deduplication key (the run_id + a tool_call_idx), retrying is safe. This is the cleanest fix and the right long-term answer.</li>
+            <li><strong>Checkpoint progress.</strong> After each tool call, persist the result to Redis keyed by <code class="inline">(run_id, step)</code>. On resume, skip steps that already have results. This is what LangGraph and similar agent runtimes do for you.</li>
+            <li><strong>Just disable re-claim for non-idempotent tools.</strong> If a worker crashes, mark the run failed and let the user resubmit. Simplest, but means crashes are visible to users. Acceptable for some products.</li>
+          </ul>
+          <p>For a first deployment: option 3. For production: combination of 1 and 2.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>The four operational concerns that determine whether you stay up.</h3>
+
+      <p>You've shipped the agent. It works. Now the operational reality starts. This step covers the four things that determine whether your service stays available, affordable, and debuggable as load grows: where state lives, what signal to autoscale on, how to degrade gracefully, and how to keep cost from blowing up. Each is a small section, but skipping any of them is what separates "deployed an agent" from "shipped an agent."</p>
+
+      <h4>1. State store: Postgres for truth, Redis for hot path</h4>
+
+      <p>Conversation history lives somewhere. The wrong somewhere creates problems. Two stores, two jobs:</p>
+
+      <p><strong>Postgres holds the truth.</strong> The durable record of every conversation, every message, every tool result. Schema is roughly:</p>
+
+<pre class="standalone"><span class="c-kw">CREATE</span> <span class="c-kw">TABLE</span> conversations (
+    id              UUID <span class="c-kw">PRIMARY</span> <span class="c-kw">KEY</span>,
+    user_id         <span class="c-kw">TEXT</span> <span class="c-kw">NOT</span> <span class="c-kw">NULL</span>,
+    created_at      TIMESTAMPTZ <span class="c-kw">DEFAULT</span> NOW(),
+    updated_at      TIMESTAMPTZ <span class="c-kw">DEFAULT</span> NOW(),
+    title           <span class="c-kw">TEXT</span>,
+    metadata        JSONB <span class="c-kw">DEFAULT</span> <span class="c-st">'{}'</span>::JSONB
+);
+
+<span class="c-kw">CREATE</span> <span class="c-kw">TABLE</span> messages (
+    id              BIGSERIAL <span class="c-kw">PRIMARY</span> <span class="c-kw">KEY</span>,
+    conversation_id UUID <span class="c-kw">REFERENCES</span> conversations(id) <span class="c-kw">ON</span> <span class="c-kw">DELETE</span> CASCADE,
+    role            <span class="c-kw">TEXT</span> <span class="c-kw">NOT</span> <span class="c-kw">NULL</span>,    <span class="c-cm">-- user / assistant / tool</span>
+    content         JSONB <span class="c-kw">NOT</span> <span class="c-kw">NULL</span>,   <span class="c-cm">-- the full message blocks</span>
+    token_count     <span class="c-kw">INTEGER</span>,
+    cost_usd        NUMERIC(<span class="c-st">10</span>, <span class="c-st">6</span>),
+    created_at      TIMESTAMPTZ <span class="c-kw">DEFAULT</span> NOW()
+);
+
+<span class="c-kw">CREATE</span> <span class="c-kw">INDEX</span> messages_conv_idx
+    <span class="c-kw">ON</span> messages(conversation_id, id);</pre>
+
+      <p>The <code class="inline">content</code> column is JSONB containing the full message structure — including tool_use and tool_result blocks. JSONB so you can query it later ("how many times did the agent call <code class="inline">search_docs</code> last month?") without parsing strings.</p>
+
+      <p><strong>Redis holds the hot path.</strong> For an active conversation, every turn reads the message history. Hitting Postgres for that on every turn adds 5–10ms of latency and creates an N+1 query problem. The right cache: serialize the recent messages as JSON, stash in Redis under <code class="inline">conv:{id}:messages</code>, set a 1-hour TTL, write through on every new message.</p>
+
+<pre class="standalone"><span class="c-cm"># app/state.py</span>
+<span class="c-kw">async def</span> <span class="c-fn">get_messages</span>(redis, db, conversation_id: <span class="c-kw">str</span>) -> <span class="c-kw">list</span>[<span class="c-kw">dict</span>]:
+    <span class="c-cm"># Hot path: Redis</span>
+    cached = <span class="c-kw">await</span> redis.get(<span class="c-kw">f</span><span class="c-st">"conv:{conversation_id}:messages"</span>)
+    <span class="c-kw">if</span> cached:
+        <span class="c-kw">return</span> json.loads(cached)
+
+    <span class="c-cm"># Cold path: Postgres</span>
+    rows = <span class="c-kw">await</span> db.fetch(
+        <span class="c-st">"SELECT content FROM messages WHERE conversation_id = $1 ORDER BY id"</span>,
+        conversation_id,
+    )
+    messages = [r[<span class="c-st">"content"</span>] <span class="c-kw">for</span> r <span class="c-kw">in</span> rows]
+
+    <span class="c-cm"># Warm the cache for next time</span>
+    <span class="c-kw">await</span> redis.set(
+        <span class="c-kw">f</span><span class="c-st">"conv:{conversation_id}:messages"</span>,
+        json.dumps(messages),
+        ex=<span class="c-st">3600</span>,
+    )
+    <span class="c-kw">return</span> messages
+
+<span class="c-kw">async def</span> <span class="c-fn">append_message</span>(redis, db, conversation_id: <span class="c-kw">str</span>, msg: <span class="c-kw">dict</span>):
+    <span class="c-cm"># Write to truth first</span>
+    <span class="c-kw">await</span> db.execute(
+        <span class="c-st">"INSERT INTO messages (conversation_id, role, content, ...) VALUES ..."</span>,
+        conversation_id, msg[<span class="c-st">"role"</span>], json.dumps(msg[<span class="c-st">"content"</span>]),
+    )
+    <span class="c-cm"># Invalidate cache; will be repopulated on next read</span>
+    <span class="c-kw">await</span> redis.delete(<span class="c-kw">f</span><span class="c-st">"conv:{conversation_id}:messages"</span>)</pre>
+
+      <p>The invariant: <em>Postgres is the truth; Redis is a cache that can be wrong and self-heal</em>. Cache invalidation on writes is the simplest scheme that works — don't try to do write-through cache updates unless you have a reason. The cache is repopulated on the next read; that's fine.</p>
+
+      <h4>2. Autoscale on the right signal</h4>
+
+      <p>CPU-based autoscaling, as covered in Step 1, never triggers for agents. The signals that actually correlate with "I need more capacity":</p>
+
+      <ul>
+        <li><strong>Semaphore saturation</strong> (Pattern A). The <code class="inline">in_flight</code> count on the <code class="inline">/health</code> endpoint. Scale up when it's been &gt;80% of cap for &gt;1 minute.</li>
+        <li><strong>Queue depth</strong> (Pattern B). <code class="inline">XLEN queue:runs</code>. Scale workers up when the depth grows; scale down when it's been zero for &gt;5 minutes.</li>
+        <li><strong>P95 latency on submit</strong>. Even the submit endpoint (which should be milliseconds) gets slow if Redis or Postgres are saturated. Watch this for upstream pressure.</li>
+        <li><strong>Error rate from the model provider</strong>. 429 spikes mean you're at rate-limit ceiling; scaling more replicas doesn't help, you need to reduce per-replica concurrency or contact the provider.</li>
+      </ul>
+
+      <p>Most managed platforms (Fly.io, Modal, Railway) let you autoscale on custom metrics by hooking up Prometheus or by polling an HTTP endpoint. The metric to expose: <code class="inline">in_flight</code> for API replicas, <code class="inline">queue_depth</code> for worker replicas. Wire them into your platform's autoscaler, set the thresholds, ship it.</p>
+
+      <h4>3. Graceful degradation: the three failures you'll see</h4>
+
+      <p>Three production failure modes happen often enough that you should plan for them.</p>
+
+      <p><strong>Model provider outage or 5xx storm.</strong> Anthropic or OpenAI returns errors for 10 minutes. Your agent can't run. The right behavior: serve a clear error to users ("model temporarily unavailable, retry in a moment") rather than letting requests time out. The implementation: a circuit breaker that trips when error rate &gt;50% for &gt;60 seconds and fails fast for the next 5 minutes, with periodic test pings to detect recovery.</p>
+
+<pre class="standalone"><span class="c-cm"># app/circuit.py</span>
+<span class="c-kw">class</span> <span class="c-fn">CircuitBreaker</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, threshold=<span class="c-st">0.5</span>, window=<span class="c-st">60</span>, cooldown=<span class="c-st">300</span>):
+        self.threshold = threshold
+        self.window = window
+        self.cooldown = cooldown
+        self.results: <span class="c-kw">list</span>[<span class="c-kw">tuple</span>[<span class="c-kw">float</span>, <span class="c-kw">bool</span>]] = []   <span class="c-cm"># (timestamp, ok)</span>
+        self.tripped_until = <span class="c-st">0</span>
+
+    <span class="c-kw">def</span> <span class="c-fn">record</span>(self, ok: <span class="c-kw">bool</span>):
+        now = time.time()
+        self.results.append((now, ok))
+        self.results = [r <span class="c-kw">for</span> r <span class="c-kw">in</span> self.results <span class="c-kw">if</span> r[<span class="c-st">0</span>] > now - self.window]
+        <span class="c-kw">if</span> <span class="c-kw">len</span>(self.results) >= <span class="c-st">10</span>:
+            error_rate = <span class="c-st">1</span> - <span class="c-kw">sum</span>(ok <span class="c-kw">for</span> _, ok <span class="c-kw">in</span> self.results) / <span class="c-kw">len</span>(self.results)
+            <span class="c-kw">if</span> error_rate > self.threshold:
+                self.tripped_until = now + self.cooldown
+
+    <span class="c-kw">def</span> <span class="c-fn">is_open</span>(self) -> <span class="c-kw">bool</span>:
+        <span class="c-kw">return</span> time.time() < self.tripped_until</pre>
+
+      <p><strong>Fallback to a cheaper or different model.</strong> When the circuit is tripped on your primary, sometimes you can fall back to a secondary — Sonnet → Haiku, GPT-5.5 → GPT-5-mini, or a different provider entirely. The fallback is usually slower or less capable, but it's a real answer instead of an error. Two cautions: the fallback model needs its own circuit breaker (you don't want both providers down to take you down forever), and your evals (chapter 1.4, chapter 3.1) should include the fallback paths so you know what quality looks like there.</p>
+
+      <p><strong>Runaway costs.</strong> A buggy prompt change causes the agent to call <code class="inline">search_docs</code> 50 times per run instead of 2. You discover this from the cost dashboard the next morning, after $4,000 in spend. The defense: per-user, per-run cost ceilings enforced in the loop itself.</p>
+
+<pre class="standalone"><span class="c-cm"># In the agent loop, after each model call:</span>
+run_cost += response.usage.input_tokens * INPUT_PRICE / <span class="c-st">1e6</span>
+run_cost += response.usage.output_tokens * OUTPUT_PRICE / <span class="c-st">1e6</span>
+
+<span class="c-kw">if</span> run_cost > MAX_COST_PER_RUN:
+    log.warn(<span class="c-st">"run_cost_exceeded"</span>, run_id=run_id, cost=run_cost)
+    <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"error"</span>,
+           <span class="c-st">"payload"</span>: {<span class="c-st">"reason"</span>: <span class="c-st">"cost_budget_exceeded"</span>}}
+    <span class="c-kw">return</span>
+
+<span class="c-cm"># Also check daily user budget</span>
+daily = <span class="c-kw">await</span> redis.incrbyfloat(<span class="c-kw">f</span><span class="c-st">"cost:user:{user_id}:{today}"</span>, run_cost)
+<span class="c-kw">if</span> daily > MAX_COST_PER_USER_PER_DAY:
+    <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"error"</span>,
+           <span class="c-st">"payload"</span>: {<span class="c-st">"reason"</span>: <span class="c-st">"daily_budget_exceeded"</span>}}
+    <span class="c-kw">return</span></pre>
+
+      <p>Sensible defaults: $1 per run for end-user agents, $20 per user per day, with explicit overrides for trusted accounts. The ceilings are belt-and-suspenders to the budgets in chapter 3.1 — those gate <em>shipping</em> a regression, these gate <em>spending</em> on one that snuck through.</p>
+
+      <h4>4. The runbook</h4>
+
+      <p>Last piece, often skipped: write down what to do when things break. A page or two of plain text living next to your deploy config. The minimum that's useful:</p>
+
+      <ul>
+        <li><strong>How to deploy.</strong> The exact commands. Include both the normal path and the emergency rollback path.</li>
+        <li><strong>How to see what's happening.</strong> Where the dashboards live. Where the logs are. The three queries you run when paged.</li>
+        <li><strong>How to make it stop.</strong> The kill switch (chapter 2.3 — the flag that halts every run). The cost ceiling toggle. The model provider switch.</li>
+        <li><strong>The five most likely failure modes and the first thing to check for each.</strong> Tied to your observability dashboards from chapter 2.1. "Latency p95 spiking → check semaphore saturation on /health; if &gt;90%, scale up." "Cost spike → check which tool's call count grew; check for prompt regression in last 24h of PRs."</li>
+      </ul>
+
+      <p>The runbook is the thing that lets a different engineer (or future-you at 3am) handle an incident competently. Write it the day after you ship, not when you need it.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My platform doesn't expose custom autoscaling metrics. Workarounds?</div>
+        <div class="answer">
+          <p>Three options. <strong>Concurrent connection count</strong> (most platforms expose this) is a decent proxy for in-flight runs if you're not doing weird things. <strong>HTTP request rate</strong> over a 1-minute window is a coarse but usable signal. <strong>External-driven scaling:</strong> a small cron job that polls your metrics endpoint and calls the platform's "set replica count" API. Less elegant than built-in autoscaling but works on every platform.</p>
+          <p>If you find yourself building elaborate workarounds: that's a signal you've outgrown your platform. Consider moving to one with first-class autoscaling on custom metrics (Modal, Kubernetes with HPA, Fly.io with their autoscaling beta).</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about secrets management for API keys?</div>
+        <div class="answer">
+          <p>For a starting deployment: platform-native secrets (Fly Secrets, Railway environment variables, Kubernetes Secrets). Don't put API keys in the Docker image, the Git repo, or the runtime command line. The platform's mechanism is good enough.</p>
+          <p>Reach for HashiCorp Vault, AWS Secrets Manager, or similar when (a) you have multiple environments with rotation requirements, (b) you need audit logs of who accessed what secret, or (c) compliance requires it. For most teams shipping their first agent, platform-native is fine and one fewer thing to set up.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">When do I split the API server and worker into separate services?</div>
+        <div class="answer">
+          <p>When their scaling profiles diverge meaningfully. Concretely: the API server scales on connection count (handles many short requests), the worker scales on queue depth (handles fewer long jobs). If you're routinely scaling one without the other, splitting them stops you from over-provisioning the unused side. The marker to watch: are you ever running more API replicas than you need just to get worker capacity (or vice versa)? If yes, split.</p>
+          <p>For the first 6 months of a service: one container with both. After that: usually split. The cost of splitting is low (two Dockerfiles instead of one, two deployment configs); the cost of <em>not</em> splitting is over-provisioning.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>Your first deploy in 30 minutes: Fly.io, end to end.</h3>
+
+      <p>Patterns are easier to internalize after you've shipped one. This walkthrough takes the Pattern A endpoint from Step 2, deploys it to Fly.io with a Redis instance attached, and ends with a working URL you can curl. Fly.io specifically because it's the lowest-overhead path from <em>localhost</em> to <em>production-ish</em>: no Kubernetes, no AWS console, two commands. The principles map cleanly to Railway, Render, Modal, or AWS App Runner if you prefer those — the only differences are syntax.</p>
+
+      <p>Assumptions: you have the Pattern A code from Step 2 in a directory, a working <code class="inline">requirements.txt</code>, and an <code class="inline">ANTHROPIC_API_KEY</code> (or <code class="inline">OPENAI_API_KEY</code>) in your environment.</p>
+
+      <h4>Minute 0–5: project structure</h4>
+
+      <p>If you don't already have this shape, set it up:</p>
+
+<pre class="shell standalone"><span class="c-out">my-agent/
+├── app/
+│   ├── __init__.py
+│   ├── main.py            # the FastAPI app from Step 2
+│   └── agent/
+│       ├── __init__.py
+│       └── streaming.py   # run_agent_streaming() from Step 2
+├── requirements.txt
+├── Dockerfile
+└── fly.toml               # we'll create this next</span></pre>
+
+      <p>The <code class="inline">requirements.txt</code> for the minimum viable deploy:</p>
+
+<pre class="standalone">fastapi==<span class="c-st">0.115</span>.<span class="c-st">0</span>
+uvicorn[standard]==<span class="c-st">0.32</span>.<span class="c-st">0</span>
+sse-starlette==<span class="c-st">2.1</span>.<span class="c-st">3</span>
+anthropic==<span class="c-st">0.40</span>.<span class="c-st">0</span>
+pydantic==<span class="c-st">2.9</span>.<span class="c-st">0</span></pre>
+
+      <p>The Dockerfile from Step 2 with one addition — a healthcheck binary path so Fly's prober doesn't false-positive during slow starts:</p>
+
+<pre class="standalone"><span class="c-cm"># Dockerfile</span>
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+
+CMD [<span class="c-st">"uvicorn"</span>, <span class="c-st">"app.main:app"</span>,
+     <span class="c-st">"--host"</span>, <span class="c-st">"0.0.0.0"</span>,
+     <span class="c-st">"--port"</span>, <span class="c-st">"8000"</span>,
+     <span class="c-st">"--workers"</span>, <span class="c-st">"2"</span>,
+     <span class="c-st">"--timeout-keep-alive"</span>, <span class="c-st">"120"</span>]</pre>
+
+      <h4>Minute 5–10: Fly setup and first launch</h4>
+
+      <p>Install the CLI if you don't have it: <code class="inline">curl -L https://fly.io/install.sh | sh</code>. Then sign up and log in:</p>
+
+<pre class="shell standalone"><span class="c-out">$ fly auth signup           # or: fly auth login
+$ fly launch --no-deploy    # creates fly.toml interactively</span></pre>
+
+      <p>The CLI asks a few questions. Sensible answers for a first deploy:</p>
+
+      <ul>
+        <li><strong>App name:</strong> something globally unique like <code class="inline">my-agent-yourname</code>.</li>
+        <li><strong>Region:</strong> closest to your users.</li>
+        <li><strong>Postgres / Redis / Sentry:</strong> say No to all for now — we'll add Redis explicitly in a minute.</li>
+        <li><strong>Deploy now:</strong> No (we want to set secrets first).</li>
+      </ul>
+
+      <p>The result is a <code class="inline">fly.toml</code> file. Open it and add an internal port and a healthcheck section — the defaults are close, these tweaks are what make it work for streaming:</p>
+
+<pre class="standalone"><span class="c-cm"># fly.toml</span>
+app = <span class="c-st">"my-agent-yourname"</span>
+primary_region = <span class="c-st">"sjc"</span>
+
+[build]
+
+[http_service]
+  internal_port = <span class="c-st">8000</span>
+  force_https = <span class="c-kw">true</span>
+  auto_stop_machines = <span class="c-st">"stop"</span>     <span class="c-cm"># save $ when idle</span>
+  auto_start_machines = <span class="c-kw">true</span>
+  min_machines_running = <span class="c-st">1</span>       <span class="c-cm"># at least one warm replica</span>
+
+  [[http_service.checks]]
+    interval = <span class="c-st">"30s"</span>
+    timeout = <span class="c-st">"5s"</span>
+    grace_period = <span class="c-st">"10s"</span>
+    method = <span class="c-st">"GET"</span>
+    path = <span class="c-st">"/health"</span>
+
+[[vm]]
+  size = <span class="c-st">"shared-cpu-1x"</span>
+  memory = <span class="c-st">"512mb"</span>           <span class="c-cm"># enough for agent + SDK + asyncio</span></pre>
+
+      <h4>Minute 10–15: secrets and Redis</h4>
+
+      <p>Set your API key as a Fly secret (encrypted at rest, injected as env var at runtime):</p>
+
+<pre class="shell standalone"><span class="c-out">$ fly secrets set ANTHROPIC_API_KEY=sk-ant-...
+$ fly secrets set OPENAI_API_KEY=sk-...           # if also using OpenAI</span></pre>
+
+      <p>Add Redis via Upstash (managed, free tier sufficient for starting):</p>
+
+<pre class="shell standalone"><span class="c-out">$ fly redis create
+  # CLI walks you through region selection, naming
+  # On success it sets REDIS_URL as a secret automatically
+$ fly redis status &lt;your-redis-name&gt;
+  # Verify it's running</span></pre>
+
+      <p>Your app code reads <code class="inline">os.environ["REDIS_URL"]</code> — Fly has injected it as a secret. Nothing else to configure.</p>
+
+      <h4>Minute 15–20: deploy</h4>
+
+<pre class="shell standalone"><span class="c-out">$ fly deploy
+
+==&gt; Verifying app config
+==&gt; Building image
+    Image: registry.fly.io/my-agent-yourname:deployment-...
+    Image size: 187 MB
+==&gt; Creating release
+==&gt; Monitoring deployment
+    1 desired, 1 placed, 1 healthy, 0 unhealthy
+    --&gt; v1 deployed successfully
+
+Visit your newly deployed app at https://my-agent-yourname.fly.dev/</span></pre>
+
+      <p>Your app is now public at <code class="inline">https://my-agent-yourname.fly.dev/</code>. Health check first:</p>
+
+<pre class="shell standalone"><span class="c-out">$ curl https://my-agent-yourname.fly.dev/health
+{"ok": true, "in_flight": 0}</span></pre>
+
+      <p>Now the real test — the streaming endpoint:</p>
+
+<pre class="shell standalone"><span class="c-out">$ curl -N -X POST https://my-agent-yourname.fly.dev/chat/stream \
+    -H "Content-Type: application/json" \
+    -d '{"message": "what is 2 + 2?", "user_id": "test"}'
+
+event: start
+data: {"run_id": "8c1e..."}
+
+event: status
+data: {"message": "thinking..."}
+
+event: token
+data: {"text": "2"}
+
+event: token
+data: {"text": " + 2"}
+
+event: token
+data: {"text": " equals 4"}
+
+event: done
+data: </span></pre>
+
+      <p>The <code class="inline">-N</code> flag on curl disables buffering so you can see tokens stream in real time. Watching the events arrive one at a time is the visceral confirmation that streaming is actually working end-to-end.</p>
+
+      <h4>Minute 20–25: observability sanity check</h4>
+
+      <p>Fly gives you logs and basic metrics built in. The commands you'll use most:</p>
+
+<pre class="shell standalone"><span class="c-out">$ fly logs                          # tail logs from all replicas
+$ fly logs --instance &lt;machine-id&gt;   # tail one replica
+$ fly status                         # replica health, memory, CPU
+$ fly dashboard                      # opens web UI in browser</span></pre>
+
+      <p>If you wired up chapter 2.1 observability (OpenTelemetry → Langfuse), now is when you confirm traces are reaching your dashboard. Send a few requests, open Langfuse, see them appear with correct span trees. If they don't, the OTLP exporter URL or auth header is wrong — check <code class="inline">fly logs</code> for the error.</p>
+
+      <h4>Minute 25–30: scale and lock it down</h4>
+
+      <p>You're live but on a single replica with no scaling and no rate limits. Three commands away from production-readier:</p>
+
+<pre class="shell standalone"><span class="c-out"># Autoscale to 1-3 replicas based on connection count.
+$ fly autoscale set min=1 max=3 \
+    --metric concurrent_connections=20
+
+# Add a simple rate limit at the Fly edge (10 req/min per IP).
+# Edit fly.toml:
+[http_service.concurrency]
+  type = "requests"
+  hard_limit = 25
+  soft_limit = 20
+
+# Cost ceiling at the platform level — set a monthly budget alert.
+# In the web dashboard: Organization → Billing → Spend Alert.
+# Set to $50/mo so an accidental loop doesn't bankrupt you.</span></pre>
+
+      <p>Redeploy with <code class="inline">fly deploy</code>. You now have an agent that:</p>
+
+      <ul>
+        <li>Serves over HTTPS at a stable URL with a managed cert.</li>
+        <li>Streams tokens to clients via SSE in real time.</li>
+        <li>Has a healthcheck and auto-restarts on crash.</li>
+        <li>Scales between 1 and 3 replicas based on load.</li>
+        <li>Stops idle machines to save money during quiet hours.</li>
+        <li>Has Redis attached for the Pattern B upgrade when you need it.</li>
+        <li>Logs are tailable and queryable.</li>
+        <li>Has a spend alert so a runaway loop won't surprise you.</li>
+      </ul>
+
+      <h4>What this isn't yet</h4>
+
+      <p>To be honest about what you've shipped: this is "production-ish," not "production." Specifically, you haven't yet wired up Pattern B (no worker process; long runs would still hit HTTP timeouts), the state-store split (no Postgres; conversations don't persist across restarts), or the circuit breaker (if Anthropic has a 5xx storm, your users see errors with no graceful degradation). Those are the next deployment milestones; the 30-minute version is the floor, not the ceiling.</p>
+
+      <p>What you <em>do</em> have is the substrate: a real URL serving real traffic, with the right shape to grow. Pattern B becomes "add a worker process to <code class="inline">fly.toml</code> as a second machine group." The state-store split becomes "add Fly Postgres, write the schema migration." The circuit breaker is a few hundred lines added to the agent code. None of these require re-architecting; they layer onto what you have.</p>
+
+      <h4>Mapping to other platforms</h4>
+
+      <p>If you're not on Fly, the same workflow translates cleanly:</p>
+
+      <ul>
+        <li><strong>Railway:</strong> push to GitHub, click "Deploy from repo," set env vars in the dashboard. Add Redis as an addon. Same Dockerfile works.</li>
+        <li><strong>Render:</strong> create a Web Service from your repo. Add a Redis instance. Set env vars. Same Dockerfile.</li>
+        <li><strong>Modal:</strong> wrap your FastAPI app in <code class="inline">@app.asgi_app()</code>, deploy with <code class="inline">modal deploy</code>. Redis via Upstash.</li>
+        <li><strong>AWS App Runner:</strong> push your image to ECR, create an App Runner service pointed at it. Redis via ElastiCache.</li>
+        <li><strong>Kubernetes:</strong> if you have a cluster, a basic Deployment + Service + ConfigMap will do it. Don't reach for k8s just for this; it's overkill until you have multiple services or specific networking needs.</li>
+      </ul>
+
+      <p>The economic baseline for any of these: a small agent with moderate traffic costs $5–20 per month in compute on Fly (free tier eats most of it), $10–30 on Railway or Render, and however much your model provider bills you for actual usage. The model bill dominates by 10–100×. Don't over-optimize platform spend.</p>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 2.4</div>
+      <h3>Deliverable</h3>
+      <p>A deployed agent on a cloud platform of your choice, serving real traffic with the production patterns that matter: SSE streaming endpoint for short runs, queue + worker pair for long runs, Postgres-and-Redis state split, autoscaling on signals that actually move, circuit breakers and per-user cost ceilings against the failure modes you'll actually hit, and a runbook your future self can read at 3am. With chapter 2.1 observability and chapter 2.3 safety in place, this is the substrate an agent ships on.</p>
+      <ul class="checklist">
+        <li>FastAPI + sse-starlette streaming endpoint with semaphore-limited concurrency</li>
+        <li>Async agent loop with token streaming and tool_start/tool_end events</li>
+        <li>Client disconnect detection (request.is_disconnected) to stop runaway runs</li>
+        <li>Submit/poll endpoint pair backed by Redis Streams + consumer groups</li>
+        <li>Worker process with SIGTERM handling and at-least-once delivery</li>
+        <li>SSE resumption via Last-Event-ID for flaky-network resilience</li>
+        <li>Postgres for conversation truth; Redis cache with invalidate-on-write</li>
+        <li>Autoscaling on semaphore saturation (API) and queue depth (workers)</li>
+        <li>Circuit breaker for model provider outages; fallback model wired up</li>
+        <li>Per-run and per-user-per-day cost ceilings enforced in the loop</li>
+        <li>Runbook covering deploy, observe, kill-switch, and top-5 failure modes</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('s3')">
+        <div class="dir">← prev</div>
+        <div class="title">2.3 Safety &amp; guardrails</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('e1')">
+        <div class="dir">next →</div>
+        <div class="title">3.1 Eval-driven development</div>
+      </button>
+    </div>
+  </section>

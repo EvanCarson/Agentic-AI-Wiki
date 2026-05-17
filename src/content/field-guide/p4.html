@@ -1,0 +1,476 @@
+<section class="phase">
+    <div class="phase-num">1.4</div>
+    <div class="week">Part I / Build · Week 4</div>
+    <h2>Your first eval suite.</h2>
+    <p class="goal">The thing that separates "built one" from "ships them." Three layers of evals: components, trajectories, end-to-end. You can't improve what you can't measure, and you can't measure agents by reading traces — you measure them with datasets, harnesses, and judges. This chapter builds the first version end-to-end; <strong>Part III · Evaluate</strong> extends the practice into a continuous discipline.</p>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Build a 50-question dataset.</h3>
+
+      <p>The hardest part of evals isn't the harness — it's the dataset. A bad dataset gives you confidence in a bad agent. A good dataset surfaces real failure modes. Spend a day on this. Don't outsource it. Don't generate the whole thing with an LLM and trust it.</p>
+
+      <h4>The four tiers</h4>
+
+      <p>Stratify the 50 questions into four tiers so the eval distinguishes capabilities, not just averages.</p>
+
+      <ul>
+        <li><strong>Tier 1 (15 questions): Lookups.</strong> Single fact, one document. "What port does Postgres use by default?" If the agent fails these, retrieval is broken.</li>
+        <li><strong>Tier 2 (15 questions): Multi-hop.</strong> Need 2-3 docs synthesized. "How does PgBouncer pooling interact with prepared statements?"</li>
+        <li><strong>Tier 3 (10 questions): Comparative.</strong> Comparing options with trade-offs. "When to use partitioning vs sharding."</li>
+        <li><strong>Tier 4 (10 questions): Negative cases.</strong> Things <em>not</em> in the corpus. "How do I configure PgBouncer with Redis?" The agent should say "not in corpus," not invent an answer.</li>
+      </ul>
+
+      <h4>The schema</h4>
+
+      <p>Provider-agnostic; just JSON.</p>
+
+<pre class="standalone"><span class="c-cm"># evals/dataset.jsonl — one question per line</span>
+{
+  <span class="c-st">"id"</span>: <span class="c-st">"q001"</span>,
+  <span class="c-st">"tier"</span>: <span class="c-st">"lookup"</span>,
+  <span class="c-st">"question"</span>: <span class="c-st">"What port does PostgreSQL listen on by default?"</span>,
+  <span class="c-st">"expected_answer_contains"</span>: [<span class="c-st">"5432"</span>],
+  <span class="c-st">"expected_chunks"</span>: [<span class="c-st">"runtime-config-connection::0"</span>],
+  <span class="c-st">"forbidden_phrases"</span>: [<span class="c-st">"I don't know"</span>, <span class="c-st">"not sure"</span>],
+  <span class="c-st">"notes"</span>: <span class="c-st">"basic fact, must succeed on every run"</span>
+}
+{
+  <span class="c-st">"id"</span>: <span class="c-st">"q024"</span>,
+  <span class="c-st">"tier"</span>: <span class="c-st">"multi_hop"</span>,
+  <span class="c-st">"question"</span>: <span class="c-st">"Why do prepared statements break in PgBouncer transaction mode?"</span>,
+  <span class="c-st">"expected_answer_contains"</span>: [<span class="c-st">"session"</span>, <span class="c-st">"transaction"</span>],
+  <span class="c-st">"expected_chunks"</span>: [<span class="c-st">"pgbouncer-modes::1"</span>, <span class="c-st">"sql-prepare::0"</span>],
+  <span class="c-st">"requires_synthesis"</span>: <span class="c-kw">true</span>
+}
+{
+  <span class="c-st">"id"</span>: <span class="c-st">"q045"</span>,
+  <span class="c-st">"tier"</span>: <span class="c-st">"negative"</span>,
+  <span class="c-st">"question"</span>: <span class="c-st">"How does PostgreSQL integrate with Redis Streams?"</span>,
+  <span class="c-st">"expected_behavior"</span>: <span class="c-st">"refuse"</span>,
+  <span class="c-st">"expected_answer_contains"</span>: [<span class="c-st">"not in"</span>, <span class="c-st">"corpus"</span>],
+  <span class="c-st">"forbidden_phrases"</span>: [<span class="c-st">"you can use"</span>, <span class="c-st">"the integration"</span>]
+}</pre>
+
+      <h4>How to build the questions</h4>
+
+      <p>Three sources, in order:</p>
+
+      <ol style="list-style: decimal; margin-left: 20px; margin-top: 14px;" class="step-ol">
+        <li style="padding: 6px 0; font-size: 16px;"><strong>Your trace log from Phases 1-3.</strong> Every question your agent answered wrong is a perfect eval question. Failing real cases > inventing cases.</li>
+        <li style="padding: 6px 0; font-size: 16px;"><strong>Browsing the docs.</strong> Open the corpus, find sections you find non-trivial, write a natural-language question whose answer is in that section.</li>
+        <li style="padding: 6px 0; font-size: 16px;"><strong>LLM-generated, then human-filtered.</strong> Have a model propose 100 questions from the corpus; you keep the 30 that are actually realistic and discard the rest. This is the only step where LLMs help, and only with a human gate.</li>
+      </ol>
+
+      <div class="callout warn">
+        <p>Do <strong>not</strong> let the agent itself generate the eval dataset. You will end up measuring "questions the agent finds easy" and never see the questions it can't handle.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why only 50 questions? Bigger is better, right?</div>
+        <div class="answer">
+          <p>Bigger is better <em>asymptotically</em>, but the first 50 are the highest-leverage questions you'll ever write. They're where you fix the most bugs per dollar of API spend. Spend the time on quality: each question should test something specific and have unambiguous pass/fail criteria.</p>
+          <p>Grow the dataset later, after you know what failure modes are common in production. 50 → 200 → 500 as you scale, not 5000 upfront.</p>
+        </div>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Evaluate components in isolation.</h3>
+
+      <p>End-to-end evals are noisy. They mix retrieval failures, planning failures, synthesis failures, and verifier failures into one number. To debug, you need to know which component is broken. So evaluate components separately.</p>
+
+      <h4>Retrieval eval: recall@k and MRR</h4>
+
+      <p>For each question in the dataset that has <code class="inline">expected_chunks</code>, run retrieval and ask: did we surface the expected chunk in the top k results?</p>
+
+<pre class="standalone"><span class="c-cm"># evals/eval_retrieval.py</span>
+<span class="c-kw">import</span> json
+<span class="c-kw">from</span> retrieval <span class="c-kw">import</span> retrieve
+<span class="c-kw">from</span> retrieval.bm25_index <span class="c-kw">import</span> BM25Index
+<span class="c-kw">from</span> retrieval.dense_index <span class="c-kw">import</span> DenseIndex
+<span class="c-kw">from</span> retrieval.hybrid <span class="c-kw">import</span> HybridSearch
+
+<span class="c-kw">def</span> <span class="c-fn">load_dataset</span>():
+    <span class="c-kw">return</span> [json.loads(line)
+            <span class="c-kw">for</span> line <span class="c-kw">in</span> <span class="c-kw">open</span>(<span class="c-st">"evals/dataset.jsonl"</span>)]
+
+<span class="c-kw">def</span> <span class="c-fn">eval_retrieval</span>(retriever, dataset, k=<span class="c-st">5</span>):
+    hits, mrr_sum, n = <span class="c-st">0</span>, <span class="c-st">0.0</span>, <span class="c-st">0</span>
+    <span class="c-kw">for</span> q <span class="c-kw">in</span> dataset:
+        <span class="c-kw">if</span> <span class="c-kw">not</span> q.get(<span class="c-st">"expected_chunks"</span>): <span class="c-kw">continue</span>
+        n += <span class="c-st">1</span>
+        results = retriever(q[<span class="c-st">"question"</span>], top_k=k)
+        result_ids = [c.chunk_id <span class="c-kw">for</span> c <span class="c-kw">in</span> results]
+        <span class="c-cm"># Recall: at least one expected chunk in top-k</span>
+        <span class="c-kw">if</span> <span class="c-kw">any</span>(eid <span class="c-kw">in</span> result_ids
+               <span class="c-kw">for</span> eid <span class="c-kw">in</span> q[<span class="c-st">"expected_chunks"</span>]):
+            hits += <span class="c-st">1</span>
+        <span class="c-cm"># MRR: 1 / rank of first expected chunk</span>
+        <span class="c-kw">for</span> rank, rid <span class="c-kw">in</span> <span class="c-kw">enumerate</span>(result_ids, <span class="c-st">1</span>):
+            <span class="c-kw">if</span> rid <span class="c-kw">in</span> q[<span class="c-st">"expected_chunks"</span>]:
+                mrr_sum += <span class="c-st">1.0</span> / rank
+                <span class="c-kw">break</span>
+    <span class="c-kw">return</span> {<span class="c-st">"recall@k"</span>: hits / n, <span class="c-st">"mrr"</span>: mrr_sum / n, <span class="c-st">"n"</span>: n}</pre>
+
+      <h4>What it tells you</h4>
+
+      <p>Run the same eval with three different retrievers — BM25 only, dense only, hybrid — and compare:</p>
+
+<pre class="trace"><span class="c-out">              recall@5   recall@20    MRR    n
+BM25 only       0.62       0.81      0.41   40
+Dense only      0.68       0.85      0.47   40
+Hybrid (RRF)    0.82       0.94      0.58   40
+Hybrid+rerank   0.89       0.94      0.71   40</span></pre>
+
+      <div class="observe">
+        <div class="label">How to read this</div>
+        <p><strong>Recall@5 from 0.62 to 0.89</strong> is what justified all of Phase 2. Without numbers like these, you're guessing whether the complexity was worth it.</p>
+        <p><strong>recall@20 plateaus at 0.94 for both hybrid variants.</strong> That means the right chunk is in the top 20 most of the time — the reranker isn't <em>finding</em> better chunks, it's <em>ordering</em> them better. MRR (0.58 → 0.71) confirms this — the right chunk is moving up the list.</p>
+        <p><strong>The 6% missing from recall@20</strong> is questions where retrieval simply can't find the right chunk. That's a chunking problem (chunk doesn't contain the answer phrase) or a corpus problem (answer requires multi-doc synthesis you can't get from retrieval alone).</p>
+      </div>
+
+      <h4>Verifier eval: precision and recall on claims</h4>
+
+      <p>Hand-label 30 (claim, sources, verdict) triples — yourself, not an LLM — then run the verifier and check agreement.</p>
+
+<pre class="standalone"><span class="c-cm"># evals/verifier_gold.jsonl — hand-labeled</span>
+{<span class="c-st">"claim"</span>: <span class="c-st">"Transaction pooling breaks prepared statements"</span>,
+ <span class="c-st">"sources"</span>: [<span class="c-st">"pgbouncer-modes::1"</span>],
+ <span class="c-st">"human_verdict"</span>: <span class="c-st">"SUPPORT"</span>}
+{<span class="c-st">"claim"</span>: <span class="c-st">"This is the most common migration failure"</span>,
+ <span class="c-st">"sources"</span>: [<span class="c-st">"pgbouncer-modes::1"</span>],
+ <span class="c-st">"human_verdict"</span>: <span class="c-st">"NOT_SUPPORTED"</span>}</pre>
+
+<pre class="standalone"><span class="c-kw">def</span> <span class="c-fn">eval_verifier</span>(gold):
+    correct = <span class="c-st">0</span>
+    <span class="c-kw">for</span> ex <span class="c-kw">in</span> gold:
+        result = verify(ex[<span class="c-st">"claim"</span>],
+                        load_chunks(ex[<span class="c-st">"sources"</span>]))
+        v = result[<span class="c-st">"claims"</span>][<span class="c-st">0</span>][<span class="c-st">"verdict"</span>]
+        <span class="c-kw">if</span> v == ex[<span class="c-st">"human_verdict"</span>]:
+            correct += <span class="c-st">1</span>
+    <span class="c-kw">return</span> {<span class="c-st">"agreement"</span>: correct / <span class="c-kw">len</span>(gold)}</pre>
+
+<pre class="trace"><span class="c-out">verifier agreement with humans: 0.87  (26 of 30)</span>
+
+inspecting disagreements:
+  3 cases where verifier said PARTIAL, human said SUPPORT
+    → verifier is slightly too strict on phrasing
+  1 case where verifier said SUPPORT, human said PARTIAL
+    → genuine bug; source says "X under condition Y"
+      but verifier missed the condition</pre>
+
+      <div class="observe">
+        <div class="label">What 87% agreement means</div>
+        <p>Of 30 hand-labeled claims, the verifier got 26 right. The 4 disagreements split: 3 false-PARTIAL (overly strict — not a safety problem) and 1 false-SUPPORT (genuine bug — a hallucination would slip through). Acceptable for now; the false-SUPPORT case becomes a regression test for the next verifier-prompt iteration.</p>
+        <p>Below 80% agreement, the verifier is adding noise; tune until you cross 80% before relying on it.</p>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Evaluate trajectories with LLM-as-judge.</h3>
+
+      <p>Component evals tell you whether each piece works. Trajectory evals tell you whether the agent as a whole succeeds — and that's not just "is the final answer right." It's also: did it use a reasonable number of steps? Did it cite the right sources? Did it avoid forbidden behaviors?</p>
+
+      <h4>Hard checks first (cheap, deterministic)</h4>
+
+<pre class="standalone"><span class="c-cm"># evals/eval_trajectory.py</span>
+<span class="c-kw">def</span> <span class="c-fn">hard_checks</span>(q: <span class="c-kw">dict</span>, result: <span class="c-kw">dict</span>) -> <span class="c-kw">dict</span>:
+    answer = result.get(<span class="c-st">"answer"</span>, <span class="c-st">""</span>).lower()
+    checks = {}
+
+    <span class="c-cm"># Did the answer mention expected terms?</span>
+    expected = q.get(<span class="c-st">"expected_answer_contains"</span>, [])
+    checks[<span class="c-st">"contains_expected"</span>] = <span class="c-kw">all</span>(
+        term.lower() <span class="c-kw">in</span> answer <span class="c-kw">for</span> term <span class="c-kw">in</span> expected
+    )
+
+    <span class="c-cm"># Avoid forbidden phrases (especially for negatives)</span>
+    forbidden = q.get(<span class="c-st">"forbidden_phrases"</span>, [])
+    checks[<span class="c-st">"no_forbidden"</span>] = <span class="c-kw">not</span> <span class="c-kw">any</span>(
+        p.lower() <span class="c-kw">in</span> answer <span class="c-kw">for</span> p <span class="c-kw">in</span> forbidden
+    )
+
+    <span class="c-cm"># Citation overlap with expected chunks</span>
+    cited = <span class="c-kw">set</span>(result.get(<span class="c-st">"citations"</span>, []))
+    expected_chunks = <span class="c-kw">set</span>(q.get(<span class="c-st">"expected_chunks"</span>, []))
+    <span class="c-kw">if</span> expected_chunks:
+        checks[<span class="c-st">"citation_overlap"</span>] = <span class="c-kw">bool</span>(cited & expected_chunks)
+
+    <span class="c-cm"># Step efficiency: didn't burn budget</span>
+    checks[<span class="c-st">"under_budget"</span>] = result.get(<span class="c-st">"steps_used"</span>, <span class="c-st">99</span>) <= <span class="c-st">8</span>
+
+    <span class="c-cm"># For negative cases: agent must have refused</span>
+    <span class="c-kw">if</span> q.get(<span class="c-st">"expected_behavior"</span>) == <span class="c-st">"refuse"</span>:
+        checks[<span class="c-st">"refused"</span>] = (
+            <span class="c-st">"not in"</span> <span class="c-kw">in</span> answer <span class="c-kw">or</span>
+            <span class="c-st">"corpus"</span> <span class="c-kw">in</span> answer <span class="c-kw">or</span>
+            <span class="c-st">"don't have"</span> <span class="c-kw">in</span> answer
+        )
+
+    <span class="c-kw">return</span> checks</pre>
+
+      <h4>Then soft checks via LLM-judge</h4>
+
+      <p>For "is the answer correct and well-formed" — questions that hard checks can't answer — use a judge model. Use a <em>different</em> model than the agent (cross-model judging reduces self-confirmation bias). If the agent runs on Claude, judge with GPT, and vice versa.</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic agent → OpenAI judge</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI agent → Anthropic judge</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># evals/judge.py — judge with GPT</span>
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+judge_client = OpenAI()
+
+JUDGE_PROMPT = <span class="c-st">"""Rate the agent's answer on three axes.
+
+QUESTION: {question}
+EXPECTED ANSWER NOTES: {expected_notes}
+AGENT'S ANSWER: {answer}
+AGENT'S CITATIONS: {citations}
+
+Score each from 1 (terrible) to 5 (excellent):
+- correctness: does it answer the question accurately?
+- completeness: are key aspects covered?
+- groundedness: are claims supported by citations?
+
+Output JSON: {{"correctness": N, "completeness": N,
+"groundedness": N, "reasoning": "one sentence"}}"""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">judge</span>(q, result):
+    response = judge_client.responses.create(
+        model=<span class="c-st">"gpt-5.5"</span>,
+        input=JUDGE_PROMPT.format(
+            question=q[<span class="c-st">"question"</span>],
+            expected_notes=q.get(<span class="c-st">"notes"</span>, <span class="c-st">""</span>),
+            answer=result.get(<span class="c-st">"answer"</span>, <span class="c-st">""</span>),
+            citations=result.get(<span class="c-st">"citations"</span>, []),
+        ),
+        text={<span class="c-st">"format"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"json_object"</span>}},
+    )
+    <span class="c-kw">return</span> json.loads(response.output_text)</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># evals/judge.py — judge with Claude</span>
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+judge_client = Anthropic()
+
+JUDGE_PROMPT = <span class="c-st">"""Rate the agent's answer on three axes.
+
+QUESTION: {question}
+EXPECTED ANSWER NOTES: {expected_notes}
+AGENT'S ANSWER: {answer}
+AGENT'S CITATIONS: {citations}
+
+Score each from 1 (terrible) to 5 (excellent):
+- correctness: does it answer the question accurately?
+- completeness: are key aspects covered?
+- groundedness: are claims supported by citations?
+
+Output JSON only: {{"correctness": N, "completeness": N,
+"groundedness": N, "reasoning": "one sentence"}}"""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">judge</span>(q, result):
+    response = judge_client.messages.create(
+        model=<span class="c-st">"claude-sonnet-4-5"</span>,
+        max_tokens=<span class="c-st">512</span>,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+                   <span class="c-st">"content"</span>: JUDGE_PROMPT.format(
+                       question=q[<span class="c-st">"question"</span>],
+                       expected_notes=q.get(<span class="c-st">"notes"</span>, <span class="c-st">""</span>),
+                       answer=result.get(<span class="c-st">"answer"</span>, <span class="c-st">""</span>),
+                       citations=result.get(<span class="c-st">"citations"</span>, []),
+                   )}],
+    )
+    <span class="c-kw">return</span> json.loads(response.content[<span class="c-st">0</span>].text)</pre>
+      </div>
+
+      <h4>Run the judge 3 times per question</h4>
+
+      <p>LLM judges are noisy. Their scores vary across runs even with temperature=0. To get a reliable signal, run each judgment 3 times and take the median. The variance itself is interesting data: if a judge gives scores [3, 5, 4] for the same example, your eval signal is weak for that question.</p>
+
+<pre class="standalone"><span class="c-kw">def</span> <span class="c-fn">judge_with_variance</span>(q, result, n=<span class="c-st">3</span>):
+    scores = [judge(q, result) <span class="c-kw">for</span> _ <span class="c-kw">in</span> <span class="c-kw">range</span>(n)]
+    <span class="c-kw">def</span> <span class="c-fn">median</span>(key):
+        <span class="c-kw">return</span> <span class="c-kw">sorted</span>(s[key] <span class="c-kw">for</span> s <span class="c-kw">in</span> scores)[n // <span class="c-st">2</span>]
+    <span class="c-kw">return</span> {
+        <span class="c-st">"correctness"</span>: median(<span class="c-st">"correctness"</span>),
+        <span class="c-st">"completeness"</span>: median(<span class="c-st">"completeness"</span>),
+        <span class="c-st">"groundedness"</span>: median(<span class="c-st">"groundedness"</span>),
+        <span class="c-st">"variance"</span>: <span class="c-kw">max</span>(s[<span class="c-st">"correctness"</span>] <span class="c-kw">for</span> s <span class="c-kw">in</span> scores) -
+                    <span class="c-kw">min</span>(s[<span class="c-st">"correctness"</span>] <span class="c-kw">for</span> s <span class="c-kw">in</span> scores),
+    }</pre>
+
+      <h4>The full eval run</h4>
+
+<pre class="trace"><span class="c-out">$ python scripts/eval.py --full
+
+evaluating 50 questions across 4 tiers...
+
+Tier 1 (lookup):     15/15 hard pass    avg judge: 4.7 / 5.0
+Tier 2 (multi-hop):  13/15 hard pass    avg judge: 4.2 / 5.0
+Tier 3 (comparative): 8/10 hard pass    avg judge: 3.9 / 5.0
+Tier 4 (negative):    9/10 hard pass    avg judge: 4.5 / 5.0
+
+OVERALL hard-pass rate: 45/50 = 90.0%
+OVERALL judge correctness (median): 4.3 / 5.0
+OVERALL judge groundedness (median): 4.6 / 5.0
+
+high-variance questions (judge disagrees with itself):
+  q017: scores [3, 5, 4] — answer is partially correct,
+        judge unsure which way to score
+  q031: scores [2, 5, 3] — answer is verbose; judge
+        differs on whether length helps or hurts
+
+failing questions:
+  q024: missed expected chunk pgbouncer-modes::1
+        (retrieval ranked it at 7)
+  q037: cited a chunk that doesn't support the claim
+        (verifier should have caught this — bug)
+  q045: invented Redis integration details
+        (negative case failed)</span></pre>
+
+      <div class="observe">
+        <div class="label">This is what shipping looks like</div>
+        <p>90% hard-pass is a real, defensible number you can graph over time. Specific failing questions become specific bugs to fix. The high-variance ones tell you where your eval signal is weakest — those are candidates for rewriting (more precise question, clearer expected answer).</p>
+        <p>You now have something you can show a teammate: "our agent passes 90% of the test set, here's what fails and why, here's the trajectory of the number across the last 20 commits."</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Isn't LLM-as-judge unreliable? I've read criticism of it.</div>
+        <div class="answer">
+          <p>Yes, used naively. The known failure modes are: position bias (preferring the first answer shown), length bias (preferring longer answers), self-affinity (a model rating its own outputs higher), and verbosity bias on subjective questions. All real.</p>
+          <p>Mitigations that work: cross-model judging (Claude evaluating GPT or vice versa, never self-rating), running 3+ times and using medians, hard checks for objective facts before any LLM judgment, and hand-auditing ~10% of judgments monthly to detect drift.</p>
+          <p>With these guardrails, LLM-as-judge is the best tool we have for scoring open-ended outputs. Without them, it's a random-number generator that feels rigorous.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why median instead of mean across 3 runs?</div>
+        <div class="answer">
+          <p>Robustness to outliers. If the judge gives [3, 4, 5], mean and median both say 4 — fine. If it gives [4, 4, 1], the mean says 3 (an outlier dragged it down) while the median says 4 (correctly ignores the outlier). LLM judges occasionally produce wildly off scores; median is more stable.</p>
+          <p>With n=3, you're really getting a "majority vote with outlier tolerance." With n=5+, mean becomes safer. We use 3 because the cost-per-judge matters at 50 questions × 3 runs = 150 judge calls per eval run.</p>
+        </div>
+      </div>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Wire evals into your dev loop.</h3>
+
+      <p>An eval suite that you run once a week is research; an eval suite that runs on every commit is engineering. Make it cheap enough that you'll actually run it, fast enough to use during development, with clear pass/fail signals.</p>
+
+      <h4>Two tiers: fast and full</h4>
+
+      <p>The full eval takes minutes; you don't want to wait for it after every code change. Split into a fast tier (10 questions, runs in ~30 seconds) for iteration, and the full tier (50 questions, 3-5 minutes) for confidence.</p>
+
+<pre class="shell standalone"><span class="c-cm"># Makefile</span>
+.PHONY: eval-fast eval-full eval-watch
+
+eval-fast:
+    python scripts/eval.py --tier fast --n 10
+
+eval-full:
+    python scripts/eval.py --full --judge --variance 3
+
+eval-watch:
+    <span class="c-cm"># Re-run fast eval whenever agent/ changes</span>
+    fswatch -o agent/ retrieval/ | xargs -n1 -I{} make eval-fast
+
+ci:
+    make eval-full
+    python scripts/eval.py --regression-check</pre>
+
+      <h4>Track scores over time</h4>
+
+      <p>The single most useful artifact: a CSV of every eval run with date, git commit, and scores. Plot it.</p>
+
+<pre class="standalone"><span class="c-cm"># evals/scoreboard.csv — append after every run</span>
+date,commit,hard_pass,judge_correct,judge_grounded,steps_p50
+2026-05-08,a1b2c3d,0.72,3.8,4.1,5.2
+2026-05-09,e4f5g6h,0.78,4.0,4.3,4.8   <span class="c-cm"># added reranker</span>
+2026-05-10,i7j8k9l,0.84,4.2,4.5,4.5   <span class="c-cm"># tuned chunk size</span>
+2026-05-12,m0n1o2p,0.88,4.3,4.6,4.2   <span class="c-cm"># added planner</span>
+2026-05-15,q3r4s5t,0.90,4.3,4.6,3.8   <span class="c-cm"># subagent context isolation</span></pre>
+
+      <p>Now you have a story. "Adding the reranker bought us 6 points of hard-pass. Subagents didn't move correctness but cut median steps from 4.2 to 3.8." That's the kind of thing you ship in a PR description and present at a review.</p>
+
+      <h4>Regression checks</h4>
+
+      <p>A simple gate: any question that passed last time and fails now is a regression. Block the merge.</p>
+
+<pre class="standalone"><span class="c-kw">def</span> <span class="c-fn">regression_check</span>(current, baseline):
+    regressed = []
+    <span class="c-kw">for</span> qid, c <span class="c-kw">in</span> current.items():
+        b = baseline.get(qid)
+        <span class="c-kw">if</span> b <span class="c-kw">and</span> b[<span class="c-st">"passed"</span>] <span class="c-kw">and</span> <span class="c-kw">not</span> c[<span class="c-st">"passed"</span>]:
+            regressed.append(qid)
+    <span class="c-kw">if</span> regressed:
+        <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"REGRESSION: {regressed}"</span>)
+        sys.exit(<span class="c-st">1</span>)
+    <span class="c-kw">print</span>(<span class="c-st">"no regressions"</span>)</pre>
+
+      <div class="callout tip">
+        <p>The first time a teammate refuses to merge your PR because <code class="inline">make ci</code> shows a regression on q024, you'll know the eval suite is actually doing its job. That's the goal.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My eval suite agrees with itself but disagrees with what users think is good. Why?</div>
+        <div class="answer">
+          <p>Your dataset doesn't reflect real usage. Common causes:</p>
+          <ul>
+            <li><strong>Question distribution wrong.</strong> Your test set has 30% comparatives but real users ask 80% lookups. Optimize for the lookups.</li>
+            <li><strong>Phrasing too clean.</strong> Real users misspell, abbreviate, use jargon. Your eval should mirror that — pull real questions from logs once you have them.</li>
+            <li><strong>Missing failure modes.</strong> Users complain about formatting or tone; your eval only checks correctness. Add tone/format checks.</li>
+          </ul>
+          <p>The fix is dataset iteration. Treat the dataset as living software — review and update it monthly based on what users actually need.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">When should I move from this DIY harness to a vendor (Braintrust, Langfuse, Weights & Biases)?</div>
+        <div class="answer">
+          <p>When you have multiple people running evals, want to share results across a team, or need fancier features like A/B comparisons across runs and richer dashboards. The patterns we built here — dataset of expected outputs, hard checks + LLM-judge with variance, per-component evals, regression gates — are the same ideas those tools wrap in nicer UIs.</p>
+          <p>Build it yourself first so you understand the abstractions. Adopt a vendor when scale or team coordination demands it. The Python-and-Makefile approach is genuinely production-grade for a single team — don't feel obligated to pay for sophistication you don't yet need.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of week 4</div>
+      <h3>Deliverable</h3>
+      <p>An eval suite that runs every commit, tracks scores over time, and blocks regressions. You can now make changes to the agent and know — with numbers — whether they helped, hurt, or were neutral. This is the difference between hobby and product. <strong>Part III · Evaluate</strong> extends this: eval-driven development as ongoing practice, calibrating LLM-as-judge, reading public benchmarks, CI integration.</p>
+      <ul class="checklist">
+        <li>50-question stratified dataset (4 tiers, JSONL)</li>
+        <li>Retrieval eval: recall@5, recall@20, MRR</li>
+        <li>Verifier eval: agreement with 30 hand-labels</li>
+        <li>Trajectory eval: hard checks + LLM-judge × 3 with variance</li>
+        <li>Makefile with eval-fast / eval-full / CI gate</li>
+        <li>scoreboard.csv tracking scores over commits</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('p3')">
+        <div class="dir">← prev</div>
+        <div class="title">1.3 The real loop</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('s1')">
+        <div class="dir">next →</div>
+        <div class="title">2.1 Observability</div>
+      </button>
+    </div>
+  </section>

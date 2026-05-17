@@ -1,0 +1,703 @@
+<section class="phase">
+    <div class="phase-num">4.4</div>
+    <div class="week">Part IV / Specialize · The pattern with the worst hype-to-reality ratio</div>
+    <h2>Multi-agent systems: when to decompose, and when not.</h2>
+    <p class="goal">"Multi-agent" is the agent topic with the highest hype-to-reality ratio. The marketing picture — agents collaborating like a team, dynamically dispatching tasks, debating each other to better answers — is mostly fiction. The engineering reality is narrower: a small set of decomposition patterns work in production, the rest don't, and applying any of them costs roughly 10–20× a single-agent baseline. This chapter teaches when multi-agent is the right answer, the three patterns that actually ship at scale, the coordination problems that sink naive implementations, and how to evaluate a multi-agent system honestly. By the end you'll know when to reach for it and when to refuse — and have the engineering vocabulary to defend either choice.</p>
+
+    
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>When multi-agent makes sense — and when it doesn't.</h3>
+
+      <p>The default position on multi-agent should be skepticism. Most "multi-agent" architectures you see in demos and tutorials would work equally well, faster, and at a tenth the cost as a single-agent loop with well-designed tools. The honest question to ask before reaching for multi-agent: <em>what specifically am I gaining that I couldn't get from a single agent with better tools?</em></p>
+
+      <p>The answer is a real one in some cases. The four properties below describe the situations where multi-agent decomposition genuinely earns its cost. If your problem doesn't have at least one of them strongly, you probably don't need multi-agent.</p>
+
+      <h4>Property 1: parallelizable independent work</h4>
+
+      <p>The strongest justification. If a task decomposes into N sub-tasks that can run independently — no sub-task depends on another's output — then multi-agent lets you do them concurrently. Wall-clock time drops from the sum of sub-task durations to the max of them. For a research query with 5 independent investigation threads, this is the difference between 25 minutes and 5 minutes.</p>
+
+      <p>The test: <em>can you describe the sub-tasks before any work happens?</em> If yes (orchestrator can plan upfront), multi-agent parallelism is genuinely available. If no (the next sub-task depends on what the previous one found), you're describing a sequential agent, not a parallel one — multi-agent gives you no parallelism, only overhead.</p>
+
+      <p>This is the property behind the research-agent pattern in chapter 4.3. It's why parallel research works and why "agents debating to improve an answer" usually doesn't — the latter is fundamentally sequential, with each "round" depending on the previous.</p>
+
+      <h4>Property 2: role specialization at the prompt level</h4>
+
+      <p>Some tasks involve cognitive operations different enough that one prompt can't be optimized for both. A planner needs different reasoning patterns than a synthesizer; a code-reviewer needs different criteria than a code-writer; a moderator needs different judgment than a creative writer. Trying to encode all of these in one system prompt produces a mediocre prompt that does each badly.</p>
+
+      <p>The fix: separate prompts for separate roles, with each role's prompt optimized for its specific cognitive task. This is multi-agent in the form of "multiple specialized prompts called in sequence or in coordination," even when those prompts are running on the same model and inside one workflow.</p>
+
+      <p>The test: <em>are the cognitive demands of your sub-tasks so different that one prompt can't serve both well?</em> If a single prompt can do "find sources and synthesize them," it's not a multi-agent case. If "deeply explore one angle" and "reconcile findings across angles" need fundamentally different instructions, that's a real role split.</p>
+
+      <h4>Property 3: context isolation</h4>
+
+      <p>From chapter 4.3's research-agent discussion: as a single agent's context grows with accumulated tool results, performance degrades. Lost-in-the-middle effects kick in. The agent forgets early findings. Synthesis quality drops.</p>
+
+      <p>Multi-agent lets each sub-agent maintain a context window dedicated to its own narrow task. The lead/orchestrator only sees the <em>compressed summaries</em> from each, not the raw context that produced them. This is the architecture's most subtle benefit — and often the one that justifies the cost when parallelism alone wouldn't.</p>
+
+      <p>The test: <em>does your task involve enough raw input that a single agent would suffer context degradation?</em> Research with many sources, code review across many files, document analysis across many pages — all are context-bound. Pure reasoning tasks with small inputs aren't.</p>
+
+      <h4>Property 4: fault containment</h4>
+
+      <p>A single agent that gets stuck in a bad reasoning chain — wrong assumption, hallucinated tool result, infinite loop — corrupts its own context and the entire task. Recovery requires either restarting the whole task or surgical context editing, neither of which is great.</p>
+
+      <p>Multi-agent contains faults to single sub-agents. If subagent #3 spirals into an unproductive loop, the orchestrator can detect this (the sub-agent's findings are missing or incoherent), retry it from a clean context, or substitute a different approach. The other sub-agents' work is unaffected. The task as a whole survives the local failure.</p>
+
+      <p>The test: <em>is partial failure recoverable in your task?</em> If you can ship the answer even when one sub-task fails (with a noted gap), multi-agent gives you graceful degradation. If every sub-task is essential, fault containment is less valuable.</p>
+
+      <h4>The four-property test, summarized</h4>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  SHOULD YOU GO MULTI-AGENT?                                 │
+│                                                             │
+│  How many of these are TRUE for your problem?               │
+│                                                             │
+│  □ Parallelizable: sub-tasks are independent, knowable      │
+│    upfront                                                  │
+│                                                             │
+│  □ Role-specialized: sub-tasks need genuinely different     │
+│    prompts                                                  │
+│                                                             │
+│  □ Context-bound: single agent would hit context limits     │
+│    or degradation                                           │
+│                                                             │
+│  □ Partial-failure-ok: graceful degradation is valuable     │
+│                                                             │
+│  Score:                                                     │
+│    3-4 properties → multi-agent is likely right             │
+│    2 properties   → consider it, but try single-agent first │
+│    0-1 properties → almost certainly use single-agent       │
+│                                                             │
+│  The 15× cost multiplier needs ≥3 of these to pay back.    │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>This is a deliberately conservative test. The default failure mode in this space is over-engineering — building multi-agent systems for problems a well-designed single-agent loop would handle, then spending months on coordination logic. The cost shows up later, when you're paying 15× per query for a benefit you couldn't articulate.</p>
+
+      <h4>The patterns that look multi-agent but aren't</h4>
+
+      <p>Three patterns are commonly described as "multi-agent" that are <em>not</em> multi-agent in any meaningful engineering sense — and treating them as such adds complexity without benefit.</p>
+
+      <p><strong>An agent that calls multiple LLMs.</strong> If your agent's loop dispatches a Sonnet call for some steps and a Haiku call for others (chapter 2.2's model cascade), that's not multi-agent. That's <em>one</em> agent with model-routing per step. The agent has a single coherent state, single conversation history, single loop. No coordination problem exists.</p>
+
+      <p><strong>An agent with many tools.</strong> An agent with web search, database access, code execution, file ops, and email — even 20 tools — is still a single agent. Tools aren't agents. Each tool call is structured and returns to the same agent's loop. The agent doesn't coordinate with itself.</p>
+
+      <p><strong>A pipeline of LLM calls.</strong> A workflow that does "summarize this doc, then translate the summary, then post it to Slack" via three sequential LLM calls is a pipeline, not multi-agent. There's no shared task, no coordination, no decomposition. Each call is its own unit, processed in order.</p>
+
+      <p>Genuine multi-agent has agents with their own <em>independent loops</em> that interact via structured communication. Multiple model calls aren't enough; multiple tools aren't enough; sequential workflows aren't enough. The communication-between-loops is what makes it multi-agent, and that's where the coordination cost lives.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about "agents debating to reach a better answer"? That sounds like a clear multi-agent win.</div>
+        <div class="answer">
+          <p>It's the most-cited pattern in research papers and one of the least-effective in production. The mechanism: spawn two agents, have them argue or critique each other's answers, take the consensus. The hope: errors get caught, reasoning improves.</p>
+          <p>What actually happens, most of the time: the agents converge on whatever was said most confidently first (especially when both agents are the same underlying model — they have correlated reasoning, so they "agree" with each other for the same reasons they'd have produced the same wrong answer alone). The result: 2× cost for marginal quality improvement, often within noise.</p>
+          <p>Where debate does work: when the agents are <em>different models</em> (Claude debating GPT, with their genuinely different training distributions), and when the question has objective verifiable structure (math, code with tests). The papers showing dramatic debate benefits are usually one of these. Generalizing to "any task" doesn't replicate.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about "agent X dynamically deciding to spawn agent Y based on the situation"? That feels powerful.</div>
+        <div class="answer">
+          <p>It's powerful in concept and brittle in practice. The failure mode: agent X has poor judgment about when to spawn agent Y. It spawns too often (cost balloons), too rarely (misses opportunities), or with bad task specs (Y produces useless work).</p>
+          <p>The way this pattern works in production — the chapter 4.3 architecture — is to constrain "dynamic spawning" tightly. The orchestrator decides the decomposition <em>once at planning time</em>, based on the user's query. It doesn't dynamically spawn during execution. This shifts the decision from a hard runtime judgment ("should I create a new agent?") to a one-time planning decision ("what are the sub-questions for this query?"), which is much more reliable.</p>
+          <p>The unrestricted version — agents spawning other agents during execution, recursively, based on their own judgment — is a footgun in current capabilities. It's been demoed; it doesn't ship reliably.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How do I decide between "more tools" and "more agents"?</div>
+        <div class="answer">
+          <p>Default to "more tools" until the four-property test fires. Tools are cheaper, simpler, easier to evaluate, and the agent's reasoning stays in one coherent context. You only reach for "more agents" when one of the four properties strongly applies — and even then, the right shape is usually one orchestrator plus a small number of specialized workers, not a swarm.</p>
+          <p>Heuristic: if you can describe your additional capability as "the agent should be able to do X," that's a tool. If you can describe it as "the agent should be able to delegate Y to a separate context that handles it independently and returns a summary," that's a subagent. Most "I need another agent for this" intuitions turn out to be "I need a better tool for this."</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>The three patterns that work in production.</h3>
+
+      <p>Engineering practice has converged on three multi-agent patterns that ship reliably. Most production multi-agent systems are one of these, occasionally with two combined. The patterns are <strong>orchestrator-worker</strong>, <strong>pipeline</strong>, and <strong>specialized peer routing</strong>. Each has a specific shape, a specific use case, and specific failure modes — and most of the exotic patterns from the research literature are variations on these or genuinely don't generalize.</p>
+
+      <h4>Pattern 1: orchestrator-worker</h4>
+
+      <p>The pattern from chapter 4.3, generalized beyond research. One coordinating agent (orchestrator) decomposes the task, spawns N parallel workers each handling one sub-task, and synthesizes their structured outputs into the final result.</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  PATTERN 1: ORCHESTRATOR-WORKER                             │
+│                                                             │
+│                 ┌───────────────┐                           │
+│   task    →    │ ORCHESTRATOR  │                            │
+│                 │ (plans + sync)│                           │
+│                 └───────┬───────┘                           │
+│                         │                                   │
+│         ┌───────────────┼───────────────┐                   │
+│         ▼               ▼               ▼                   │
+│      ┌─────┐         ┌─────┐         ┌─────┐                │
+│      │ W₁  │         │ W₂  │         │ W₃  │   (parallel)   │
+│      └──┬──┘         └──┬──┘         └──┬──┘                │
+│         │               │               │                   │
+│         └───────────────┼───────────────┘                   │
+│                         ▼                                   │
+│                 ┌───────────────┐                           │
+│                 │  result       │                           │
+│                 └───────────────┘                           │
+│                                                             │
+│  Best for: tasks decomposable into parallel sub-tasks       │
+│  Examples: research, multi-document review, audit-style     │
+│            tasks that fan out then converge                 │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>The structure is simple but it's the workhorse pattern. Anthropic's Research feature uses it. OpenAI's Deep Research uses it. Most "AI does work in parallel" products are this shape under the hood. What makes it work in practice:</p>
+
+      <ul>
+        <li><strong>The orchestrator plans upfront.</strong> All workers are dispatched after one planning step. The orchestrator doesn't make spawning decisions during execution.</li>
+        <li><strong>Workers are stateless w.r.t. each other.</strong> Worker #2 doesn't know about Worker #1's existence, much less their findings. This isolation is the whole point — it's what gives you context isolation and fault containment.</li>
+        <li><strong>Structured worker outputs.</strong> Each worker returns a typed object (per the chapter 4.3 COMPRESSED_FINDING schema), not free-form chat. The orchestrator can reliably parse and synthesize.</li>
+        <li><strong>Sized to the task.</strong> Effort scaling: 2 workers for simple comparisons, 10+ for complex problems. The orchestrator decides at planning time.</li>
+      </ul>
+
+      <p>Where this pattern fits beyond research: legal-document review (each section reviewed by a worker), code audit (each file by a worker), financial analysis (each thesis-line by a worker), customer-feedback synthesis (each cluster by a worker). The common shape: a body of work that splits naturally into independent pieces, each piece can be analyzed alone, and the value comes from synthesizing across them.</p>
+
+      <h4>Pattern 2: pipeline (sequential specialization)</h4>
+
+      <p>A different shape: each agent handles one <em>stage</em> of a fixed workflow, and the output of stage N is the input of stage N+1. No parallelism; the value is role specialization across sequential phases.</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  PATTERN 2: PIPELINE                                        │
+│                                                             │
+│   input →  Agent A  →  Agent B  →  Agent C  →  output       │
+│            (extract)   (analyze)   (format)                 │
+│                                                             │
+│   Each agent:                                               │
+│     • Has its own optimized prompt for its phase            │
+│     • Receives structured input from the previous           │
+│     • Emits structured output for the next                  │
+│     • Knows nothing about earlier/later phases              │
+│                                                             │
+│  Best for: tasks with clearly distinct phases that each     │
+│            need their own prompt-engineering                │
+│  Examples: document → extract entities → classify by type   │
+│            → format as report                               │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>The pipeline pattern wins when the phases of work are genuinely distinct cognitive operations and each benefits from a focused prompt. Classic example: a content moderation pipeline that does (1) extract the claim being made → (2) categorize the claim type → (3) verify against policy → (4) format the moderation decision. Trying to do all four in one prompt produces a long, complex prompt that scores worse on each individual phase.</p>
+
+      <p>What's important to recognize: <strong>a pipeline isn't the same as a multi-step single-agent loop</strong>. The difference is that pipeline stages are independent processes — they don't share conversation state, don't iterate together, don't loop back. Each stage is essentially a structured-input-to-structured-output transformation.</p>
+
+      <p>Anthropic's Claude Code internally uses this for some workflows: a "planning" stage produces a structured plan, the "execution" stage consumes that plan and runs against it, the "verification" stage checks the results. Each stage has its own model and prompt; they're loosely coupled via the structured intermediate outputs.</p>
+
+      <p>The trade-off: pipelines lose the flexibility of an agent loop. If stage B realizes that stage A's extraction was wrong, it can't go back — it has to either work with the wrong extraction or fail. Pipelines fit when the phases are well-understood and stable; they don't fit when the work has to iterate.</p>
+
+      <h4>Pattern 3: specialized peer routing</h4>
+
+      <p>A small set of agents with distinct roles, and a routing layer that decides which agent handles which request. The agents themselves don't communicate directly; the router does the dispatch.</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  PATTERN 3: SPECIALIZED PEER ROUTING                        │
+│                                                             │
+│                 ┌──────────────┐                            │
+│   request  →   │   ROUTER     │                             │
+│                 │ (classifies) │                            │
+│                 └──────┬───────┘                            │
+│                        │                                    │
+│      ┌─────────────────┼─────────────────┐                  │
+│      ▼                 ▼                 ▼                  │
+│   ┌────────┐       ┌────────┐       ┌────────┐              │
+│   │Billing │       │Tech    │       │Account │              │
+│   │ agent  │       │support │       │mgmt    │              │
+│   └────────┘       └────────┘       └────────┘              │
+│   (each tuned for one domain)                               │
+│                                                             │
+│  Best for: support systems with distinct request types      │
+│            requiring different tools/prompts                │
+│  Examples: customer support triage, multi-domain assistant  │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>This is the support-agent pattern most enterprise deployments converge on. A customer asks a question; a routing model classifies it (billing question? technical support? account management?); the right specialized agent handles it. Each specialized agent has its own tools, system prompt, and domain knowledge.</p>
+
+      <p>The win: each agent can be deeply tuned for its domain — the billing agent has access to billing-system APIs and a system prompt with billing-specific rules; the tech-support agent has docs and runbooks for the product. Trying to make one agent good at all of these produces a generalist that's mediocre at each.</p>
+
+      <p>Two important variants:</p>
+
+      <p><strong>Pure routing</strong>: the router picks one agent and that agent handles the entire conversation. Simple, clear escalation paths. Limitation: if the conversation drifts into another domain mid-way, you need explicit re-routing.</p>
+
+      <p><strong>Routing with handoff</strong>: a specialized agent can hand off to a peer if the question turns out to be outside its domain. More flexible, but the handoff protocol becomes a coordination problem. Implementation: the agent emits a special "handoff" tool result that the router interprets to redirect.</p>
+
+      <h4>Picking the right pattern</h4>
+
+      <p>The decision often comes down to the shape of your task:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Task shape</div>
+          <div>Right pattern</div>
+          <div>Why</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Fan out, then synthesize across many pieces</div>
+          <div class="vector">Orchestrator-worker</div>
+          <div class="defense">Parallelism + context isolation + structured synthesis</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Sequential phases, each different cognitively</div>
+          <div class="vector">Pipeline</div>
+          <div class="defense">Role specialization, structured intermediate outputs</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Many distinct request types from users</div>
+          <div class="vector">Specialized peer routing</div>
+          <div class="defense">Each domain agent stays focused and tunable</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Single ongoing conversation, iterative</div>
+          <div class="vector">Single agent (not multi-agent)</div>
+          <div class="defense">Multi-agent overhead doesn't pay for iterative work</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Code generation, then verification</div>
+          <div class="vector">Single agent (chapter 4.1)</div>
+          <div class="defense">The "verification" is tool use, not another agent</div>
+        </div>
+      </div>
+
+      <h4>Combinations: when patterns layer</h4>
+
+      <p>Production systems sometimes layer patterns. The most common combination: <strong>specialized peer routing at the top, with each specialized agent itself using orchestrator-worker for complex tasks within its domain</strong>. A customer-support deployment might route a "complex billing dispute" to the billing agent, which then spawns workers to investigate different aspects of the dispute in parallel.</p>
+
+      <p>The general principle: layering is fine when each layer's pattern fits the problem at that level. Don't layer patterns just to be sophisticated; layer them when the additional structure genuinely matches the work.</p>
+
+      <p>The anti-pattern: layering patterns to fit a framework you've adopted, regardless of whether the layering helps. A common failure: someone adopts CrewAI or LangGraph, builds a 7-agent system where one would have worked, and ships a system that's 10× more expensive and harder to evaluate than the simple version.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about the "manager-worker-evaluator" pattern, where an evaluator agent grades the worker's output and feeds back?</div>
+        <div class="answer">
+          <p>This is real and works in specific cases — it's essentially the LLM-as-judge pattern (chapter 3.3) embedded in the agent loop. The worker produces a candidate output, the evaluator scores it, and either the worker iterates or the output ships.</p>
+          <p>Where it works: tasks with clear quality criteria the evaluator can apply (code with tests, structured output matching a schema, document containing required sections). The evaluator's prompt is focused on grading, the worker's on producing.</p>
+          <p>Where it breaks: when the evaluator's standards drift or the worker can't act on the evaluator's feedback (the worker rewrites everything from scratch each iteration instead of revising). Both are common failure modes in production. If you adopt this pattern, instrument it carefully — and have a clear iteration cap so you don't loop forever.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Are frameworks like LangGraph, CrewAI, AutoGen worth using for multi-agent?</div>
+        <div class="answer">
+          <p>Sometimes. They give you primitives (agent definitions, message passing, state graphs) that match the patterns above. Used well, they save you from reinventing coordination plumbing.</p>
+          <p>Used poorly, they encourage over-engineering — making it easy to spin up many agents tempts you to use many agents whether the problem needs them or not. The frameworks themselves aren't the issue; the encouragement to "make it more agentic" is.</p>
+          <p>The pragmatic test: if you can articulate which of the three patterns above you're implementing and why, the framework is a good fit. If you're using the framework's "agent network" or "swarm" features because they sound cool, you're likely over-engineering. Most production multi-agent systems are simple enough that you don't strictly need a framework — but the frameworks are convenient and not harmful when used with discipline.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How do agents in these patterns actually communicate? Function calls? Message queues? Shared state?</div>
+        <div class="answer">
+          <p>Three options, with different trade-offs:</p>
+          <ul>
+            <li><strong>Direct function calls / structured returns.</strong> The orchestrator-worker pattern usually uses this. The orchestrator calls <code class="inline">await run_subagent(...)</code> and the subagent's structured output is the return value. Simplest, in-process, no infrastructure required.</li>
+            <li><strong>Message queues (Redis streams, SQS).</strong> Useful when sub-agents are independent processes that might be on different machines. Adds operational complexity. Use this when you need to scale sub-agents independently of the orchestrator, or when sub-agent runs are long enough to need durability.</li>
+            <li><strong>Shared state (database, key-value store).</strong> Some patterns benefit from sub-agents reading shared state. The pipeline pattern uses this implicitly (the output of stage A is read by stage B). Other multi-agent patterns mostly avoid shared mutable state because it creates coordination headaches.</li>
+          </ul>
+          <p>Default: structured function calls. Reach for queues or shared state only when the architecture genuinely needs them.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Coordination: the hard part.</h3>
+
+      <p>Multi-agent's reputation as fragile-in-production isn't because the patterns are bad — they're solid. The fragility lives in <em>coordination</em>: how agents pass work to each other, how failures are handled, how partial successes are reconciled. Coordination problems sink more multi-agent systems than agent-quality problems do. This step covers the patterns that hold up.</p>
+
+      <h4>Task specification: the highest-leverage discipline</h4>
+
+      <p>Chapter 4.3 named this in the research-agent context; it generalizes. The most important determinant of multi-agent quality is <strong>how well the orchestrator describes each sub-task to the worker</strong>. Sloppy task specs produce sloppy work; tight task specs produce tight work.</p>
+
+      <p>A good task spec contains five elements:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Element</div>
+          <div>What it specifies</div>
+          <div>Why it matters</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Objective</div>
+          <div class="vector">The single concrete question this worker answers</div>
+          <div class="defense">Without this, workers wander or duplicate each other</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Scope boundaries</div>
+          <div class="vector">What's in-scope and what's NOT</div>
+          <div class="defense">Prevents scope drift; flags genuine ambiguity</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Tool grants</div>
+          <div class="vector">Which tools this worker may use</div>
+          <div class="defense">Narrow toolsets focus the worker; broad toolsets confuse it</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Budget</div>
+          <div class="vector">Maximum tool calls or token spend</div>
+          <div class="defense">Hard cap prevents runaway sub-agents</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Output schema</div>
+          <div class="vector">Exact structure of the expected return</div>
+          <div class="defense">Makes synthesis reliable; prevents free-form mush</div>
+        </div>
+      </div>
+
+      <p>An orchestrator that emits task specs with all five elements gets dramatically better worker output than one that emits "investigate X." This is exactly the discipline chapter 4.3 covered for research; it applies to every orchestrator-worker setup.</p>
+
+      <p>Concretely in code:</p>
+
+<pre class="standalone"><span class="c-cm"># Bad: vague task spec</span>
+<span class="c-kw">await</span> run_worker(<span class="c-st">"Investigate Acme's recent product launches"</span>)
+
+<span class="c-cm"># Good: complete task spec</span>
+<span class="c-kw">await</span> run_worker(
+    objective=<span class="c-st">"Identify product launches by Acme Corp in the last 6 months "</span>
+              <span class="c-st">"with launch date, product name, and one-sentence positioning"</span>,
+    scope_in=[<span class="c-st">"products launched publicly"</span>,
+              <span class="c-st">"feature releases announced as 'new product'"</span>],
+    scope_out=[<span class="c-st">"feature updates to existing products"</span>,
+               <span class="c-st">"acquisitions"</span>,
+               <span class="c-st">"hiring announcements"</span>],
+    tools=[<span class="c-st">"web_search"</span>, <span class="c-st">"web_fetch"</span>],
+    budget_tool_calls=<span class="c-st">10</span>,
+    output_schema=PRODUCT_LAUNCH_SCHEMA,   <span class="c-cm"># typed object</span>
+)</pre>
+
+      <p>The good version is much more code at the call site, but it's the same effort the orchestrator has to do <em>somehow</em> — better in structured task-spec code than ad-hoc in a prompt string. The structured spec is also easier to log, audit, and reuse.</p>
+
+      <h4>Failure handling: every worker can fail</h4>
+
+      <p>The naive multi-agent implementation assumes workers succeed. They don't. A worker can fail in several distinct ways, and a robust system handles each.</p>
+
+      <p><strong>Hard failure: the worker errors out.</strong> Network issue, API rate limit, exception in the loop. The orchestrator's <code class="inline">await</code> raises. Easiest to handle: catch, log, decide whether to retry or skip. A worker that hard-fails on transient errors gets one retry; on persistent errors gets logged and skipped (with the sub-question noted as unanswered in the final output).</p>
+
+      <p><strong>Soft failure: the worker returns, but its output is bad.</strong> The structured output validates against the schema but the content is wrong — empty findings, off-topic results, hallucinated sources. Harder to handle because the orchestrator can't tell from the return value alone. Detection patterns: schema-level checks ("at least N claims required"), content-level checks (an LLM judge inspects the worker's output for "did this actually answer the sub-question?"), source-validity checks (sources must resolve to real URLs).</p>
+
+      <p><strong>Timeout: the worker never returns.</strong> Stuck in a loop, or just slow. The orchestrator's wait blocks. Mitigation: each worker call has a wall-clock timeout (typically 2–5× the budgeted runtime). On timeout, the worker is canceled and treated as a soft failure.</p>
+
+      <p><strong>Partial success: the worker returns a degraded but usable output.</strong> "Only investigated 2 of the 3 sources I planned." "Found 1 of the expected 5 claims." The orchestrator includes this in synthesis with a note about the limitation, rather than treating it as either complete success or total failure.</p>
+
+<pre class="standalone"><span class="c-cm"># Failure-aware worker invocation</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">run_worker_safe</span>(task_spec, timeout_s=<span class="c-st">300</span>):
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> asyncio.wait_for(
+            run_worker(**task_spec),
+            timeout=timeout_s,
+        )
+        <span class="c-cm"># Soft-failure check: did the worker actually do useful work?</span>
+        <span class="c-kw">if not</span> validate_worker_output(result, task_spec):
+            <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"soft_fail"</span>,
+                    <span class="c-st">"reason"</span>: <span class="c-st">"output did not meet quality bar"</span>,
+                    <span class="c-st">"partial"</span>: result}
+        <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"success"</span>, <span class="c-st">"result"</span>: result}
+    <span class="c-kw">except</span> asyncio.TimeoutError:
+        <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"timeout"</span>, <span class="c-st">"task_spec"</span>: task_spec}
+    <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+        <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"error"</span>, <span class="c-st">"error"</span>: <span class="c-kw">str</span>(e),
+                <span class="c-st">"task_spec"</span>: task_spec}
+
+<span class="c-cm"># Orchestrator gathers all worker results, including failures</span>
+worker_results = <span class="c-kw">await</span> asyncio.gather(*[
+    run_worker_safe(spec) <span class="c-kw">for</span> spec <span class="c-kw">in</span> task_specs
+])
+
+successes  = [w[<span class="c-st">"result"</span>] <span class="c-kw">for</span> w <span class="c-kw">in</span> worker_results <span class="c-kw">if</span> w[<span class="c-st">"status"</span>] == <span class="c-st">"success"</span>]
+soft_fails = [w <span class="c-kw">for</span> w <span class="c-kw">in</span> worker_results <span class="c-kw">if</span> w[<span class="c-st">"status"</span>] == <span class="c-st">"soft_fail"</span>]
+hard_fails = [w <span class="c-kw">for</span> w <span class="c-kw">in</span> worker_results <span class="c-kw">if</span> w[<span class="c-st">"status"</span>] <span class="c-kw">in</span> {<span class="c-st">"timeout"</span>, <span class="c-st">"error"</span>}]</pre>
+
+      <p>The synthesis step then handles each category appropriately — include successes, mention soft failures as partial information, note hard failures as gaps. The final output is honest about what worked and what didn't.</p>
+
+      <h4>The "structured output for handoffs" principle</h4>
+
+      <p>The most common multi-agent failure mode: free-form chat being passed between agents. Agent A writes "I found that the customer's last payment was 2024-03-15 and the amount was $1,200." Agent B has to parse this from natural language. Sometimes the parsing works; sometimes it doesn't; the inconsistency is invisible until it bites you.</p>
+
+      <p>The fix: <strong>every inter-agent handoff goes through a typed schema, not free-form text</strong>. Agent A doesn't write a sentence about the payment — it emits a structured object: <code class="inline">{"last_payment_date": "2024-03-15", "last_payment_amount_usd": 1200.00}</code>. Agent B receives this object directly. No parsing required.</p>
+
+      <p>This is the equivalent of the citation-discipline argument from chapter 4.3: <em>structural commitments prevent classes of errors that documentation can't</em>. A schema enforces what a prompt-instruction can only request. The agents can still produce explanatory text — but the load-bearing communication is structured.</p>
+
+      <h4>The token cost of coordination, made honest</h4>
+
+      <p>The chapter 4.3 number (15× chat) is the baseline. Three operational realities make it potentially worse if not managed:</p>
+
+      <p><strong>Each worker's context includes redundant material.</strong> Every worker needs to know the original task, the relevant sub-question, the tool docs, the output schema. This baseline context is duplicated across N workers. Mitigation: prompt caching (chapter 2.2) on the per-worker boilerplate cuts this substantially.</p>
+
+      <p><strong>The orchestrator's synthesis context includes everyone's summaries.</strong> If 10 workers each return a 500-token finding, the orchestrator's synthesis call has 5,000 tokens of input on top of its own context. Mitigation: structured findings (not chat text) are more compact than prose summaries.</p>
+
+      <p><strong>Failed/retried workers double-pay.</strong> If a worker times out and is retried, you paid for both attempts. Mitigation: identify the soft-failure pattern and abandon (don't retry) when retry is unlikely to help; track retry rates per worker type as a metric.</p>
+
+      <p>A well-engineered multi-agent system runs at 10–15× single-agent cost. A poorly engineered one runs at 30–50×. The difference is exactly these three coordination economies. They sound boring; they're where the cost savings live.</p>
+
+      <h4>The patterns that look good in papers and break in production</h4>
+
+      <p>For honesty, the multi-agent patterns that the literature is enthusiastic about and that production teams have largely abandoned:</p>
+
+      <p><strong>Free-form agent debate.</strong> Multiple agents critique each other's outputs through chat. Sounds powerful; in practice produces ~5% quality improvement at 3-5× cost. Same-model debate is especially weak. Cross-model debate (Claude + GPT) sometimes works for verifiable tasks but most teams don't ship it.</p>
+
+      <p><strong>Hierarchical agent trees.</strong> Manager spawns sub-managers, who spawn workers. Cost compounds exponentially with depth; coordination becomes intractable. Production systems max out at one level of delegation.</p>
+
+      <p><strong>Open-ended agent societies.</strong> A "team" of agents with roles (CEO, engineer, marketer) that "collaborate" on tasks. Demos well, ships poorly. The collaboration is too unstructured; agents talk past each other, duplicate work, fail to converge.</p>
+
+      <p><strong>Self-modifying agent systems.</strong> Agents that update their own prompts based on performance. Demoed; the loop doesn't converge. The agent's judgment about its own prompt isn't reliable enough to drive prompt improvement autonomously.</p>
+
+      <p>None of these are <em>impossible</em> — they may work in the future, with better models or with novel techniques. They don't ship reliably in 2026. If you're building a multi-agent system right now, stick to the three patterns from Step 2.</p>
+
+      <div class="callout warn">
+        <p>The framework that helps you distinguish "exciting multi-agent paper" from "production-shipping multi-agent system": ask whether the paper's success is measured on closed-domain benchmarks (where coordination overhead is amortized over many runs and tuning is possible) versus open-ended production traffic (where coordination overhead hits every query and tuning has to generalize). Many patterns that beat baselines on benchmarks don't survive open-ended production traffic.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What's a reasonable retry strategy for failed workers?</div>
+        <div class="answer">
+          <p>Three levels:</p>
+          <ul>
+            <li><strong>Hard failures (network errors, timeouts):</strong> retry once with exponential backoff. If retry fails too, the worker is dead — note the gap and continue.</li>
+            <li><strong>Soft failures (bad output):</strong> retry zero or one times, with a different prompt that includes feedback ("your previous answer didn't include the required claims; please ensure..."). If the second attempt also soft-fails, escalate (different model, different scoping, or skip).</li>
+            <li><strong>Don't retry indefinitely.</strong> Set a per-task retry budget (typically 2 retries max) and respect it. Infinite retry is how you turn a 5-minute multi-agent run into a 30-minute one without improving quality.</li>
+          </ul>
+          <p>Log retry rates per worker type. High retry rates indicate a worker's prompt or task spec needs work, not that you need more retries.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How do I debug a multi-agent system when something goes wrong?</div>
+        <div class="answer">
+          <p>Observability is non-negotiable (chapter 2.1). Every agent's full conversation, every tool call, every structured handoff, every retry — all spans, all traced. When something breaks in production, you'll be reading these traces to figure out which agent did what, in what order, with what inputs.</p>
+          <p>Specific things to instrument that single-agent systems don't need:</p>
+          <ul>
+            <li>Per-worker latency and token cost (so you can spot the one expensive worker).</li>
+            <li>Worker output validation rate (how often workers produce schema-conforming output the first time vs need a retry).</li>
+            <li>Synthesis-input size (the orchestrator's context just before synthesis — bloat here is a warning).</li>
+            <li>End-to-end latency P95 (parallelism should make this bounded by max(workers); if it's growing, something's gone serial).</li>
+          </ul>
+          <p>Teams that ship multi-agent without proper observability spend their first month firefighting things they could have prevented with proper traces.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">When sub-agents need to share state during execution (not just at the end), how do I do that without breaking context isolation?</div>
+        <div class="answer">
+          <p>Three options, in increasing order of intrusiveness:</p>
+          <ul>
+            <li><strong>Shared blackboard via tool.</strong> Add a <code class="inline">post_finding</code> tool that sub-agents can call to publish a finding to a shared blackboard, and a <code class="inline">read_blackboard</code> tool to consume what others have posted. Each sub-agent only sees the blackboard when it chooses to. Doesn't bloat the per-agent context until needed.</li>
+            <li><strong>Orchestrator-mediated relay.</strong> Sub-agents send messages to the orchestrator (via structured output); the orchestrator decides what to relay to whom. More controlled, more code; useful when "who needs to know what" is policy-driven.</li>
+            <li><strong>Direct sub-agent communication.</strong> Rarely a good idea. Hard to reason about; coordination problems multiply.</li>
+          </ul>
+          <p>For most cases, the simpler design — sub-agents work in isolation and the orchestrator handles synthesis at the end — is enough. Reach for shared state only when sub-agents genuinely benefit from each other's findings mid-execution, which is less often than it sounds.</p>
+        </div>
+      </div>
+    </div>
+
+
+    
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Evaluating a multi-agent system.</h3>
+
+      <p>A single-agent system has one set of metrics — task-level success, cost, latency. A multi-agent system has all those <em>plus</em> a layer of metrics specific to the multi-agent structure: how well does the orchestrator decompose? How well do workers complete their tasks? How well does synthesis combine them? Evaluating the system requires looking at each layer.</p>
+
+      <h4>The two-layer eval structure</h4>
+
+      <p>For any orchestrator-worker system, two distinct evaluation questions:</p>
+
+      <p><strong>Layer 1: end-to-end quality.</strong> Did the final output meet user needs? This is the chapter 3.1 eval applied unchanged. From the user's perspective, all that matters is the output — they don't care how many agents were involved.</p>
+
+      <p><strong>Layer 2: per-agent quality.</strong> How well did each agent do its job? This is multi-agent-specific. Three sub-questions: did the orchestrator decompose the task sensibly? Did each worker complete its assigned sub-task? Did the synthesis preserve and combine the workers' findings faithfully?</p>
+
+      <p>Why both layers: if your end-to-end quality is bad, you need the per-agent diagnostics to know <em>where</em> the failure originated. A poor output could be the orchestrator's planning failure, a worker's investigation failure, or the synthesis losing what the workers found. Without layer-2 metrics, you can't distinguish these — and you don't know which prompt to fix.</p>
+
+      <h4>Orchestrator quality: did the decomposition make sense?</h4>
+
+      <p>The first thing to grade. Given a user query, did the orchestrator's plan break it into sensible sub-questions? Three concrete checks:</p>
+
+      <p><strong>Coverage.</strong> Do the sub-questions, taken together, address the user's full query? An LLM judge can grade this: given the user query and the orchestrator's plan, are there obvious aspects of the query that aren't covered by any sub-question?</p>
+
+      <p><strong>Non-overlap.</strong> Do the sub-questions duplicate each other? (Chapter 4.3's named failure mode — two sub-agents investigating the same thing in parallel.) Judge: do these sub-questions describe distinct investigations?</p>
+
+      <p><strong>Right-sizing.</strong> Is the number of sub-agents appropriate to the question complexity? Anthropic's documented rules (1 for fact-check / 2-4 for comparison / 10+ for complex research) make this measurable: take a labeled dataset of queries with their expected complexity tier, run the orchestrator, check whether the actual number of sub-agents matches.</p>
+
+      <p>These three metrics let you measure orchestrator quality without grading downstream worker output, which is essential — you want to be able to fix the orchestrator independent of fixing workers.</p>
+
+      <h4>Worker quality: did each worker complete its task?</h4>
+
+      <p>For each worker invocation, two questions:</p>
+
+      <p><strong>Schema-validity.</strong> Did the worker emit structured output matching the expected schema? This is binary — output either validates or doesn't. Track the validity rate as a per-worker-type metric. Drops indicate prompt issues with that worker type.</p>
+
+      <p><strong>Task-completion.</strong> Given the task spec and the worker's output, did the worker actually answer its sub-question? An LLM judge grades this: read the task spec, read the output, is the output a substantive answer to the spec's objective?</p>
+
+      <p>The task-completion check is the one that catches "worker returned a schema-valid object full of nothing." A worker that hit its tool budget without finding answers might emit an empty findings array — schema-valid, task-incomplete.</p>
+
+      <h4>Synthesis quality: did the orchestrator faithfully combine?</h4>
+
+      <p>The final step, and the one most likely to silently degrade. Chapter 4.3's citation-faithfulness check applies directly: every substantive claim in the synthesized output should trace to a worker's finding. The worker findings themselves are already source-attributed; the synthesis just needs to preserve the attribution.</p>
+
+      <p>Two specific failure modes to test for:</p>
+
+      <p><strong>Confabulation in synthesis.</strong> The synthesizer adds claims that weren't in any worker's findings, drawing from training data without source. Detection: for each claim in the output, trace it to a worker finding; if no match, flag.</p>
+
+      <p><strong>Dropped findings.</strong> The synthesizer omits relevant findings from workers (perhaps because the synthesizer's context was busy with other findings). Detection: count workers whose findings appear in the synthesis vs. workers whose findings are absent. If a worker's substantive findings are absent from the synthesis without justification, flag.</p>
+
+      <h4>The combined eval dashboard</h4>
+
+      <p>For a multi-agent system in production, the metrics worth tracking, in priority order:</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  MULTI-AGENT EVAL DASHBOARD                                 │
+│                                                             │
+│  End-to-end (the user's perspective):                       │
+│   ─ task_completion_rate     (0-1)                          │
+│   ─ end_to_end_latency_p95   (seconds)                      │
+│   ─ cost_per_run_usd         (dollars)                      │
+│   ─ citation_faithfulness    (0-1)                          │
+│                                                             │
+│  Orchestrator-specific:                                     │
+│   ─ plan_coverage_score      (0-1 judge)                    │
+│   ─ subquestion_overlap_rate (0-1 judge, lower better)      │
+│   ─ subagent_count_p50/p95   (calibration vs complexity)    │
+│                                                             │
+│  Worker-specific (per worker type):                         │
+│   ─ schema_validity_rate     (0-1)                          │
+│   ─ task_completion_rate     (0-1 judge)                    │
+│   ─ retry_rate               (0-1, lower better)            │
+│   ─ tool_budget_utilization  (mean fraction of budget used) │
+│                                                             │
+│  Synthesis-specific:                                        │
+│   ─ confabulation_rate       (0-1, lower better)            │
+│   ─ dropped_findings_rate    (0-1, lower better)            │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>This is more instrumentation than a single-agent system needs, and it's the cost of running multi-agent in production. The metrics aren't optional — without them, when end-to-end quality degrades, you have no way to localize the regression. With them, "orchestrator's plan_coverage dropped 8 points after Tuesday's deploy" tells you exactly what to look at.</p>
+    </div>
+
+    
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>A customer-support triage system, traced through the patterns it earned.</h3>
+
+      <p>To anchor everything in this chapter concretely: a real-shape system that started simple and ended multi-agent — but only after the team had clear evidence the simpler version didn't work. The honest version of "we became multi-agent because we had to," not "we were multi-agent from day one."</p>
+
+      <h4>The setup</h4>
+
+      <p>A SaaS company's customer support is overwhelmed. Tickets arrive at 800/day; the team can answer ~600. The 200 that don't get answered create churn risk. They want an AI agent to handle the simple ones, freeing humans for the hard ones.</p>
+
+      <p>The product requirement: handle tickets where the answer is unambiguous, escalate to humans on anything ambiguous, never make things worse (no wrong answers to billing questions, no incorrect technical guidance).</p>
+
+      <h4>Week 1: single-agent attempt</h4>
+
+      <p>The team's first build: one Sonnet-based agent with web access, knowledge-base search, account-lookup tool, and "respond" + "escalate to human" actions. System prompt: "You are a customer support agent. Handle the ticket if you can answer confidently; escalate if you can't."</p>
+
+      <p>Results after a week on shadow traffic (the agent's responses are produced but not sent; humans evaluate retroactively):</p>
+
+      <ul>
+        <li>Tickets confidently handled: 68% (target: 70%, close)</li>
+        <li>Wrong-answer rate: 14% (target: &lt;2%, dramatic miss)</li>
+        <li>Escalation rate: 32% (target: 30%, fine)</li>
+      </ul>
+
+      <p>The wrong-answer rate is the killer. The agent confidently answered billing questions with technical-support reasoning, gave incorrect refund guidance, and misclassified account types. The team's investigation: the single agent's system prompt was trying to handle "billing rules" + "technical troubleshooting" + "account management" + "escalation judgment" all at once, and was mediocre at each.</p>
+
+      <h4>Week 2: pattern 3 — specialized peer routing</h4>
+
+      <p>The team adopts the pattern-3 (specialized peer routing) architecture. Three specialized agents (billing, tech support, account management) each with their own system prompt and tools, plus a routing agent that classifies incoming tickets and dispatches to the right specialist.</p>
+
+      <p>Each specialist has only the tools relevant to its domain — the billing agent has access to billing APIs but not technical knowledge-base; the tech agent has KB access but not billing systems. This is itself a major improvement: incorrect tool use is impossible.</p>
+
+      <p>Results after a week:</p>
+
+      <ul>
+        <li>Tickets confidently handled: 71%</li>
+        <li>Wrong-answer rate: 3.2% (much better, still missing the &lt;2% target)</li>
+        <li>Escalation rate: 28%</li>
+      </ul>
+
+      <p>The wrong-answer rate dropped a lot but isn't yet acceptable. Investigation: most remaining wrong answers are in the routing step — the router classifies a ticket as "billing" when it's actually a technical issue about a paid feature, and the billing agent confidently produces wrong technical guidance.</p>
+
+      <h4>Week 3: adding orchestrator-worker for complex cases</h4>
+
+      <p>The team adds a layer: complex tickets (multi-topic, ambiguous category, or VIP customer) get routed to an "orchestrator" path instead of directly to a specialist. The orchestrator does pattern 1 — it dispatches sub-questions to relevant specialists in parallel and synthesizes their answers.</p>
+
+      <p>This is more expensive (10× per ticket) but only fires on the ~15% of tickets that need it. For the other 85%, the cheap routing path still applies.</p>
+
+      <p>Results after a week:</p>
+
+      <ul>
+        <li>Tickets confidently handled: 73%</li>
+        <li>Wrong-answer rate: 1.4% (under target!)</li>
+        <li>Escalation rate: 26%</li>
+        <li>Cost: $0.04 per ticket average ($0.02 for simple, $0.40 for complex)</li>
+      </ul>
+
+      <p>The wrong-answer rate is now acceptable. The architectural shape: pattern 3 (routing) for the common case, pattern 1 (orchestrator-worker) for the edge cases. The composition isn't elegant in any abstract sense — it's an honest response to the failure modes the team actually hit.</p>
+
+      <h4>The failure mode that surfaced in week 4</h4>
+
+      <p>Production-quality at end of week 3. Week 4 brought a different problem: end-to-end latency for the complex-case path was 12 seconds (5 sub-agents running in parallel, plus orchestrator overhead). Customers noticed the lag and abandoned. The 12% of customers on the complex path were responding to "are you still there?" before the agent's response arrived.</p>
+
+      <p>The team's fix: streaming partial responses to the customer as sub-agents complete, with a status indicator ("checking your account... looking up your invoice... preparing your response..."). End-to-end latency unchanged, perceived latency dropped to ~3 seconds (chapter 2.4's streaming pattern). Customer abandonment on the complex path dropped to baseline.</p>
+
+      <p>This is a chapter 2.4 problem, not a multi-agent problem — but it surfaces in multi-agent contexts more often because the operations are longer-running.</p>
+
+      <h4>What the trace teaches</h4>
+
+      <p>Three lessons that generalize beyond this specific system:</p>
+
+      <p><strong>Don't start multi-agent.</strong> The team's instinct could have been "this is a multi-domain problem, let's build multi-agent from day one." They didn't — they tried single-agent first, found specific failure modes, then adopted multi-agent patterns to address specific failures. The eventual architecture is justified <em>because</em> the team can name the specific problems multi-agent solved.</p>
+
+      <p><strong>Compose patterns based on real needs.</strong> The final shape (routing + orchestrator-worker for edge cases) isn't a textbook pattern. It's two patterns layered because the team had two distinct problems (most tickets are simple-and-specialized; some tickets are complex-and-cross-domain). Both needed solving; the architecture is the union of solutions.</p>
+
+      <p><strong>Operations problems compound with multi-agent.</strong> Latency, observability, cost — all get harder. Each new agent in the system is another moving part. Plan for the operational reality, not just the agent-quality story.</p>
+
+      <div class="observe">
+        <div class="label">The honest economics of multi-agent</div>
+        <p>This system runs at about $0.04 per ticket average — a 10× cost increase from a naive single-agent baseline, but still small in absolute terms. The cost is more than justified because the alternative (200 unhandled tickets per day creating churn) is far more expensive. Multi-agent's reputation for being expensive is true relative to single-agent baselines; it's cheap relative to the human-labor it replaces. Whether your specific problem fits depends on the relative costs in your situation.</p>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 4.4</div>
+      <h3>Deliverable</h3>
+      <p>A working understanding of multi-agent systems as a specific tool with real costs and real benefits. The four-property test for when multi-agent is justified. The three patterns that ship in production (orchestrator-worker, pipeline, specialized peer routing) and what each is good for. The coordination disciplines (task specs, structured handoffs, failure handling) that determine whether the architecture works or breaks. The two-layer evaluation framework that lets you debug multi-agent failures. The honest discussion of patterns that don't ship despite literature enthusiasm. Most importantly: the discipline to default to single-agent and only reach for multi-agent when the four properties strongly apply.</p>
+      <ul class="checklist">
+        <li>Four-property test applied to a candidate problem; multi-agent justified only with 3+ matches</li>
+        <li>Pattern selected based on task shape (orchestrator-worker / pipeline / peer routing)</li>
+        <li>Task specs include objective, scope, tools, budget, output schema</li>
+        <li>Inter-agent handoffs are structured (typed schemas), never free-form chat</li>
+        <li>Failure handling for hard fails (retry-once), soft fails (retry-with-feedback), timeouts (wall-clock), partial successes</li>
+        <li>Per-worker retry budgets enforced (max 2); retry rate tracked as a metric</li>
+        <li>Prompt caching applied to per-worker boilerplate to limit token bloat</li>
+        <li>Observability instruments per-worker latency, schema validity, retry rate</li>
+        <li>Two-layer eval: end-to-end metrics AND per-agent diagnostics</li>
+        <li>Orchestrator-specific evals: coverage, non-overlap, right-sizing</li>
+        <li>Synthesis-specific evals: confabulation rate, dropped-findings rate</li>
+        <li>Default position: single-agent until specific failure modes justify decomposition</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('x3')">
+        <div class="dir">← prev</div>
+        <div class="title">4.3 Research agents</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('r1')">
+        <div class="dir">next →</div>
+        <div class="title">5.1 Frontier reading</div>
+      </button>
+    </div>
+  </section>
