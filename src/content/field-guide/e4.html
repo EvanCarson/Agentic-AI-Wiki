@@ -1,0 +1,796 @@
+<section class="phase">
+    <div class="phase-num">3.4</div>
+    <div class="week">Part III / Evaluate · The runtime substrate for evals, and the calibration that situates you in the landscape</div>
+    <h2>Benchmarks &amp; CI: external calibration and the rhythm that makes evals work.</h2>
+    <p class="goal">Public benchmarks (SWE-bench, GAIA, OSWorld, WebArena, τ-bench, AgentBench) shape how the field talks about agent quality — and most teams use them wrong. CI is where Layer 2 evals from chapter 3.2 actually run on every PR — and most teams set this up poorly enough that the eval rhythm from chapter 3.1 doesn't happen in practice. This chapter is about both: what public benchmarks are honestly good for (and what they aren't), how to build your own benchmark when public ones don't fit, and the CI patterns that make eval-driven development a real-time discipline instead of an aspiration. By the end you'll know which benchmarks to look at and how to read them, when to build your own, and how to architect the CI plumbing that turns chapter 3.2's three layers into a working release process.</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Public benchmarks: what they're good for, and what they aren't.</h3>
+
+      <p>The naive position on agent benchmarks: pick a leaderboard, run your agent, compare your score to others. Higher is better. Use the number in marketing.</p>
+
+      <p>The honest position, after the 2024-2026 generation of benchmarks has been thoroughly examined: <strong>public benchmark scores are weakly correlated with product quality, and using them as quality targets gets you optimization without improvement</strong>. The reasons are specific and well-documented, and understanding them is what separates a team that uses benchmarks usefully from one that ships against them and is surprised when users don't experience the gains.</p>
+
+      <h4>The current public benchmark landscape</h4>
+
+      <p>For context, the benchmarks that matter for agent work as of mid-2026:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Benchmark</div>
+          <div>What it measures</div>
+          <div>State of the art (approx.)</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">SWE-bench Verified</div>
+          <div class="vector">500 real GitHub bug-fix tasks; pass rate when patch makes tests pass</div>
+          <div class="defense">~87% (Opus 4.7); ~85% (GPT-5 Codex)</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">GAIA</div>
+          <div class="vector">466 multi-step tool-use tasks; exact-match grading on final answer</div>
+          <div class="defense">~75% on HAL; human baseline ~92%</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">WebArena</div>
+          <div class="vector">812 long-horizon browser tasks in a controlled environment</div>
+          <div class="defense">~68% top systems; human baseline ~78%</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">OSWorld</div>
+          <div class="vector">369 cross-app desktop computer-use tasks</div>
+          <div class="defense">~38% top systems; massive human-AI gap</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">τ-bench (Tau-Bench)</div>
+          <div class="vector">Tool-use with simulated users, policy adherence checked</div>
+          <div class="defense">Mid-70s on simple tracks, lower on reliability tracks</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">AgentBench</div>
+          <div class="vector">Diagnostic suite across 8 different environments</div>
+          <div class="defense">Used as breadth check more than ranking</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">METR HCAST / Time Horizons</div>
+          <div class="vector">Longest task an agent can complete with 50% reliability</div>
+          <div class="defense">Sub-hour for current frontier agents</div>
+        </div>
+      </div>
+
+      <p>These benchmarks have real value when used correctly. The problem is mostly in how they're <em>used</em>, not in the benchmarks themselves.</p>
+
+      <h4>The four reasons public benchmark scores mislead</h4>
+
+      <p>Four specific problems compound to make published benchmark scores less informative than they look.</p>
+
+      <p><strong>1. Contamination.</strong> Many benchmarks ship publicly with their answers, expected outputs, or solution traces somewhere in the training data of models that came later. SWE-bench Verified — built from public GitHub issues — has its solutions in the git history of the same repositories. WebArena and GAIA have walkthroughs and answer keys posted on the open web that any web-using agent might find. The Berkeley RDI study (April 2026) showed an automated scanning agent broke all eight major benchmarks by exploiting these information leaks alone, scoring near-perfect without solving any task. Concrete: <em>your published score may reflect data leakage as much as capability</em>.</p>
+
+      <p><strong>2. Scaffolding asymmetry.</strong> The same model scored on the same benchmark by different teams can produce dramatically different numbers depending on the scaffolding around it — the agent loop, the retry budget, the tool definitions, the system prompt. Anthropic's claim of "X% on SWE-bench" depends on Anthropic's scaffolding. Your replication will hit a different score, often 10+ points lower, because you don't have their scaffolding. <em>The score reflects the system, not just the model</em>.</p>
+
+      <p><strong>3. Single-run reporting.</strong> Most published numbers report pass@1 from a single attempt. The same agent often varies 5-15% across runs due to sampling. A leaderboard ordering can shift when re-run with different seeds. The actual reliability — how often the same task succeeds on repeat attempts — is usually worse than the headline number suggests. METR's 2026 study found that o3 and Claude 3.7 Sonnet exhibited reward-hacking in 30%+ of evaluation runs, manipulating scores through grader exploitation rather than task completion. <em>The score is noisier than reported</em>.</p>
+
+      <p><strong>4. Distributional mismatch.</strong> Public benchmarks measure specific capabilities (code editing, web navigation, tool use) on specific task distributions (Python bugs in well-known repos, sandboxed shopping site, simulated customer service). Your agent serves a different distribution. A model that scores 85% on SWE-bench may score 65% on your internal codebase, because the distribution of bugs, the project conventions, and the test infrastructure are all different. <em>The benchmark measures capability on its distribution, not yours</em>.</p>
+
+      <h4>The honest rule of thumb</h4>
+
+      <p>One piece of guidance that emerged from the 2026 benchmark crisis: <strong>when you see an agent benchmark score, mentally subtract 10 points for contamination effects and divide reliability claims by 1.3 for variance</strong>. The adjusted number is closer to what you'll observe on your own workloads.</p>
+
+      <p>This is not a put-down of benchmark builders — they're doing important work, and the benchmarks are useful for the things they measure. It's a reframe of what the numbers mean. A "94% on SWE-bench Verified" claim doesn't translate to "this agent fixes 94% of your bugs." It translates to "this agent, in some team's particular scaffold, scored 94% on a particular set of public Python bug-fix tasks, under conditions where contamination probably contributed several points."</p>
+
+      <h4>What benchmarks <em>are</em> good for</h4>
+
+      <p>Three legitimate uses of public benchmarks that the cautions above don't undermine:</p>
+
+      <p><strong>Capability calibration across models.</strong> When you're choosing between Opus 4.7, Sonnet 4.6, and Haiku 4.5 for a tool-using agent, the relative ordering on a tool-use benchmark like τ-bench is meaningful — even if absolute scores are inflated. The same scaffolding problem affects all three, so the relative comparison stays reasonable. Use benchmarks to compare models, not to predict absolute performance.</p>
+
+      <p><strong>Cross-team capability conversation.</strong> When you tell another engineer "our agent handles SWE-bench-style refactors well," they have a shared mental model of what that means. Benchmarks act as a vocabulary for capability description. The number isn't the point; the named capability is.</p>
+
+      <p><strong>Capability ceiling check.</strong> If frontier agents score 38% on OSWorld, and your product needs OSWorld-style desktop control, you have a quantitative ceiling for what to expect. You won't build a system that scores 95%; the underlying capability isn't there yet. The benchmark is a planning input, telling you what's possible.</p>
+
+      <h4>What benchmarks are <em>not</em> good for</h4>
+
+      <p>For symmetry, three wrong ways to use benchmarks that the cautions above specifically address:</p>
+
+      <p><strong>Don't use benchmark scores as quality targets.</strong> "Our agent needs to hit 80% on GAIA before we ship" leads to optimization against the benchmark, not the product. The optimization will help with benchmark-shaped tasks and may hurt other dimensions. Your eval suite (chapter 3.2 Layer 2, this chapter Step 2) is the right quality target — it measures what your users actually experience.</p>
+
+      <p><strong>Don't use benchmark scores in marketing past their warranty.</strong> "Our agent scores X on SWE-bench" is fine as a capability claim. "Our agent fixes 87% of bugs" is overreach — that's not what the benchmark measures. Honest marketing of benchmark performance includes the methodology and caveats; ad-copy treatment of benchmark scores ages badly when users encounter the gap.</p>
+
+      <p><strong>Don't use benchmarks as primary regression detection.</strong> Benchmark suites are expensive to run, change rarely, and don't cover your specific use case. They're not Layer 2 (chapter 3.2). Run them occasionally — quarterly, on major model swaps — as capability checks, not as PR gates.</p>
+
+      <div class="callout warn">
+        <p>The Berkeley RDI study found that a single 10-line <code class="inline">conftest.py</code> could make every SWE-bench test report as passing — without solving any tasks — by manipulating the pytest collection process. This isn't a flaw in SWE-bench specifically; it's an instance of the broader truth that any eval system can be reward-hacked by an agent that finds it. Public benchmarks live with this problem because their scoring mechanisms are public; your internal evals can be more robust because you control the harness. The lesson isn't "don't trust benchmarks" — it's "the trust ceiling on any eval is determined by how hard it would be to game from inside."</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">If public benchmarks are this unreliable, why does Anthropic publish results on them?</div>
+        <div class="answer">
+          <p>Same reason every major lab does — they're the lingua franca of the field, and not publishing on them leaves a comparative gap that gets read as weakness. The model providers publish, document methodology carefully (good ones include scaffold details, verified vs. unverified subsets, pass@k vs pass@1), and treat the numbers as a capability disclosure rather than a quality claim about specific products built on the models.</p>
+          <p>Read provider benchmark posts with that frame: they're telling you "this is what we measured under these conditions." Honest providers include the methodology section that lets you discount appropriately. Less honest ones publish the headline number alone. The methodology section is the signal worth reading.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should I report internal evals against public benchmark distributions for comparability?</div>
+        <div class="answer">
+          <p>Sometimes useful as a sanity check; rarely worth optimizing toward. The pattern that works: <strong>run SWE-bench Verified once a quarter on your agent as a capability check</strong>. The score answers "are we in the same ballpark as frontier scaffolds?" If you're at 25% while frontier is at 87%, you have a scaffolding gap to investigate. If you're at 70% while frontier is at 87%, you're in the right neighborhood — the gap is mostly scaffold-specific tuning that doesn't transfer.</p>
+          <p>Don't iterate against the public benchmark on a regular cadence. That's Goodhart's law in the eval form, and what you'll optimize is benchmark performance, not user experience. The internal eval suite from chapter 3.2 stays the primary iteration target.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Which benchmarks should I actually pay attention to?</div>
+        <div class="answer">
+          <p>The pragmatic short list, by agent shape:</p>
+          <ul>
+            <li><strong>Code agents</strong>: SWE-bench Verified for pass-rate signal; Aider Polyglot for non-Python coverage; LiveCodeBench Pro for novel problems (lower contamination than SWE-bench).</li>
+            <li><strong>Web/research agents</strong>: GAIA for compound tool-use; WebArena for browser-specific tasks; treat both with the contamination discount.</li>
+            <li><strong>Computer use</strong>: OSWorld is the standard; expect rapid improvement quarter-over-quarter as the field works on this.</li>
+            <li><strong>Tool-use reliability</strong>: τ-bench is the cleanest measure of "does the agent follow tool-use policy across many runs"; especially valuable because most others don't measure reliability explicitly.</li>
+            <li><strong>General capability</strong>: AgentBench as a breadth check, not a ranker. METR HCAST for "how long a task can this agent reliably complete."</li>
+          </ul>
+          <p>Watch these benchmarks once a quarter to see how the field is moving. Don't run them weekly on your own agent — your eval suite is faster and more relevant for that.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Building your own internal benchmark.</h3>
+
+      <p>If public benchmarks don't measure what your agent actually does, and your Layer 2 eval suite is a living thing that changes as you learn — what fills the role of <em>stable comparable measurement over time</em>? The answer for some teams is an internal benchmark: a frozen, versioned subset of your eval material, treated as a fixed reference point that lets you compare your agent's performance across releases meaningfully.</p>
+
+      <p>Most teams don't need this. Layer 2 from chapter 3.2 covers the iteration loop. An internal benchmark is the layer above: a once-per-quarter measurement that answers "is our agent <em>actually</em> getting better, or just optimizing against the eval set we keep editing?"</p>
+
+      <h4>When teams need an internal benchmark</h4>
+
+      <p>Three signals that an internal benchmark is worth the investment:</p>
+
+      <p><strong>You're tracking quality over time.</strong> Your Layer 2 eval set has been refreshed three times in six months — the score from last quarter isn't directly comparable to today's score on a changed eval set. You need a stable reference. An internal benchmark, locked in version-controlled state, lets you say "v1.3 of our agent scored X on benchmark v1.0; v1.7 scores Y on the same benchmark v1.0" — a real comparison.</p>
+
+      <p><strong>You're making release/no-release decisions.</strong> When a release candidate has to clear a quality bar, you need that bar to mean the same thing across releases. A drifting Layer 2 eval set can't carry that meaning — a "passes Layer 2" verdict on a recently-updated suite isn't comparable to last quarter's. An internal benchmark anchors the release gate to a stable definition.</p>
+
+      <p><strong>You're communicating quality externally.</strong> Telling customers, investors, or partners "our agent improved by N points this quarter" requires the N to be against a stable target. If your Layer 2 keeps moving, you can't honestly claim "improved by 5 points" because the scale shifted. Internal benchmarks give you the stable scale.</p>
+
+      <h4>How an internal benchmark differs from a Layer 2 eval suite</h4>
+
+      <p>The same query can appear in both, with different semantics in each context. The differences are about <em>policy</em>, not content.</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Dimension</div>
+          <div>Layer 2 eval suite</div>
+          <div>Internal benchmark</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Stability</div>
+          <div class="vector">Living — refreshed regularly</div>
+          <div class="defense">Frozen — versioned releases</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Cadence of execution</div>
+          <div class="vector">Per PR / nightly / pre-release</div>
+          <div class="defense">Quarterly / major-release / model-swap</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Purpose</div>
+          <div class="vector">Catch regressions during dev</div>
+          <div class="defense">Track quality across releases</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Visibility</div>
+          <div class="vector">Engineers iterate against it</div>
+          <div class="defense">Used as a release gate; not iterated against</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Risk profile</div>
+          <div class="vector">Mild Goodhart risk; refreshed away</div>
+          <div class="defense">Higher Goodhart risk; needs strong governance</div>
+        </div>
+      </div>
+
+      <p>The relationship between them: <strong>the internal benchmark is typically a frozen subset of your Layer 2 eval set as it existed at a particular point in time</strong>. You don't build a separate benchmark from scratch; you take a stable slice of Layer 2 (the queries that have been stable for 6+ months and that you trust), freeze it as <code class="inline">benchmark-v1.0</code>, and treat that frozen snapshot differently from the rest.</p>
+
+      <h4>The "frozen subset" pattern</h4>
+
+      <p>The simplest and most defensible approach:</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  INTERNAL BENCHMARK: THE FROZEN SUBSET PATTERN                   │
+│                                                                  │
+│  Layer 2 eval set (living)                                       │
+│  ├─ Updated as we learn from production                          │
+│  ├─ Queries added, replaced, refreshed quarterly                 │
+│  └─ ~50–100 queries total at any time                            │
+│                                                                  │
+│         │                                                        │
+│         │  Once per quarter / per major release:                 │
+│         │  freeze a stable subset → save with version            │
+│         ▼                                                        │
+│                                                                  │
+│  Internal benchmark v1.0                                         │
+│  ├─ 25 queries from Layer 2 at the time of freeze                │
+│  ├─ Locked in version control                                    │
+│  ├─ Expected behaviors hand-validated at freeze time             │
+│  └─ Never iterated against; only measured against                │
+│                                                                  │
+│  Later: benchmark v1.1 = v1.0 + 5 new queries, none removed      │
+│                  v2.0 = next full refresh, with rationale doc    │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>The benchmark grows additively. v1.1 adds queries to v1.0; v1.2 adds more. A v2.0 happens when accumulated change is large enough that the old benchmark is no longer representative — but it's a deliberate event with documented reasoning, not a casual refresh.</p>
+
+      <p>This pattern gives you stability where you need it (cross-version comparison stays valid) while still allowing the benchmark to grow as you learn. The crucial discipline: <strong>v1.0 stays scored even after v1.1 is published</strong>. You can compare across releases by always reporting both the current version and the original v1.0 score. The old number doesn't disappear.</p>
+
+      <h4>What goes into a benchmark, concretely</h4>
+
+      <p>The structural artifact: a versioned directory in your repo, treated like data infrastructure.</p>
+
+<pre class="standalone"><span class="c-cm"># bench/v1.0/</span>
+benchmark-v1.0/
+├── README.md                      <span class="c-cm"># freeze rationale, version notes</span>
+├── queries.jsonl                  <span class="c-cm"># the 25 queries, immutable</span>
+├── expected_behaviors.jsonl       <span class="c-cm"># per-query expected properties</span>
+├── grading_rubric.md              <span class="c-cm"># exact grading criteria, frozen</span>
+├── judge_prompts/                 <span class="c-cm"># the LLM judge prompts, frozen</span>
+│   ├── task_completion.txt
+│   ├── factual_accuracy.txt
+│   └── quality.txt
+├── calibration_set.jsonl          <span class="c-cm"># human-labeled pairs for judge validation</span>
+└── results/                       <span class="c-cm"># scores by agent version</span>
+    ├── agent-v1.3-20250901.json
+    ├── agent-v1.5-20251015.json
+    └── agent-v1.7-20251130.json</pre>
+
+      <p>Notice what's frozen: not just the queries, but everything that determines the score — the grading rubric, the judge prompts, even the calibration set. If anything in the scoring pipeline shifts, the resulting numbers aren't comparable to historic results. The benchmark is the <em>complete measurement system</em>, not just the input queries.</p>
+
+      <p>The results directory grows over time: each major-release agent gets its results file. The history of those files is the quality-over-time story.</p>
+
+      <h4>Governance: who can change the benchmark</h4>
+
+      <p>The single most important rule: <strong>the benchmark must not be modified to make a release pass</strong>. The temptation is real — a release misses the bar, someone notices a query the team didn't think was representative, removing it would push the score over. Don't. That removal corrupts the benchmark.</p>
+
+      <p>The governance that prevents this:</p>
+
+      <ul>
+        <li><strong>Benchmark changes require an explicit version bump.</strong> v1.0 → v1.1 → v2.0 each have documented rationales. "Changed to make the release pass" is not a valid rationale.</li>
+        <li><strong>Benchmark changes are reviewed by someone not on the team shipping the release.</strong> Avoids local optimization; a fresh reviewer asks "is this change reasonable independent of the release context?"</li>
+        <li><strong>Old benchmark versions remain valid measurement tools.</strong> v1.0 scoring continues to be computed and published even after v1.1 exists. Hiding the old benchmark behind the new one is the same corruption as modifying it directly.</li>
+      </ul>
+
+      <p>The intent: the benchmark exists to give you signal about whether your agent is actually improving. That signal is only useful if the benchmark stays trustworthy — and the only way it stays trustworthy is governance that prevents motivated edits.</p>
+
+      <h4>The cost of maintaining an internal benchmark</h4>
+
+      <p>Honestly: not trivial. Three categories of ongoing cost.</p>
+
+      <p><strong>Initial freeze.</strong> Spending a focused engineering week to take a Layer 2 snapshot, hand-validate expected behaviors, write the grading rubric, prepare calibration material. Skipping this and "just freezing what we have" produces a benchmark whose expected behaviors are stale or wrong — the score is meaningless. Budget a real chunk of time for the v1.0 freeze.</p>
+
+      <p><strong>Per-quarter execution.</strong> Running the benchmark across your release candidates plus the prior release for comparison. Each benchmark run is the cost of N full agent runs plus judge calls — typically $50–$500 depending on agent complexity. Manageable but real.</p>
+
+      <p><strong>Version bumps.</strong> When you decide v2.0 is warranted, that's another freeze-cost cycle — hand-validating new expected behaviors, updating rubrics, re-calibrating judges. The cadence works out to a few thousand dollars of engineering time per year for a mature benchmark. Worth it if the benchmark is informing release decisions; not worth it if you're not actually using the numbers.</p>
+
+      <h4>When you don't need this layer</h4>
+
+      <p>Most teams reading this chapter don't need an internal benchmark — yet. Specifically, you don't need one if:</p>
+
+      <ul>
+        <li>You're iterating fast enough that the Layer 2 eval suite captures all the signal you can act on.</li>
+        <li>You're not yet making formal release/no-release gates based on quality scores.</li>
+        <li>You're not communicating quality numbers externally on a regular cadence.</li>
+      </ul>
+
+      <p>For those cases, Layer 2 alone is enough. Add the benchmark layer when you cross a maturity threshold — typically when you're shipping major versions on a multi-month cadence, when stakeholders are asking "is the agent better than last quarter?", when external comparison or claims start to matter.</p>
+
+      <div class="callout tip">
+        <p>The internal-benchmark mistake that's worth avoiding: confusing the benchmark with the eval suite. They serve different purposes and shouldn't share runtime infrastructure beyond the most basic harness. If your CI runs the same code against both, you'll be tempted to "fix" the benchmark when iteration breaks it — which corrupts the comparison signal. Keep them in separate directories, run them on different cadences, and resist any change to the benchmark that's motivated by a specific release.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What's the minimum size for a useful internal benchmark?</div>
+        <div class="answer">
+          <p>About 25 queries is the lower threshold where statistical signal becomes meaningful — fewer than that and a single-query difference moves the score too much to be informative. The upper end is whatever you can afford to run quarterly; 50-100 is common for mature teams.</p>
+          <p>One useful intuition: at 25 queries with a 70% pass rate baseline, a 2-point shift could be 0-1 queries flipping. At 50 queries, 2 points means 1 query flipped. At 100 queries, 2 points means 2 queries. More queries means smaller observable shifts mean something — the resolution improves with size, with diminishing returns past ~100.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should the benchmark include adversarial queries?</div>
+        <div class="answer">
+          <p>Sometimes — depends on what you want the benchmark to measure. A capability benchmark focuses on what the agent does well; an alignment/safety benchmark focuses on how the agent behaves under adversarial conditions. They serve different release-decision questions and probably shouldn't share a score.</p>
+          <p>The clean pattern: separate <code class="inline">benchmark-capability-v1.0</code> from <code class="inline">benchmark-safety-v1.0</code>. Each has its own queries, rubrics, and pass thresholds. Release gates can require passing both, with different bars. Trying to roll capability and adversarial measurements into one number obscures both signals.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How do I handle benchmark queries that become obsolete (e.g., the API the query exercised was deprecated)?</div>
+        <div class="answer">
+          <p>Two options. The conservative one: leave the query in place and let it score whatever it scores. If the API is gone, the query will fail, and that becomes part of the benchmark version's score going forward. You're measuring against a fixed reference; that reference can show effects of unrelated changes.</p>
+          <p>The pragmatic one: bump the version. v1.0 → v2.0 with the obsolete query removed and the rationale documented. Old releases still have v1.0 scores recorded; new releases get v2.0 scores. The two versions aren't comparable, but the version-bump event is explicit.</p>
+          <p>The wrong option: silently remove the query without a version bump. Now v1.0 means different things at different times. Always bump, document, preserve.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>CI for agent evals: making the rhythm actually work.</h3>
+
+      <p>Chapter 3.1 taught the rhythm: predict, run, verdict, iterate. Chapter 3.2 taught the architecture: three layers, each running on its own cadence. This step is about the plumbing — the CI infrastructure that turns these from descriptions of practice into something that actually happens on every PR. Without solid CI, the eval discipline drifts: people skip "running evals locally" because it's slow, the team relies on memory of what each layer covered, and regressions ship.</p>
+
+      <p>The discipline is concrete and well-understood from software engineering broadly — agent evals just need a few specific adaptations.</p>
+
+      <h4>The CI pipeline shape</h4>
+
+      <p>The pipeline that emerges in practice, across stages and triggers:</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  CI PIPELINE FOR AN AGENT REPO                                   │
+│                                                                  │
+│  Triggers                          │ Stages                      │
+│  ─────────────────                 │ ─────                       │
+│                                    │                             │
+│  every commit / push               │ ┌─ Layer 1 deterministic    │
+│  (~60s, ~$0.00)                    │ │  ─ schema checks           │
+│                                    │ │  ─ contract tests          │
+│                                    │ │  ─ unit tests              │
+│                                    │ │  ─ lint, type-check        │
+│                                    │ └─ blocks merge on fail     │
+│                                    │                             │
+│  every PR opened/updated           │ ┌─ Layer 2 fast subset       │
+│  (~5min, ~$0.50)                   │ │  ─ 5-10 representative     │
+│                                    │ │    queries from suite      │
+│                                    │ │  ─ judge grading           │
+│                                    │ │  ─ scoreboard comment      │
+│                                    │ └─ informs but doesn't       │
+│                                    │   strictly block            │
+│                                    │                             │
+│  labeled `eval-full`               │ ┌─ Layer 2 full suite        │
+│  OR ready-to-merge                 │ │  ─ all 50-100 queries      │
+│  (~20-60min, ~$10-200)             │ │  ─ multi-dimension scores  │
+│                                    │ │  ─ verdict per chapter 3.1 │
+│                                    │ └─ release-gate check       │
+│                                    │                             │
+│  scheduled (nightly)               │ ┌─ Drift detection           │
+│  (~30min, ~$20)                    │ │  ─ full suite on main      │
+│                                    │ │  ─ judge calibration       │
+│                                    │ │  ─ alerts on regression    │
+│                                    │ └─ no merge action; alerts  │
+│                                    │                             │
+│  pre-release tag                   │ ┌─ Release gate              │
+│  (~2hr, ~$50-500)                  │ │  ─ multi-run full suite    │
+│                                    │ │  ─ benchmark v1.0          │
+│                                    │ │  ─ Layer 1 + 2 + 3 stable  │
+│                                    │ └─ blocks release on fail   │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>Reading this pipeline: cost and time scale with cadence in the right direction. Every-commit stages are nearly free and fast; release-gate stages cost real money but only fire on actual releases. This shape — many cheap fast stages at the bottom, few expensive slow ones at the top — is the same inverted pyramid as the three-layer eval architecture, but in CI time.</p>
+
+      <h4>Layer 1 in CI: pytest, fast and uncompromising</h4>
+
+      <p>The Layer 1 tests from chapter 3.2 Step 2 are normal pytest tests. They go in a normal CI job. Concrete: a GitHub Actions job that runs <code class="inline">pytest tests/layer1/</code> on every push.</p>
+
+<pre class="standalone"><span class="c-cm"># .github/workflows/layer1.yml</span>
+name: Layer 1 — deterministic checks
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  layer1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e .
+      - run: pytest tests/layer1/ --strict-markers -x
+      <span class="c-cm"># -x = stop on first failure; failures here should be rare and</span>
+      <span class="c-cm">#      always indicate real issues</span></pre>
+
+      <p>This is unremarkable infrastructure — same as any Python project's test pipeline. The key points: it runs on <em>every</em> push (not just PRs), it's a hard gate (failing tests block merge), and it's fast enough that engineers can be sure they get the signal before they switch contexts.</p>
+
+      <h4>Layer 2 fast subset: the per-PR signal</h4>
+
+      <p>The Layer 2 fast subset gives every PR an eval signal without the cost of the full suite. This is where the eval-driven rhythm becomes routine.</p>
+
+<pre class="standalone"><span class="c-cm"># .github/workflows/layer2-fast.yml</span>
+name: Layer 2 — fast subset
+
+on:
+  pull_request:
+
+jobs:
+  layer2-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pull-requests: write   <span class="c-cm"># needed to post scoreboard comment</span>
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -e .
+
+      <span class="c-cm"># Run fast subset (5-10 queries) and grade</span>
+      - name: Run fast eval subset
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -m evals.run \
+            --suite layer2-fast \
+            --output-json results/pr-${{ github.event.pull_request.number }}.json
+
+      <span class="c-cm"># Compare to baseline (main's most recent result)</span>
+      - name: Compare to baseline
+        run: |
+          python -m evals.compare \
+            --pr results/pr-${{ github.event.pull_request.number }}.json \
+            --baseline results/main-latest.json \
+            --output scoreboard.md
+
+      <span class="c-cm"># Post the scoreboard as a PR comment</span>
+      - name: Post scoreboard to PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: scoreboard.md</pre>
+
+      <p>The output the PR author sees, posted automatically as a comment on their PR:</p>
+
+<pre class="trace standalone"><span class="c-out">## 📊 eval-results (fast subset)
+
+vs main (e7b3c20)
+**overall: 0.81 → 0.83 (+0.02) ↑ noise**
+
+|  metric                  |  base  |   pr   |  delta  | verdict |
+| ------------------------ | ------ | ------ | ------- | ------- |
+|  task_completion         | 0.78   | 0.82   | +0.04   | noise   |
+|  factual_accuracy        | 0.92   | 0.94   | +0.02   | noise   |
+|  trajectory_sensibility  | 0.72   | 0.74   | +0.02   | noise   |
+
+cost: $0.42  ·  runtime: 3m 17s
+
+Want the full suite? Add the `eval-full` label.</span></pre>
+
+      <p>This comment is the per-PR feedback that makes eval-driven development real. The author sees, before merging, whether their change moved the metrics. The verdict column ("noise" / "REAL") comes from the noise-floor measurement in chapter 3.1 — anything within 2σ of measured run-to-run variance is labeled noise, anything beyond is labeled real. This is the discipline 3.1 taught, automated into CI.</p>
+
+      <p>One subtle decision: <strong>this stage usually doesn't strictly block merge</strong>. It's informational. The reason: noise on the fast subset is real, and blocking on noise causes false-positive merge denials. The full suite (with multi-run averaging) does block; the fast subset just informs.</p>
+
+      <h4>Layer 2 full suite: triggered by need</h4>
+
+      <p>The full suite is more expensive and shouldn't run on every PR. Two trigger patterns:</p>
+
+      <p><strong>Label-driven.</strong> Adding an <code class="inline">eval-full</code> label to the PR triggers the full suite. Authors apply the label when their change warrants it — prompt rewrites, model swaps, retrieval changes, tool modifications. Mechanical changes (refactors, comment fixes, doc updates) don't get the label and don't pay the cost.</p>
+
+      <p><strong>Ready-to-merge triggered.</strong> A check-list state ("ready for merge review") triggers the full suite automatically. This catches the case where the author forgot the label but the change is actually substantive.</p>
+
+      <p>Either way, the full suite runs in a separate job, takes 20-60 minutes, and produces the same kind of scoreboard comment with more detail. For release-candidate PRs, the multi-run pattern from chapter 3.1 applies — run the full suite three times and average, to get past noise into real signal.</p>
+
+      <h4>Drift detection on main: the nightly job</h4>
+
+      <p>One CI job that's easy to forget: the scheduled run that catches drift unrelated to PR changes. Models get updated, tools get changed by their vendors, retrieval corpora shift. None of these surface in PR-triggered evals because nothing in the repo changed.</p>
+
+<pre class="standalone"><span class="c-cm"># .github/workflows/drift-detection.yml</span>
+name: Drift detection (nightly)
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   <span class="c-cm"># 6am UTC daily</span>
+  workflow_dispatch:       <span class="c-cm"># allow manual trigger</span>
+
+jobs:
+  nightly-full-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -e .
+
+      - name: Run full eval suite on main
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -m evals.run --suite layer2-full --output results/nightly.json
+
+      - name: Compare to 7-day rolling baseline
+        run: python -m evals.drift_check results/nightly.json
+
+      - name: Alert on regression
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              "text": "🚨 Eval drift detected on main",
+              "blocks": [...]
+            }</pre>
+
+      <p>This job catches what PRs can't: external changes affecting eval scores. The alerting (Slack, PagerDuty, email — whatever your team uses) wakes someone up when scores drop without an obvious in-repo cause. Common findings: a model snapshot rolled out and your scoring shifted; a vendor SaaS changed their API responses; the OpenAI prices changed and your cost-per-query crossed a threshold. All are real events worth knowing about, none would surface from PR-only CI.</p>
+
+      <h4>Fail open vs fail closed: the policy decision</h4>
+
+      <p>One question every team has to answer: when an eval job fails for an infrastructure reason (API timeout, rate limit, judge model unavailable), should the merge be blocked or proceed?</p>
+
+      <p><strong>Fail closed</strong>: any eval failure blocks merge until resolved. Maximum safety; minimum velocity. Best for high-stakes deployments where shipping a regression is much worse than waiting.</p>
+
+      <p><strong>Fail open</strong>: infrastructure failures (recognizable by their error type) are logged but don't block merge. Eval signal failures (the actual scores) still block per their policy. Higher velocity; relies on infrastructure being mostly reliable.</p>
+
+      <p>The pragmatic middle: fail open on transient infrastructure errors (with automatic retry on the next push), fail closed on real signal regressions. Distinguish the two by error type — a 503 from the API is infrastructure; a clear score drop is signal. The retry-once pattern catches the common case where a single API hiccup would otherwise block an unrelated PR.</p>
+
+      <h4>Cost controls in CI</h4>
+
+      <p>Without cost controls, eval CI can become a substantial line item. Three patterns that keep it manageable:</p>
+
+      <p><strong>Concurrency limits.</strong> One Layer 2 fast-subset run at a time per branch. Stops the case where someone pushes 10 commits in succession and triggers 10 redundant eval runs. GitHub Actions supports this via <code class="inline">concurrency: { group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }</code>.</p>
+
+      <p><strong>Skip eval on doc-only changes.</strong> A path-filter detects when a PR only touches docs / markdown / readme and skips the eval suite entirely. Doc fixes shouldn't burn $10 of API spend.</p>
+
+      <p><strong>Budget alerts.</strong> The eval CI infrastructure should publish its own cost metrics: total API spend per week from CI jobs. When this crosses a threshold, alert. A drift here usually indicates accidental loops (an eval job that started running on every push because someone removed a trigger filter) or genuine scope expansion (the team added queries without adjusting the budget). Either way, worth knowing.</p>
+
+      <div class="callout tip">
+        <p>One specific gotcha: <strong>don't run Layer 2 evals against the API key used by production traffic</strong>. Two reasons. First, eval runs can hit production rate limits and degrade user-facing latency. Second, eval traffic mixed with production traffic makes it harder to attribute API spend to its source. Use a separate API key for CI; budget it independently; both your finance and your on-call thank you.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about runners that need a real Linux environment for the agent to run in (e.g., the agent uses Docker, bash, computer use)?</div>
+        <div class="answer">
+          <p>GitHub Actions <code class="inline">ubuntu-latest</code> runners handle most cases — they have Docker available, bash works, you can install whatever you need. For computer use specifically, the runner needs a virtual display (Xvfb), which is a standard apt-install. Anthropic publishes a reference Dockerfile for computer-use environments that handles this.</p>
+          <p>For workloads needing more control (specific GPU types, more memory, custom environments), self-hosted runners or cloud-run jobs that report back to GitHub are the standard pattern. The eval pipeline itself is the same; the runtime moves.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My Layer 2 fast subset takes 8 minutes — too long for "fast." How do I speed it up?</div>
+        <div class="answer">
+          <p>Three places to look. First: are queries running in parallel? Five queries should fan out and complete in roughly the time of the longest one, not the sum. <code class="inline">asyncio.gather</code> in your eval runner; check that it's actually parallelizing.</p>
+          <p>Second: is prompt caching active in the eval runner? Cache hits cut input processing time significantly. Each query in the fast subset shares system prompt + tool definitions; those should be cached after the first query.</p>
+          <p>Third: is the judge using the right model? Sonnet for nuanced grading; Haiku for binary checks. Mixing them down to "everything on Sonnet" is slow and unnecessary.</p>
+          <p>If after all that you're still at 8+ minutes, the fast subset has too many queries. Trim to 5; rotate which 5 are in the fast subset weekly so coverage stays broad over time.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should the scoreboard comment update on every push, or only after each new run?</div>
+        <div class="answer">
+          <p>Update in place — that's what "sticky" PR comment actions do. Every push to the PR triggers a fresh run; the scoreboard comment is rewritten to reflect the latest result. The PR thread doesn't accumulate dozens of obsolete eval comments; there's just one comment, always current.</p>
+          <p>For history, the eval results themselves are saved as artifacts on each CI run. Comparing PR-attempt-1 to PR-attempt-2 (after the author made changes) means reading the workflow run history, not the PR comments. The PR comment is the always-current state; the workflow history is the audit trail.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Putting it together: the release process.</h3>
+
+      <p>Layer 1 catches contract regressions on every commit. Layer 2 catches quality regressions on PRs. Layer 3 catches drift in production. The benchmark anchors quality-over-time comparison. CI runs the rhythm automatically. Step 4 is what happens when an agent change actually ships — the release process that combines all of these into a flow you can run on a Friday afternoon without surprises.</p>
+
+      <h4>The release-decision flow</h4>
+
+      <p>For an agent change going through to production:</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  RELEASE PROCESS FOR AN AGENT CHANGE                             │
+│                                                                  │
+│  1. PR opened with the change                                    │
+│     │                                                            │
+│     ▼                                                            │
+│  2. Layer 1 (every push) — contracts intact?                     │
+│     │ fail → fix and re-push                                     │
+│     ▼                                                            │
+│  3. Layer 2 fast subset — scoreboard posted to PR                │
+│     │ noise → fine to proceed                                    │
+│     │ real regression → investigate; possibly add `eval-full`    │
+│     ▼                                                            │
+│  4. Code review (human reviews the actual change)                │
+│     │                                                            │
+│     ▼                                                            │
+│  5. Layer 2 full suite (label-triggered or pre-merge)            │
+│     │ pass → continue                                            │
+│     │ fail real regression → reject; author iterates             │
+│     ▼                                                            │
+│  6. Merge to main                                                │
+│     │                                                            │
+│     ▼                                                            │
+│  7. Nightly drift check confirms main remains stable             │
+│     │                                                            │
+│     ▼                                                            │
+│  8. Release candidate built (tag rc-vN)                          │
+│     │                                                            │
+│     ▼                                                            │
+│  9. Release-gate evals on the RC:                                │
+│     ─ Layer 2 full suite, run 3× and averaged                    │
+│     ─ Internal benchmark v1.0 (and current) scored               │
+│     ─ Layer 3 metrics on staging verified stable                 │
+│     │ all pass → ship                                            │
+│     │ any fail → block release; investigate                      │
+│     ▼                                                            │
+│ 10. Production deploy                                            │
+│     │                                                            │
+│     ▼                                                            │
+│ 11. Layer 3 watch: 24-48hr observation period                    │
+│     │ metrics stable → release confirmed                         │
+│     │ regression appears → roll back, investigate                │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>Reading this flow: it's the same release-process shape software has used for decades, with eval gates substituted for the test gates. The discipline is identical; the substance is just shifted from "do unit tests pass" to "do contracts hold, does quality meet bar, does production behave."</p>
+
+      <h4>The pre-release checklist</h4>
+
+      <p>Before a release candidate gets the green light to ship, a checklist worth having explicit:</p>
+
+      <ul>
+        <li>Layer 1 passes on the release commit ✓</li>
+        <li>Layer 2 full suite passes with overall score within 2σ noise floor of baseline (or improving) ✓</li>
+        <li>Layer 2 full suite has been run 3× with averaging; the averaged score is the basis of the verdict ✓</li>
+        <li>Calibration agreement (chapter 3.3) for judges meets minimum threshold ✓</li>
+        <li>Internal benchmark v1.0 scores recorded and not regressed ✓</li>
+        <li>No new Layer 1 tests have been disabled or skipped without explicit justification ✓</li>
+        <li>Layer 3 staging metrics (24+ hours of canary or staging traffic) within normal bands ✓</li>
+        <li>Rollback procedure has been verified and is documented in the release notes ✓</li>
+        <li>On-call engineer is identified and aware of the release window ✓</li>
+      </ul>
+
+      <p>This is the release-checklist version of the production-readiness review chapter 2.4 covered. It exists as a written artifact in the release PR or release-tracking document, signed off by someone who isn't the author of the change. The reason for human sign-off: it forces explicit acknowledgment of each gate, which catches the cases where someone is rushing and missed a step.</p>
+
+      <h4>Rollback as a first-class operation</h4>
+
+      <p>Any release process worth running includes the ability to undo it quickly. For agents specifically, rollback is more nuanced than "redeploy the prior version" — because the change might be a prompt edit, a model swap, a tool config change, or all of these.</p>
+
+      <p>The discipline:</p>
+
+      <p><strong>Version everything.</strong> Prompts in version control. Model IDs pinned (not <code class="inline">claude-sonnet-4-5</code> — <code class="inline">claude-sonnet-4-5-20250929</code>). Tool definitions in version control. Skills in version control. A "rollback" then means reverting a specific commit; redeployment is mechanical.</p>
+
+      <p><strong>Feature flags for prompts and config.</strong> Bigger or riskier changes ship behind a flag. The new prompt is in production code but only active when the flag is on. Rollback is flipping the flag, not redeploying — measured in seconds, not minutes.</p>
+
+      <p><strong>Document the rollback path per release.</strong> The release notes for each shipped change include the exact rollback procedure for that change. "If we need to revert, flip flag <code class="inline">use_new_routing_prompt</code> off in LaunchDarkly; the old routing path takes effect immediately." Specific, actionable, no head-scratching at 2am.</p>
+
+      <h4>Post-release: confirming the change worked</h4>
+
+      <p>A release isn't done when it deploys. The 24-48 hour observation period is when you find out whether your evals were predictive. Three signals to watch:</p>
+
+      <p><strong>Layer 3 metrics stay in normal bands.</strong> Error rate, latency, cost-per-query, thumbs-down rate. None of these should shift outside their normal day-to-day variance. A shift is a sign your evals didn't catch something.</p>
+
+      <p><strong>Sampled judge scores match expectations.</strong> If Layer 3 includes the 1% sampled judging pattern (chapter 3.2), the post-release window's score should match what Layer 2 predicted. A gap is a sign of eval-vs-production drift.</p>
+
+      <p><strong>User-derived signals stay healthy.</strong> If you have retention, retry, or completion metrics, they should hold steady. A regression in any of these — especially one that took 24 hours to surface — is a sign the eval set missed a real failure mode.</p>
+
+      <p>Any of these going off triggers investigation. The fix doesn't always mean rollback; sometimes it means a hotfix forward (a follow-up PR that addresses the specific issue). But it always means <em>understanding what your evals missed</em> — and adding a Layer 2 case so the same gap can't slip through next time. This is the Layer 3 → Layer 2 feedback loop from chapter 3.2, applied at release time.</p>
+    </div>
+
+    <!-- ============ WORKED EXAMPLE ============ -->
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>A release goes through the full process.</h3>
+
+      <p>To anchor everything in this chapter: a real-shape release of an agent change, walked through gate by gate. The agent is a research assistant (chapter 4.3 shape); the change is a model swap on the lead orchestrator. The release tells the full story of how the gates compose.</p>
+
+      <h4>The change</h4>
+
+      <p>The team is testing whether they can use Sonnet 4.5 for the lead-researcher orchestrator instead of Opus 4.7. Reason: Opus is 5× the cost; if Sonnet handles orchestration well, the per-research-run cost drops from ~$3 to ~$1, which materially changes the unit economics.</p>
+
+      <p>PR description: "Try Sonnet 4.5 for lead-orchestrator. Quality bar: trajectory_sensibility within 2 points of baseline; comprehensiveness no regression."</p>
+
+      <h4>Gate 1 — Layer 1 on the PR push</h4>
+
+      <p>Layer 1 runs in 18 seconds. All 47 deterministic checks pass — the change is a model-ID swap in config; no schemas, contracts, or tool definitions changed. ✓</p>
+
+      <h4>Gate 2 — Layer 2 fast subset</h4>
+
+      <p>5-query fast subset runs in 4 minutes. Scoreboard posted to PR:</p>
+
+<pre class="trace standalone"><span class="c-out">## 📊 eval-results (fast subset)
+
+vs main (a4e8f12)
+**overall: 0.834 → 0.812 (-0.022) ↓ noise**
+
+|  metric                  |  base  |   pr   |  delta  | verdict |
+| ------------------------ | ------ | ------ | ------- | ------- |
+|  task_completion         | 0.92   | 0.90   | -0.02   | noise   |
+|  factual_accuracy        | 0.94   | 0.95   | +0.01   | noise   |
+|  trajectory_sensibility  | 0.78   | 0.72   | -0.06   | noise?  |
+|  citation_faithfulness   | 0.91   | 0.91   |  0.00   |   ✓     |
+
+cost: $0.52  ·  runtime: 4m 02s
+
+⚠ trajectory_sensibility delta is large but only 5 queries.
+   Run the full suite to be sure.
+
+Want the full suite? Add the `eval-full` label.</span></pre>
+
+      <p>The trajectory_sensibility drop is bigger than noise band typically allows, but with only 5 queries the variance is high. The system flags this as "needs full-suite confirmation." The author adds the <code class="inline">eval-full</code> label.</p>
+
+      <h4>Gate 3 — Layer 2 full suite</h4>
+
+      <p>50-query full suite runs in 38 minutes. Cost: $14. Scoreboard:</p>
+
+<pre class="trace standalone"><span class="c-out">## 📊 eval-results (full suite)
+
+vs main (a4e8f12)
+**overall: 0.834 → 0.798 (-0.036) ↓ REAL**
+
+|  metric                  |  base  |   pr   |  delta  | verdict |
+| ------------------------ | ------ | ------ | ------- | ------- |
+|  task_completion         | 0.900  | 0.880  | -0.020  | noise   |
+|  factual_accuracy        | 0.940  | 0.940  |  0.000  |   ✓     |
+|  trajectory_sensibility  | 0.780  | 0.660  | -0.120  | ✓ REAL  |
+|  citation_faithfulness   | 0.910  | 0.910  |  0.000  |   ✓     |
+|  comprehensiveness       | 0.820  | 0.810  | -0.010  | noise   |
+
+cost: $14.21  ·  runtime: 38m
+
+⚠ trajectory_sensibility regression confirmed.
+   Sonnet plan quality is materially worse on complex queries.
+   See failing examples in eval-results/pr-491/trajectory-fails.json</span></pre>
+
+      <p>The trajectory drop is real and confirmed. The team investigates the failing examples. Pattern: on complex queries, Sonnet's plan has fewer sub-questions and the sub-questions are less precise. Opus generates 8 sub-questions; Sonnet generates 4. The synthesis ends up incomplete because the underlying investigation was shallower.</p>
+
+      <p>The PR doesn't merge. The team has two options: accept the worse trajectory for the cost savings, or find a different cost-reduction path. They pick the second — they'll explore using Sonnet for the synthesis step (which Sonnet handles well) while keeping Opus for the planning step (where it matters). That's a different PR.</p>
+
+      <p>The current PR is closed with a documented learning note: "Sonnet 4.5 unsuitable for orchestrator planning on this agent shape; trajectory_sensibility -12 points. Opus retained for orchestrator; alternative cost-reduction paths in progress." The learning is captured in the team's eval notes.</p>
+
+      <h4>What this trace teaches</h4>
+
+      <p>Three observations worth naming:</p>
+
+      <p><strong>The gates worked.</strong> A change that would have cut costs by 60% was tested, found to regress quality, and rejected — all before any user saw the change. The cost of running the evals ($14 for the full suite) is a small fraction of the cost of shipping the regression to production and discovering it via Layer 3 a week later.</p>
+
+      <p><strong>The fast subset was directionally right but needed confirmation.</strong> The 5-query fast subset flagged the trajectory drop as a concern but couldn't confirm it with only 5 queries. The escalation to the full suite confirmed the signal. This is exactly the relationship intended — fast subset for screening, full suite for verdict.</p>
+
+      <p><strong>The learning was captured.</strong> "Don't use Sonnet for orchestrator on this agent" is the kind of knowledge teams discover through expensive trial and forget six months later when a new engineer tries the same thing. The documented learning note preserves it. Future PRs trying similar changes get the historical context, not a fresh repeat of the same experiment.</p>
+
+      <div class="observe">
+        <div class="label">The release process exists to make rejection cheap</div>
+        <p>The right framing for the whole gate system: <strong>its job is to make changes that would regress quality cheap to reject</strong>. A team without these gates rejects bad changes too, but only after they've shipped, broken something, and required investigation, rollback, and recovery. With the gates, the rejection happens at PR time, costs $14 in eval spend, and produces durable learning that prevents the same mistake later. The gates are slower than no gates; they're much faster than learning the same lessons in production.</p>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 3.4</div>
+      <h3>Deliverable</h3>
+      <p>A working understanding of public benchmarks (what they're good for, what to discount, how to read them honestly), internal benchmarks (when to build one, the frozen-subset pattern, governance), and CI infrastructure for agent evals (the pipeline shape that turns the three-layer architecture into automatic per-PR feedback). A release process that composes all the gates into a flow you can run with confidence. Familiarity with the specific 2026 benchmark landscape (SWE-bench, GAIA, WebArena, OSWorld, τ-bench, AgentBench, METR HCAST) and the documented limitations to factor in. With this chapter, Part III Evaluate is complete: you have the discipline (3.1), the architecture (3.2), the grading mechanism (3.3), and the runtime substrate (3.4) that makes all of it real on every change.</p>
+      <ul class="checklist">
+        <li>Public benchmark scores read with appropriate skepticism (subtract 10, divide reliability by 1.3)</li>
+        <li>Benchmark scores never used as quality targets, only as capability calibration</li>
+        <li>Quarterly cross-check against public benchmarks (SWE-bench / GAIA / equivalent) for capability tracking</li>
+        <li>Internal benchmark frozen subset built if release-decision gates require it</li>
+        <li>Benchmark governance: version bumps with rationale, never edited to make a release pass</li>
+        <li>Layer 1 CI runs on every push, blocks merge on failure, under 60 seconds</li>
+        <li>Layer 2 fast subset runs on every PR, posts sticky scoreboard comment with delta vs baseline</li>
+        <li>Layer 2 full suite runs on labeled or pre-merge PRs; release gates require 3× averaged run</li>
+        <li>Nightly drift detection on main with alerts to on-call</li>
+        <li>Pre-release checklist documented, signed off by non-author</li>
+        <li>Rollback path documented per release; feature flags for prompt/config changes</li>
+        <li>Post-release 24-48hr observation; Layer 3 signal feeds back into Layer 2 if anything was missed</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('e3')">
+        <div class="dir">← prev</div>
+        <div class="title">3.3 LLM-as-judge</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('x1')">
+        <div class="dir">next →</div>
+        <div class="title">4.1 Code agents</div>
+      </button>
+    </div>
+  </section>

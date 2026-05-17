@@ -1,0 +1,457 @@
+<section class="phase">
+    <div class="phase-num">0.4</div>
+    <div class="week">Part 0 / Foundations · The async patterns the rest of the guide assumes</div>
+    <h2>Async Python: the patterns that show up in every agent loop.</h2>
+    <p class="goal">Every code example in this guide uses async Python. <code class="inline">async def</code>, <code class="inline">await</code>, <code class="inline">asyncio.gather</code> — these aren't accidental. They're the shape that agent code takes, because agents spend most of their time waiting on I/O (model calls, tool calls, network requests), and async gives you concurrency without threads. This chapter assumes you can read async Python. Its job is to surface the <em>patterns</em> that matter for agent code specifically — parallel tool dispatch, timeouts, structured cancellation, error isolation, backpressure — and the pitfalls that trip up otherwise-fine code when it scales. Shorter than the other chapters in this part on purpose: you've absorbed most of the patterns by example already. Here they're named.</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Why agents are async: the I/O wait pattern.</h3>
+
+      <p>An agent doing real work spends most of its wall-clock time waiting. Model calls take 1-5 seconds. Tool calls take 100ms-2s. Database queries, web fetches, file reads — all wait. The agent's CPU work (parsing JSON, validating schemas, deciding what to do next) is milliseconds. The runtime cost is overwhelmingly I/O wait.</p>
+
+      <p>This is the shape async is designed for. While one operation is waiting on I/O, the event loop can run other operations. You don't get more CPU work done — but you stop blocking on each individual wait. A multi-tool agent turn that does 5 sequential tool calls at 400ms each takes 2 seconds; the same agent dispatching them concurrently takes ~400ms. Same total work; very different wall-clock latency.</p>
+
+      <h4>The concurrency-vs-parallelism distinction</h4>
+
+      <p>One source of confusion worth resolving up front. Async Python gives you <em>concurrency</em> (multiple tasks making progress without blocking each other) but not <em>parallelism</em> (multiple tasks executing simultaneously on multiple CPUs). The GIL still applies; Python code runs on one thread at a time.</p>
+
+      <p>For agents, this is fine — almost all the time you want to overlap is I/O wait time, where the actual work is happening on someone else's server (the model provider's GPU, the database, the remote API). Your Python process is just waiting for the response. While it waits, the event loop runs other tasks. The concurrency model exactly matches the workload.</p>
+
+      <p>The cases where parallelism (true multi-CPU execution) matters for agents are rare: heavy local CPU work like running a large embedding model in-process, or batched local inference. For those, you reach for multiprocessing or accelerated libraries. For everything else (tool dispatch, model calls, retrieval, parallel sub-agents), async concurrency is the right fit.</p>
+
+      <h4>What async buys you in concrete numbers</h4>
+
+      <p>An agent that does the following in a single turn:</p>
+
+      <ul>
+        <li>3 web searches (400ms each in parallel possible) </li>
+        <li>5 web fetches on returned URLs (600ms each in parallel possible) </li>
+        <li>1 synthesis model call (3 seconds) </li>
+      </ul>
+
+      <p>Serial execution: 0.4×3 + 0.6×5 + 3 = 7.2 seconds.</p>
+
+      <p>Concurrent execution with async: max(0.4, 0.4, 0.4) + max(0.6, 0.6, 0.6, 0.6, 0.6) + 3 = 0.4 + 0.6 + 3 = 4 seconds.</p>
+
+      <p>That's a 45% latency reduction with zero changes to the underlying work, zero added compute cost — just from running independent operations concurrently. For interactive agents where latency directly shapes user experience, this matters; for autonomous agents that run for minutes, it compounds across many turns.</p>
+
+      <h4>The three async patterns this guide uses</h4>
+
+      <p>Three patterns appear repeatedly in the rest of the guide. Naming them explicitly:</p>
+
+      <p><strong>Pattern 1: parallel tool dispatch.</strong> When a model emits multiple tool-use blocks in one turn, dispatch them concurrently via <code class="inline">asyncio.gather</code>. Chapter 0.3 introduced this; chapter 2.2 made it a latency lever; chapter 4.4 generalized it to multi-agent coordination.</p>
+
+      <p><strong>Pattern 2: bounded sub-agent execution.</strong> When the orchestrator spawns sub-agents (chapter 4.3, 4.4), each runs concurrently with a wall-clock timeout. <code class="inline">asyncio.wait_for</code> caps individual runtimes; <code class="inline">asyncio.gather</code> dispatches them together.</p>
+
+      <p><strong>Pattern 3: streaming with concurrent work.</strong> The agent streams output to the user (chapter 2.4) while continuing to do background work — generating the response while logging spans, updating dashboards, queueing follow-up tool calls. Async lets these happen in parallel without blocking the stream.</p>
+
+      <p>All three are the same underlying technique (<code class="inline">asyncio.gather</code> with appropriate error handling); their differences are in what they coordinate.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">If async is just concurrency, not parallelism, why use it instead of threads?</div>
+        <div class="answer">
+          <p>Three reasons that matter for agent code specifically. First, async is dramatically lighter weight per "task" — running 100 concurrent operations as coroutines costs trivially more memory than running 5. Threads have real OS overhead per thread. Second, async is debuggable in a way threaded code isn't — the event loop is sequential at any given moment, so there's no thread-interleaving non-determinism. Stack traces and logs read naturally. Third, async composes with the Python ecosystem for HTTP, database, and AI SDKs — all the libraries you'd use in an agent (anthropic, openai, httpx, asyncpg) have async-native APIs.</p>
+          <p>The case for threads is mostly historical or about CPU-bound work. For agent loops, async is the right default by a wide margin.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Can I mix synchronous and asynchronous code in the same agent?</div>
+        <div class="answer">
+          <p>Yes, with friction. Synchronous calls inside an async function block the event loop — while the sync call runs, no other coroutine makes progress. For an agent doing many concurrent things, this is a serious problem; a 200ms sync database call freezes all 10 of your concurrent sub-agents for 200ms.</p>
+          <p>The fix: wrap sync calls in <code class="inline">asyncio.to_thread</code> so they run in a thread pool without blocking the event loop. <code class="inline">await asyncio.to_thread(slow_sync_func, args)</code> gives you back something awaitable. Use this for sync libraries you can't replace and for genuinely-CPU-bound work.</p>
+          <p>Don't sprinkle sync calls casually into async code without this wrapping — the symptoms are subtle (mysterious latency, mostly-fine until under load) and the fix is mechanical once you know to look.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>The four patterns that show up in every agent.</h3>
+
+      <p>Four async patterns appear in nearly every production agent codebase. Each is short; each has subtleties that matter when you ship.</p>
+
+      <h4>Pattern 1: parallel dispatch with asyncio.gather</h4>
+
+      <p>The workhorse. <code class="inline">asyncio.gather</code> takes N coroutines and runs them concurrently, returning when all have completed (or one has raised).</p>
+
+<pre class="standalone"><span class="c-cm"># The pattern from chapter 0.3, expanded</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">dispatch_tools</span>(tool_use_blocks):
+    <span class="c-cm"># Build a list of coroutines (not running them yet)</span>
+    coros = [run_one_tool(block) <span class="c-kw">for</span> block <span class="c-kw">in</span> tool_use_blocks]
+    <span class="c-cm"># gather runs them concurrently; returns when all finish</span>
+    results = <span class="c-kw">await</span> asyncio.gather(*coros)
+    <span class="c-kw">return</span> results
+
+<span class="c-kw">async def</span> <span class="c-fn">run_one_tool</span>(block):
+    <span class="c-kw">return await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)</pre>
+
+      <p>Three subtleties:</p>
+
+      <p><strong>The list comprehension creates coroutines, not results.</strong> <code class="inline">[run_one_tool(b) for b in blocks]</code> evaluates each <code class="inline">run_one_tool(b)</code> expression, which returns a coroutine object without executing it. The execution happens inside <code class="inline">gather</code>. This is correct; it's also the source of confusion when someone thinks "the list comprehension already ran them in parallel."</p>
+
+      <p><strong>By default, gather raises on the first exception.</strong> If one tool fails, the others get cancelled and the exception propagates. Often not what you want — usually you want all tools to complete (or fail) so the agent can deal with the results individually.</p>
+
+      <p><strong>The <code class="inline">return_exceptions=True</code> flag changes this.</strong> <code class="inline">asyncio.gather(*coros, return_exceptions=True)</code> returns results <em>or exception objects</em> in the same list. Exceptions don't propagate; you handle them per-result. This is almost always what you want for tool dispatch — one failed tool shouldn't kill the others.</p>
+
+<pre class="standalone"><span class="c-cm"># The production version</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">dispatch_tools_safe</span>(tool_use_blocks):
+    coros = [run_one_tool(block) <span class="c-kw">for</span> block <span class="c-kw">in</span> tool_use_blocks]
+    results = <span class="c-kw">await</span> asyncio.gather(*coros, return_exceptions=<span class="c-kw">True</span>)
+
+    <span class="c-cm"># results is a list where some elements may be Exception objects</span>
+    tool_results = []
+    <span class="c-kw">for</span> block, result <span class="c-kw">in</span> <span class="c-kw">zip</span>(tool_use_blocks, results):
+        <span class="c-kw">if</span> <span class="c-kw">isinstance</span>(result, Exception):
+            tool_results.append({
+                <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                <span class="c-st">"tool_use_id"</span>: block.id,
+                <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"Error: {result}"</span>,
+                <span class="c-st">"is_error"</span>: <span class="c-kw">True</span>,
+            })
+        <span class="c-kw">else</span>:
+            tool_results.append({
+                <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                <span class="c-st">"tool_use_id"</span>: block.id,
+                <span class="c-st">"content"</span>: result,
+            })
+    <span class="c-kw">return</span> tool_results</pre>
+
+      <p>This is the shape every production agent's tool dispatcher takes. The variations are minor — different error formatting, different result post-processing — but the core pattern (gather with exception capture, per-result handling) is stable across agents.</p>
+
+      <h4>Pattern 2: timeouts with asyncio.wait_for</h4>
+
+      <p>Any I/O operation should have a timeout. Model calls, tool calls, network requests — all can hang. Without a timeout, your agent waits forever; with a timeout, you get a clean cancellation and a clear error.</p>
+
+<pre class="standalone"><span class="c-cm"># Wrap any awaitable with a timeout</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">run_with_timeout</span>(coro, timeout_s: <span class="c-kw">float</span>):
+    <span class="c-kw">try</span>:
+        <span class="c-kw">return await</span> asyncio.wait_for(coro, timeout=timeout_s)
+    <span class="c-kw">except</span> asyncio.TimeoutError:
+        <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"timeout"</span>, <span class="c-st">"elapsed_s"</span>: timeout_s}
+
+<span class="c-cm"># Applied to a tool call</span>
+result = <span class="c-kw">await</span> run_with_timeout(
+    HANDLERS[<span class="c-st">"slow_web_fetch"</span>](url=long_url),
+    timeout_s=<span class="c-st">10.0</span>,
+)</pre>
+
+      <p>Three rules of thumb for picking timeouts:</p>
+
+      <ul>
+        <li><strong>Model calls</strong>: 60-120 seconds. Some models with extended thinking can run for a minute or more on hard problems. Set the timeout to 2× the expected P99 latency.</li>
+        <li><strong>Web fetches and external APIs</strong>: 10-30 seconds. Anything legitimate happens fast; longer than that and the request is broken.</li>
+        <li><strong>Database / internal services</strong>: 1-5 seconds. Internal infra should be fast.</li>
+      </ul>
+
+      <p>Timeouts cascade: an agent's total run timeout should be larger than the sum of all per-step timeouts (plus some margin). If a single model call can take 60s and your agent does up to 10 of them, your total budget should be at least 700-800 seconds, with retries factored in.</p>
+
+      <p><strong>What happens on timeout</strong>: the awaited operation is cancelled mid-flight. For pure async code (network requests, asyncio.sleep), this is clean — the operation stops. For operations wrapping sync work in <code class="inline">to_thread</code>, cancellation is messier: the thread keeps running, and the cancellation only takes effect when the thread completes. Plan accordingly — don't rely on timeout to <em>actually stop</em> sync work, only to stop your code waiting on it.</p>
+
+      <h4>Pattern 3: structured concurrency with TaskGroup</h4>
+
+      <p>Python 3.11+ added <code class="inline">asyncio.TaskGroup</code> as the modern replacement for raw <code class="inline">gather</code> in many cases. It enforces a stricter discipline: all tasks spawned within the group are guaranteed to complete (or be cancelled) before the <code class="inline">async with</code> block exits.</p>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">run_subagents</span>(task_specs: <span class="c-kw">list</span>):
+    results = {}
+    <span class="c-kw">async with</span> asyncio.TaskGroup() <span class="c-kw">as</span> tg:
+        <span class="c-kw">for</span> spec <span class="c-kw">in</span> task_specs:
+            task = tg.create_task(run_subagent(spec))
+            results[spec.id] = task
+
+    <span class="c-cm"># Outside the `async with`, every task is guaranteed done</span>
+    <span class="c-kw">return</span> {sid: task.result() <span class="c-kw">for</span> sid, task <span class="c-kw">in</span> results.items()}</pre>
+
+      <p>The benefit of TaskGroup over gather: <strong>exceptions are aggregated into an ExceptionGroup rather than killing siblings silently</strong>. If two sub-agents fail, you see both exceptions, not just the first. The structured-concurrency discipline also makes the lifecycle clear — you can't accidentally leak a task by forgetting to await it.</p>
+
+      <p>For new agent code on Python 3.11+, prefer TaskGroup over raw gather. For codebases that need 3.10 compatibility, raw gather with <code class="inline">return_exceptions=True</code> remains the right pattern.</p>
+
+      <h4>Pattern 4: streaming concurrently with background work</h4>
+
+      <p>The streaming pattern from chapter 2.4: yield tokens to the client as they arrive, but do other work concurrently (logging, observability, follow-up dispatch).</p>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">stream_with_logging</span>(messages):
+    <span class="c-cm"># Start the model stream</span>
+    <span class="c-kw">async with</span> client.messages.stream(
+        model=<span class="c-st">"claude-sonnet-4-5"</span>,
+        max_tokens=<span class="c-st">4096</span>,
+        messages=messages,
+    ) <span class="c-kw">as</span> stream:
+        full_text = []
+        <span class="c-kw">async for</span> text <span class="c-kw">in</span> stream.text_stream:
+            full_text.append(text)
+            <span class="c-cm"># Yield to client as tokens arrive</span>
+            <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"token"</span>, <span class="c-st">"text"</span>: text}
+
+        <span class="c-cm"># After stream completes, kick off background work</span>
+        final = <span class="c-kw">await</span> stream.get_final_message()
+
+        <span class="c-cm"># asyncio.create_task launches without awaiting — the background</span>
+        <span class="c-cm"># work runs after the stream caller finishes consuming events</span>
+        asyncio.create_task(log_run_async(
+            messages=messages,
+            response=final,
+            tokens=<span class="c-kw">len</span>(<span class="c-st">""</span>.join(full_text)),
+        ))
+
+        <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"done"</span>, <span class="c-st">"usage"</span>: final.usage}</pre>
+
+      <p>The <code class="inline">asyncio.create_task</code> pattern lets you fire off work that doesn't need to block the response. Common uses: writing observability spans, updating dashboards, queueing follow-up actions. The caller doesn't wait for the logging to finish; the logging happens on the event loop's own schedule.</p>
+
+      <p>The trap: <strong>tasks created with <code class="inline">create_task</code> can be silently dropped if the event loop ends before they complete</strong>. For critical background work (writing audit logs that must persist), gather them explicitly before exiting the agent's context, or use a structured concurrency pattern. For best-effort work (a nice-to-have dashboard update), fire-and-forget is fine.</p>
+
+      <div class="callout warn">
+        <p>One specific bug that hits every team eventually: holding a reference to the task is required for it to survive garbage collection. If you write <code class="inline">asyncio.create_task(my_coro())</code> without storing the result, Python may garbage-collect the task before it runs, with no error. The fix: keep the task in a list or set you own. <code class="inline">background_tasks.add(task)</code> with <code class="inline">task.add_done_callback(background_tasks.discard)</code> is the recommended pattern.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should I use semaphores to limit concurrency, or is gather enough?</div>
+        <div class="answer">
+          <p>For tool dispatch within a single turn (5-10 concurrent operations), raw gather is fine — the rate limits on your downstream services typically tolerate that level of concurrency comfortably. For larger fan-out (50+ concurrent operations against rate-limited APIs), you need a semaphore to cap concurrency.</p>
+          <p>The pattern:</p>
+          <pre>sem = asyncio.Semaphore(10)  # max 10 concurrent
+
+async def bounded(coro):
+    async with sem:
+        return await coro
+
+results = await asyncio.gather(*[bounded(c) for c in coros])</pre>
+          <p>The semaphore caps the number of operations actually running at any moment; the rest wait. Use this when your downstream has rate limits you'd otherwise blow through.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">When does asyncio.run vs creating an event loop manually matter?</div>
+        <div class="answer">
+          <p>For most agent code: <code class="inline">asyncio.run(main())</code> at your entry point and nothing else. It creates the event loop, runs your coroutine, cleans up. This is the right default.</p>
+          <p>Manual loop management (<code class="inline">asyncio.get_event_loop()</code>, <code class="inline">loop.run_until_complete</code>) was the older API and has subtle gotchas. Reach for it only when integrating async code into a synchronous framework that owns its own event loop (some web frameworks, some testing setups). Otherwise, <code class="inline">asyncio.run</code> is sufficient.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>The five pitfalls that bite every team.</h3>
+
+      <p>Async Python has well-known pitfalls — patterns that pass code review, work in tests, and break under production load. Five of them affect agent code specifically often enough to be worth naming.</p>
+
+      <h4>Pitfall 1: forgetting <code class="inline">await</code></h4>
+
+      <p>The error: calling an async function without awaiting its result.</p>
+
+<pre class="standalone"><span class="c-cm"># Bug — calls the function but doesn't wait for the result</span>
+result = run_subagent(spec)        <span class="c-cm"># result is a coroutine, not the answer</span>
+process(result)                    <span class="c-cm"># processing a coroutine — bug</span>
+
+<span class="c-cm"># Correct</span>
+result = <span class="c-kw">await</span> run_subagent(spec)  <span class="c-cm"># result is the answer</span>
+process(result)</pre>
+
+      <p>Modern type checkers (mypy, pyright) and IDE warnings catch this most of the time. Without them, the failure mode is a RuntimeWarning that's easy to miss, and downstream code processing a coroutine object instead of a result. Run type-checking; it's not optional in async-heavy code.</p>
+
+      <h4>Pitfall 2: serializing what should be parallel</h4>
+
+      <p>Looking parallel but actually serial:</p>
+
+<pre class="standalone"><span class="c-cm"># Bug — these run sequentially even though they look parallel</span>
+results = []
+<span class="c-kw">for</span> spec <span class="c-kw">in</span> task_specs:
+    result = <span class="c-kw">await</span> run_subagent(spec)   <span class="c-cm"># awaits each before continuing</span>
+    results.append(result)
+
+<span class="c-cm"># Correct — actually concurrent</span>
+results = <span class="c-kw">await</span> asyncio.gather(*[
+    run_subagent(spec) <span class="c-kw">for</span> spec <span class="c-kw">in</span> task_specs
+])</pre>
+
+      <p>The first version is async but sequential — each <code class="inline">await</code> blocks before the next iteration starts. You get all the overhead of async with none of the concurrency benefit. The second version dispatches all work concurrently. The wall-clock difference for 5 sub-agents at 3 seconds each: 15 seconds vs ~3 seconds.</p>
+
+      <p>The pattern to internalize: <strong>if work is independent, batch it into gather; if it's sequential, await in order</strong>. Don't accidentally serialize independent work by awaiting inside a loop.</p>
+
+      <h4>Pitfall 3: blocking the event loop with sync work</h4>
+
+      <p>A synchronous call inside an async function blocks the entire event loop:</p>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">process_document</span>(doc_path: <span class="c-kw">str</span>):
+    <span class="c-cm"># Bug — open() and read() are sync; they block the event loop</span>
+    <span class="c-kw">with</span> <span class="c-kw">open</span>(doc_path) <span class="c-kw">as</span> f:
+        content = f.read()    <span class="c-cm"># blocks; nothing else makes progress</span>
+    <span class="c-kw">return await</span> process_content_async(content)
+
+<span class="c-cm"># Better — wrap sync I/O to run in a thread</span>
+<span class="c-kw">async def</span> <span class="c-fn">process_document</span>(doc_path: <span class="c-kw">str</span>):
+    content = <span class="c-kw">await</span> asyncio.to_thread(
+        <span class="c-kw">lambda</span>: <span class="c-kw">open</span>(doc_path).read()
+    )
+    <span class="c-kw">return await</span> process_content_async(content)
+
+<span class="c-cm"># Best — use an async-native library (aiofiles, etc.)</span>
+<span class="c-kw">async def</span> <span class="c-fn">process_document</span>(doc_path: <span class="c-kw">str</span>):
+    <span class="c-kw">async with</span> aiofiles.<span class="c-kw">open</span>(doc_path) <span class="c-kw">as</span> f:
+        content = <span class="c-kw">await</span> f.read()
+    <span class="c-kw">return await</span> process_content_async(content)</pre>
+
+      <p>The symptoms of accidental blocking: agent latency that scales with concurrent load (because each agent's sync call blocks all the others), or mysterious slowdowns under traffic spikes. The diagnostic: add logging to your event-loop iterations and watch for long gaps. The fix is mechanical once identified.</p>
+
+      <p>Common sync calls to watch for: file I/O without aiofiles, sync database libraries (psycopg2 instead of asyncpg), CPU-bound work like JSON parsing of huge documents (use aiojson or move to thread), and any third-party library that wasn't written with async in mind.</p>
+
+      <h4>Pitfall 4: cancellation that doesn't actually cancel</h4>
+
+      <p>You wrap an operation in <code class="inline">wait_for</code> with a timeout. The timeout fires. You expect the operation to stop. It doesn't:</p>
+
+<pre class="standalone"><span class="c-cm"># The operation wraps sync work in a thread</span>
+<span class="c-kw">async def</span> <span class="c-fn">slow_op</span>():
+    <span class="c-kw">await</span> asyncio.to_thread(very_long_sync_function)
+
+<span class="c-cm"># Timeout fires after 5s, but the thread keeps running</span>
+<span class="c-kw">try</span>:
+    <span class="c-kw">await</span> asyncio.wait_for(slow_op(), timeout=<span class="c-st">5.0</span>)
+<span class="c-kw">except</span> asyncio.TimeoutError:
+    <span class="c-kw">pass</span>
+<span class="c-cm"># The sync function is still running in the thread pool!</span></pre>
+
+      <p>Cancellation only works for genuinely-async operations. <code class="inline">asyncio.sleep</code>, network I/O via async libraries, and other awaitables all cancel cleanly. Sync work running in a thread does not — Python threads can't be safely killed from outside, so the thread keeps running to completion. Your async code returns control on timeout, but the underlying work continues.</p>
+
+      <p>The practical implications: don't rely on timeout to <em>actually stop</em> sync work; only to stop your code waiting on it. If the operation has external side effects (writing files, calling APIs), those still happen even after the timeout. Plan around this — either accept that "timeout" means "I stopped waiting, the work continues" or move the work into a true async implementation.</p>
+
+      <h4>Pitfall 5: silently swallowed exceptions in fire-and-forget tasks</h4>
+
+      <p>Tasks created with <code class="inline">create_task</code> that raise exceptions: the exception is captured by the task object but never re-raised unless someone awaits the task. If you never await, the exception is silently lost.</p>
+
+<pre class="standalone"><span class="c-cm"># Bug — exceptions in this task disappear silently</span>
+asyncio.create_task(log_async(message))
+
+<span class="c-cm"># Better — at minimum, log the exception when it happens</span>
+<span class="c-kw">def</span> <span class="c-fn">_log_exception</span>(task):
+    <span class="c-kw">if</span> task.exception():
+        logger.error(<span class="c-st">"Background task failed"</span>, exc_info=task.exception())
+
+t = asyncio.create_task(log_async(message))
+t.add_done_callback(_log_exception)</pre>
+
+      <p>The <code class="inline">add_done_callback</code> pattern at least surfaces the failure to your logs. For critical background work, the better fix is to await the task explicitly before exiting the agent's context (or use TaskGroup, which raises exceptions from completed tasks). The "silent failure of background tasks" pattern is responsible for many "but the dashboard isn't updating" mysteries in production.</p>
+    </div>
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Advanced patterns: cancellation, backpressure, async iteration.</h3>
+
+      <p>Three patterns beyond the basics that show up in mature agent code. Skim these for awareness; reach for them when the basic patterns don't suffice.</p>
+
+      <h4>Cooperative cancellation: shielding critical work</h4>
+
+      <p>When your agent run is cancelled (a timeout fires, the user aborts), you usually want everything to stop cleanly. Sometimes, though, there's critical cleanup work that must complete even as cancellation propagates — flushing a final log entry, releasing a lock, committing a partial transaction.</p>
+
+      <p><code class="inline">asyncio.shield</code> protects a coroutine from outer cancellation:</p>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">run_with_cleanup</span>(work_coro):
+    <span class="c-kw">try</span>:
+        <span class="c-kw">return await</span> work_coro
+    <span class="c-kw">finally</span>:
+        <span class="c-cm"># This cleanup runs even if work_coro was cancelled,</span>
+        <span class="c-cm"># and shield protects the cleanup from also being cancelled</span>
+        <span class="c-kw">await</span> asyncio.shield(write_final_audit_log())</pre>
+
+      <p>Use shield sparingly — it can extend cancellation latency significantly if abused. The right use case is brief, bounded cleanup work that must complete; for everything else, normal cancellation is the right behavior.</p>
+
+      <h4>Backpressure: controlled flow when downstream is slow</h4>
+
+      <p>If your agent produces output faster than it can be consumed (a streaming response that the network can't deliver fast enough), naive code accumulates in memory. <code class="inline">asyncio.Queue</code> with a bounded size lets the producer wait when the consumer falls behind:</p>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">produce_with_backpressure</span>(queue: asyncio.Queue):
+    <span class="c-kw">async for</span> chunk <span class="c-kw">in</span> stream.text_stream:
+        <span class="c-cm"># If queue is full (consumer slow), put() blocks here</span>
+        <span class="c-kw">await</span> queue.put(chunk)
+    <span class="c-kw">await</span> queue.put(<span class="c-kw">None</span>)   <span class="c-cm"># sentinel for end-of-stream</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">consume_with_pacing</span>(queue: asyncio.Queue):
+    <span class="c-kw">while True</span>:
+        chunk = <span class="c-kw">await</span> queue.get()
+        <span class="c-kw">if</span> chunk <span class="c-kw">is None</span>: <span class="c-kw">break</span>
+        <span class="c-kw">await</span> send_to_client(chunk)
+
+<span class="c-cm"># Bounded queue applies backpressure when consumer is slow</span>
+q = asyncio.Queue(maxsize=<span class="c-st">10</span>)
+<span class="c-kw">await</span> asyncio.gather(produce_with_backpressure(q), consume_with_pacing(q))</pre>
+
+      <p>This pattern matters for streaming agents serving slow clients. Without backpressure, a slow client (or a stuck network) causes memory growth as your producer races ahead. With backpressure, the producer naturally paces itself to consumer speed.</p>
+
+      <h4>Async iteration: streaming agent loops</h4>
+
+      <p>The streaming-agent pattern from chapter 2.4 uses async generators (<code class="inline">async def</code> + <code class="inline">yield</code>) to emit events as they happen:</p>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">stream_agent_events</span>(messages):
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(MAX_STEPS):
+        <span class="c-cm"># Stream the model response, yielding tokens as they arrive</span>
+        <span class="c-kw">async with</span> client.messages.stream(...) <span class="c-kw">as</span> stream:
+            <span class="c-kw">async for</span> text <span class="c-kw">in</span> stream.text_stream:
+                <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"token"</span>, <span class="c-st">"text"</span>: text}
+
+        final = <span class="c-kw">await</span> stream.get_final_message()
+        <span class="c-kw">if</span> final.stop_reason != <span class="c-st">"tool_use"</span>:
+            <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"done"</span>}
+            <span class="c-kw">return</span>
+
+        <span class="c-cm"># Tool dispatch, yielding progress events</span>
+        <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"tool_use"</span>, <span class="c-st">"blocks"</span>: get_tool_blocks(final)}
+        results = <span class="c-kw">await</span> dispatch_tools_safe(get_tool_blocks(final))
+        <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"tool_results"</span>, <span class="c-st">"results"</span>: results}
+
+        messages.append(...)   <span class="c-cm"># update conversation, loop</span>
+
+<span class="c-cm"># Callers iterate</span>
+<span class="c-kw">async for</span> event <span class="c-kw">in</span> stream_agent_events(messages):
+    handle_event(event)</pre>
+
+      <p>The async-generator pattern is what makes streaming agent loops clean. Each yield emits one event to the caller; the caller processes it; the loop continues. The producer (agent) and consumer (client renderer) decouple naturally, and the code reads sequentially even though it's running asynchronously underneath.</p>
+
+      <p>This is the pattern the Agent SDK's <code class="inline">query()</code> function exposes, the pattern Anthropic's streaming endpoints support, and the pattern your own streaming agents should adopt. It's a meaningful upgrade over "return a final result" once you have any user-facing latency to manage.</p>
+
+      <div class="callout tip">
+        <p>If you remember one thing from this chapter, remember <code class="inline">return_exceptions=True</code> on <code class="inline">asyncio.gather</code>. It's the single highest-leverage async pattern for agents — without it, one flaky tool can kill an entire turn's worth of dispatched work. With it, you handle each result on its own merits. Apply it everywhere you dispatch independent work.</p>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 0.4</div>
+      <h3>Deliverable</h3>
+      <p>A working command of the async Python patterns that appear in every agent codebase. Parallel dispatch with gather (and <code class="inline">return_exceptions=True</code> for production), timeouts with wait_for, structured concurrency with TaskGroup on 3.11+, streaming with async generators. Awareness of the five pitfalls (missing await, accidental serialization, blocking the loop, broken cancellation, silent task failures) and the diagnostics for each. Advanced patterns (shielding, backpressure, async iteration) as tools to reach for when basic patterns aren't enough.</p>
+      <ul class="checklist">
+        <li>Tool dispatch uses <code class="inline">asyncio.gather(*coros, return_exceptions=True)</code></li>
+        <li>Every model call, tool call, network request has a timeout via <code class="inline">asyncio.wait_for</code></li>
+        <li>Per-step timeouts ladder up to a total agent-run timeout with margin for retries</li>
+        <li>Python 3.11+: prefer TaskGroup for new code; falls back to gather for older versions</li>
+        <li>Sync I/O wrapped in <code class="inline">asyncio.to_thread</code> or replaced with async-native libraries</li>
+        <li>Fire-and-forget tasks hold references in a set to avoid GC; add done callback for error logging</li>
+        <li>Type checking (mypy/pyright) enabled to catch missing awaits and other async mistakes</li>
+        <li>Streaming agent loops use <code class="inline">async def</code> + <code class="inline">yield</code>; callers iterate with <code class="inline">async for</code></li>
+        <li>Backpressure via bounded queues for streaming pipelines with variable consumer speed</li>
+        <li>Awareness that timeout cancels your wait, not necessarily the underlying sync work</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('f3')">
+        <div class="dir">← prev</div>
+        <div class="title">0.3 Tool use</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('p1')">
+        <div class="dir">next →</div>
+        <div class="title">1.1 The loop</div>
+      </button>
+    </div>
+  </section>

@@ -1,0 +1,536 @@
+<section class="phase">
+    <div class="phase-num">0.1</div>
+    <div class="week">Part 0 / Foundations · The intuitions everything later assumes</div>
+    <h2>The LLM mental model.</h2>
+    <p class="goal">This chapter teaches you to think about a language model well enough to predict roughly what it will do on a given prompt, and to explain why a specific failure mode happens when it doesn't. Not "what is an LLM" — you've used one. The working intuitions that turn LLMs from black boxes into systems you can reason about: tokens as the real unit, context windows as a finite resource, sampling as a distribution to navigate, and hallucinations as predictable failure modes with named mechanisms. Everything in the rest of this guide assumes these intuitions.</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Tokens: the real unit.</h3>
+
+      <p>A language model does not read characters and does not read words. It reads <strong>tokens</strong> — subword units, typically between 2 and 6 characters in length for English, picked by the tokenizer to balance vocabulary size against sequence length. Internalizing this is the foundation everything else rests on, because half the bugs and surprises in LLM work trace back to confusion about what counts as a token.</p>
+
+      <h4>The first thing to see</h4>
+
+      <p>Run a tokenizer on a few strings. Here's what happens with Anthropic's Claude tokenizer (OpenAI's <code class="inline">tiktoken</code> behaves similarly for English):</p>
+
+<pre class="trace standalone"><span class="c-out">"Hello"           → 1 token
+"Hello world"     → 2 tokens  (Hello | world)
+"ChatGPT"         → 1 token   (one canonical chunk)
+"Anthropic"       → 1 token
+"unhappiness"     → 3 tokens  (un | happiness ... or un | happi | ness)
+"supercalifragilisticexpialidocious" → 8 tokens
+
+"Czesław Miłosz"  → 7 tokens  (C | z | es | ł | a | w |  Mił | osz ...)
+"日本語"          → 3 tokens  (one per character)
+"🦀"             → 2 tokens  (the emoji decomposes into bytes)
+
+"{\"name\":\"alex\"}"           → 7 tokens
+"{ \"name\" : \"alex\" }"       → 10 tokens (extra spaces cost real tokens)</span></pre>
+
+      <p>Four things in this list deserve attention.</p>
+
+      <p><strong>"ChatGPT" is one token.</strong> Frequent strings in the training corpus get their own dedicated token because it's efficient. "Anthropic" gets one. "OpenAI" probably gets one or two. Common product names, API names, programming keywords — all one token, because they appeared often enough that the tokenizer training merged them. This is also why <code class="inline">def function_name():</code> in Python is fewer tokens than the English description of the same thing.</p>
+
+      <p><strong>Polish, Japanese, and emoji cost much more.</strong> "Czesław" — a normal Polish name — costs six or seven tokens because the tokenizer was trained mostly on English and isn't optimized for Polish diacritics. The same name in English transliteration ("Czeslaw") would be 2–3 tokens. This is not a bug; it's a direct consequence of the training distribution. The practical impact: a chatbot serving non-English users costs 2–4× more per turn than the same chatbot serving English users, and has a smaller effective context window because each user message eats more tokens.</p>
+
+      <p><strong>Whitespace and formatting are real tokens.</strong> The two JSON examples differ by whitespace and the difference is meaningful. Tabs, newlines, extra spaces — they all consume tokens. A "compact" prompt format is genuinely cheaper than a "readable" one. This matters most in production where you're paying for every token, multiplied by every request.</p>
+
+      <p><strong>Tokenization is deterministic but not intuitive.</strong> The tokenizer is a piece of code that takes a string and produces a sequence of integers (token IDs). Same input, same output, every time. But the boundaries are picked by an algorithm trained on a corpus, not by linguistic rules. You cannot predict tokenization by inspection; you have to actually run the tokenizer to know.</p>
+
+      <h4>The implications for your prompt costs</h4>
+
+      <p>Three concrete consequences you'll feel in production:</p>
+
+      <p>Your prompt cost is not your character count, your word count, or any quantity you can eyeball. It's a tokenizer-output count, and the only way to know it is to measure. The provider's billing dashboard will show you the real number after the fact; if you want to know in advance, run the tokenizer locally on your inputs.</p>
+
+<pre class="standalone"><span class="c-cm"># Pre-flight token counting (Anthropic)</span>
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+client = Anthropic()
+
+count = client.messages.count_tokens(
+    model=<span class="c-st">"claude-sonnet-4-5"</span>,
+    messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: prompt}],
+)
+<span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"input tokens: {count.input_tokens}"</span>)
+
+<span class="c-cm"># Or locally with tiktoken for OpenAI</span>
+<span class="c-kw">import</span> tiktoken
+enc = tiktoken.encoding_for_model(<span class="c-st">"gpt-5.5"</span>)
+<span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"input tokens: {len(enc.encode(prompt))}"</span>)</pre>
+
+      <h4>The implications for failures</h4>
+
+      <p>Three failure modes that trace back to tokens, all of which look like other things until you check:</p>
+
+      <p><strong>Truncation mid-name in JSON outputs.</strong> The model is generating a JSON object that contains a name field. <code class="inline">max_tokens</code> is set to 200. The model emits <code class="inline">{"name": "Czesł</code> and stops because the tokens to finish that Polish name plus the rest of the JSON exceeded the budget. The JSON is malformed; your downstream code crashes. If you'd measured token counts before setting max_tokens, you'd have given it 250.</p>
+
+      <p><strong>Subword bleeding in structured output.</strong> You ask the model to output one of three categories: "critical", "warning", "info". You get back "criti" or "warning_" or "infos". The model started emitting the right token but its sampling drifted at a subword boundary. Strict mode and JSON-schema-constrained generation prevent this; their existence is why tokens matter.</p>
+
+      <p><strong>Inconsistent behavior on edge cases.</strong> Your prompt works on examples typed in ASCII. It fails on the same examples typed with curly quotes ("smart" quotes). The reason: <code class="inline">"</code> and <code class="inline">"</code> tokenize differently. The model has seen the ASCII version a million times in training and the smart-quote version maybe 10,000 times. Behavior diverges on inputs that look identical to humans.</p>
+
+      <div class="callout warn">
+        <p>The single highest-leverage habit for an LLM engineer: <strong>look at the tokenization of any prompt you're optimizing</strong>. The free tokenizer playgrounds (Anthropic and OpenAI both publish web tools) let you paste text and see the token boundaries colored. Five minutes of staring at how your prompt tokenizes will surface bugs you've been chasing for hours.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How big are the tokenizer vocabularies?</div>
+        <div class="answer">
+          <p>Roughly 100,000–200,000 tokens. Claude's tokenizer is around 200K; OpenAI's <code class="inline">cl100k_base</code> is 100,256. Llama's tokenizers vary by version. The vocabulary is chosen at tokenizer training time — once frozen, it's part of the model. Bigger vocabulary = each token covers more text on average = lower token counts for the same input = lower cost, but more parameters in the embedding layer.</p>
+          <p>The practical takeaway: tokenizer choice affects cost, but you don't control it. Provider picks the tokenizer; you pay for what it gives you.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why is "ChatGPT" one token but "Czesław" six?</div>
+        <div class="answer">
+          <p>BPE (byte-pair encoding, the algorithm) merges the most frequent character pairs in the training corpus into vocabulary entries. "ChatGPT" appeared often enough during tokenizer training to earn a dedicated entry. "Czesław" did not, so it gets broken down into smaller pieces (and "ł" specifically is rare enough in English text that it usually gets its own token or even decomposes to UTF-8 bytes). The vocabulary is a frequency-weighted snapshot of the training corpus.</p>
+          <p>This is why technical English (with words like "function", "object", "request") tokenizes well — those words are extremely frequent in code-heavy training corpora.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Does the model see token IDs or token strings?</div>
+        <div class="answer">
+          <p>Token IDs — integers. The model never sees the string "ChatGPT"; it sees something like <code class="inline">[5942]</code>. The model's embedding layer maps each ID to a high-dimensional vector, and from there it's all vector arithmetic. The string-to-ID mapping (the tokenizer) is a separate piece of code that runs before the model sees anything and after the model emits anything.</p>
+          <p>This is why models can output tokens that don't decode to valid UTF-8 in rare cases — the model is operating on IDs, the tokenizer is operating on strings, and the round-trip can fail for byte-fallback tokens. Streaming has to buffer until valid UTF-8 emerges.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>The context window is a finite, position-sensitive resource.</h3>
+
+      <p>You hear "200K context window" and intuit "200,000 tokens of free space." Both halves of that intuition are wrong in production. The space costs real money, and not all positions inside it are equal — content in the middle of a long context performs measurably worse than the same content at the start or end. Treating the context window as homogeneous flat memory is the source of subtle quality bugs that don't surface in dev.</p>
+
+      <h4>Context costs scale with usage, not capacity</h4>
+
+      <p>The headline number — Claude Sonnet 4.5's 200K context window — is a maximum, not a price tier. You pay for the tokens you actually use, and you pay for them <em>on every turn</em>. A multi-turn agent conversation that fills 80K tokens of history pays for 80K input tokens on every subsequent model call, not once. Across a 20-turn conversation, that's 1.6M input tokens paid for the same accumulated history. Prompt caching (chapter 2.2) reduces this significantly when context is stable, but the baseline shape is "context cost compounds with conversation length."</p>
+
+      <p>The corollary: <em>context is the most expensive resource an agent burns</em>. Not model calls, not tool calls — tokens of accumulated context. Optimizing how much context an agent carries forward (summarization, truncation, subagent isolation as in chapter 1.3) is usually the highest-leverage cost optimization available.</p>
+
+      <h4>The lost-in-the-middle effect</h4>
+
+      <p>The harder intuition: <strong>position inside the context window affects how reliably the model can use what's there</strong>. Multiple studies in 2023–2025 documented the pattern that has come to be called "lost in the middle": when you put 30 documents in context and ask the model to use one of them, the model is much more likely to use a document positioned at the start or end of the context than one positioned in the middle.</p>
+
+      <p>The shape of the effect:</p>
+
+      <div class="diagram">                  Recall accuracy
+                  by document position in a 30-doc context
+
+                  ↑
+              100 │██                                          ██
+                  │██                                        ██
+               80 │██████                                ██████
+                  │██████                              ██████
+               60 │████████                          ████████
+                  │████████      ↓ "lost middle"   ████████
+               40 │████████  ████████████████████ ████████
+                  │████████  ████████████████████ ████████
+               20 │████████  ████████████████████ ████████
+                  │████████  ████████████████████ ████████
+                0 └─────────────────────────────────────────→
+                   start                                  end
+                   of context                       of context
+
+  Recall is high at the start (the model anchored on the first few)
+  and at the end (recency effect — these were seen most recently).
+  In the middle, performance can drop by 20-40 percentage points.</div>
+
+      <p>The effect is well-established, varies in magnitude by model and task, and shrinks (but does not disappear) with newer models. Frontier models in 2026 handle long contexts better than 2023 models, but the middle-of-context penalty is still measurable. Plan around it.</p>
+
+      <h4>What to do about it</h4>
+
+      <p>Three practical implications for how you arrange information in your prompts:</p>
+
+      <p><strong>Put the most important content at the start and end.</strong> If your system prompt has critical rules ("never reveal API keys"), put them either at the very top or very bottom — not buried in the middle of a 2000-token system prompt. If your retrieved context has 10 chunks ranked by relevance, put the top-ranked chunks at the boundaries, not the middle.</p>
+
+      <p><strong>Restate critical instructions near the user's actual question.</strong> If the system prompt says "respond in JSON only" and then 50K tokens of conversation history follow, the model may forget the JSON constraint by the time it generates the response. The fix: include a short restatement at the end of the user message ("Respond in JSON only, as specified in the system prompt"). The redundancy looks ugly; it's worth it.</p>
+
+      <p><strong>Don't fill the context just because you can.</strong> Adding more documents to retrieval-augmented generation often hurts quality at some point, not because the model can't read them, but because the relevant document is now buried in the middle and the model can't focus on it. Most production RAG settles at top-5 or top-10 chunks, not because that's all the model can handle, but because that's the sweet spot before lost-in-the-middle starts costing more than the marginal context adds.</p>
+
+      <h4>The mental model: attention as a budget</h4>
+
+      <p>The mechanism underlying lost-in-the-middle: every token in context has to be attended to when generating the next token. The attention mechanism is fundamentally about <em>weighing</em> all input tokens — and with 100,000 tokens of input, each one gets a small slice of attention by default. Tokens at the start get "anchored" early in processing (the model's representation builds from left to right in a sense); tokens at the end are most recent in the sequence and get strong positional weighting. Middle tokens are neither anchored nor recent.</p>
+
+      <p>You don't need to understand the math to use the intuition: <strong>think of attention as a limited budget the model spreads across input tokens, with structural advantages for the start and end</strong>. Information you want the model to actually use should sit where the budget is biggest.</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  WHERE TO PUT WHAT                                          │
+│                                                             │
+│  Start of context:                                          │
+│  ─ System prompt with critical rules                        │
+│  ─ Most important retrieved documents                       │
+│  ─ Tool definitions (model needs them throughout)           │
+│                                                             │
+│  Middle of context:                                         │
+│  ─ Bulk content the model needs to read but probably won't  │
+│    refer back to constantly                                 │
+│  ─ Historical conversation turns the model can summarize    │
+│                                                             │
+│  End of context (just before model generation):             │
+│  ─ User's most recent message                               │
+│  ─ Restated critical instructions ("respond in JSON")       │
+│  ─ Any "do this next" prompt for the assistant              │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <h4>Long context vs RAG: a deeper question than it looks</h4>
+
+      <p>"Just dump everything in context, the window is huge" is a tempting alternative to retrieval-augmented generation. Sometimes it's the right answer, sometimes not, and the trade-off has three axes:</p>
+
+      <ul>
+        <li><strong>Cost.</strong> 200K tokens of input on every turn is expensive — call it $0.60 per turn on Sonnet at 2026 pricing. RAG with 5 retrieved chunks costs about $0.015 per turn. The difference compounds.</li>
+        <li><strong>Latency.</strong> Processing 200K tokens takes meaningful time even with optimized inference — typically 3–10 seconds before the first generated token. RAG with smaller context produces first-token-out in under a second.</li>
+        <li><strong>Quality.</strong> Sometimes long context wins (when the right answer requires synthesizing across many documents). Sometimes RAG wins (when the right document needs to be at the start/end of context for the lost-in-the-middle reason). Measure on your eval set.</li>
+      </ul>
+
+      <p>The honest answer: long context is a tool, not a replacement for retrieval. Use it when you need cross-document reasoning over a known corpus. Use RAG when the corpus is too large to fit, or when cost and latency matter, or when the bulk of queries only need a few chunks.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Has lost-in-the-middle gotten better with newer models?</div>
+        <div class="answer">
+          <p>Yes, but not gone. Frontier 2026 models handle 100K+ contexts much better than 2023 models did — recall at middle positions is dramatically improved, especially with techniques like contextual training and improved attention variants. But on benchmark tests of mid-context retrieval, you can still measure a gap between start/end and middle positions of 5–15 percentage points depending on task.</p>
+          <p>For agent design: treat lost-in-the-middle as a real effect that you can mitigate (by positioning content well) but should not assume away. The cost of placing important content at the boundaries is essentially zero; the cost of <em>not</em> placing it there is occasional quality regression you can't reproduce.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about the "200K context but only 8K effective" claims I've seen?</div>
+        <div class="answer">
+          <p>Those claims come from "needle in a haystack" benchmarks where the model is asked to retrieve one specific fact from a long document. They're directionally correct — recall degrades with context length — but often overstate the magnitude for typical use. The real picture: for tasks that <em>need</em> cross-document reasoning, modern long-context models work well. For tasks that need to find one buried fact, they work less well, and retrieval-augmented approaches usually win.</p>
+          <p>The pragmatic rule: if your task is "find and use," use RAG. If your task is "synthesize across," consider long context. Either way, measure on your specific eval set rather than trusting general claims.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Does prompt caching change any of this?</div>
+        <div class="answer">
+          <p>Prompt caching (chapter 2.2 covers it in depth) reduces the cost dimension dramatically — cached tokens are billed at 10% of normal input price. It does <em>not</em> change the quality dimension; the model still has to attend to all tokens, and lost-in-the-middle still applies. Caching changes the economics of long context but not the cognitive shape of working with it.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Sampling: the model is a distribution, not a function.</h3>
+
+      <p>The most useful single shift in mental model: <strong>the model doesn't pick a single output for a given input</strong>. For each next token, it produces a probability distribution over the whole vocabulary, and a separate sampling step picks one of those tokens. Different sampling settings, different output — same input, same model. Internalizing this dissolves a class of confusion ("why did I get a different answer this time?") and gives you a control surface for production agents.</p>
+
+      <h4>What the model actually outputs</h4>
+
+      <p>For each step of generation, the model emits a vector of logits — one number per vocabulary entry, typically 100,000–200,000 numbers. Softmax those and you get a probability distribution over what the next token might be:</p>
+
+<pre class="trace standalone"><span class="c-out">Prompt: "The capital of France is"
+Model's distribution over next token:
+  " Paris"   →  0.847
+  " the"     →  0.043
+  " a"       →  0.022
+  " located" →  0.018
+  " known"   →  0.011
+  " Lyon"    →  0.008
+  ... 200,000 more tokens, mostly near zero ...
+
+Sampling picks one of these. Then the process repeats for the next token,
+conditioned on the new sequence.</span></pre>
+
+      <p>The model's output is not " Paris" — it's the entire distribution. Sampling is what reduces the distribution to a single token. Different sampling choices, different paths down the probability tree.</p>
+
+      <h4>Temperature, in plain English</h4>
+
+      <p>Temperature is a single number — typically 0 to 2 — that controls how sharply concentrated the distribution is on the most probable token.</p>
+
+      <p>At <strong>temperature 0</strong>: take the single highest-probability token, every time. The distribution gets collapsed to a one-hot vector before sampling. Sometimes called "greedy decoding." Closest the model gets to deterministic behavior.</p>
+
+      <p>At <strong>temperature 1</strong>: sample from the actual distribution as-is. The model's natural variability.</p>
+
+      <p>At <strong>temperature 2</strong>: flatten the distribution. The high-probability tokens get sampled less often, low-probability tokens get sampled more often. Output becomes more varied, also less coherent.</p>
+
+      <div class="diagram">              temperature 0           temperature 1          temperature 2
+                                                              
+      P=1.0  │█                       │                       │
+             │█                       │█                      │
+             │█                       │█                      │
+             │█                       │█                      │
+             │█                       │██                     │█
+             │█                       │██                     │██
+             │█                       │████                   │████
+             │█                       │██████                 │██████
+             │█                       │████████               │████████
+             │█                       │██████████             │██████████
+      P=0.0  │█  · · · · · · · · ·   │██████████  · · · ·   │██████████████
+             └────────────────────    └────────────────────   └────────────────────
+              one peak. Always         broad. Most likely      flat. Anything could
+              picks the highest.       wins, but variety       come out.
+                                       is real.
+
+  The model's underlying distribution is the same in all three cases.
+  Temperature is just a transformation applied before sampling.</div>
+
+      <h4>Temperature 0 still isn't deterministic</h4>
+
+      <p>Here is the most surprising thing about sampling to people coming from traditional software: <strong>even at temperature 0, the same prompt can produce different outputs</strong>. Not always, but enough to matter in production.</p>
+
+      <p>Why? The deterministic path "always take the highest-probability token" depends on the probability vector being identical across runs. In practice, the probability vector can differ across runs because of:</p>
+
+      <ul>
+        <li><strong>Floating-point non-determinism in batched inference.</strong> Modern inference servers batch requests together for GPU efficiency. The exact batch your request lands in affects the order of additions in the matrix multiplications, which (because floating-point addition isn't associative) can shift logits by tiny amounts. Usually meaningless. Occasionally enough to tip the top-1 from one token to another.</li>
+        <li><strong>Model snapshot updates.</strong> Provider deploys a new minor version. Same model name in the API call, slightly different weights, slightly different distribution. Your "deterministic" runs diverge.</li>
+        <li><strong>Server-side processing variations.</strong> Caching, routing, fallback machinery — all of these can introduce tiny perturbations even when you specify temperature=0.</li>
+      </ul>
+
+      <p>The practical impact: <strong>treat temperature=0 as "low variance," not "no variance"</strong>. If you need actual reproducibility for tests or eval reruns, you need to combine temperature=0 with explicit seeds (where the provider supports them) and ideally a pinned model snapshot, and even then expect occasional drift.</p>
+
+      <h4>When to use which temperature</h4>
+
+      <p>The decision is task-driven, not preference-driven. Rough guide:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Task</div>
+          <div>Temperature</div>
+          <div>Reasoning</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Classification, extraction</div>
+          <div class="vector">0 to 0.2</div>
+          <div class="defense">There's a correct answer. You want the highest-probability one. Variety hurts.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Tool-calling decisions</div>
+          <div class="vector">0 to 0.3</div>
+          <div class="defense">Want predictable behavior on the same input. Some variability is fine; randomness isn't.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Code generation</div>
+          <div class="vector">0.2 to 0.4</div>
+          <div class="defense">Low but not zero — some creativity for novel problems, mostly the highest-probability path for familiar ones.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Summarization, rewriting</div>
+          <div class="vector">0.3 to 0.7</div>
+          <div class="defense">Variety in phrasing is genuinely desirable. Same content, different ways to express it.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Creative writing, brainstorming</div>
+          <div class="vector">0.7 to 1.0</div>
+          <div class="defense">You want surprise. The highest-probability tokens are often the most generic.</div>
+        </div>
+      </div>
+
+      <h4>top_p (nucleus sampling): the other dial</h4>
+
+      <p><code class="inline">top_p</code> is an alternative way to constrain sampling. Where temperature reshapes the whole distribution, top_p truncates it: sample only from the smallest set of tokens whose cumulative probability exceeds <code class="inline">top_p</code>. At <code class="inline">top_p = 0.9</code>, you're sampling from the top tokens that together account for 90% of probability mass — usually a few dozen out of 200,000.</p>
+
+      <p>The intuition: <strong>top_p caps how unlikely a token can be and still get sampled</strong>. It guarantees that you don't accidentally pick a wildly improbable token, while still allowing diversity among the merely "probable enough" ones.</p>
+
+      <p>Most production agents leave top_p at its default (1.0, i.e., no truncation) and rely on temperature alone. Combining both is occasionally useful: temperature 0.7 with top_p 0.9 gives you "diverse but never wild." Rarely worth tuning unless you have a specific failure mode you're trying to mitigate.</p>
+
+      <h4>Seeds and the limits of reproducibility</h4>
+
+      <p>Both Anthropic and OpenAI support a <code class="inline">seed</code> parameter. The promise: same seed + same prompt + same model + same parameters → same output. The reality is closer to "very likely the same output, but not guaranteed" — providers explicitly document seeds as best-effort, not contractual. The non-determinism sources from earlier (batching, snapshot drift) still apply at the margins.</p>
+
+      <p>What seeds <em>do</em> get you: meaningful reproducibility for tests within a short window. If you run your eval suite at 9am with a fixed seed and again at 10am, you'll almost certainly get the same results. If you run it next month, after a model snapshot has rolled out, you may not.</p>
+
+      <p>The practical use of seeds: set them in tests and CI runs so noise on individual examples doesn't pollute your eval signal. Don't set them in production — production benefits from the variety, and the determinism wouldn't be reliable anyway.</p>
+
+      <div class="callout tip">
+        <p>The mental model upgrade: <strong>stop thinking of the model as "wrong" when it produces a different answer to the same prompt</strong>. Think of it as sampling from a distribution. The right question is "is the distribution centered on the right answer with appropriate confidence?" — and that's measurable on your eval set. A model that's right 80% of the time is right 80% of the time on average; running it once might land in the 20%. That's not a bug, it's sampling.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">If temperature 0 isn't deterministic, why use it at all?</div>
+        <div class="answer">
+          <p>Because "low variance" is almost always what you want for production agents. The runs that diverge at temperature 0 are tipping near the boundary between two similarly-probable tokens — exactly the cases where the model is uncertain. The output isn't "random"; it's picking between two reasonable continuations. For classification or extraction tasks, this is fine. For creative tasks where you actively want variety, you'd be at a higher temperature anyway.</p>
+          <p>Don't reach for temperature 0 expecting deterministic replay. Reach for it expecting "highest-probability path, most of the time." That's the right framing.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My eval scores fluctuate ±2 points between runs. Is that sampling noise?</div>
+        <div class="answer">
+          <p>Almost certainly yes, and chapter 3.1's noise-floor measurement quantifies exactly this. The right response isn't to chase determinism — it's to run the noisy metrics multiple times and report the mean. Two sigma above the mean is the threshold for "real change"; below that is sampling.</p>
+          <p>If your eval set has 50 examples and three of them are right at the boundary where the model's top-1 token might flip from "correct" to "incorrect," then ±2 points per run is exactly what you'd expect. Multi-run measurement absorbs this.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Does temperature affect tool calling?</div>
+        <div class="answer">
+          <p>Yes — and almost always you want it low for tool calls. At higher temperatures, the model might choose to call a different tool than it would have at temperature 0, or pass slightly different arguments. For most agents this is undesirable: you want predictable behavior on the tool dispatch step. Set temperature to 0–0.3 if your loop is heavy on tool calls.</p>
+          <p>Some agent frameworks set temperature 0 for the tool-decision step and higher for the final synthesis step — a useful pattern when you want deterministic tool selection but more varied final-answer phrasing.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Hallucinations are predictable failure modes, not random errors.</h3>
+
+      <p>"Hallucination" is overloaded. People use it for everything from minor factual errors to confidently-invented citations to outright fabrications. Treating it as a single phenomenon means you can't debug it; treating it as three or four distinct mechanisms means you can name the one in front of you and choose the right fix.</p>
+
+      <p>Here are the four mechanisms that account for most of what gets called "hallucination" in production agents. Each one is a predictable consequence of how the model works, and each one has a distinct fix.</p>
+
+      <h4>Mechanism 1: Continuation bias</h4>
+
+      <p>The model is fundamentally a next-token predictor. Given a partially-written response, it generates the token that best continues the pattern. This is a feature when the pattern is good. It becomes a failure mode when the model has committed to a confident-sounding start that doesn't have factual support.</p>
+
+      <p>Concretely: ask the model "What year did the Treaty of Westphalia end?" and it might start "The Treaty of Westphalia ended in" — and now the next-token distribution heavily favors a specific year. If the model has been trained on enough sources to know it's 1648, you get the right answer. If the model is uncertain, the distribution still favors <em>some</em> year (because what else completes the sentence?), and it samples one. The wrong year sounds exactly as confident as the right year would have, because the syntactic shape is identical.</p>
+
+      <p>The mechanism: <strong>once the model has committed to a sentence shape, it will complete the shape even if it has to invent the content</strong>. There's no "wait, I don't actually know this" branch in the next-token computation by default.</p>
+
+      <p>The fix: prompts that explicitly authorize uncertainty. "If you don't know the answer, say 'I don't know'" works better than you'd expect — it gives the model a permitted continuation that isn't "invent a confident answer." Combine with grounding: "Answer based only on the provided sources. If the answer isn't in the sources, say so." Cuts continuation-bias hallucinations substantially.</p>
+
+      <h4>Mechanism 2: Training-distribution gaps</h4>
+
+      <p>The model knows what it's seen during training. For topics, people, products, or events that didn't appear in training (or appeared rarely), the model is operating without reliable signal. The distribution over plausible tokens flattens, sampling becomes more variable, and outputs become factually unreliable in proportion to how poorly the topic was represented in training.</p>
+
+      <p>The symptom: confidently wrong on niche topics, accurate on common topics, with no clear signal to the user which is which. A user asking about a major historical figure gets correct answers; the same user asking about a minor regional figure gets confident fiction. The model doesn't expose its uncertainty in either case.</p>
+
+      <p>The mechanism: <strong>the model interpolates plausibly from sparse training data, and "plausibly" looks identical to "factually" from the outside</strong>.</p>
+
+      <p>The fix: retrieval-augmented generation (chapter 1.2). Don't ask the model what it knows; give it the relevant documents and ask it to answer from those. The model is much better at "synthesize from this provided text" than "recall from training." Grounding shifts the workload from memory (unreliable) to reading (reliable).</p>
+
+      <h4>Mechanism 3: Instruction conflict</h4>
+
+      <p>The model has been trained to follow user instructions and to give helpful answers. When these conflict — when following the instruction would produce a less helpful-sounding answer, or vice versa — the model navigates the conflict and sometimes lands wrong.</p>
+
+      <p>Concrete example: a user asks "list the API endpoints in alphabetical order" and provides a list of 20 endpoints. The model sorts most of them correctly but quietly fixes a typo in one endpoint name on the way through. The user said "list them" — not "list them and silently correct spelling" — but the model's helpfulness training nudged it toward producing the "obviously corrected" version. The user might miss this; the model might be wrong about which spelling is correct; either way, the user gets an output that differs from the input in ways they didn't ask for.</p>
+
+      <p>The mechanism: <strong>the model is balancing multiple objectives during generation, and when they pull in different directions, the resolution can introduce content the user didn't request</strong>.</p>
+
+      <p>The fix: be explicit about which dimension matters. "Preserve the input exactly; do not correct or normalize." "Be terse; do not add explanations unless asked." Instructions that close off the path the helpfulness training would otherwise push toward.</p>
+
+      <h4>Mechanism 4: Confabulation under pressure</h4>
+
+      <p>The fourth and trickiest mechanism: the model produces text that sounds like a memory or a fact but is actually being generated on the spot, with no underlying retrieval or computation behind it. This is what people usually <em>mean</em> when they say "hallucination" in the alarming sense — invented citations, made-up function signatures, fabricated quotes.</p>
+
+      <p>This happens most often when the model is asked for specific structured factual claims — a citation, a function signature, a date, a phone number — that it doesn't actually know. Because the syntactic shape of the answer is well-defined ("Author (Year)" for citations, "function_name(arg1, arg2)" for code), the model can produce something that fits the shape perfectly without having the content.</p>
+
+      <p>The mechanism: <strong>the model generates outputs that conform to the requested format even when it doesn't have the content to fill them, because format-conformity is what its training rewarded</strong>.</p>
+
+      <p>The fix is multi-layered. Grounding (Mechanism 2's fix) helps when the source material is provided. Verification (chapter 1.2's grounding-check pattern) helps when you can validate claims against sources after generation. Explicit prompting helps marginally: "Only cite sources that exist in the provided context; if you don't have a real citation, say so." For high-stakes outputs — medical, legal, code execution — combine all three and treat any unverified claim as suspect.</p>
+
+      <h4>Reasoning models vs chat models: the new axis</h4>
+
+      <p>From 2024 onward, providers have shipped a distinct class of "reasoning" models — Claude with extended thinking, OpenAI's o-series and GPT-5 reasoning mode, DeepSeek-R1 and similar. These models generate "thinking" tokens internally before producing their visible response. The thinking is hidden from the user but consumes real tokens and real compute.</p>
+
+      <p>The intuition for when reasoning helps:</p>
+
+      <ul>
+        <li><strong>Helps:</strong> multi-step logic problems, math, code review, complex planning, anything where the model benefits from "working out" an answer before committing to it. The thinking tokens are essentially the model talking to itself, exploring branches, catching its own mistakes.</li>
+        <li><strong>Doesn't help (and costs more):</strong> simple factual lookup, classification, extraction, conversational responses. There's nothing to "reason about" — the model either knows the answer or it doesn't, and the extra thinking tokens are wasted compute.</li>
+        <li><strong>Actively hurts (counterintuitively):</strong> tasks where the model knows the answer immediately but extended thinking introduces overthinking or second-guessing. Some calibrated, well-trained behaviors get noisier when you make the model "think more" first.</li>
+      </ul>
+
+      <p>The practical impact for agent design: <strong>match the model to the task within the agent</strong>. Use a reasoning model for the planning step (deciding what to do next), use a faster non-reasoning model for the synthesis step (writing the final answer), use the cheapest model that works for the classification steps (deciding what tool to call). Chapter 2.2's cost ladder is built on exactly this insight.</p>
+
+      <p>The honest caveat: this advice is the state of practice as of early 2026 and the boundary between "reasoning" and "chat" models is blurring. Sonnet 4.5 and GPT-5.5 both have hybrid modes where they can think when needed and not when not, controlled by a single parameter. The trend is toward "one model, adjustable thinking budget" rather than "two model families." But the underlying mental model — extended thinking helps on hard problems, hurts on easy ones — still applies.</p>
+
+      <h4>Summarizing: hallucination triage in 30 seconds</h4>
+
+      <p>When you see a hallucination in production, run through the four mechanisms in order:</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  HALLUCINATION TRIAGE                                       │
+│                                                             │
+│  Did the model commit to a sentence shape and then          │
+│  invent content to complete it?                             │
+│   → Mechanism 1: continuation bias.                         │
+│     Fix: authorize "I don't know" in the prompt.            │
+│                                                             │
+│  Is the topic obscure, niche, or post-training-cutoff?      │
+│   → Mechanism 2: training-distribution gap.                 │
+│     Fix: retrieval-augmented generation.                    │
+│                                                             │
+│  Did the output differ from the input in ways the user      │
+│  didn't ask for?                                            │
+│   → Mechanism 3: instruction conflict.                      │
+│     Fix: explicit "preserve / don't add / be terse" rules.  │
+│                                                             │
+│  Did the model produce a specific structured claim          │
+│  (citation, signature, date) with no underlying source?     │
+│   → Mechanism 4: confabulation.                             │
+│     Fix: grounding + post-generation verification.          │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>Almost every hallucination in a production agent is one of these four, or a combination. Naming the mechanism is half the fix — it directs you to the specific intervention rather than vague "make the prompt better" guesswork.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">If I just use a more powerful model, won't most of these hallucinations go away?</div>
+        <div class="answer">
+          <p>Some — not all. More powerful models have larger training corpora (smaller Mechanism 2 gaps), better calibration (less continuation bias in Mechanism 1), and better instruction-following (less Mechanism 3 conflict). But none of these mechanisms is fundamentally solved by scaling. Confabulation in particular — Mechanism 4 — persists across all model sizes, because the model is doing exactly what its training rewarded: producing format-compliant outputs.</p>
+          <p>The mental model: <strong>scaling reduces hallucination rates but doesn't eliminate them</strong>. Agent design has to assume hallucinations will happen and engineer around them with verification, grounding, and uncertainty acknowledgment. Don't bet on the next model release fixing what your retrieval pipeline should fix today.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Is "hallucination" even the right word for these?</div>
+        <div class="answer">
+          <p>It's the word the field uses, so you'll keep encountering it. But it's misleading — it implies the model is doing something unusual or pathological when it produces these outputs, when actually it's doing exactly what it was trained to do (predict plausible next tokens). The outputs aren't "hallucinations" in any meaningful sense; they're <em>predictable failure modes of plausible-text generation</em>. The framing matters because it changes the fix: you don't fix a hallucination by telling the model not to hallucinate; you fix it by changing the conditions that produced it.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">When does extended thinking actually pay for itself?</div>
+        <div class="answer">
+          <p>Three rough patterns where the cost is justified:</p>
+          <ul>
+            <li><strong>Complex planning</strong> with many constraints — extended thinking lets the model enumerate, evaluate, and reject options before committing to one.</li>
+            <li><strong>Math and logic puzzles</strong> with explicit step-by-step structure — the model uses thinking tokens to literally do the steps.</li>
+            <li><strong>Self-correction tasks</strong> like code review or fact-checking — the model can identify issues during thinking that wouldn't surface in a single-pass response.</li>
+          </ul>
+          <p>The marker that extended thinking is wasted: the model's "thinking" output (if you can see it via streaming) is just paraphrasing the question or rambling. That's a signal the task didn't need it and you should drop back to a faster model.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 0.1</div>
+      <h3>Deliverable</h3>
+      <p>A working mental model of LLMs that lets you predict roughly what a model will do on a given input and explain failure modes when they happen. You see tokens as the real unit and tokenize inputs before optimizing them. You treat the context window as a finite, position-sensitive resource and place important information accordingly. You think of the model as a distribution and choose temperature based on the task, not preference. You recognize hallucinations by their mechanism — continuation bias, training-gap, instruction conflict, or confabulation — and apply the matching fix. Every other chapter in this guide assumes these intuitions, and now they're yours.</p>
+      <ul class="checklist">
+        <li>Run a tokenizer on a representative prompt; understand where the tokens are going</li>
+        <li>Measure your effective context length on a real workload; compare to nominal limit</li>
+        <li>Place critical content at start/end of context; never bury it in the middle</li>
+        <li>Choose temperature deliberately per task (0–0.3 for tool calls, 0.5+ for creative)</li>
+        <li>Stop treating temperature 0 as "deterministic"; treat it as "low-variance"</li>
+        <li>Use seeds in tests, not in production</li>
+        <li>For every hallucination, name the mechanism before fixing it</li>
+        <li>Authorize "I don't know" in prompts to defuse continuation bias</li>
+        <li>Use RAG to handle training-distribution gaps</li>
+        <li>Add explicit "preserve / don't add" rules to defuse instruction conflict</li>
+        <li>Match model class (reasoning vs chat) to task complexity, not by default</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('intro')">
+        <div class="dir">← prev</div>
+        <div class="title">Intro</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('f2')">
+        <div class="dir">next →</div>
+        <div class="title">0.2 Prompt engineering</div>
+      </button>
+    </div>
+  </section>

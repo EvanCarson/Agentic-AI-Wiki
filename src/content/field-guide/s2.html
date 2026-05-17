@@ -1,0 +1,742 @@
+<section class="phase">
+    <div class="phase-num">2.2</div>
+    <div class="week">Part II / Ship · The economics of agentic AI in production</div>
+    <h2>Cost and latency: where the dollars and the seconds actually go.</h2>
+    <p class="goal">Most production agent problems eventually surface as either "this is too expensive" or "this is too slow." Both have the same underlying cause — a misunderstanding of where the cost and latency actually live inside an agent loop — and the same fix shape: build an accurate mental model first, then apply targeted techniques. This chapter shows you the breakdown of a real agent turn (the answer is not what most people guess), then teaches the three highest-leverage optimizations (prompt caching, the model cascade, and parallel/streaming patterns) with the discipline to measure each one. By the end you'll know exactly which lever to pull for a given problem, and how much to expect from pulling it.</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Where the dollars and seconds actually go.</h3>
+
+      <p>Before you can optimize, you have to know where the bill is coming from. The intuition most engineers carry — that output tokens dominate cost and that tool execution dominates latency — is wrong, and being wrong about it leads to optimization effort spent in the wrong places.</p>
+
+      <h4>The shape of a real agent turn</h4>
+
+      <p>A concrete example: a research agent answering a question. Four model calls, three tool calls, ending in a final answer. Here's where the money goes:</p>
+
+<pre class="trace standalone"><span class="c-out">Turn 1: User asks "How do I tune Postgres autovacuum for write-heavy workloads?"
+
+──────────────────────────────────────────────────────────────────────
+Step  Type        Input tokens  Output tokens  Cost (Sonnet 4.5)   Latency
+──────────────────────────────────────────────────────────────────────
+ 1    model call    3,200          120          $0.011             1.8s
+                                                                   (decides to search)
+ 2    tool          —              —            $0.00              0.4s
+                                                                   (search_docs)
+ 3    model call    4,800          80           $0.015             2.1s
+                                                                   (decides to fetch one)
+ 4    tool          —              —            $0.00              0.6s
+                                                                   (fetch_doc)
+ 5    model call    7,200          90           $0.022             2.6s
+                                                                   (decides to search again)
+ 6    tool          —              —            $0.00              0.5s
+                                                                   (search_docs)
+ 7    model call    9,400          640          $0.038             4.1s
+                                                                   (synthesis: final answer)
+──────────────────────────────────────────────────────────────────────
+TOTAL              24,600        930          $0.086             12.1s
+──────────────────────────────────────────────────────────────────────</span></pre>
+
+      <p>Stare at that table for a minute. Three things stand out:</p>
+
+      <p><strong>Input tokens dominate.</strong> 24,600 input vs 930 output. The ratio is 26:1. At Sonnet pricing of $3 / $15 per million tokens (5× input-to-output ratio), input tokens still account for 84% of the bill ($0.074 of $0.086). Most cost optimizations should target input, not output. The intuition "output tokens are 5× more expensive" is true per-token, but in agent loops you generate 20× fewer of them, so input wins the overall bill.</p>
+
+      <p><strong>Input tokens grow with every turn.</strong> The first model call uses 3,200 input tokens; by the synthesis step it's up to 9,400 — almost 3×. Why? Because every turn carries forward the entire conversation history including all prior tool results. Each tool result added to the context becomes input on every subsequent model call. <em>Context is paid for on every turn it exists, not once</em>.</p>
+
+      <p><strong>Tool execution is fast; model calls are slow.</strong> Model calls account for 10.6s of the 12.1s total (88%). Tools account for 1.5s. If you want to make the agent faster, optimizing the model calls (or running them in parallel) is the lever; tool optimization is rounding error.</p>
+
+      <h4>The cost equation in one line</h4>
+
+      <p>For any agent turn, the cost is approximately:</p>
+
+      <pre class="standalone">cost  ≈  Σ (input_tokens_at_step_i  ×  input_price)
+       +  Σ (output_tokens_at_step_i ×  output_price)
+
+The dominant term is almost always the first sum — and the steps
+near the end of the loop dominate it because they carry the most
+context forward.</pre>
+
+      <p>The four levers that move this equation, in order of effectiveness for a typical agent:</p>
+
+      <ol>
+        <li><strong>Prompt caching</strong> on the stable prefix (system prompt, tool definitions, retrieved documents that persist). 90% discount on cached input tokens. Step 2.</li>
+        <li><strong>Model cascade</strong>: use Haiku for the routing steps where Sonnet is overkill. Step 3.</li>
+        <li><strong>Context budget discipline</strong>: keep accumulated context from ballooning across turns (summarize history, drop stale tool results).</li>
+        <li><strong>Output budget discipline</strong>: cap <code class="inline">max_tokens</code> appropriately; structured outputs are usually shorter than free-form.</li>
+      </ol>
+
+      <p>For latency, the levers are different:</p>
+
+      <ol>
+        <li><strong>Streaming</strong>: start showing output before the model finishes. Doesn't reduce total latency but makes perceived latency much better. Step 4.</li>
+        <li><strong>Parallel tool calls</strong>: when the model fires multiple independent tools in one turn, run them concurrently. Step 4.</li>
+        <li><strong>Model cascade</strong>: same lever as cost — smaller models are also faster. Step 3.</li>
+        <li><strong>Prompt caching</strong>: also reduces latency on cache hits (the model doesn't have to re-process cached tokens). Step 2.</li>
+      </ol>
+
+      <p>Notice that prompt caching and model cascade appear on both lists. They're the two highest-leverage techniques — applying either reliably improves both cost and latency. The rest of this chapter walks through them in depth.</p>
+
+      <h4>What to measure before optimizing</h4>
+
+      <p>Before applying any technique, instrument these four numbers for every model call. Without them you can't tell whether an optimization helped or hurt:</p>
+
+<pre class="standalone"><span class="c-cm"># For every model call, log:</span>
+{
+    <span class="c-st">"step"</span>: <span class="c-st">"synthesis"</span>,
+    <span class="c-st">"model"</span>: <span class="c-st">"claude-sonnet-4-5"</span>,
+    <span class="c-st">"input_tokens"</span>: <span class="c-st">9400</span>,
+    <span class="c-st">"cache_creation_input_tokens"</span>: <span class="c-st">0</span>,    <span class="c-cm"># charged at 1.25x</span>
+    <span class="c-st">"cache_read_input_tokens"</span>: <span class="c-st">3200</span>,      <span class="c-cm"># charged at 0.1x</span>
+    <span class="c-st">"output_tokens"</span>: <span class="c-st">640</span>,
+    <span class="c-st">"latency_ms"</span>: <span class="c-st">4100</span>,
+    <span class="c-st">"latency_to_first_token_ms"</span>: <span class="c-st">820</span>,    <span class="c-cm"># if streaming</span>
+    <span class="c-st">"cost_usd"</span>: <span class="c-st">0.0285</span>,                     <span class="c-cm"># computed from above</span>
+}</pre>
+
+      <p>Four metrics, recorded as span attributes (chapter 2.1's observability infrastructure). The two cache-related metrics are the ones most teams miss; without them you can't compute your effective input price or your cache hit rate. Once you have these numbers, every optimization claim becomes testable.</p>
+
+      <div class="callout warn">
+        <p>The single most common cost-optimization mistake: spending time tuning <code class="inline">max_tokens</code> to reduce output costs while the input bill is 20× larger and untouched. The intuition "output is more expensive per token" leads people here, but it's a fraction of the total spend. Always measure first; optimize where the money actually is.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My agent's cost is 90% output tokens, not input. Is the table above wrong for me?</div>
+        <div class="answer">
+          <p>No, but you have a different shape of agent. If your output is 90% of cost, you're either generating very long content (writing, code generation, long-form synthesis) or your agent loop is short (1-2 turns) with minimal accumulated context. Both are valid shapes; the breakdown just looks different.</p>
+          <p>The general principle still holds: measure where your cost is, then optimize there. The 20:1 input:output ratio is typical for multi-turn research/assistant agents. Single-turn generation agents skew the other way. Compute your actual ratio before choosing techniques.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Are these latency numbers (1.8s, 2.1s, 4.1s) reasonable, or is something slow?</div>
+        <div class="answer">
+          <p>They're typical for non-cached, non-streaming Sonnet calls with a few thousand input tokens. Latency scales roughly linearly with input length (more tokens = more processing) plus the time to generate output tokens (about 30-80 tokens per second on Sonnet depending on load). A 4s synthesis call producing 640 output tokens at ~150 tokens per second of generation, plus ~1s of input processing, is within the expected envelope.</p>
+          <p>Two things shift these numbers significantly: cache hits cut input processing time by ~70%, and streaming makes the user perceive latency starting at first-token-out (typically 0.5-1s) instead of last-token-out. Both are covered later in this chapter.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Prompt caching: the single biggest cost lever.</h3>
+
+      <p>Prompt caching is the optimization that most teams under-invest in, despite the fact that it's the single biggest cost lever available. Done right, it cuts input token costs by 60–90% on agent workloads. Done wrong, it does nothing and you don't notice because the API doesn't error — your bill is just higher than it could be.</p>
+
+      <h4>How it works, mechanically</h4>
+
+      <p>The mechanism is simple but worth understanding precisely: when you mark a portion of your prompt as cacheable, Anthropic stores the intermediate computation (the key-value attention cache, or "KV cache") for that prefix. The next request with the same prefix doesn't need to re-process it — the model resumes from the cached state.</p>
+
+      <p>The pricing as of 2026:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Token category</div>
+          <div>Price multiplier</div>
+          <div>Effective rate (Sonnet)</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Standard input</div>
+          <div class="vector">1.0×</div>
+          <div class="defense">$3.00 / 1M tokens</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Cache write (5-min TTL)</div>
+          <div class="vector">1.25×</div>
+          <div class="defense">$3.75 / 1M tokens (paid once)</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Cache write (1-hour TTL)</div>
+          <div class="vector">2.0×</div>
+          <div class="defense">$6.00 / 1M tokens (paid once)</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Cache read</div>
+          <div class="vector">0.1×</div>
+          <div class="defense">$0.30 / 1M tokens (every hit)</div>
+        </div>
+      </div>
+
+      <p>The break-even math: a 5-minute cache pays off after a single read. A 1-hour cache pays off after two reads. Both are nearly always worth it for any prefix that gets reused.</p>
+
+      <p>Important constraints:</p>
+
+      <ul>
+        <li><strong>Minimum prefix size.</strong> Sonnet/Haiku: 1,024 tokens. Opus: 4,096 tokens. Below the minimum, your <code class="inline">cache_control</code> directive is silently ignored. (Most production system prompts exceed this; very short prompts don't benefit from caching anyway.)</li>
+        <li><strong>Exact prefix match.</strong> The cache hits only when the cached prefix is byte-identical to a stored entry. One extra space, one different timestamp, one rotated model snapshot — cache miss.</li>
+        <li><strong>Up to 4 cache breakpoints per request.</strong> You can cache several segments independently if your prompt has multiple stable layers.</li>
+      </ul>
+
+      <h4>The minimal-correct API call</h4>
+
+      <p>Two ways to use it, both small additions to the standard call:</p>
+
+<pre class="standalone"><span class="c-cm"># Automatic caching: simplest, recommended starting point</span>
+response = client.messages.create(
+    model=<span class="c-st">"claude-sonnet-4-5"</span>,
+    max_tokens=<span class="c-st">1024</span>,
+    cache_control={<span class="c-st">"type"</span>: <span class="c-st">"ephemeral"</span>},   <span class="c-cm"># default 5-min TTL</span>
+    system=LARGE_SYSTEM_PROMPT,
+    tools=TOOLS,
+    messages=messages,
+)
+<span class="c-cm"># Anthropic decides where to put the breakpoint (typically end of system+tools).</span>
+
+<span class="c-cm"># Explicit breakpoints: fine-grained control</span>
+response = client.messages.create(
+    model=<span class="c-st">"claude-sonnet-4-5"</span>,
+    max_tokens=<span class="c-st">1024</span>,
+    system=[
+        {<span class="c-st">"type"</span>: <span class="c-st">"text"</span>, <span class="c-st">"text"</span>: LARGE_SYSTEM_PROMPT,
+         <span class="c-st">"cache_control"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"ephemeral"</span>}}
+    ],
+    tools=TOOLS_WITH_CACHE,   <span class="c-cm"># cache_control on the last tool</span>
+    messages=messages,
+)</pre>
+
+      <p>The response includes <code class="inline">usage.cache_creation_input_tokens</code> and <code class="inline">usage.cache_read_input_tokens</code> — the numbers that tell you whether caching is actually working. Always log these.</p>
+
+      <h4>The architecture that makes caching pay off</h4>
+
+      <p>The mistake most teams make is sprinkling <code class="inline">cache_control</code> across their code and assuming caching is now happening. It might be. It's also possible nothing is being cached because the "stable" content shifts on every request. The discipline is to <strong>structure your prompts as a stacked hierarchy of stability</strong>:</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  PROMPT STRUCTURE FOR MAXIMUM CACHE HIT RATE                │
+│                                                             │
+│  [most stable] ─── cached, 1-hour TTL                       │
+│  System prompt (rules, persona, output format)              │
+│  Tool definitions                                           │
+│  Skills / reference material                                │
+│                                                             │
+│  [less stable] ─── cached, 5-minute TTL                     │
+│  Retrieved documents for this conversation                  │
+│  Conversation history (older turns)                         │
+│                                                             │
+│  [volatile] ─── NOT cached                                  │
+│  Current user message                                       │
+│  Current turn timestamp (if needed at all)                  │
+│  Per-request data                                           │
+└─────────────────────────────────────────────────────────────┘
+
+  Cache breakpoints go AT THE BOUNDARY between stability layers.
+  Everything BEFORE a breakpoint is cached together. Everything
+  AFTER it is fresh on every request.</div>
+
+      <p>Concretely: put your system prompt and tool definitions first, with a cache breakpoint right after them. Conversation history goes next, with another breakpoint after the second-most-recent turn (so the recent turn is fresh but everything older is cached). The current user message is last and never inside a cache region.</p>
+
+      <p>This structure typically achieves 60–80% cache hit rates on production agent workloads, which translates to roughly 50–70% reduction in total input token costs after accounting for cache write overhead.</p>
+
+      <h4>The five anti-patterns that quietly break caching</h4>
+
+      <p>The reason most "caching is enabled" implementations don't deliver the 90% savings: one of these five patterns is silently invalidating the cache on every request.</p>
+
+      <p><strong>Anti-pattern 1: timestamps in the prefix.</strong> A line like <code class="inline">"Current time: 2026-04-17T14:32:15Z"</code> at the start of your system prompt changes on every request. Cache key changes → cache miss on every call. The fix: either drop the timestamp (does the model actually need second-precision?), truncate it to the day (<code class="inline">"Date: 2026-04-17"</code> only changes daily), or move it out of the cached region into the user message.</p>
+
+      <p><strong>Anti-pattern 2: user-specific content in the cached prefix.</strong> Putting <code class="inline">"You are helping {user.name} who works at {user.company}"</code> in the system prompt makes every user get their own cache entry. Fine if you have hundreds of requests per user; expensive if you have thousands of users with few requests each. The fix: move user-specific content to the user message; keep the cached prefix user-agnostic.</p>
+
+      <p><strong>Anti-pattern 3: inconsistent whitespace.</strong> Your prompt builder strips trailing whitespace inconsistently — sometimes there's a newline at the end, sometimes not. The cache hash doesn't care that the difference is invisible; it sees a different prefix. The fix: aggressively normalize. Always strip, always join with a single style of separator. A 30-line prompt-canonicalization function pays for itself within a day.</p>
+
+      <p><strong>Anti-pattern 4: model snapshot rotations.</strong> When Anthropic releases a new minor snapshot of Sonnet, your cached entries on the old snapshot become useless. Cache writes cost extra; a snapshot rotation creates a temporary cost spike while caches warm back up. The fix: pin model snapshots in production (<code class="inline">claude-sonnet-4-5-20250929</code> not <code class="inline">claude-sonnet-4-5</code>) so rotations are explicit choices, and plan cache warmup alongside any model upgrade.</p>
+
+      <p><strong>Anti-pattern 5: prefix shorter than the minimum.</strong> You add <code class="inline">cache_control</code> to a 600-token system prompt and expect caching. The minimum is 1,024 tokens; nothing is cached. The API doesn't error — it just processes at full price. Always verify with the response's <code class="inline">cache_creation_input_tokens</code> field, which is non-zero only when caching actually happens.</p>
+
+      <h4>Measuring whether caching is working</h4>
+
+      <p>The metric to track in your observability dashboard:</p>
+
+      <pre class="standalone">cache_hit_ratio  =  cache_read_input_tokens
+                     ────────────────────────────────────────────
+                     cache_read_input_tokens + standard_input_tokens
+
+Healthy production workloads: 50–80%
+Below 20%: prefix design is broken; audit for anti-patterns
+Above 90%: probably leaving even more on the table; investigate
+           if user-message tokens could be reduced too</pre>
+
+      <p>The number alone isn't enough — track it over time and check for drops. A sudden cache hit ratio drop usually means an anti-pattern just crept in (someone added a timestamp, a model snapshot rolled, a deploy changed prompt formatting).</p>
+
+      <h4>The 5-minute vs 1-hour TTL decision</h4>
+
+      <p>Anthropic's default cache TTL is 5 minutes. There's also a 1-hour TTL at 2× write cost. When to use which:</p>
+
+      <p><strong>5-minute TTL</strong> for interactive workloads where you expect rapid follow-up requests. A chat agent gets many requests within minutes of each other; a 5-minute window captures most of them. If the user goes away and comes back 20 minutes later, you pay the cache write again — but that's rare and the 5-minute writes are cheap (1.25×).</p>
+
+      <p><strong>1-hour TTL</strong> for batch workloads where the same context is used across many requests spaced minutes apart. A document-processing pipeline that takes 45 minutes to chew through 10,000 documents benefits from 1-hour TTL because the system prompt stays warm the entire run. Worth the 2× write because you'll get 10,000 reads at 0.1×.</p>
+
+      <p>Don't reach for 1-hour TTL by default. The 2× write penalty stings if your workload isn't actually long-lived; if you misjudge, 5-minute would have been cheaper.</p>
+
+      <h4>The real numbers, from a realistic workload</h4>
+
+      <p>To anchor expectations: a customer-support agent handling 1,000 conversations a day, each averaging 4 turns, with a 2,000-token system prompt and accumulated context growing from 2K to 8K across turns. Doing the math at Sonnet pricing:</p>
+
+      <pre class="standalone">Without caching:
+  System prompt (2K) sent on every call: 2K × 4 turns × 1000 conv = 8M tokens
+  Other input (~5K avg per call):                                 = 20M tokens
+  Total input: 28M tokens × $3/M = $84/day
+  Output (~500 tokens × 4 calls × 1000): 2M × $15/M               = $30/day
+  ────────
+  Total: $114/day, $42K/year
+
+With 5-minute caching (assuming 70% cache hit ratio):
+  Cached input: 0.70 × 28M = 19.6M tokens × $0.30/M              = $5.88/day
+  Standard input: 0.30 × 28M = 8.4M × $3/M                       = $25.20/day
+  Cache writes: ~2.8M tokens × $3.75/M                           = $10.50/day
+  Output: same                                                    = $30/day
+  ────────
+  Total: $71.58/day, $26K/year
+  Savings: $42 - $26 = $16K/year, ~38% reduction
+
+With model cascade on top (next step):
+  ... ~$45/day, ~$16K/year   (further 37% reduction)</pre>
+
+      <p>The cache savings alone are real and meaningful. Stacked with model cascade (Step 3), production agents typically end up at 20–30% of their unoptimized cost.</p>
+
+      <div class="callout tip">
+        <p>If you implement one thing from this chapter this week, implement prompt caching on your largest stable prompt prefix. It's a single API parameter, the discount is real (60–80% on input), and the only thing standing between you and the discount is not auditing your prefix for the five anti-patterns. Set aside an hour, do the audit, deploy. Most teams see meaningful bill reduction within 24 hours.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Does prompt caching work the same way on OpenAI / GPT?</div>
+        <div class="answer">
+          <p>OpenAI introduced prompt caching in late 2024 with similar mechanics — a discount (50% as of early 2026, not 90%) on cached input tokens, with automatic detection of repeated prefixes. The architecture decision is the same (stable prefix, volatile suffix); the discount magnitude is smaller. The same anti-pattern audit applies.</p>
+          <p>Across providers, the principle is becoming standardized: structure your prompts to maximize prefix stability and you get a discount. The specific multipliers vary; the discipline doesn't.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">When does caching actually hurt instead of help?</div>
+        <div class="answer">
+          <p>Two scenarios. First, if your workload genuinely has no repeated prefix — every request is unique end-to-end — you pay the 1.25× write multiplier on cache writes that never get read. Cost goes up by 25% on the input side. Unlikely in real agent workloads (system prompts and tool definitions almost always repeat), but possible if you've architected unusually.</p>
+          <p>Second, if you have hundreds of distinct cache prefixes that each get written once and read once or twice. The write overhead dominates and the math just barely works out. The fix: consolidate prefixes (fewer unique system prompts) or accept that this particular workload doesn't benefit from caching.</p>
+          <p>If you want to be defensive: instrument the metric, and if your cache hit ratio is below 20% for two weeks, turn caching off until you've fixed the prefix design.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Can I cache tool results to avoid re-paying for them in the next turn?</div>
+        <div class="answer">
+          <p>Sort of, indirectly. Tool results become part of the message history, which then becomes input on the next turn. If your message history fits within a cache region (with a breakpoint after it), then yes — older tool results stay cached and get the 90% discount. If your message history is the last thing before the volatile user message, then your tool results <em>are</em> in the cached region.</p>
+          <p>The pattern: cache breakpoint <em>after</em> message history, <em>before</em> the new user message. That way each new turn pays full price only on the new user message and any tool calls that turn, while everything that came before is on the cache discount.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>The model cascade: smaller models for the easy steps.</h3>
+
+      <p>Most agents use one model for everything. They call <code class="inline">claude-sonnet-4-5</code> for the planning step, the tool-decision step, the synthesis step, and the formatting step. This is the easy way to build, and for low-volume agents it's fine. For production agents it leaves serious money on the table.</p>
+
+      <p>The insight is simple: <strong>different steps of an agent loop have different difficulty</strong>. Deciding whether to search the docs is easy. Synthesizing a final answer from retrieved chunks is hard. Using the same model for both means you're paying Sonnet prices for tasks Haiku could handle equally well.</p>
+
+      <h4>The model lineup, with prices and speeds</h4>
+
+      <p>The current Anthropic and OpenAI lineups, with rough characterizations:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Model</div>
+          <div>Input / Output</div>
+          <div>Best for</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Claude Haiku 4.5</div>
+          <div class="vector">$1 / $5 per 1M</div>
+          <div class="defense">Routing, classification, extraction, simple tool calls, structured output. Fast (~100 tok/s generation).</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Claude Sonnet 4.5/4.6</div>
+          <div class="vector">$3 / $15 per 1M</div>
+          <div class="defense">The default for most agent work. Strong reasoning, reliable tool use, good synthesis. Balanced speed/quality.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Claude Opus 4.7</div>
+          <div class="vector">$5 / $25 per 1M</div>
+          <div class="defense">Hardest problems: complex multi-step reasoning, code review, deep analysis. Slower.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">GPT-5-mini</div>
+          <div class="vector">~$0.30 / $1.20 per 1M</div>
+          <div class="defense">Cheapest tier for routing/classification. Bigger context premium vs Haiku, smaller capability gap.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">GPT-5 / 5.5</div>
+          <div class="vector">~$2.50 / $10 per 1M</div>
+          <div class="defense">OpenAI's mid-tier. Direct competitor to Sonnet at lower per-token cost; quality varies by task.</div>
+        </div>
+      </div>
+
+      <p>The 3-5× price differential between Haiku and Sonnet is the lever. If half your model calls in an agent loop can move to Haiku without quality loss, you save substantial money without changing anything else.</p>
+
+      <h4>Which steps can move to a smaller model?</h4>
+
+      <p>The framework that works in practice: <strong>match the model to what the step actually needs to do</strong>. Three categories:</p>
+
+      <p><strong>Routing / dispatch / classification steps → smallest model that works.</strong> "Should we search docs, search the web, or answer directly?" "Is this question about billing, technical support, or general?" "Does this query require multiple sources?" These steps have low-cardinality outputs (3-5 options) and don't require deep reasoning. Haiku handles them at quality indistinguishable from Sonnet, and 3× cheaper.</p>
+
+      <p><strong>Tool-decision steps → mid-tier model (or smallest that works).</strong> "Given this user message and these tools, which tool should I call with what arguments?" Slightly harder than pure classification because argument formation requires understanding the question. Haiku usually works; check on your eval set. If Haiku misroutes more than 5-10% of cases, move to Sonnet.</p>
+
+      <p><strong>Synthesis / final-answer steps → biggest model that fits your budget.</strong> Writing the final answer that the user sees. This is where quality is most visible, where bad outputs hurt user satisfaction, and where the marginal cost of a better model is most justified. Default to Sonnet here. Reach for Opus when synthesis is genuinely hard (multi-document reasoning, code review).</p>
+
+      <h4>The concrete pattern in code</h4>
+
+<pre class="standalone"><span class="c-cm"># agent/loop.py — model cascade</span>
+
+ROUTING_MODEL   = <span class="c-st">"claude-haiku-4-5-20251001"</span>   <span class="c-cm"># cheap, fast</span>
+SYNTHESIS_MODEL = <span class="c-st">"claude-sonnet-4-5"</span>             <span class="c-cm"># quality</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_message: <span class="c-kw">str</span>):
+    <span class="c-cm"># Step 1: route — which path does this question need?</span>
+    <span class="c-cm"># Haiku is enough: this is a classification.</span>
+    route = <span class="c-kw">await</span> client.messages.create(
+        model=ROUTING_MODEL,
+        max_tokens=<span class="c-st">50</span>,
+        system=ROUTING_PROMPT,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_message}],
+    )
+    path = parse_route(route)   <span class="c-cm"># "search" | "calculate" | "direct"</span>
+
+    <span class="c-cm"># Step 2: tool-using loop. Use Haiku — it can call simple tools fine.</span>
+    tool_results = []
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(<span class="c-st">5</span>):
+        response = <span class="c-kw">await</span> client.messages.create(
+            model=ROUTING_MODEL,   <span class="c-cm"># still Haiku for tool decisions</span>
+            max_tokens=<span class="c-st">1024</span>,
+            tools=TOOLS,
+            system=TOOL_PROMPT,
+            messages=build_messages(user_message, tool_results),
+        )
+        <span class="c-kw">if</span> response.stop_reason != <span class="c-st">"tool_use"</span>:
+            <span class="c-kw">break</span>
+        <span class="c-cm"># dispatch tools, collect results</span>
+        tool_results.extend(<span class="c-kw">await</span> dispatch_tools(response))
+
+    <span class="c-cm"># Step 3: synthesis — write the final answer. Use Sonnet.</span>
+    <span class="c-cm"># This is where quality matters most.</span>
+    final = <span class="c-kw">await</span> client.messages.create(
+        model=SYNTHESIS_MODEL,
+        max_tokens=<span class="c-st">2048</span>,
+        system=SYNTHESIS_PROMPT,
+        messages=build_synthesis_messages(user_message, tool_results),
+    )
+    <span class="c-kw">return</span> final.content[<span class="c-st">0</span>].text</pre>
+
+      <p>Three model calls, three different choices. The routing and tool-use steps run on Haiku; only the user-visible synthesis runs on Sonnet. For an agent that previously ran everything on Sonnet, this is typically a 50–60% cost reduction with no quality regression on a well-designed eval suite.</p>
+
+      <h4>How to validate the cascade on your evals</h4>
+
+      <p>The right way to roll out a model cascade: keep Sonnet as baseline, swap in Haiku for one step at a time, run your eval suite (chapter 3.1), measure the delta. If the metric you care about (typically <code class="inline">trajectory_pass_rate</code> or your equivalent) doesn't move, the swap is safe. If it drops, the step needs the bigger model.</p>
+
+      <p>The order to try, lowest risk first:</p>
+
+      <ol>
+        <li><strong>Routing/classification steps</strong> (lowest risk). Haiku handles these with negligible quality loss.</li>
+        <li><strong>Simple tool calls</strong> with structured output (search_docs, get_user, etc.). Haiku usually works.</li>
+        <li><strong>Multi-step tool sequences</strong> where the model needs to reason about prior tool results. Haiku sometimes degrades; measure.</li>
+        <li><strong>Synthesis steps with simple inputs.</strong> Maybe Haiku works for short factual answers.</li>
+        <li><strong>Synthesis steps with complex inputs.</strong> Probably needs Sonnet. Eval will tell you.</li>
+      </ol>
+
+      <p>The discipline: <strong>every cascade decision is an eval question, not an intuition question</strong>. "Can Haiku handle this step?" gets answered by running the eval suite with Haiku on that step and comparing to the Sonnet baseline. If the answer is "yes, score didn't move," ship the cheaper version. If it's "no, score dropped 2 points," keep Sonnet.</p>
+
+      <h4>The reasoning-model exception</h4>
+
+      <p>One additional axis: reasoning-enabled models (Opus 4.7 with extended thinking, GPT-5 reasoning mode). These are slower and pricier even than their non-reasoning counterparts because they generate hidden "thinking" tokens before responding. Worth using only for steps where the extra reasoning actually changes the answer — typically complex planning or multi-step logical inference.</p>
+
+      <p>The mental model from chapter 0.1 applies: extended thinking helps on hard reasoning problems, hurts on simple tasks. In the cascade, this means:</p>
+
+      <ul>
+        <li>Routing/classification: never reasoning mode. Haiku or non-reasoning Sonnet.</li>
+        <li>Tool decisions: rarely reasoning mode. Only if your agent does complex multi-step planning.</li>
+        <li>Synthesis: depends on complexity. Reasoning for code review, math, multi-doc analysis. Non-reasoning for everything else.</li>
+      </ul>
+
+      <h4>A pragmatic default for new projects</h4>
+
+      <p>If you're starting a new agent and don't know yet which steps need which model, here's a defensible starting point that you'll tune over time:</p>
+
+      <pre class="standalone">Routing / classification:  Haiku 4.5
+Tool decisions:            Haiku 4.5  (start here; upgrade if eval fails)
+Synthesis:                 Sonnet 4.5
+
+If you have an Opus budget, use Opus only for:
+- Synthesis on the highest-stakes paths
+- Multi-document analysis or code-review style tasks
+
+Never default to Opus across the board. The cost compounds badly
+in agent loops, and the quality gap vs Sonnet rarely justifies it
+on non-frontier tasks.</pre>
+
+      <h4>The compound effect with caching</h4>
+
+      <p>Cascade and caching stack multiplicatively. A workload that costs $100/day with no optimization, $60/day with caching alone, and $40/day with cascade alone, costs roughly $25/day with both — because the cascade reduces the model-tier multiplier and caching reduces the input-token multiplier simultaneously. Each does about a 40% reduction; combined they do about 75%.</p>
+
+      <p>The dollar amounts depend on your specific workload, but the multiplicative structure is general. If you've implemented one and not the other, you're leaving money on the table that gets recovered by implementing the second.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How do I tell if a Haiku-vs-Sonnet swap is actually safe without rerunning the whole eval suite?</div>
+        <div class="answer">
+          <p>You can't, reliably. Spot-checking 5 examples doesn't tell you whether the 5th percentile case regressed. The discipline from chapter 3.1 applies: every model swap is a hypothesis with a prediction ("swapping routing to Haiku should not change trajectory_pass_rate by more than 1 point") and a verdict ("ran the eval; pass rate moved 0.3 points, within noise floor of 0.044 → ship it").</p>
+          <p>If your eval suite is too slow to run on every cascade decision, you have a different problem to solve first (chapter 3.1). The fast subset of the eval (10–15 examples that run in 2–3 minutes) is enough for go/no-go on most cascade decisions.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should I use different model families (Claude + GPT) within a single agent?</div>
+        <div class="answer">
+          <p>Generally no, with one specific exception. The reasons not to: different families have subtly different behavior on tool use, structured output, and instruction following. Mixing them inside a loop means debugging two failure modes instead of one, and your tool-call patterns may need provider-specific tweaks.</p>
+          <p>The exception: when you have a strong reason that one family is meaningfully better at a specific subtask (e.g., GPT-5-mini at very-cheap classification, Claude Haiku at instruction-following with specific output formats). For most teams this isn't worth the complexity. Pick one provider, cascade within their lineup.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about routing within a single API call — can the model decide which tier to use?</div>
+        <div class="answer">
+          <p>Some providers are exploring this (Anthropic's hybrid reasoning modes, where the model decides how much thinking to do). For now, the decision of "which model handles this step" is something you make in code, based on your evals. The model can't self-route at the per-step level — your dispatch code does it.</p>
+          <p>The future direction is interesting: a single API endpoint that decides per-request how much compute to spend. As of mid-2026 this is partially available (extended thinking with auto-budget) but not yet at the level of "pick between Haiku and Sonnet for this turn." Keep an eye on it.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Latency: streaming, parallelism, and the perceived/actual split.</h3>
+
+      <p>Cost and latency overlap in their levers but not perfectly. Two patterns matter for latency specifically: streaming (which doesn't reduce total time but improves perceived time dramatically) and parallel tool execution (which does reduce total time, sometimes by a lot). Both deserve their own treatment.</p>
+
+      <h4>The perceived/actual latency split</h4>
+
+      <p>The first conceptual move: <strong>users care about perceived latency, not actual latency</strong>. Perceived latency is how long the user feels they're waiting, which is dominated by the time before they see <em>anything</em>. Actual latency is how long the agent takes from start to finish. These can be very different numbers.</p>
+
+      <p>An agent that takes 12 seconds to produce a complete answer, with nothing on screen for the first 11 seconds, feels slow. The same agent that takes 12 seconds to produce a complete answer but starts showing tokens at 0.8 seconds feels fast — even though the actual latency is identical. The user is reading while the agent is generating; their wait time is the time until they have <em>something to read</em>, not the time until generation completes.</p>
+
+      <p>This is the fundamental case for streaming, and it's why streaming is non-negotiable in any user-facing agent.</p>
+
+      <h4>Streaming, from the wire up</h4>
+
+      <p>Both Anthropic and OpenAI support streaming via Server-Sent Events. The model generates one token at a time and emits each one as it's produced. The client (browser, mobile app, terminal) consumes the stream and displays tokens as they arrive.</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># Streaming with the Anthropic SDK</span>
+<span class="c-kw">async with</span> client.messages.stream(
+    model=<span class="c-st">"claude-sonnet-4-5"</span>,
+    max_tokens=<span class="c-st">2048</span>,
+    messages=messages,
+) <span class="c-kw">as</span> stream:
+    <span class="c-kw">async for</span> text <span class="c-kw">in</span> stream.text_stream:
+        <span class="c-cm"># Yield each token to the client as it arrives.</span>
+        <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"token"</span>, <span class="c-st">"text"</span>: text}
+
+    final = <span class="c-kw">await</span> stream.get_final_message()
+    <span class="c-cm"># final.usage has the token counts; useful for cost tracking</span></pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># Streaming with the OpenAI SDK (Responses API)</span>
+stream = client.responses.stream(
+    model=<span class="c-st">"gpt-5.5"</span>,
+    input=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: message}],
+)
+<span class="c-kw">with</span> stream <span class="c-kw">as</span> s:
+    <span class="c-kw">for</span> event <span class="c-kw">in</span> s:
+        <span class="c-kw">if</span> event.<span class="c-kw">type</span> == <span class="c-st">"response.output_text.delta"</span>:
+            <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"token"</span>, <span class="c-st">"text"</span>: event.delta}
+
+    <span class="c-cm"># final response, with full output and usage</span>
+    final = s.get_final_response()</pre>
+      </div>
+
+      <p>Two metrics to track on streaming endpoints:</p>
+
+      <ul>
+        <li><strong>Time to first token (TTFT)</strong>: how long until the first piece of output appears. This is the number that defines perceived latency. Healthy: under 1s. Concerning: over 2s. Indicates input-processing speed.</li>
+        <li><strong>Tokens per second (TPS)</strong>: generation speed once tokens start flowing. Sonnet typically runs at 30-80 TPS; Haiku faster. This affects how long the user reads while waiting for the rest. Less critical than TTFT but worth monitoring.</li>
+      </ul>
+
+      <p>TTFT is the metric to optimize. If your TTFT is 3 seconds, it doesn't matter that your TPS is fast — the user is staring at a blank screen for three seconds and concluding that your product is slow. Reduce TTFT first.</p>
+
+      <h4>What pushes TTFT down</h4>
+
+      <p>The largest contributor to TTFT is <strong>input token count</strong>. The model has to process every input token before it can produce the first output token. For a 10K input prompt, this typically takes 500-1500ms on Sonnet, even before generation starts. Cut that to 3K input via better context discipline, and TTFT drops to 200-500ms.</p>
+
+      <p>Other factors:</p>
+
+      <ul>
+        <li><strong>Cache hits</strong> reduce TTFT substantially because cached tokens skip processing. A request hitting cache typically has TTFT 30–50% lower than the same request as a cold cache write.</li>
+        <li><strong>Model size</strong>: Haiku's TTFT is generally 30-50% of Sonnet's at equivalent input size.</li>
+        <li><strong>Server-side load</strong>: provider-side latency varies with how busy their infrastructure is. Less under your control, but the <code class="inline">x-request-id</code> in response headers lets you correlate with their dashboards if something looks anomalous.</li>
+      </ul>
+
+      <h4>Parallel tool calls</h4>
+
+      <p>The second latency lever is concurrent execution. From chapter 0.3, you know the agent can fire multiple tool calls in a single turn. The question for this chapter is what to <em>do</em> with them: serialize or parallelize?</p>
+
+      <p>The naive dispatcher iterates tool calls sequentially:</p>
+
+<pre class="standalone"><span class="c-cm"># Naive: sequential — wastes latency</span>
+<span class="c-kw">for</span> block <span class="c-kw">in</span> tool_use_blocks:
+    result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+    results.append(result)
+<span class="c-cm"># 3 tools × 400ms each = 1.2s</span></pre>
+
+      <p>The production dispatcher runs them concurrently:</p>
+
+<pre class="standalone"><span class="c-cm"># Production: parallel — bounded latency = max(individual)</span>
+<span class="c-kw">async def</span> <span class="c-fn">run_one</span>(block):
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+        <span class="c-kw">return</span> tool_result_block(block.id, result)
+    <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+        <span class="c-kw">return</span> tool_result_block(block.id, <span class="c-kw">f</span><span class="c-st">"Error: {e}"</span>, is_error=<span class="c-kw">True</span>)
+
+results = <span class="c-kw">await</span> asyncio.gather(*[run_one(b) <span class="c-kw">for</span> b <span class="c-kw">in</span> tool_use_blocks])
+<span class="c-cm"># 3 tools × 400ms each ≈ 450ms (longest + overhead)</span></pre>
+
+      <p>For a research agent that fires 5 retrieval calls in a single turn, this is the difference between 2 seconds and 400 milliseconds. Free latency improvement — no quality trade.</p>
+
+      <p>The caveat: state-changing tools (writes, sends, deletes) shouldn't be parallelized blindly. Two concurrent <code class="inline">delete_record</code> calls might race. The safe pattern: separate tools into read-only and state-changing categories; parallelize the former, sequentialize the latter.</p>
+
+      <h4>The latency budget</h4>
+
+      <p>Set a per-turn latency budget and enforce it. For interactive agents, 3 seconds is a reasonable ceiling on perceived latency (TTFT under 1s, total response under 3s for short answers; longer is OK if the agent shows progress along the way).</p>
+
+      <p>The budget framework:</p>
+
+      <pre class="standalone">For a multi-turn agent, the budget at each step:
+  ─ Pre-flight (auth, validation, cache lookup):   &lt; 50ms
+  ─ Initial model call (routing/tool decision):    &lt; 1500ms
+  ─ Tool execution (in parallel):                  &lt; 1000ms (max of any individual)
+  ─ Synthesis call:                                &lt; 2500ms (with TTFT &lt; 800ms)
+  ─ Network/streaming overhead:                    &lt; 200ms
+
+Total budget: ~5s, with TTFT under 1s.
+
+For agents that legitimately need more time (deep research, long
+synthesis), use Pattern B from chapter 2.4 — submit/poll with
+streaming events.  The latency budget then applies per-event,
+not per-end-to-end-response.</pre>
+
+      <p>The discipline: instrument every component of the budget. When the agent feels slow, look at the span tree (chapter 2.1) and find the component that exceeded its budget. Usually it's the model call (input too large, no cache hit) or sequential tool execution. Both are fixable.</p>
+
+      <h4>Speculative execution: when latency really matters</h4>
+
+      <p>For high-stakes latency situations, an advanced technique: <strong>start the next step's work before the previous step finishes</strong>, on a guess about what the next step needs.</p>
+
+      <p>Example: a research agent's routing step decides whether to search docs, search web, or answer directly. Three options, with roughly equal probability. Instead of waiting for the routing decision before starting any work, you could fire all three searches in parallel — pre-warming them — and then use only the result from the path the routing step actually chose.</p>
+
+      <p>This costs 3× the tool execution money but cuts perceived latency to the maximum of (routing call time, tool call time) instead of their sum. Only worth it when latency is genuinely critical and the speculative cost is small (a tool call is way cheaper than a model call, so the trade often works).</p>
+
+      <p>For most agents this is over-engineering. For chatbots competing on responsiveness or for trading/real-time agents where every 100ms matters, it's the right move. Don't reach for it preemptively; reach for it when your perceived latency is the limit on user satisfaction and you've exhausted simpler levers.</p>
+
+      <h4>What the right shape looks like</h4>
+
+      <p>Pulling it all together, a well-optimized production agent looks like this:</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  WHAT A WELL-OPTIMIZED AGENT LOOK LIKE                      │
+│                                                             │
+│  Cost shape:                                                │
+│   ─ Cache hit ratio: 60-80%                                 │
+│   ─ Routing/dispatch on Haiku-tier model                    │
+│   ─ Synthesis on Sonnet-tier (Opus only for hard cases)     │
+│   ─ Context budget per turn: monitored, &lt; 10K typical       │
+│   ─ Total cost per turn: $0.01-0.05 typical                 │
+│                                                             │
+│  Latency shape:                                             │
+│   ─ TTFT under 1 second on cached prefix                    │
+│   ─ Multi-tool turns run in parallel via asyncio.gather     │
+│   ─ Streaming SSE to client (perceived latency &lt;&lt; actual)   │
+│   ─ Total interactive turn: 3-5 seconds end-to-end          │
+│                                                             │
+│  Observability:                                             │
+│   ─ Span tree per turn with model, tokens, cache, latency   │
+│   ─ Per-day dashboard: cost, latency P50/P95, cache ratio   │
+│   ─ Alerts on cache ratio drop, latency spike, cost spike   │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>This is the shape that lets you serve real users sustainably. None of these numbers are achievable on day one — you build to them iteratively, using the levers in this chapter, with the measurements from chapter 2.1's observability work to know whether you're moving the right metrics.</p>
+
+      <div class="callout tip">
+        <p>The right order to apply the techniques in this chapter, on a fresh agent: (1) instrument the four cost/latency metrics; (2) implement prompt caching on the largest stable prefix; (3) roll out model cascade one step at a time, validated against your eval suite; (4) audit tool dispatcher for sequential-where-it-should-be-parallel; (5) enable streaming if you haven't; (6) set a latency budget per step and alert on breaches. Each step is a one-day investment that pays back within a week of production traffic.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My agent's TTFT is 4 seconds. Where do I look?</div>
+        <div class="answer">
+          <p>Four-second TTFT is high; expected is under 1s on a cached prefix and under 2s on uncached for typical input sizes. Diagnostic order:</p>
+          <ul>
+            <li><strong>Check input token count.</strong> If you're sending 50K tokens to Sonnet on every request, 2-4s TTFT is the expected price of admission. Reduce input via context trimming or cache hits.</li>
+            <li><strong>Check cache hit ratio.</strong> If it's near zero, you're paying full processing cost every call. See Step 2 for anti-patterns.</li>
+            <li><strong>Check model tier.</strong> Opus has substantially higher TTFT than Sonnet, which has higher than Haiku. If you're on Opus, downgrade where you can.</li>
+            <li><strong>Check provider-side weather.</strong> Occasionally inference clusters are under load. Look at provider status pages and the request-id in response headers.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Does running streaming and non-streaming both add complexity to the codebase?</div>
+        <div class="answer">
+          <p>It can — if you have two code paths for "produce text" vs "stream text," they tend to diverge. The cleanest pattern: <strong>always stream internally</strong>, and have the non-streaming code path be a thin wrapper that consumes the stream into a single string. Then the agent loop is single-shape (async generator), and "non-streaming" is just a different way of consuming the output.</p>
+          <p>For tool calls where you don't need streaming, the streaming overhead is negligible (a few ms). The unified-shape benefit far outweighs it.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Where does the Batch API fit in?</div>
+        <div class="answer">
+          <p>Batch API gives 50% off both input and output tokens, with a 24-hour processing window. It stacks with prompt caching (so cache reads inside batch are 0.5× × 0.1× = 0.05× of base input). The catch: it's async and slow. You submit a batch, you check back later for results.</p>
+          <p>For interactive agents, batch is irrelevant — your latency budget is seconds, not hours. For offline workloads (eval suite runs, batch document processing, training data generation, periodic reports), batch can be the right answer. Don't try to retrofit batch into a real-time path; that's not what it's for.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 2.2</div>
+      <h3>Deliverable</h3>
+      <p>A cost-and-latency-disciplined agent: instrumented metrics on every model call, prompt caching active on the stable prefix with 60-80% hit ratio, model cascade matching tier to task difficulty, parallel tool dispatch where independent, streaming for interactive paths. A clear understanding of where the bill comes from (input tokens, accumulated across turns) and where the seconds come from (model calls, mostly serial). The mental model that turns "optimize cost" and "optimize latency" from vague aspirations into specific levers you know how to pull. The economic substrate that lets the agent serve real users at a real cost basis.</p>
+      <ul class="checklist">
+        <li>Token-level instrumentation: input, output, cache_creation, cache_read, latency per model call</li>
+        <li>Prompt caching enabled on the largest stable prefix; minimum 1,024 (Sonnet) / 4,096 (Opus) tokens</li>
+        <li>Cache hit ratio dashboard with alerts for drops below threshold</li>
+        <li>Anti-pattern audit: no timestamps, no user-specific data, normalized whitespace in cached region</li>
+        <li>Model cascade: Haiku for routing, Sonnet for synthesis, Opus only when measurably needed</li>
+        <li>Each cascade decision validated against the eval suite with predicted-and-measured deltas</li>
+        <li>Parallel tool dispatch via asyncio.gather; state-changing tools sequential</li>
+        <li>SSE streaming on interactive endpoints; non-streaming as thin wrapper</li>
+        <li>TTFT measured and tracked; target under 1s on cached prefix</li>
+        <li>Per-turn latency budget defined and enforced; alerts on breaches</li>
+        <li>Batch API for offline workloads (evals, document processing); standard for interactive</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('s1')">
+        <div class="dir">← prev</div>
+        <div class="title">2.1 Observability</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('s3')">
+        <div class="dir">next →</div>
+        <div class="title">2.3 Safety &amp; guardrails</div>
+      </button>
+    </div>
+  </section>

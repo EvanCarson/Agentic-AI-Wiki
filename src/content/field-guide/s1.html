@@ -1,0 +1,776 @@
+<section class="phase">
+    <div class="phase-num">2.1</div>
+    <div class="week">Part II / Ship · The chapter that makes the next three possible</div>
+    <h2>Observability: every run leaves a trace you can read.</h2>
+    <p class="goal">An agent that fails in production for an unknown reason is an agent you can't ship. This chapter wires every model call, tool call, and retrieval into a span tree following the OpenTelemetry GenAI conventions; sets up structured logging that survives <code class="inline">asyncio.gather</code>; and gives you a replay CLI that takes a trace ID and re-runs the agent locally with the exact same tool results. The first time you debug a production failure in five minutes instead of five hours, you'll know the chapter earned its keep.</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Why <code class="inline">print()</code> stops working.</h3>
+
+      <p>You've been debugging your agent with <code class="inline">print()</code> statements scattered through the loop. That worked while you were the only user, running one request at a time, watching the terminal scroll. It stops working the instant any of those conditions changes.</p>
+
+      <p>Let me walk you through a specific failure pattern, because the motivation is concrete. Your agent is deployed. A user files a ticket: "I asked it about my Q3 invoices and it told me about Q1." You go look at your logs. What you find:</p>
+
+<pre class="trace standalone"><span class="c-out">[2026-03-14 10:42:13] INFO  request received: "show me Q3 invoices"
+[2026-03-14 10:42:13] INFO  calling search_docs
+[2026-03-14 10:42:14] INFO  search_docs returned 5 results
+[2026-03-14 10:42:14] INFO  calling search_docs
+[2026-03-14 10:42:15] INFO  search_docs returned 3 results
+[2026-03-14 10:42:16] INFO  calling answer
+[2026-03-14 10:42:18] INFO  request complete (5.2s)
+[2026-03-14 10:42:13] INFO  request received: "where do I update billing"
+[2026-03-14 10:42:14] INFO  calling fetch_doc
+[2026-03-14 10:42:14] INFO  fetch_doc returned
+[2026-03-14 10:42:15] INFO  calling answer
+[2026-03-14 10:42:16] INFO  request complete (3.1s)</span></pre>
+
+      <p>Read those lines carefully. There are at least two concurrent requests interleaved. You cannot tell which <code class="inline">search_docs</code> call belonged to which user. You cannot see what query was actually passed to the tool, what results came back, what the model decided to do next, or what final answer the user got. You have timestamps and tool names. That's it.</p>
+
+      <p>This is the production-debugging cliff. Single-user, sequential, REPL-driven development gives you everything you need by reading scrollback. The moment you have concurrent requests, an async tool layer, and an unhappy user pointing at a specific failure, you need three things <code class="inline">print()</code> doesn't give you:</p>
+
+      <ul>
+        <li><strong>Correlation.</strong> Every log line must say which request it belongs to.</li>
+        <li><strong>Structure.</strong> "Calling search_docs" isn't useful; "search_docs(query='Q3 invoices', filter='date>=2025-07-01')" is.</li>
+        <li><strong>Hierarchy.</strong> Calls happen inside calls. The agent loop contains the model call, which decided to make a tool call, which made a database query. That nesting is essential context.</li>
+      </ul>
+
+      <h4>The span tree as the right data model</h4>
+
+      <p>The data structure that gives you all three is a <strong>span tree</strong>. A span represents one operation — a model call, a tool call, a retrieval, an agent run. It has a start time, end time, a unique ID, a parent span's ID (or none, if it's the root), a name, and a bag of attributes describing what happened. Spans nest: a child span starts after its parent and ends before it.</p>
+
+      <p>For a single agent run, the tree looks like this:</p>
+
+      <div class="diagram">invoke_agent  "user asks about Q3 invoices"   ┐
+├─ chat       claude-sonnet-4-5  3 turns       │  parent span
+│             input: 2,341 tok   out: 412 tok  │
+│  ├─ execute_tool  search_docs                │
+│  │              args: {query: "Q3 invoices"} │
+│  │              result: 5 chunks             │
+│  ├─ execute_tool  search_docs                │
+│  │              args: {query: "Q3 2025"}     │
+│  │              result: 3 chunks             │
+│  └─ chat       claude-sonnet-4-5  synthesis  │
+│                output: "Your Q3 invoices..." │
+└─ duration: 5.2s    tokens: 2,753   cost: $0.034 ┘</div>
+
+      <p>From a span tree like this you can answer: which tools did the agent use? With what arguments? In what order? Did any fail? How long did each take? How many tokens did each model call consume? What was the final answer? You can answer all of that in seconds, for any past request, by looking up its trace ID.</p>
+
+      <h4>The OpenTelemetry GenAI conventions</h4>
+
+      <p>This isn't a new invention. OpenTelemetry — the observability standard that already underlies most production tracing — has a working group dedicated to LLM and agent semantics, and they've published a vocabulary. As of 2026 these conventions are still marked experimental, but the field names are stabilizing and major vendors (Datadog, Grafana, Langfuse, Braintrust) all support them. Using these names instead of inventing your own means your traces work with off-the-shelf tooling.</p>
+
+      <p>The core span names and attributes you'll use in the rest of this chapter:</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Span name</div>
+          <div>When to emit</div>
+          <div>Key attributes</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">invoke_agent</div>
+          <div class="vector">Once per agent run (top-level)</div>
+          <div class="defense"><code class="inline">gen_ai.agent.name</code>, <code class="inline">gen_ai.conversation.id</code>, <code class="inline">user.id</code></div>
+        </div>
+        <div class="threat-row">
+          <div class="name">chat</div>
+          <div class="vector">Each model call</div>
+          <div class="defense"><code class="inline">gen_ai.request.model</code>, <code class="inline">gen_ai.usage.input_tokens</code>, <code class="inline">gen_ai.usage.output_tokens</code>, <code class="inline">gen_ai.response.finish_reasons</code></div>
+        </div>
+        <div class="threat-row">
+          <div class="name">execute_tool</div>
+          <div class="vector">Each tool dispatch</div>
+          <div class="defense"><code class="inline">gen_ai.tool.name</code>, <code class="inline">gen_ai.tool.call.id</code>, plus your own args/result</div>
+        </div>
+      </div>
+
+      <p>Spans also carry conversation content when you opt in: <code class="inline">gen_ai.system_instructions</code>, <code class="inline">gen_ai.input.messages</code>, and <code class="inline">gen_ai.output.messages</code>. These are big and contain user data, so they're recorded conditionally — more on that below.</p>
+
+      <div class="callout tip">
+        <p>You don't need an OpenTelemetry collector or a vendor account to start. The data model is the unlock — once your agent produces spans with these names and attributes, you can ship them anywhere later: a JSONL file, Langfuse, Datadog, your own Postgres. Pick the data model first, the destination second.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My agent runs synchronously. Single user, local CLI. Do I really need spans?</div>
+        <div class="answer">
+          <p>If you'll never run it concurrently, never deploy it, and never want to debug a failure that happened ten minutes ago — no, prints are fine. But that's a short list. The moment you put a FastAPI handler in front of the agent (Chapter 2.4) or run an eval suite that fires off 50 trajectories in parallel (Chapter 1.4), interleaved logs become unreadable. Spans cost nothing to add now; they cost a lot to add later when you've got code paths that didn't think about correlation.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why "spans" and not just structured JSON logs?</div>
+        <div class="answer">
+          <p>Spans <em>are</em> structured JSON logs, with two pieces of structure that ordinary logs lack: a duration (start/end time pair) and a parent pointer. Those two fields are what lets you render the tree view above. Without them you have a flat stream of events; with them you have a hierarchy you can navigate. Modern observability tools (Langfuse, Braintrust, Datadog, etc.) require this shape because their UIs are tree views.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Instrument the loop.</h3>
+
+      <p>Now the engineering. We'll add tracing to the agent loop from Chapter 1.1, using the OpenTelemetry SDK directly. The pattern is the same regardless of where the spans end up — at the end of this step we'll point them at a JSONL file for local development; at the end of the chapter you can swap the exporter for Langfuse, Braintrust, or any OTLP-compatible backend with zero code changes.</p>
+
+      <h4>The minimal setup</h4>
+
+      <p>Three pieces: a tracer (gives you spans), an exporter (sends them somewhere), and a processor (batches them efficiently). One-time configuration at app startup:</p>
+
+<pre class="standalone"><span class="c-cm"># obs/tracing.py</span>
+<span class="c-kw">from</span> opentelemetry <span class="c-kw">import</span> trace
+<span class="c-kw">from</span> opentelemetry.sdk.trace <span class="c-kw">import</span> TracerProvider
+<span class="c-kw">from</span> opentelemetry.sdk.trace.export <span class="c-kw">import</span> BatchSpanProcessor
+<span class="c-kw">from</span> opentelemetry.sdk.trace.export <span class="c-kw">import</span> ConsoleSpanExporter
+<span class="c-kw">from</span> opentelemetry.sdk.resources <span class="c-kw">import</span> Resource
+
+<span class="c-kw">def</span> <span class="c-fn">init_tracing</span>(service_name: <span class="c-kw">str</span> = <span class="c-st">"my-agent"</span>):
+    resource = Resource.create({<span class="c-st">"service.name"</span>: service_name})
+    provider = TracerProvider(resource=resource)
+
+    <span class="c-cm"># For now: dump spans to stdout as JSON. Swap for OTLPSpanExporter</span>
+    <span class="c-cm"># pointed at Langfuse / Braintrust / Datadog later — zero other changes.</span>
+    provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    trace.set_tracer_provider(provider)
+
+tracer = trace.get_tracer(<span class="c-st">"agent"</span>)</pre>
+
+      <h4>Wrap the agent loop</h4>
+
+      <p>Now we wrap the three things that matter: the top-level run, each model call, and each tool dispatch. Compare this to the bare loop from Chapter 1.1 — the only difference is the <code class="inline">with tracer.start_as_current_span(...)</code> wrappers and the attribute setting.</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># agent/loop.py — instrumented version</span>
+<span class="c-kw">from</span> opentelemetry <span class="c-kw">import</span> trace
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+<span class="c-kw">from</span> uuid <span class="c-kw">import</span> uuid4
+
+tracer = trace.get_tracer(<span class="c-st">"agent"</span>)
+client = Anthropic()
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_msg: <span class="c-kw">str</span>, user_id: <span class="c-kw">str</span>):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"invoke_agent"</span>) <span class="c-kw">as</span> root:
+        root.set_attribute(<span class="c-st">"gen_ai.agent.name"</span>, <span class="c-st">"research-assistant"</span>)
+        root.set_attribute(<span class="c-st">"gen_ai.conversation.id"</span>, <span class="c-kw">str</span>(uuid4()))
+        root.set_attribute(<span class="c-st">"user.id"</span>, user_id)
+
+        messages = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_msg}]
+        <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(<span class="c-st">20</span>):  <span class="c-cm"># budget</span>
+            response = <span class="c-kw">await</span> _chat(messages)
+            messages.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>,
+                             <span class="c-st">"content"</span>: response.content})
+
+            <span class="c-kw">if</span> response.stop_reason == <span class="c-st">"end_turn"</span>:
+                root.set_attribute(<span class="c-st">"gen_ai.response.finish_reasons"</span>,
+                                   [<span class="c-st">"end_turn"</span>])
+                <span class="c-kw">return</span> response.content[<span class="c-st">0</span>].text
+
+            tool_results = []
+            <span class="c-kw">for</span> block <span class="c-kw">in</span> response.content:
+                <span class="c-kw">if</span> block.<span class="c-kw">type</span> == <span class="c-st">"tool_use"</span>:
+                    result = <span class="c-kw">await</span> _dispatch_tool(block)
+                    tool_results.append({
+                        <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                        <span class="c-st">"tool_use_id"</span>: block.id,
+                        <span class="c-st">"content"</span>: result,
+                    })
+            messages.append({<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: tool_results})
+
+<span class="c-kw">async def</span> <span class="c-fn">_chat</span>(messages):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"chat"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.request.model"</span>, <span class="c-st">"claude-sonnet-4-5"</span>)
+        span.set_attribute(<span class="c-st">"gen_ai.provider.name"</span>, <span class="c-st">"anthropic"</span>)
+        response = client.messages.create(
+            model=<span class="c-st">"claude-sonnet-4-5"</span>,
+            max_tokens=<span class="c-st">4096</span>,
+            tools=TOOLS,
+            messages=messages,
+        )
+        span.set_attribute(<span class="c-st">"gen_ai.usage.input_tokens"</span>,
+                           response.usage.input_tokens)
+        span.set_attribute(<span class="c-st">"gen_ai.usage.output_tokens"</span>,
+                           response.usage.output_tokens)
+        span.set_attribute(<span class="c-st">"gen_ai.response.finish_reasons"</span>,
+                           [response.stop_reason])
+        <span class="c-kw">return</span> response
+
+<span class="c-kw">async def</span> <span class="c-fn">_dispatch_tool</span>(block):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"execute_tool"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.tool.name"</span>, block.name)
+        span.set_attribute(<span class="c-st">"gen_ai.tool.call.id"</span>, block.id)
+        span.set_attribute(<span class="c-st">"tool.args"</span>, json.dumps(block.<span class="c-kw">input</span>))
+        <span class="c-kw">try</span>:
+            result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+            span.set_attribute(<span class="c-st">"tool.result_size"</span>, <span class="c-kw">len</span>(<span class="c-kw">str</span>(result)))
+            <span class="c-kw">return</span> result
+        <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+            span.set_attribute(<span class="c-st">"error.type"</span>, <span class="c-kw">type</span>(e).__name__)
+            span.record_exception(e)
+            <span class="c-kw">raise</span></pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># agent/loop.py — instrumented version</span>
+<span class="c-kw">from</span> opentelemetry <span class="c-kw">import</span> trace
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+<span class="c-kw">from</span> uuid <span class="c-kw">import</span> uuid4
+
+tracer = trace.get_tracer(<span class="c-st">"agent"</span>)
+client = OpenAI()
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_msg: <span class="c-kw">str</span>, user_id: <span class="c-kw">str</span>):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"invoke_agent"</span>) <span class="c-kw">as</span> root:
+        root.set_attribute(<span class="c-st">"gen_ai.agent.name"</span>, <span class="c-st">"research-assistant"</span>)
+        root.set_attribute(<span class="c-st">"gen_ai.conversation.id"</span>, <span class="c-kw">str</span>(uuid4()))
+        root.set_attribute(<span class="c-st">"user.id"</span>, user_id)
+
+        <span class="c-cm"># Responses API maintains state via previous_response_id</span>
+        prev_id = <span class="c-kw">None</span>
+        current_input = user_msg
+        <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(<span class="c-st">20</span>):
+            response = <span class="c-kw">await</span> _chat(current_input, prev_id)
+            prev_id = response.id
+
+            tool_calls = [item <span class="c-kw">for</span> item <span class="c-kw">in</span> response.output
+                          <span class="c-kw">if</span> item.<span class="c-kw">type</span> == <span class="c-st">"function_call"</span>]
+            <span class="c-kw">if</span> <span class="c-kw">not</span> tool_calls:
+                root.set_attribute(<span class="c-st">"gen_ai.response.finish_reasons"</span>,
+                                   [<span class="c-st">"stop"</span>])
+                <span class="c-kw">return</span> response.output_text
+
+            results = []
+            <span class="c-kw">for</span> call <span class="c-kw">in</span> tool_calls:
+                result = <span class="c-kw">await</span> _dispatch_tool(call)
+                results.append({
+                    <span class="c-st">"type"</span>: <span class="c-st">"function_call_output"</span>,
+                    <span class="c-st">"call_id"</span>: call.call_id,
+                    <span class="c-st">"output"</span>: <span class="c-kw">str</span>(result),
+                })
+            current_input = results
+
+<span class="c-kw">async def</span> <span class="c-fn">_chat</span>(input_data, previous_response_id):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"chat"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.request.model"</span>, <span class="c-st">"gpt-5.5"</span>)
+        span.set_attribute(<span class="c-st">"gen_ai.provider.name"</span>, <span class="c-st">"openai"</span>)
+        response = client.responses.create(
+            model=<span class="c-st">"gpt-5.5"</span>,
+            tools=TOOLS,
+            <span class="c-kw">input</span>=input_data,
+            previous_response_id=previous_response_id,
+        )
+        span.set_attribute(<span class="c-st">"gen_ai.usage.input_tokens"</span>,
+                           response.usage.input_tokens)
+        span.set_attribute(<span class="c-st">"gen_ai.usage.output_tokens"</span>,
+                           response.usage.output_tokens)
+        <span class="c-kw">return</span> response
+
+<span class="c-kw">async def</span> <span class="c-fn">_dispatch_tool</span>(call):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"execute_tool"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.tool.name"</span>, call.name)
+        span.set_attribute(<span class="c-st">"gen_ai.tool.call.id"</span>, call.call_id)
+        args = json.loads(call.arguments)
+        span.set_attribute(<span class="c-st">"tool.args"</span>, call.arguments)
+        <span class="c-kw">try</span>:
+            result = <span class="c-kw">await</span> HANDLERS[call.name](**args)
+            span.set_attribute(<span class="c-st">"tool.result_size"</span>, <span class="c-kw">len</span>(<span class="c-kw">str</span>(result)))
+            <span class="c-kw">return</span> result
+        <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+            span.set_attribute(<span class="c-st">"error.type"</span>, <span class="c-kw">type</span>(e).__name__)
+            span.record_exception(e)
+            <span class="c-kw">raise</span></pre>
+      </div>
+
+      <h4>What you get</h4>
+
+      <p>Run a query through it and you get a stream of JSON spans on stdout. Pretty-printed and arranged in tree order:</p>
+
+<pre class="trace standalone"><span class="c-out">{
+  "name": "invoke_agent",
+  "trace_id": "8f3c2e1a9b4d5067...",
+  "span_id": "a0b1c2d3...",
+  "parent_span_id": null,
+  "start_time": "2026-03-14T10:42:13.412Z",
+  "end_time":   "2026-03-14T10:42:18.673Z",
+  "attributes": {
+    "gen_ai.agent.name": "research-assistant",
+    "gen_ai.conversation.id": "4e7a-9c2f-...",
+    "user.id": "u_8821",
+    "gen_ai.response.finish_reasons": ["end_turn"]
+  }
+}
+  {
+    "name": "chat",
+    "parent_span_id": "a0b1c2d3...",
+    "start_time": "10:42:13.420Z",
+    "end_time":   "10:42:14.108Z",
+    "attributes": {
+      "gen_ai.request.model": "claude-sonnet-4-5",
+      "gen_ai.provider.name": "anthropic",
+      "gen_ai.usage.input_tokens": 2341,
+      "gen_ai.usage.output_tokens": 89,
+      "gen_ai.response.finish_reasons": ["tool_use"]
+    }
+  }
+    {
+      "name": "execute_tool",
+      "parent_span_id": "a0b1c2d3..." (sibling of chat),
+      "attributes": {
+        "gen_ai.tool.name": "search_docs",
+        "gen_ai.tool.call.id": "toolu_01ABC...",
+        "tool.args": "{\"query\": \"Q3 invoices\"}",
+        "tool.result_size": 1842
+      }
+    }
+    ...</span></pre>
+
+      <div class="observe">
+        <div class="label">What changed from the print-based world</div>
+        <p>Every line that used to be a print is now an attribute on a span. The span's parent pointer encodes the call hierarchy. The trace ID links every span back to its originating request — concurrent requests can't be confused because each gets its own trace ID at the top.</p>
+        <p>The tree is the unlock. Once you have it, every observability tool on the market — Langfuse, Braintrust, Datadog, Honeycomb, Grafana — can ingest it and give you a UI. You can also dump it to JSONL and query it with <code class="inline">jq</code>. The data is portable.</p>
+      </div>
+
+      <h4>Pointing it at a vendor</h4>
+
+      <p>Once your code emits spans, sending them to a vendor is a one-line change: swap the exporter. To use Langfuse (free tier, designed for LLM apps):</p>
+
+<pre class="standalone"><span class="c-cm"># obs/tracing.py — Langfuse variant</span>
+<span class="c-kw">from</span> opentelemetry.exporter.otlp.proto.http.trace_exporter <span class="c-kw">import</span> (
+    OTLPSpanExporter
+)
+
+<span class="c-kw">def</span> <span class="c-fn">init_tracing</span>(service_name: <span class="c-kw">str</span> = <span class="c-st">"my-agent"</span>):
+    resource = Resource.create({<span class="c-st">"service.name"</span>: service_name})
+    provider = TracerProvider(resource=resource)
+
+    <span class="c-cm"># Replace ConsoleSpanExporter with OTLP pointed at Langfuse</span>
+    exporter = OTLPSpanExporter(
+        endpoint=<span class="c-st">"https://us.cloud.langfuse.com/api/public/otel/v1/traces"</span>,
+        headers={<span class="c-st">"Authorization"</span>: <span class="c-kw">f</span><span class="c-st">"Bearer {os.environ['LANGFUSE_KEY']}"</span>},
+    )
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)</pre>
+
+      <p>Braintrust, Datadog, Honeycomb, and any other OTLP-compatible backend differ only in URL and auth header. The agent code is unchanged.</p>
+
+      <h4>What about content?</h4>
+
+      <p>You'll notice I haven't put the prompts or completions on the spans. That's deliberate — they're large, they often contain user data, and you usually don't want every retrieved document text echoed into your observability storage. The convention provides <code class="inline">gen_ai.input.messages</code> and <code class="inline">gen_ai.output.messages</code> for this, but the recommendation is to opt in conditionally:</p>
+
+<pre class="standalone"><span class="c-cm"># Only record full content for sampled traces (1%) or for traces</span>
+<span class="c-cm"># flagged for inspection. Cheap to add per-call.</span>
+
+CAPTURE_CONTENT = os.environ.get(<span class="c-st">"CAPTURE_CONTENT"</span>) == <span class="c-st">"1"</span>
+
+<span class="c-kw">def</span> <span class="c-fn">should_capture</span>(trace_id: <span class="c-kw">str</span>) -> <span class="c-kw">bool</span>:
+    <span class="c-kw">if</span> CAPTURE_CONTENT: <span class="c-kw">return</span> <span class="c-kw">True</span>
+    <span class="c-cm"># Sample 1% by trace_id hash for ambient observability</span>
+    <span class="c-kw">return</span> <span class="c-kw">int</span>(trace_id[:<span class="c-st">8</span>], <span class="c-st">16</span>) % <span class="c-st">100</span> == <span class="c-st">0</span>
+
+<span class="c-kw">if</span> should_capture(span.context.trace_id):
+    span.set_attribute(<span class="c-st">"gen_ai.input.messages"</span>,
+                       json.dumps(messages)[:<span class="c-st">10000</span>])
+    span.set_attribute(<span class="c-st">"gen_ai.output.messages"</span>,
+                       json.dumps([b.model_dump() <span class="c-kw">for</span> b <span class="c-kw">in</span> response.content]))</pre>
+
+      <div class="callout warn">
+        <p>If you're handling regulated data — health, finance, EU personal data — talk to your privacy team <em>before</em> turning on full-content capture. Traces are logs; logs are storage; storage has regulatory implications. The 1% sampling pattern above is the production default for a reason.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Won't all this tracing slow my agent down?</div>
+        <div class="answer">
+          <p>In practice, no. The OpenTelemetry SDK uses an asynchronous batch processor — spans get queued in memory and flushed to the exporter in the background. The hot path overhead is on the order of microseconds per span; even an agent that emits 20 spans per run pays single-digit milliseconds. Compared to a single LLM call at 800ms+, the tracing cost is invisible.</p>
+          <p>Where you can hurt yourself: serializing huge prompt/completion content as attributes on every span. That's why content capture is conditional. The structural attributes (model name, token counts, tool name) are tiny and always-on.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Which vendor should I pick — Langfuse, Braintrust, Datadog, something else?</div>
+        <div class="answer">
+          <p>Honest answer: it doesn't matter as much as it feels like it does, because the OpenTelemetry data model makes them interchangeable. My rough heuristic:</p>
+          <ul>
+            <li><strong>Langfuse</strong> — best free tier, LLM-native UI, easiest to start. Pick this if you're a small team and your stack is "just LLMs."</li>
+            <li><strong>Braintrust</strong> — best evals integration, opinionated about prompt-engineering workflow. Pick this if Chapter 1.4 evals are a daily activity for your team.</li>
+            <li><strong>Datadog / Honeycomb / Grafana</strong> — pick whichever your company already runs. The LLM-specific affordances are catching up to the LLM-native tools quickly; the value of one unified pane is high.</li>
+            <li><strong>Roll your own (just JSONL → SQLite)</strong> — viable for personal projects, and the right answer if you want to understand what these tools do. Stops being viable once a teammate needs to see traces too.</li>
+          </ul>
+          <p>The lock-in risk is low because the data model is shared. Migrating from one to another is a config change, not a rewrite.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Logs that survive <code class="inline">asyncio.gather</code>.</h3>
+
+      <p>Spans cover the structured story: which operations happened, in what order, with what attributes. You still need ordinary log lines for the unstructured story — error messages, debug context, intermediate values you didn't decide deserved an attribute. The problem is that ordinary Python <code class="inline">logging</code> loses the connection to the trace tree as soon as you cross an <code class="inline">await</code> boundary inside <code class="inline">asyncio.gather</code>.</p>
+
+      <p>Concretely, this fails in a way that's hard to spot:</p>
+
+<pre class="attack standalone"><span class="c-cm"># Naive logging — what NOT to do</span>
+<span class="c-kw">import</span> logging
+log = logging.getLogger(<span class="c-st">"agent"</span>)
+
+<span class="c-kw">async def</span> <span class="c-fn">fan_out_retrieval</span>(queries):
+    <span class="c-cm"># Logs from these concurrent calls interleave with no way</span>
+    <span class="c-cm"># to tell which log belongs to which query.</span>
+    <span class="c-kw">return</span> <span class="c-kw">await</span> asyncio.gather(*[search(q) <span class="c-kw">for</span> q <span class="c-kw">in</span> queries])
+
+<span class="c-kw">async def</span> <span class="c-fn">search</span>(query):
+    log.info(<span class="c-kw">f</span><span class="c-st">"searching for {query}"</span>)
+    results = <span class="c-kw">await</span> bm25.search(query)
+    log.info(<span class="c-kw">f</span><span class="c-st">"found {len(results)} results"</span>)
+    <span class="c-kw">return</span> results</pre>
+
+<pre class="trace standalone"><span class="c-out"># Log output during a concurrent run:
+INFO:agent:searching for Q3 invoices
+INFO:agent:searching for billing settings
+INFO:agent:found 12 results
+INFO:agent:searching for refund policy
+INFO:agent:found 3 results
+INFO:agent:found 8 results</span></pre>
+
+      <p>Which result count belongs to which query? You cannot tell from the log. This is the same correlation problem from Step 1, but now within a single trace. The fix is to propagate context through <code class="inline">contextvars</code> — Python's mechanism for variables that follow the async task instead of the thread — and to bind that context onto every log record.</p>
+
+      <h4>The pattern</h4>
+
+      <p><code class="inline">structlog</code> + <code class="inline">contextvars</code> gives you the cleanest version. About fifteen lines of setup and every subsequent log line carries the trace context for free:</p>
+
+<pre class="standalone"><span class="c-cm"># obs/logging.py</span>
+<span class="c-kw">import</span> structlog, logging, sys
+<span class="c-kw">from</span> opentelemetry <span class="c-kw">import</span> trace
+
+<span class="c-kw">def</span> <span class="c-fn">_add_trace_context</span>(logger, method_name, event_dict):
+    <span class="c-st">"""Pull current trace IDs from OpenTelemetry into log record."""</span>
+    span = trace.get_current_span()
+    ctx = span.get_span_context()
+    <span class="c-kw">if</span> ctx.is_valid:
+        event_dict[<span class="c-st">"trace_id"</span>] = <span class="c-kw">format</span>(ctx.trace_id, <span class="c-st">"032x"</span>)
+        event_dict[<span class="c-st">"span_id"</span>] = <span class="c-kw">format</span>(ctx.span_id, <span class="c-st">"016x"</span>)
+    <span class="c-kw">return</span> event_dict
+
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,  <span class="c-cm"># pull bound vars</span>
+        _add_trace_context,                       <span class="c-cm"># pull OTel IDs</span>
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt=<span class="c-st">"iso"</span>),
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+)
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, <span class="c-kw">format</span>=<span class="c-st">"%(message)s"</span>)
+
+log = structlog.get_logger(<span class="c-st">"agent"</span>)</pre>
+
+      <p>Two things make this work:</p>
+
+      <ul>
+        <li><strong><code class="inline">merge_contextvars</code></strong> — pulls in any variable bound via <code class="inline">structlog.contextvars.bind_contextvars(...)</code>. Bindings are scoped to the current async task: <code class="inline">asyncio.gather</code> gives each coroutine its own context, so bindings don't leak between concurrent calls.</li>
+        <li><strong><code class="inline">_add_trace_context</code></strong> — reads the current OpenTelemetry span ID at log-emit time. Every log line gets the trace and span ID of whatever span is active when the log fires, automatically.</li>
+      </ul>
+
+      <h4>Use it</h4>
+
+      <p>Where before you wrote:</p>
+
+<pre class="attack standalone">log.info(<span class="c-kw">f</span><span class="c-st">"searching for {query}"</span>)  <span class="c-cm"># f-string concatenation</span></pre>
+
+      <p>Now you write:</p>
+
+<pre class="standalone">log.info(<span class="c-st">"searching"</span>, query=query, top_k=<span class="c-st">5</span>)</pre>
+
+      <p>And the output, for a concurrent run, becomes:</p>
+
+<pre class="trace standalone"><span class="c-out">{"timestamp":"2026-03-14T10:42:13.421Z","level":"info","event":"searching",
+ "query":"Q3 invoices","top_k":5,
+ "trace_id":"8f3c2e1a9b4d50670c8...","span_id":"a0b1c2d3e4f50678"}
+{"timestamp":"2026-03-14T10:42:13.422Z","level":"info","event":"searching",
+ "query":"billing settings","top_k":5,
+ "trace_id":"8f3c2e1a9b4d50670c8...","span_id":"b1c2d3e4f5067890"}
+{"timestamp":"2026-03-14T10:42:13.890Z","level":"info","event":"found",
+ "query":"Q3 invoices","count":12,
+ "trace_id":"8f3c2e1a9b4d50670c8...","span_id":"a0b1c2d3e4f50678"}
+{"timestamp":"2026-03-14T10:42:13.894Z","level":"info","event":"found",
+ "query":"billing settings","count":8,
+ "trace_id":"8f3c2e1a9b4d50670c8...","span_id":"b1c2d3e4f5067890"}</span></pre>
+
+      <p>Now you can answer "which result count belonged to which query" in two ways: by the explicit <code class="inline">query</code> field, or by matching <code class="inline">span_id</code>. Both work. The latter generalizes to logs that don't happen to repeat the query string.</p>
+
+      <h4>Binding higher-level context</h4>
+
+      <p>At the top of your agent run, bind <code class="inline">user_id</code> and any other identifiers you'll want on every subsequent log line:</p>
+
+<pre class="standalone"><span class="c-kw">from</span> structlog.contextvars <span class="c-kw">import</span> bind_contextvars, clear_contextvars
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_msg: <span class="c-kw">str</span>, user_id: <span class="c-kw">str</span>):
+    clear_contextvars()
+    bind_contextvars(user_id=user_id, agent=<span class="c-st">"research-assistant"</span>)
+
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"invoke_agent"</span>):
+        log.info(<span class="c-st">"agent_start"</span>, user_msg_len=<span class="c-kw">len</span>(user_msg))
+        <span class="c-cm"># ... agent loop ...</span>
+        log.info(<span class="c-st">"agent_done"</span>, duration_s=elapsed)</pre>
+
+      <p>Every log line emitted anywhere inside <code class="inline">run_agent</code> — including from tool handlers, retrieval code, anything you call — gets the bound <code class="inline">user_id</code> automatically, courtesy of <code class="inline">contextvars</code>. And because <code class="inline">contextvars</code> are async-task-scoped, two concurrent <code class="inline">run_agent</code> calls don't trample each other's bindings.</p>
+
+      <h4>Search and aggregate</h4>
+
+      <p>Once logs are structured JSON with trace IDs, two things become trivial:</p>
+
+      <ul>
+        <li><strong>Drill into one request.</strong> <code class="inline">jq 'select(.trace_id=="8f3c...")' app.log</code> dumps every log line from that one request. Combine with the span tree from the previous step and you have a full reconstruction.</li>
+        <li><strong>Aggregate across requests.</strong> <code class="inline">jq -s 'group_by(.event) | map({event:.[0].event, count:length})' app.log</code> tells you which events fire most. Useful for spotting high-frequency error events.</li>
+      </ul>
+
+      <p>Most observability vendors also ingest structured logs and correlate them with traces automatically — Langfuse, Datadog, Honeycomb all do this when both signals share a trace ID. You don't have to choose between traces and logs; you use both, and they cross-reference.</p>
+
+      <div class="callout tip">
+        <p>If you only do one thing from this step: replace every <code class="inline">f"..."</code>-style log message with <code class="inline">log.info("event_name", field=value, ...)</code>. The discipline of "every log is a typed event with named fields" pays back for years. The async-correlation piece is a bonus.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">I'm already using the standard <code class="inline">logging</code> module everywhere. Can I keep it?</div>
+        <div class="answer">
+          <p>Yes. <code class="inline">structlog</code> wraps <code class="inline">logging</code> rather than replacing it; it sits in front of the standard handlers and reformats. Existing <code class="inline">logging.getLogger("foo").info("bar")</code> calls keep working — they just produce plain strings instead of structured records. You can migrate file by file.</p>
+          <p>The minimum useful step: don't migrate the whole codebase. Migrate your agent loop and tool handlers — the places where correlation matters most — and leave the rest alone.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why <code class="inline">contextvars</code> and not just thread-local storage?</div>
+        <div class="answer">
+          <p>Thread-local storage is per OS thread; <code class="inline">asyncio</code> runs many tasks on one thread. A binding set in task A would be visible to task B if they share a thread — exactly the correlation bug we're trying to avoid. <code class="inline">contextvars</code> are per async task, so each <code class="inline">asyncio.gather</code> child gets its own independent context. This was the whole point of PEP 567.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Replay: run the failure on your laptop.</h3>
+
+      <p>You now have a trace tree for every production run, and structured logs that correlate to it. That gets you 80% of the way through most debugging: read the trace, see the bad tool call, identify the bad result. But for the other 20% — the bugs where you need to step through the agent's behavior, change one prompt, see what would have happened differently — you need <strong>replay</strong>.</p>
+
+      <p>Replay means: take a trace ID from production, re-run the agent on the same input, but instead of calling tools for real, return the exact tool results that were recorded during the original run. The model sees the same context it saw before, runs through its loop the same way, and you can pause, mutate, or re-prompt at any step. It is the agentic-AI equivalent of a debugger.</p>
+
+      <h4>The two-piece architecture</h4>
+
+      <p>To make replay work you need to persist tool I/O during the original run, then teach your tool dispatcher to look up recorded results when in replay mode. About forty lines of code.</p>
+
+<pre class="standalone"><span class="c-cm"># obs/replay.py</span>
+<span class="c-kw">import</span> json, contextvars
+<span class="c-kw">from</span> pathlib <span class="c-kw">import</span> Path
+
+REPLAY_DIR = Path(<span class="c-st">"runs/replay"</span>)
+REPLAY_DIR.mkdir(parents=<span class="c-kw">True</span>, exist_ok=<span class="c-kw">True</span>)
+
+<span class="c-cm"># When non-None, _dispatch_tool returns recorded results instead of</span>
+<span class="c-cm"># calling handlers. Set by the replay CLI.</span>
+replay_mode: contextvars.ContextVar = contextvars.ContextVar(
+    <span class="c-st">"replay_mode"</span>, default=<span class="c-kw">None</span>
+)
+
+<span class="c-kw">def</span> <span class="c-fn">recorder_path</span>(trace_id: <span class="c-kw">str</span>) -> Path:
+    <span class="c-kw">return</span> REPLAY_DIR / <span class="c-kw">f</span><span class="c-st">"{trace_id}.jsonl"</span>
+
+<span class="c-kw">def</span> <span class="c-fn">record</span>(trace_id: <span class="c-kw">str</span>, event: <span class="c-kw">dict</span>):
+    <span class="c-st">"""Append a tool I/O event to this trace's recording."""</span>
+    <span class="c-kw">with</span> recorder_path(trace_id).<span class="c-kw">open</span>(<span class="c-st">"a"</span>) <span class="c-kw">as</span> f:
+        f.write(json.dumps(event) + <span class="c-st">"\n"</span>)
+
+<span class="c-kw">def</span> <span class="c-fn">load_recording</span>(trace_id: <span class="c-kw">str</span>) -> <span class="c-kw">list</span>[<span class="c-kw">dict</span>]:
+    path = recorder_path(trace_id)
+    <span class="c-kw">if</span> <span class="c-kw">not</span> path.exists():
+        <span class="c-kw">raise</span> FileNotFoundError(<span class="c-kw">f</span><span class="c-st">"no recording for trace {trace_id}"</span>)
+    <span class="c-kw">return</span> [json.loads(line) <span class="c-kw">for</span> line <span class="c-kw">in</span> path.<span class="c-kw">open</span>()]</pre>
+
+      <h4>Record during normal runs</h4>
+
+      <p>Modify <code class="inline">_dispatch_tool</code> to record every input/output pair. We use the tool call ID (already on the span) as the lookup key. The recording is keyed by trace ID, so each request's tools are in their own file.</p>
+
+<pre class="standalone"><span class="c-cm"># Updated _dispatch_tool, replaces the version from Step 2</span>
+<span class="c-kw">async def</span> <span class="c-fn">_dispatch_tool</span>(block):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"execute_tool"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.tool.name"</span>, block.name)
+        span.set_attribute(<span class="c-st">"gen_ai.tool.call.id"</span>, block.id)
+
+        trace_id = <span class="c-kw">format</span>(span.get_span_context().trace_id, <span class="c-st">"032x"</span>)
+
+        <span class="c-cm"># REPLAY MODE: return recorded result, skip the real call</span>
+        recording = replay_mode.get()
+        <span class="c-kw">if</span> recording <span class="c-kw">is not</span> <span class="c-kw">None</span>:
+            recorded = next(
+                (e <span class="c-kw">for</span> e <span class="c-kw">in</span> recording <span class="c-kw">if</span> e[<span class="c-st">"call_id"</span>] == block.id),
+                <span class="c-kw">None</span>,
+            )
+            <span class="c-kw">if</span> recorded:
+                span.set_attribute(<span class="c-st">"replay.matched"</span>, <span class="c-kw">True</span>)
+                <span class="c-kw">return</span> recorded[<span class="c-st">"result"</span>]
+            <span class="c-cm"># Tool call wasn't in recording — model deviated from</span>
+            <span class="c-cm"># original trajectory. Flag it but continue with a real call.</span>
+            span.set_attribute(<span class="c-st">"replay.matched"</span>, <span class="c-kw">False</span>)
+
+        <span class="c-cm"># NORMAL MODE: call handler and record</span>
+        <span class="c-kw">try</span>:
+            result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+            record(trace_id, {
+                <span class="c-st">"call_id"</span>: block.id,
+                <span class="c-st">"tool"</span>: block.name,
+                <span class="c-st">"args"</span>: block.<span class="c-kw">input</span>,
+                <span class="c-st">"result"</span>: result,
+            })
+            <span class="c-kw">return</span> result
+        <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+            record(trace_id, {
+                <span class="c-st">"call_id"</span>: block.id,
+                <span class="c-st">"tool"</span>: block.name,
+                <span class="c-st">"args"</span>: block.<span class="c-kw">input</span>,
+                <span class="c-st">"error"</span>: <span class="c-kw">str</span>(e),
+            })
+            <span class="c-kw">raise</span></pre>
+
+      <h4>The replay CLI</h4>
+
+      <p>One command. Takes a trace ID, loads the recording, runs the agent in replay mode against the original user message.</p>
+
+<pre class="standalone"><span class="c-cm"># scripts/replay.py</span>
+<span class="c-kw">import</span> argparse, asyncio
+<span class="c-kw">from</span> agent.loop <span class="c-kw">import</span> run_agent
+<span class="c-kw">from</span> obs.replay <span class="c-kw">import</span> load_recording, replay_mode
+
+parser = argparse.ArgumentParser()
+parser.add_argument(<span class="c-st">"trace_id"</span>)
+parser.add_argument(<span class="c-st">"--user-msg"</span>, required=<span class="c-kw">True</span>,
+                    help=<span class="c-st">"the original user message"</span>)
+args = parser.parse_args()
+
+recording = load_recording(args.trace_id)
+<span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"loaded {len(recording)} tool events from trace {args.trace_id}"</span>)
+
+<span class="c-kw">async def</span> <span class="c-fn">main</span>():
+    token = replay_mode.set(recording)
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> run_agent(args.user_msg, user_id=<span class="c-st">"replay"</span>)
+        <span class="c-kw">print</span>(<span class="c-st">"---"</span>)
+        <span class="c-kw">print</span>(result)
+    <span class="c-kw">finally</span>:
+        replay_mode.reset(token)
+
+asyncio.run(main())</pre>
+
+      <h4>What this looks like</h4>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/replay.py 8f3c2e1a9b4d... \
+    --user-msg "show me my Q3 invoices"
+
+loaded 3 tool events from trace 8f3c2e1a9b4d...
+
+[span: invoke_agent  agent=research-assistant  user=replay]
+  [span: chat  model=claude-sonnet-4-5  in=2341 out=89  finish=tool_use]
+  [span: execute_tool  tool=search_docs  replay.matched=True]
+  [span: execute_tool  tool=search_docs  replay.matched=True]
+  [span: chat  model=claude-sonnet-4-5  in=3104 out=271  finish=tool_use]
+  [span: execute_tool  tool=fetch_doc  replay.matched=True]
+  [span: chat  model=claude-sonnet-4-5  in=4892 out=412  finish=end_turn]
+---
+"Your Q3 2025 invoices are: INV-4421 ($2,300, paid),
+ INV-4438 ($1,150, outstanding), INV-4502 ($875, paid)..."</span></pre>
+
+      <p>You've just reproduced a production run on your laptop. From here you can:</p>
+
+      <ul>
+        <li>Change the system prompt and re-run to see if the new prompt would have produced a better answer (the recorded tool results still match because the model's tool calls don't change shape).</li>
+        <li>Add print statements or breakpoints inside <code class="inline">_dispatch_tool</code> to inspect every recorded interaction.</li>
+        <li>Replay with a different model (Sonnet → Opus) to A/B test on a real production case.</li>
+        <li>Save the trace to your eval set — it just became a regression test.</li>
+      </ul>
+
+      <h4>When replay diverges</h4>
+
+      <p>If you change something that causes the model to make a tool call it didn't make in the original run, your recording won't have a match. The code above prints <code class="inline">replay.matched=False</code> on the span and falls through to calling the real handler. That's usually the right behavior — you want to see what would have happened — but it can have side effects (charging users, sending emails). For replay safety, gate state-changing tools behind a flag and stub them out when replay is active:</p>
+
+<pre class="standalone"><span class="c-kw">if</span> replay_mode.get() <span class="c-kw">is not</span> <span class="c-kw">None</span> <span class="c-kw">and</span> POLICIES[block.name].scope != Scope.READ_ONLY:
+    <span class="c-kw">return</span> {<span class="c-st">"error"</span>: <span class="c-st">"state-changing tool stubbed during replay"</span>}</pre>
+
+      <p>(<code class="inline">Scope</code> and <code class="inline">POLICIES</code> come from Chapter 2.3 Safety.) Read-only tools always replay safely; state-changing ones either replay from recording or return a stub error.</p>
+
+      <div class="observe">
+        <div class="label">Why this earns its keep</div>
+        <p>The first time you ship an agent and a user files a bug like "I asked it X and it said Y," your old workflow is: try to reproduce locally, fail because the corpus shifted or the retrieval randomized differently, end up guessing. Your new workflow is: copy the trace ID from the audit log, run <code class="inline">replay.py</code>, watch the exact failure happen on your laptop, fix it, replay to confirm. The difference is hours per bug, sometimes days.</p>
+        <p>This is also what makes regression evals possible. Every reproducible production failure becomes a permanent eval case. Each one you fix stays fixed, because the next time anything else changes you replay all of them and catch any regressions immediately. Spans + recording + replay is the engineering substrate for chapter 1.4's evals — and for what Part III extends.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Recording every tool result is going to be a lot of data. What about retention?</div>
+        <div class="answer">
+          <p>You don't have to keep all of it. Two pragmatic patterns:</p>
+          <ul>
+            <li><strong>Sample by default.</strong> Record 100% of failed runs (cheap, valuable) and 1% of successful runs (cheap, useful for general debugging). Both keyed off the finish reason / error state visible on the root span.</li>
+            <li><strong>Tier by age.</strong> Keep full recordings hot for 7 days; archive to cold storage for 90; delete after that. For high-traffic agents this maps to a few hundred MB hot and a few GB cold.</li>
+          </ul>
+          <p>The exception: runs flagged for inspection by a human (support ticket attached, eval failure linked, customer complaint) get full retention forever. They're future evals.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Can I replay the model call too — not just the tool calls?</div>
+        <div class="answer">
+          <p>You can, and some setups do. Anthropic and OpenAI both offer prompt caching and ID-based response retrieval that lets you re-fetch the exact response to a given input. But the more useful pattern is to <em>not</em> replay model calls — that way you can change the prompt or the model and see how the new model would behave on the same tool results.</p>
+          <p>"Replay everything" is closer to a video recording; "replay only tool I/O" is closer to a debugger. The debugger version is more useful day-to-day.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My agent uses parallel tool calls. Does replay still work?</div>
+        <div class="answer">
+          <p>Yes, because we match by <code class="inline">call_id</code>, not by call order. If the model fires three concurrent <code class="inline">search_docs</code> calls in turn 2, all three get recorded with their distinct IDs, and the replay dispatcher returns the right result for each. The only caveat is that timing-sensitive behavior won't reproduce exactly — but tool I/O is reproduced exactly, which is what matters for almost every bug.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 2.1</div>
+      <h3>Deliverable</h3>
+      <p>An agent where every run produces a span tree following the OpenTelemetry GenAI conventions, structured logs that survive concurrent execution, and a <code class="inline">replay &lt;trace_id&gt;</code> CLI that reproduces production failures on your laptop in seconds. The substrate that makes the rest of Part II — Cost (2.2), Safety (2.3), Deployment (2.4) — actually debuggable, and the substrate that makes Part III's eval-driven development tractable at scale.</p>
+      <ul class="checklist">
+        <li>OpenTelemetry SDK wired up with a ConsoleSpanExporter for local dev</li>
+        <li>invoke_agent, chat, and execute_tool spans with gen_ai.* attributes</li>
+        <li>One-line vendor swap: OTLP exporter → Langfuse / Braintrust / Datadog</li>
+        <li>structlog with contextvars + OTel trace-ID enrichment</li>
+        <li>Conditional content capture (1% sample or flag-gated)</li>
+        <li>Tool I/O recording per trace, written to runs/replay/&lt;trace_id&gt;.jsonl</li>
+        <li>replay.py CLI: load recording, set replay_mode contextvar, run agent</li>
+        <li>State-changing tools stubbed during replay (integrates with 2.3 Safety scopes)</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('p4')">
+        <div class="dir">← prev</div>
+        <div class="title">1.4 First eval suite</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('s2')">
+        <div class="dir">next →</div>
+        <div class="title">2.2 Cost &amp; latency</div>
+      </button>
+    </div>
+  </section>

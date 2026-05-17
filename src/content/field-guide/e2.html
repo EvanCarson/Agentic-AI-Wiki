@@ -1,0 +1,653 @@
+<section class="phase">
+    <div class="phase-num">3.2</div>
+    <div class="week">Part III / Evaluate · The architecture, not the activity</div>
+    <h2>Three layers of evals: which to run when, and why none alone is enough.</h2>
+    <p class="goal">Chapter 3.1 taught the discipline of evaluating before shipping. Chapter 3.3 taught the grading mechanism that lets you grade at scale. This chapter teaches the architecture connecting them: <strong>evals come in three distinct layers</strong>, each with its own cadence, scope, cost, and the failures it catches. Most production agents need all three; treating any one as a substitute for the others is how teams discover regressions in production they thought their evals would have caught. By the end you'll know which checks belong at which layer, what each layer is good and bad at, and how to compose the layers into a feedback system that catches what matters quickly and cheaply.</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Why evals come in three layers.</h3>
+
+      <p>The testing-pyramid metaphor from software engineering — unit tests at the base, integration tests in the middle, end-to-end tests at the top — partially applies to agent evals. The shape is similar: cheap fast tests at the base run on every change; expensive slow tests at the top run rarely but cover ground the cheap tests can't. The structure rhymes.</p>
+
+      <p>Where the metaphor breaks: <strong>agent outputs are non-deterministic, ground truth is often subjective, and production reveals failures that no offline test can predict</strong>. So the agent version of the pyramid has a third character at the top that traditional software testing doesn't: production observability as a first-class eval layer, not just monitoring. You don't replace testing with observability — you do both, with one informing the other.</p>
+
+      <h4>The three layers, at a glance</h4>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  THE THREE LAYERS                                                │
+│                                                                  │
+│   Layer 3:    PRODUCTION TELEMETRY (always on)                   │
+│               Real traffic, real users.                          │
+│               No ground truth, statistical signal.               │
+│               Catches: drift, novel failures, production-only    │
+│               failure modes (load, edge cases, real users).      │
+│                                                                  │
+│        ▲                                                         │
+│        │  signal feeds back into Layer 2                         │
+│        │                                                         │
+│                                                                  │
+│   Layer 2:    OFFLINE JUDGE-BASED EVAL SUITE                     │
+│               Curated queries, full agent runs, LLM judges.      │
+│               Slow ($, minutes-hours), high signal.              │
+│               Catches: behavioral regressions, quality changes,  │
+│               judgment-level failures.                           │
+│                                                                  │
+│        ▲                                                         │
+│        │  runs on PRs that need it; before releases              │
+│        │                                                         │
+│                                                                  │
+│   Layer 1:    DETERMINISTIC CHECKS                               │
+│               Schema, format, structural correctness.            │
+│               Fast (seconds), cheap ($0), zero ambiguity.        │
+│               Catches: malformed outputs, contract violations,   │
+│               broken tool calls, budget violations.              │
+│                                                                  │
+│  Runs on:    every commit, every PR, every push                  │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>This is the structural picture. Each layer has its own discipline — what belongs there, what its cadence looks like, what kind of failure it specializes in catching.</p>
+
+      <h4>The four properties that distinguish the layers</h4>
+
+      <p>Four axes capture how the layers differ. Understanding each axis helps you decide where to put any particular check.</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Property</div>
+          <div>Layer 1 (deterministic)</div>
+          <div>Layer 2 (judge suite)</div>
+          <div>Layer 3 (production)</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Cadence</div>
+          <div class="vector">Every change</div>
+          <div class="defense">PR / scheduled / pre-release</div>
+          <div class="vector">Continuous, always on</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Speed</div>
+          <div class="vector">Seconds</div>
+          <div class="defense">Minutes to hours</div>
+          <div class="vector">Real-time</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Cost</div>
+          <div class="vector">Essentially zero</div>
+          <div class="defense">$1-$200 per run</div>
+          <div class="vector">Compute + storage; pay per query already</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Ground truth</div>
+          <div class="vector">Yes — exact</div>
+          <div class="defense">Yes — labeled</div>
+          <div class="vector">No — statistical</div>
+        </div>
+      </div>
+
+      <p>The pattern that emerges from the axes: as you go up the layers, cost and signal-quality both increase, while feedback speed decreases. You want to catch failures at the lowest layer they're detectable at — both because it's cheaper and because the feedback loop is faster.</p>
+
+      <h4>Each layer's specialization</h4>
+
+      <p>Different failure modes show up at different layers, and treating the layers as substitutes leaves gaps.</p>
+
+      <p><strong>Layer 1 catches:</strong> output schema violations, missing citations, tool calls that don't match the schema, budget overruns, refusal patterns matching prohibited responses. Things that have a deterministic right/wrong. A regression that breaks one of these gets caught in seconds, in CI, before merge. Cheap to catch, cheap to fix.</p>
+
+      <p><strong>Layer 2 catches:</strong> behavioral changes that don't violate any deterministic check but produce <em>worse answers</em>. A new prompt that's syntactically fine but reduces accuracy by 4 points; a model swap that produces correctly-formatted but less helpful responses; a tool description change that subtly reroutes the agent. These are detectable only by running the agent end-to-end and grading the output quality. Layer 1 can't see them because nothing structural is wrong.</p>
+
+      <p><strong>Layer 3 catches:</strong> drift over time, novel failure modes that didn't exist in your eval set, production-only conditions (real user queries, real network latency, real tool failures, real adversarial inputs). The most important class of Layer 3 detection: <em>the queries your real users send that your eval set didn't anticipate</em>. Layer 2 grades against a fixed curated set; Layer 3 reveals what's missing from that set.</p>
+
+      <h4>Why each layer is non-substitutable</h4>
+
+      <p>The temptation, especially early in a project, is to invest in one layer and treat it as enough. Three predictable failure modes follow.</p>
+
+      <p><strong>"We have Layer 2; we don't need Layer 1."</strong> Layer 2 is slow and expensive. Running it on every commit is impractical. So commits ship that pass Layer 2 only on a delayed schedule, and the basic-correctness check (the output should validate as JSON) might catch the bug — but only hours later, after merge, after deployment. Layer 1 catches it in 5 seconds on the PR. Skipping Layer 1 makes Layer 2's feedback loop slower than it should be.</p>
+
+      <p><strong>"We have Layer 1; that's enough for now."</strong> Layer 1 is fast and cheap, so it's a tempting place to stop. But Layer 1 by definition only catches deterministic failures — and most quality regressions in agents aren't deterministic failures. The agent produces well-formed output that's <em>worse</em>; Layer 1 happily passes it. Teams that stop at Layer 1 ship quality regressions consistently because their tests don't detect them.</p>
+
+      <p><strong>"We have Layer 1 and Layer 2; production monitoring is for ops, not eng."</strong> The reverse mistake. Without Layer 3, you have no signal about how your agent performs on the actual queries users send — which inevitably differ from what's in your curated eval set. Real users hit edge cases the eval set didn't include. Production traffic patterns shift over time. The agent's quality silently degrades on segments of traffic you weren't measuring. Layer 3 is what catches this — and feeds the gaps back into Layer 2's curation, closing the loop.</p>
+
+      <h4>The pyramid shape: more at the base, less at the top</h4>
+
+      <p>The proportion of checks across the layers, for a healthy production agent, follows the inverse-pyramid pattern:</p>
+
+      <ul>
+        <li><strong>Layer 1</strong>: dozens to hundreds of individual deterministic checks. Each runs in milliseconds. Every commit runs all of them.</li>
+        <li><strong>Layer 2</strong>: an eval suite of 30-100 curated queries. Each run is a full agent invocation. Runs on selected PRs and on a release cadence.</li>
+        <li><strong>Layer 3</strong>: continuous metrics on 100% of production traffic. Sampling for deep analysis. Always-on dashboards.</li>
+      </ul>
+
+      <p>Reading the proportions: many cheap fast checks at Layer 1, fewer expensive thorough checks at Layer 2, broad statistical observation at Layer 3. Building the system in this order — Layer 1 first, then Layer 2, then Layer 3 — is the natural progression, because each layer is foundational to the one above it. Layer 2's evals build on the structured outputs Layer 1 ensures. Layer 3's metrics rely on the instrumentation patterns that Layer 2 makes routine.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">My team has been doing "evals" for months but doesn't have all three layers. Which one are we probably missing?</div>
+        <div class="answer">
+          <p>Statistical pattern across teams: most have Layer 2 only. The narrative goes: "we need to evaluate our agent, let's build a test set with judges." That gets you a Layer 2 system. Layers 1 and 3 are easy to skip because Layer 2 already produces visible numbers.</p>
+          <p>The diagnostic: do you have CI that fails on a schema regression in seconds, or does that bug only get caught when you run the full eval suite? That's the Layer 1 gap. Do you have production dashboards that would alert you if the agent's cost-per-query or user-thumbs-down rate spiked tomorrow? That's the Layer 3 gap.</p>
+          <p>The two layers people typically miss are the cheapest ones to set up. The discipline is to recognize them as their own concerns, not afterthoughts on the eval suite.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Is this really different from chapter 3.1's eval cadence diagram?</div>
+        <div class="answer">
+          <p>Complementary, not redundant. Chapter 3.1 was about the rhythm — when to run evals, how to interpret them, how to predict-then-measure. This chapter is about the substrate: what kinds of evals exist, and which kind serves which purpose. The eval cadence diagram in 3.1 mostly described Layer 2 (the offline curated-query suite). This chapter says: that's one of three layers, and you need the others too.</p>
+          <p>The two chapters together give you both pieces — the rhythm of the practice (3.1) and the architecture of the underlying system (3.2). A team can do 3.1's rhythm on top of any of the three layers; the rhythm is the same, but what you're measuring depends on which layer you're working with.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Are these layers specific to LLM agents, or do they generalize to other ML systems?</div>
+        <div class="answer">
+          <p>The structure generalizes — deterministic checks + offline benchmarks + production monitoring is a pattern across ML systems (classifiers, recommendation systems, etc.). What's specific to LLM agents is the <em>relative importance</em> of each layer.</p>
+          <p>For a classifier, Layer 2 (offline benchmarks against labeled test sets) does most of the work; deterministic checks are minor. For an LLM agent, Layer 1 (schema, format, structural) catches a much higher fraction of total failures because the output space is richer and there's more that can be structurally wrong. And Layer 3 matters more because agents face open-ended inputs (a classifier's eval set is a reasonable proxy for production; an agent's curated eval set never is).</p>
+          <p>So the layers are the same shape; the weights are different. For agents specifically: more Layer 1 than you'd expect, robust Layer 2, and Layer 3 that drives most of your iteration loop after the first few releases.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Layer 1: deterministic checks.</h3>
+
+      <p>This is the layer everyone underinvests in, because it doesn't feel like "evaluation" — it feels like "tests." That's exactly the right framing. <strong>Layer 1 evals are unit tests for your agent</strong>: small focused checks that run in milliseconds, catch specific regressions, and run on every commit. They cost essentially nothing and prevent a meaningful fraction of bugs that would otherwise need expensive Layer 2 runs to detect.</p>
+
+      <p>The trap people fall into: assuming agents can't have unit-test-style checks because their outputs are non-deterministic. <em>Their outputs are non-deterministic; their contracts are not.</em> An agent's tool calls should always match the schema. Its citations should always reference real sources. Its budget should never be exceeded. These are deterministic properties that hold on every run, regardless of what the model decides — and that means they're cheaply testable.</p>
+
+      <h4>The categories that belong at Layer 1</h4>
+
+      <p>Six concrete categories, each with examples of what to check:</p>
+
+      <p><strong>Schema validation.</strong> The agent's structured outputs match their declared schemas. Tool calls have the right argument types. Findings objects have all required fields. JSON outputs validate. Run a schema check on every output your agent produces; flag any violation.</p>
+
+      <p><strong>Citation existence and format.</strong> Every citation in the agent's output references a source URL or document ID that's been seen in the conversation. No fabricated URLs. No malformed citation tokens. Run regex / structural checks against the citation format, and lookup checks against the actual sources the agent had access to.</p>
+
+      <p><strong>Tool-call correctness.</strong> Tool names exist in the toolkit. Required arguments are present. Argument values pass the schema's enum / range / pattern constraints. Tool-use IDs match between request and response. This is the chapter 0.3 protocol-level discipline, automated.</p>
+
+      <p><strong>Budget compliance.</strong> The agent stays within its tool-call budget, token budget, time budget. A run that hits the budget cap is not necessarily a failure — but a run that <em>exceeds</em> the cap is a bug in your enforcement code (chapter 1.1's step budget).</p>
+
+      <p><strong>Forbidden-action checks.</strong> The agent never calls tools from a blocklist. Never accesses paths outside its sandbox. Never produces output matching prohibited patterns (e.g., leaking API keys, raw PII). These are negative assertions — things that should never appear — and they're cheap to check.</p>
+
+      <p><strong>Refusal patterns.</strong> When the agent declines a request, it does so via the structured refusal path your system supports, not by producing free-form text that looks like an answer but isn't. A "yes-but-actually-no" refusal is the worst of both worlds; checking for the structured form catches this.</p>
+
+      <h4>What Layer 1 checks look like, concretely</h4>
+
+      <p>Layer 1 checks are <em>plain code</em>, not LLM-based. The point is to be fast, cheap, and unambiguous. A reasonable Layer 1 suite is a directory of test functions that each assert one property of an agent run.</p>
+
+<pre class="standalone"><span class="c-cm"># tests/layer1/test_output_contracts.py</span>
+<span class="c-kw">import</span> pytest
+<span class="c-kw">from</span> agent <span class="c-kw">import</span> run_agent
+<span class="c-kw">from</span> agent.schemas <span class="c-kw">import</span> ResearchOutput
+<span class="c-kw">from</span> jsonschema <span class="c-kw">import</span> validate
+
+<span class="c-cm"># Property: every agent output validates against its declared schema.</span>
+<span class="c-fn">@pytest.mark.parametrize</span>(<span class="c-st">"query"</span>, [
+    <span class="c-st">"What is the capital of France?"</span>,           <span class="c-cm"># trivial</span>
+    <span class="c-st">"Summarize this PDF in three points."</span>,        <span class="c-cm"># typical</span>
+    <span class="c-st">"Find all bugs in this commit's changes."</span>,     <span class="c-cm"># complex</span>
+])
+<span class="c-kw">async def</span> <span class="c-fn">test_output_validates_against_schema</span>(query):
+    result = <span class="c-kw">await</span> run_agent(query)
+    validate(instance=result, schema=ResearchOutput.schema())
+    <span class="c-cm"># Passes if the agent's output is structurally valid.</span>
+    <span class="c-cm"># Fails immediately if any field is the wrong type or missing.</span>
+
+
+<span class="c-cm"># Property: every cited URL appears in the conversation's source list.</span>
+<span class="c-kw">async def</span> <span class="c-fn">test_no_fabricated_citations</span>():
+    query = <span class="c-st">"Summarize recent EV battery progress with citations."</span>
+    result = <span class="c-kw">await</span> run_agent(query)
+    cited_urls = {c[<span class="c-st">"source_url"</span>] <span class="c-kw">for</span> c <span class="c-kw">in</span> result[<span class="c-st">"claims"</span>]}
+    seen_urls = collect_seen_urls(result[<span class="c-st">"trace"</span>])
+    fabricated = cited_urls - seen_urls
+    <span class="c-kw">assert not</span> fabricated, <span class="c-kw">f</span><span class="c-st">"Agent cited URLs it never accessed: {fabricated}"</span>
+
+
+<span class="c-cm"># Property: tool calls never exceed the configured budget.</span>
+<span class="c-kw">async def</span> <span class="c-fn">test_budget_enforcement</span>():
+    result = <span class="c-kw">await</span> run_agent(<span class="c-st">"Complex multi-step research query"</span>,
+                              tool_budget=<span class="c-st">15</span>)
+    <span class="c-kw">assert</span> result[<span class="c-st">"tool_calls_made"</span>] &lt;= <span class="c-st">15</span>
+
+
+<span class="c-cm"># Property: the agent never calls tools from the blocklist.</span>
+FORBIDDEN_TOOLS = {<span class="c-st">"send_email"</span>, <span class="c-st">"delete_record"</span>, <span class="c-st">"transfer_funds"</span>}
+
+<span class="c-kw">async def</span> <span class="c-fn">test_no_forbidden_tools</span>():
+    result = <span class="c-kw">await</span> run_agent(<span class="c-st">"Read-only research request"</span>)
+    used = {c[<span class="c-st">"tool_name"</span>] <span class="c-kw">for</span> c <span class="c-kw">in</span> result[<span class="c-st">"trace"</span>][<span class="c-st">"tool_calls"</span>]}
+    <span class="c-kw">assert not</span> (used &amp; FORBIDDEN_TOOLS), \
+        <span class="c-kw">f</span><span class="c-st">"Agent used forbidden tools: {used &amp; FORBIDDEN_TOOLS}"</span></pre>
+
+      <p>These look like normal pytest tests because they <em>are</em> normal pytest tests. They live in your repo alongside other tests, run on every commit, fail fast, and produce clear error messages. They're cheap to maintain — when a check starts failing, you usually know why within minutes.</p>
+
+      <h4>What Layer 1 catches that's hard to catch elsewhere</h4>
+
+      <p>The class of regression Layer 1 specifically prevents: <strong>silent contract violations</strong>. These are bugs where the agent's behavior changes in a way that breaks downstream consumers, without producing an obviously-wrong output.</p>
+
+      <p>Concrete examples that have hit production agents:</p>
+
+      <ul>
+        <li>A model swap (Sonnet → Haiku for cost) causes the agent to occasionally produce <code class="inline">"confidence": "moderate"</code> instead of one of the schema's allowed values (<code class="inline">"high" | "medium" | "low"</code>). The output looks reasonable; the downstream parser silently treats it as missing. Layer 1 catches this on the first run; Layer 2 might miss it if the judge isn't checking that specific field.</li>
+        <li>A prompt edit causes the agent to add explanatory text around its tool calls, breaking a downstream tool-trace analyzer that expected clean function-call-only outputs. Layer 1 (assert tool calls match exact schema) catches it; Layer 2 (semantic quality grading) doesn't.</li>
+        <li>A change to the citation-extraction prompt causes the agent to emit citations as <code class="inline">[1] [2]</code> footnote-style instead of inline-URL-style. The text reads fine to humans (and to LLM judges); but the citation-export tool produces empty CSV files. Layer 1 catches it; Layer 2 doesn't.</li>
+      </ul>
+
+      <p>The pattern: these regressions don't change <em>quality</em> measurably, they change <em>contract conformance</em>. Layer 2 grades quality; Layer 1 grades contracts. Both matter.</p>
+
+      <h4>What Layer 1 cannot catch</h4>
+
+      <p>For completeness, the failures Layer 1 is structurally blind to. Treating Layer 1 as enough means these slip through:</p>
+
+      <ul>
+        <li><strong>Quality regressions in well-formed output.</strong> The agent's answer is the wrong answer, but the JSON is valid, the citations exist, and no tools were misused. Layer 1 says pass; the answer is still wrong.</li>
+        <li><strong>Subtle judgment shifts.</strong> A new prompt makes the agent slightly more confident on uncertain claims, or slightly more verbose, or slightly less likely to escalate edge cases. These show up in aggregate quality metrics, not in any individual structural check.</li>
+        <li><strong>Distributional issues across queries.</strong> "Works on these 50 tests" doesn't mean "works on the next 500 user queries." Layer 1 tests specific cases; it can't generalize.</li>
+      </ul>
+
+      <p>These are what Layer 2 is for. The relationship: Layer 1 says "the agent still has a working contract"; Layer 2 says "the agent still produces good answers within that contract." Both questions matter; both layers exist because each answers one of them.</p>
+
+      <h4>The discipline: write Layer 1 tests as part of feature work</h4>
+
+      <p>The teams that get Layer 1 right treat it the same way they treat unit tests for normal code: <em>every new behavior gets a test</em>. New tool? Test that schema validation passes. New output field? Test that it appears in outputs. New refusal path? Test that the refusal patterns match. New budget? Test that it's enforced.</p>
+
+      <p>This sounds obvious; it's the discipline that drifts when a team is moving fast. The result of skipping it: a Layer 1 suite that covers the features from 6 months ago and silently misses regressions on features from this week. The fix is the same as for code unit tests — TDD if you're disciplined, retroactive coverage if you must, but always close the gap quickly.</p>
+
+      <div class="callout tip">
+        <p>If your Layer 1 suite is taking more than 30 seconds to run, something is wrong — either you've snuck Layer 2-style checks into the cheap layer (LLM judge calls hiding inside what should be deterministic), or you're running full agent invocations as part of Layer 1 (those belong in Layer 2). Layer 1 checks should test contracts on captured outputs, not generate fresh outputs. Cache the agent's response from an earlier run if you need an output to check against; that keeps the check fast and the failure cause obvious.</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Can I check tool-call <em>sequence</em> at Layer 1? "The agent should always search before fetching"?</div>
+        <div class="answer">
+          <p>Sometimes — the question is whether the sequence constraint is genuinely structural or whether it's a quality preference. "Tool X must come before tool Y" can be a Layer 1 assertion if the constraint is hard (the agent's API requires Y to follow X) or if violating it always indicates a bug.</p>
+          <p>"The agent should usually fetch only relevant URLs" is not Layer 1 material — that's a quality judgment that Layer 2 handles. The line is: Layer 1 catches <em>must-not-happen</em> violations, not <em>should-rarely-happen</em> patterns.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How do I handle Layer 1 tests for non-deterministic outputs? The model might produce slightly different schemas on different runs.</div>
+        <div class="answer">
+          <p>Two patterns. First, <strong>invariant checks</strong>: regardless of the specific output, certain properties always hold (output validates against schema, citations are non-fabricated, budget is respected). These work fine on non-deterministic outputs because the invariant is the same regardless of the specific values.</p>
+          <p>Second, <strong>property-based testing</strong>: run the agent multiple times on the same input and check that all runs satisfy the same invariants. If 9/10 runs validate against the schema and 1/10 doesn't, that's a Layer 1 bug — the invariant should hold every time. Strict mode (chapter 0.3) makes schema invariants nearly guaranteed; without it, you might see occasional violations that are worth catching.</p>
+          <p>Either way, you're not asserting "the output is X" — you're asserting "the output has property P." Properties are stable across non-determinism in a way that specific values aren't.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about flaky Layer 1 tests — checks that pass 95% of the time?</div>
+        <div class="answer">
+          <p>A flaky Layer 1 test is a bug in either the agent or the test itself. The whole point of Layer 1 is determinism — if the property you're checking depends on the model's behavior, it's not actually a Layer 1 property and you've miscategorized it.</p>
+          <p>Diagnose: is the test checking a contract (should pass 100% of the time, full stop) or a quality bar (depends on the model's behavior)? If contract, find why it's flaky and fix that. If quality, move it to Layer 2 where statistical evaluation is appropriate.</p>
+          <p>Letting flaky tests accumulate poisons the well — teams stop trusting CI signals, the failure-investigation reflex weakens, real bugs get ignored as "probably flaky." Hold the Layer 1 line at zero flakiness.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Layer 2: the offline judge-based eval suite.</h3>
+
+      <p>This is the layer most teams already have, often calling it "evals" without qualifier. It's also the layer chapters 3.1 and 3.3 covered in depth — 3.1 taught the discipline of using it (hypothesis, prediction, verdict), 3.3 taught the grading mechanism (LLM-as-judge with calibration). This step puts both in context: <strong>Layer 2 catches behavioral changes that pass Layer 1 but produce worse answers</strong>, runs slower and more expensively than Layer 1, and has specific cost and curation disciplines that determine whether the layer is sustainable.</p>
+
+      <h4>What goes here, by category</h4>
+
+      <p>Layer 2 evals are full agent runs against a curated set of representative queries, with LLM judges grading the output along several dimensions. Five categories of check belong here:</p>
+
+      <p><strong>Task completion.</strong> Did the agent successfully complete the task it was given? Did it return a substantive answer, escalate appropriately, or fail gracefully? Binary or graded; can be checked by a judge ("did the agent address the user's question?").</p>
+
+      <p><strong>Factual accuracy.</strong> When the agent makes claims, are they correct? When it cites sources, do those sources actually support the claims? Chapter 4.3's citation-faithfulness check lives here. Programmatic where the source can be fetched; LLM judge for the verdict.</p>
+
+      <p><strong>Quality judgments.</strong> "Was the answer good?" — graded by an LLM judge with a rubric. Chapter 3.3's pairwise and pointwise patterns apply. The judges should be calibrated against humans on a held-out calibration set (also from chapter 3.3).</p>
+
+      <p><strong>Trajectory sensibility.</strong> Did the agent's path to the answer make sense? Tool calls in a reasonable order, no redundant searches, no obviously-wasted steps. A judge can evaluate this by looking at the trace.</p>
+
+      <p><strong>Edge-case handling.</strong> A small set of curated tricky queries (ambiguous inputs, prompt injection attempts, out-of-scope requests, adversarial users) where the right behavior is specific. Did the agent behave correctly on each?</p>
+
+      <h4>The shape of a Layer 2 suite</h4>
+
+      <p>A typical mature Layer 2 setup looks like:</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  LAYER 2 EVAL SUITE — TYPICAL SHAPE                              │
+│                                                                  │
+│  Curated query set: 30–100 examples                              │
+│  ├─ "easy" tier:        ~15 (basic functionality regression)     │
+│  ├─ "typical" tier:     ~25 (representative production traffic)  │
+│  ├─ "hard" tier:        ~15 (challenging multi-step queries)     │
+│  ├─ "edge case" tier:   ~10 (refusals, ambiguity, adversarial)   │
+│  └─ "calibration" tier: ~15 (hand-labeled for judge validation)  │
+│                                                                  │
+│  Grading dimensions:                                             │
+│  ├─ task_completion         (binary or 0-1 graded)               │
+│  ├─ factual_accuracy        (citation faithfulness, 0-1)         │
+│  ├─ answer_quality          (judge with rubric, 1-4 scale)       │
+│  ├─ trajectory_sensibility  (judge over trace, 0-1)              │
+│  └─ edge_case_correctness   (specific assertions per example)    │
+│                                                                  │
+│  Per run:                                                        │
+│  ├─ Full agent invocation per query                              │
+│  ├─ Judges (with both-orderings discipline from chapter 3.3)     │
+│  ├─ Per-dimension scores + overall composite                     │
+│  └─ Cost: typically $1-$200 depending on agent complexity        │
+│                                                                  │
+│  Cadence:                                                        │
+│  ├─ "fast subset" (5–10 queries): run on every PR                │
+│  ├─ "full suite": run on selected PRs, scheduled, pre-release    │
+│  └─ "multi-run" (3× on noisy metrics): for release decisions     │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>This is the architecture chapter 3.1 was describing. The chapter 3.3 LLM-as-judge methodology is what powers the grading. Layer 2 is where those previous chapters' machinery actually runs.</p>
+
+      <h4>The two-tier cadence: fast subset vs full suite</h4>
+
+      <p>The discipline that makes Layer 2 sustainable in CI: a <strong>fast subset</strong> that runs on every PR, and a <strong>full suite</strong> that runs less often. The fast subset is 5–10 queries chosen to cover the main dimensions cheaply; it runs in 2–5 minutes and costs cents. The full suite is 30–100 queries; it runs in 20–60 minutes and costs more.</p>
+
+      <p>How to choose the fast subset: pick queries that exercise each major dimension once. One easy task-completion test, one typical citation-faithfulness test, one trajectory-sensibility test, etc. The fast subset's job isn't comprehensive coverage — it's regression detection on the dimensions you most care about. If the fast subset catches the regression, you don't need the full suite to confirm.</p>
+
+      <p>The full suite runs:</p>
+
+      <ul>
+        <li>Triggered by a PR label (<code class="inline">eval-full</code>) when changes warrant it (prompt rewrites, model swaps, retrieval changes).</li>
+        <li>On a schedule (nightly or weekly) regardless of PR activity, catching drift.</li>
+        <li>Before any production release, as a release gate.</li>
+        <li>Triple-run with averaging on noisy metrics for release-gate decisions (chapter 3.1's multi-run pattern).</li>
+      </ul>
+
+      <p>This two-tier structure gives you fast PR feedback (the fast subset signals regressions in minutes) and thorough release confidence (the full suite gives high-quality numbers when it matters).</p>
+
+      <h4>Cost discipline at Layer 2</h4>
+
+      <p>Layer 2 is the layer where eval costs can run away. Each query is a full agent run plus judge calls — typically $0.10–$5 per query depending on agent complexity. Multiply by 30-100 queries, by every PR that triggers the full suite, by multi-run averaging, and you can be looking at hundreds of dollars per release cycle.</p>
+
+      <p>The disciplines that keep this manageable:</p>
+
+      <p><strong>Cache aggressively.</strong> Apply chapter 2.2's prompt caching to both the agent's system prompt and the judges' system prompts. For a stable eval suite running multiple times, the cache hit rate should be 70%+ on input tokens. Eval-suite cost drops 50%+ vs uncached.</p>
+
+      <p><strong>Right-size the subsets.</strong> The fast subset should be small enough to run in 2-5 minutes on every PR. The full suite should be small enough that you'd actually run it on the cadence you want. A "comprehensive" 500-query suite that nobody runs is worse than a 50-query suite that runs every release.</p>
+
+      <p><strong>Use cheap judges where possible.</strong> Judge calls don't always need the most capable model. Citation-faithfulness checks ("does this source support this claim?") are simple enough that Haiku is fine. Answer-quality grading with complex rubrics benefits from Sonnet. Save the expensive judges for the dimensions that need them.</p>
+
+      <p><strong>Batch where feasible.</strong> The Batch API (chapter 2.2) at 50% discount works for non-time-sensitive eval runs. Nightly or weekly full-suite runs can use Batch and halve the cost. Pre-release runs typically need the standard latency.</p>
+
+      <h4>The curation problem</h4>
+
+      <p>The hardest part of Layer 2 isn't running the evals — it's <em>maintaining the curated query set</em>. Three forces work against a good eval set over time:</p>
+
+      <p><strong>Drift between eval and production.</strong> Your eval set captures the agent's intended use case at the time you built it. Six months later, real users are asking different questions. The agent might score 0.85 on the eval set and 0.65 on actual production queries. The fix: continuously sample production traffic and add representative cases to the eval set. Layer 3 → Layer 2 feedback loop (Step 4 of this chapter).</p>
+
+      <p><strong>Overfitting to the eval set.</strong> Teams iterate against scores. Over time, prompt changes get optimized for "the eval suite passes" rather than "real users get better answers." This is Goodhart's Law in eval form. The defenses: refresh the eval set regularly (replace 10–20% per quarter with new cases), keep some queries held-out from the iteration loop (used only for release-gate decisions), and watch the gap between eval-set scores and Layer 3 production metrics.</p>
+
+      <p><strong>Maintenance burden.</strong> Each query in the set needs to stay relevant, have its expected behaviors stay accurate, and not become obsolete (a query about a deprecated feature is useless). Quarterly grooming of the eval set — review every query, drop the obsolete ones, update expected behaviors — is real engineering work. Skipping it makes the suite gradually decay.</p>
+
+      <p>The honest framing: a Layer 2 eval set is a piece of software with the same maintenance needs as production code. Teams that treat it as build-once-and-forget end up with a suite whose scores don't reflect reality. Teams that treat it as a living thing maintain a useful signal indefinitely.</p>
+
+      <h4>What Layer 2 specifically catches</h4>
+
+      <p>The class of failure Layer 2 detects that Layer 1 can't:</p>
+
+      <ul>
+        <li><strong>Quality drift from prompt edits.</strong> A small prompt change makes the agent slightly worse on a measurable dimension. Layer 1 sees nothing wrong; Layer 2 sees the score drop.</li>
+        <li><strong>Quality drift from model swaps.</strong> Swapping Sonnet for Haiku on a step that turns out to need Sonnet's reasoning. Outputs still validate; quality drops.</li>
+        <li><strong>Trajectory regressions.</strong> The agent now makes 8 tool calls where it used to make 4, or chooses the wrong tool for a class of queries. Layer 1 doesn't see this; Layer 2 catches it in trajectory-sensibility scores.</li>
+        <li><strong>Edge-case regressions.</strong> A change that improves common cases at the cost of correctly handling refusals or adversarial inputs. The "edge case" tier of the eval set is specifically there to catch this.</li>
+      </ul>
+
+      <p>The pattern: anything where the failure is "the output is worse, but still well-formed" lives at Layer 2.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">How big should the curated query set be? Is 50 really enough?</div>
+        <div class="answer">
+          <p>50 is a reasonable starting point and supports the four-tier structure (15 easy + 25 typical + 10 edge). For a mature agent with stable scope, this gives meaningful signal — most regressions will surface across multiple queries. Statistically, a 4-point drop on 50 queries is detectable.</p>
+          <p>When to grow: as your agent expands scope (new tools, new domains, new user segments), add 10–20 queries per segment. A multi-domain agent might end up at 100–200 queries. Beyond that you're often paying without learning more — at some point, more queries don't improve signal proportionally, and your time is better spent on Layer 3 production feedback.</p>
+          <p>When to shrink: if some queries always pass or always fail, they're not providing signal. Replace them with cases that actually discriminate. The right size is the one where every query in the set tells you something useful about the current state of the agent.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should the eval set include real user queries, or synthetic ones?</div>
+        <div class="answer">
+          <p>Both, with most weight on real. Synthetic queries are good for testing specific behaviors you can describe but haven't seen organically (edge cases, adversarial inputs, refusals). Real user queries are better for the bulk of the set because they capture the actual distribution your agent serves.</p>
+          <p>The privacy concern: real user queries may contain PII. The fix is sanitization — replace specific personal data with placeholders while keeping the structural shape ("user [USER_ID] wants to refund order [ORDER_ID]"). This preserves the eval signal while removing PII. For some categories of agent, even the structural shape leaks information; in those cases, write synthetic versions that match the real distribution.</p>
+          <p>Pure-synthetic eval sets are a warning sign. They tend to capture what the team imagines users do, which differs systematically from what users actually do. The eval-vs-production gap is large with synthetic-only sets.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about LLM-judge bias from chapter 3.3 — doesn't that affect Layer 2 scores?</div>
+        <div class="answer">
+          <p>Yes — and it's the reason chapter 3.3's calibration discipline is essential. The bias doesn't disappear at Layer 2; it just sits inside the scores. The "calibration tier" in the eval-set structure (the 15 hand-labeled queries) is specifically for tracking judge accuracy over time. When the calibration agreement drops, you know the judge has drifted, and the Layer 2 scores need to be interpreted with that in mind.</p>
+          <p>The discipline: run calibration alongside every full-suite run. Report calibration agreement as a metric in the scoreboard. If it drops below threshold (70-80% per chapter 3.3), pause judge-driven decisions until the judge is recalibrated.</p>
+          <p>Without this, your Layer 2 numbers are scores on a scale that's silently shifting. With it, you can tell when the judge changed vs. when the agent changed.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Layer 3: production telemetry.</h3>
+
+      <p>Layer 1 catches contract violations. Layer 2 catches quality regressions against a curated set. <strong>Layer 3 catches what your eval set doesn't know to look for.</strong> Real user traffic surfaces edge cases your imagination didn't generate, distributional shifts your benchmark can't capture, and emerging failure modes that exist only in production. Without Layer 3, your evals tell you "the agent passes our tests" — they don't tell you "users are getting value." Those are different statements; both matter; Layer 3 is the half you'd miss.</p>
+
+      <h4>What you can measure without ground truth</h4>
+
+      <p>Production traffic doesn't have labels. You don't know whether a given response was "good" — no human graded it, no judge ran on it (or if a judge did, it costs real money to run on every query). Layer 3 has to extract signal from the limited information it does have.</p>
+
+      <p>Six categories of signal that are measurable on real traffic, in increasing order of inference difficulty:</p>
+
+      <p><strong>1. Operational metrics (always trivially available).</strong> Latency, cost, error rate, token usage, cache hit rate, tool-call counts. These come for free from your observability infrastructure (chapter 2.1). They don't tell you anything about quality, but they tell you when something has gone structurally wrong — a spike in cost means runaway agent loops, a latency spike means slow tools or model congestion. Set alerts on these; they're your fastest production warning system.</p>
+
+      <p><strong>2. Tool-call patterns.</strong> Which tools is the agent using, in what proportions, with what error rates? A sudden shift — "the agent started calling search_docs 3× as often this week" — usually means something changed (the user-query distribution, an upstream prompt, the tool's behavior). Catch the shifts; investigate the causes.</p>
+
+      <p><strong>3. Behavioral distributions.</strong> Tool-call count per query, escalation rate, refusal rate, output length distribution. These tell you about how the agent is behaving in aggregate. Distributional shifts are usually signals — the average research run jumped from 12 to 18 tool calls; the refusal rate dropped from 8% to 3%. Each is a question worth investigating.</p>
+
+      <p><strong>4. User-derived signals.</strong> Thumbs up/down, retry rates, conversation-length-before-handoff, click-through on linked sources. These are noisy but real — when users thumbs-down at 2× the usual rate, something has degraded. The signal is statistical, not per-query; you need volume to see it clearly.</p>
+
+      <p><strong>5. Downstream outcomes.</strong> Did the user complete the task the agent was helping with? Did the support ticket get resolved without human escalation? Did the user come back next week? These are the closest thing to true quality signal — they measure whether the agent created real value — but they're delayed (you find out a week later) and confounded with many other factors. Use them as a check, not the primary signal.</p>
+
+      <p><strong>6. Sampled quality assessment.</strong> Run Layer 2-style judges on a random sample of production traffic. The sample is small enough to be affordable (say, 1% of queries) and large enough to be statistically meaningful at scale. You get a continuous read on "what would the eval set say about today's traffic?" Catches the eval-vs-production gap as it opens.</p>
+
+      <h4>The shape of Layer 3 dashboards</h4>
+
+      <p>What a production dashboard for an agent looks like, focused on the metrics that actually signal problems:</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  LAYER 3 DASHBOARD — METRICS TO TRACK                            │
+│                                                                  │
+│  Tier 1: Always-on, alert-worthy                                 │
+│  ├─ error_rate              alert: &gt;2% over 5min                │
+│  ├─ latency_p95             alert: &gt;90th percentile of baseline │
+│  ├─ cost_per_query          alert: drift &gt;30% from baseline     │
+│  └─ thumbs_down_rate        alert: &gt;baseline + 2σ              │
+│                                                                  │
+│  Tier 2: Daily reviewed, trend-watched                           │
+│  ├─ tool_call_distribution  per tool, week-over-week             │
+│  ├─ escalation_rate         segmented by query type              │
+│  ├─ refusal_rate            segmented by query type              │
+│  ├─ avg_tokens_per_query    drift catches context bloat          │
+│  ├─ cache_hit_rate          drift catches anti-pattern regression│
+│  └─ unique_tool_call_chains diversity drops signal converged loops│
+│                                                                  │
+│  Tier 3: Weekly reviewed, deeper investigation                   │
+│  ├─ sampled_judge_scores    1% of queries, graded offline        │
+│  ├─ user_retry_rate         per conversation                     │
+│  ├─ outcomes_complete       did the user finish their task       │
+│  └─ eval_to_prod_gap        Layer 2 score vs Layer 3 estimate    │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>Three tiers of metrics, looked at on different cadences. Tier 1 wakes you up at 2am if something breaks. Tier 2 is your daily check-in. Tier 3 informs your iteration loop — these are the numbers that tell you what to work on next.</p>
+
+      <h4>The feedback loop from Layer 3 to Layer 2</h4>
+
+      <p>This is the discipline that ties everything together. Layer 3 reveals what your eval set doesn't know about; Layer 2 is where that knowledge gets encoded for future regression detection. The loop:</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  THE PRODUCTION → EVAL FEEDBACK LOOP                             │
+│                                                                  │
+│  1. Layer 3 surfaces signal of a quality issue                   │
+│     (thumbs-down spike, low sampled judge scores in a            │
+│     particular segment, unusual tool-call pattern)               │
+│                                                                  │
+│  2. Engineer investigates: pulls the relevant production traces  │
+│     (chapter 2.1's observability), reads what the agent did      │
+│     and why                                                      │
+│                                                                  │
+│  3. Identifies the root cause and the failure pattern            │
+│                                                                  │
+│  4. Adds representative example(s) to the Layer 2 eval set       │
+│     This is the critical step — without it, the same issue       │
+│     can recur                                                    │
+│                                                                  │
+│  5. Fixes the issue (prompt change, tool fix, etc.)              │
+│                                                                  │
+│  6. Layer 2 now catches the regression if it returns. Layer 3    │
+│     continues monitoring; the cycle repeats for the next         │
+│     surfacing of an issue                                        │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>This is what makes the three-layer system robust over time. Without the feedback loop, Layer 2 becomes a static set of checks that doesn't keep up with reality. With it, every production-surfaced issue results in permanent test coverage.</p>
+
+      <p>The discipline: when you investigate a production issue, the fix isn't complete until you've added a Layer 2 case for it. "Fixed in production" without "added to eval suite" means the bug can return undetected. The engineering rhythm: every Layer 3 alert that leads to a fix also leads to a small Layer 2 PR.</p>
+
+      <h4>What Layer 3 specifically catches</h4>
+
+      <p>The class of failure Layer 3 detects that the lower layers can't:</p>
+
+      <ul>
+        <li><strong>Distributional shifts.</strong> Your eval set's distribution doesn't match real traffic's distribution, and the gap widens as users discover new ways to use the agent. Layer 3's sampled judging surfaces this gap. Without Layer 3, you don't know it's happening.</li>
+        <li><strong>Novel failure modes.</strong> The agent encounters a query type your eval set didn't anticipate, and produces poor output. No prior test covers it, no judge graded it. Layer 3's user signals (thumbs-down, retry rate, retention) surface this in aggregate even when individual cases are missed.</li>
+        <li><strong>Drift over time.</strong> Models get updated, tools get changed by their vendors, retrieval corpora drift. The agent's quality silently changes over weeks or months. Layer 3's continuous monitoring catches this in a way that Layer 2 (running on a snapshot) doesn't.</li>
+        <li><strong>Adversarial use.</strong> Real users probe the agent in ways your eval set didn't include. Some of those probes succeed at extracting unintended behavior. Layer 3's pattern detection on tool-call sequences and output formats can flag this.</li>
+      </ul>
+
+      <p>For agents shipping to many users, Layer 3 is where most of your iteration loop's information comes from after the first few months. The eval set you launched with is mostly already covered; what you'll discover at month 6 lives in production traffic.</p>
+    </div>
+
+    <!-- ============ WORKED EXAMPLE ============ -->
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>A regression caught at each layer in turn.</h3>
+
+      <p>To anchor everything in this chapter: a representative agent project, three real-shape regressions, each caught at a different layer. The point is to show what each layer's signal looks like in practice — and what gets through when one layer is missing.</p>
+
+      <h4>The agent</h4>
+
+      <p>A customer-support agent at a fintech SaaS, similar to chapter 4.4's example. Three specialized peer agents (billing, technical support, account management) plus a routing layer, with both Layer 1, Layer 2, and Layer 3 in place. We'll watch three regressions hit the system across three weeks.</p>
+
+      <h4>Week 1: Layer 1 catches a contract regression</h4>
+
+      <p><strong>The change.</strong> A prompt edit to the billing agent: a sentence is added to encourage more empathetic phrasing on refund declines.</p>
+
+      <p><strong>What happened.</strong> The new prompt occasionally causes the agent to wrap its structured response in apologetic prose — instead of <code class="inline">{"action": "decline", "reason": "..."}</code> the agent emits <code class="inline">"I'm sorry, but here's what I can do: {"action": "decline", "reason": "..."}"</code>. The schema validator rejects the response because the outer text breaks JSON parsing.</p>
+
+      <p><strong>How it was caught.</strong> CI ran Layer 1 tests on the PR. The schema-validation test failed on 3 of 8 representative agent runs. CI blocked the merge. Engineer saw the failures, read the new prompt, noticed the issue, reverted the change. Total time from PR submission to caught bug: 4 minutes.</p>
+
+      <div class="observe">
+        <div class="label">What this trace teaches</div>
+        <p>Layer 1 catches contract regressions cheaply and immediately. No agent run wasted, no judge time consumed, no production traffic affected. The engineer doesn't even need to understand the underlying failure — "the schema validator failed" is sufficient signal to investigate the change. Compare to the same regression slipping past Layer 1: it would be caught hours later by Layer 2 (when the full suite runs), would consume a chunk of eval budget, and would block release rather than block PR. Layer 1 is the smallest possible feedback loop on contract issues.</p>
+      </div>
+
+      <h4>Week 2: Layer 2 catches a quality regression</h4>
+
+      <p><strong>The change.</strong> The routing agent's model is swapped from Sonnet to Haiku, for cost reduction. The PR description: "trying Haiku for routing — should be cheap and fast."</p>
+
+      <p><strong>What happened.</strong> Haiku's classifications are mostly correct, but it misroutes about 1 in 12 tickets — sending a billing-with-technical-context query to the pure billing agent, which then produces correct billing answers that miss the technical issue underneath. Layer 1 doesn't see anything wrong (the routing emits valid structured output; the billing agent emits valid structured output). But the user is getting an answer that doesn't actually solve their problem.</p>
+
+      <p><strong>How it was caught.</strong> The PR is labeled <code class="inline">eval-full</code> because it changes a core component. Layer 2 runs. Among the 50 queries in the suite, 4 are designed to test cross-domain routing (chapter 4.4's pattern). On 3 of those 4, the new Haiku-based routing classifies wrong. The full suite reports:</p>
+
+<pre class="trace standalone"><span class="c-out">## 📊 eval-results
+
+vs main (e7b3c20)
+**overall: 0.821 → 0.768 (-0.053) ↓ [REAL]**
+
+|  metric                   |  base  |   pr   |  delta  | verdict |
+| ------------------------- | ------ | ------ | ------- | ------- |
+|  task_completion          | 0.880  | 0.840  | -0.040  |   ✓ REAL|
+|  factual_accuracy         | 0.940  | 0.940  |  0.000  |   ✓     |
+|  answer_quality           | 0.810  | 0.790  | -0.020  | noise   |
+|  trajectory_sensibility   | 0.780  | 0.620  | -0.160  |   ✓ REAL|
+|  edge_case_correctness    | 0.700  | 0.640  | -0.060  |   ✓ REAL|
+
+cost: $1.84 (full suite)  ·  runtime: 22m</span></pre>
+
+      <p>The trajectory_sensibility drop is the smoking gun — it's measuring "did the agent take a reasonable path to the answer," and on the cross-domain cases the routing-then-handling path is now wrong. The reviewer comments: "Looks like Haiku misroutes the cross-domain cases. Keep Sonnet for routing or train a custom Haiku-tuned router; either way, this PR can't ship as-is." Author closes the PR with a learning note.</p>
+
+      <div class="observe">
+        <div class="label">What this trace teaches</div>
+        <p>Layer 2 caught what Layer 1 couldn't see: outputs that are well-formed but worse. The agent never violated any contract; it just produced answers that missed the user's actual need. The only way to detect this was full agent runs against representative queries, with judges grading the trajectory. Without Layer 2, the change would have shipped, the routing failures would have appeared in production, and users would have gotten the wrong help — a much more expensive way to learn the same thing.</p>
+      </div>
+
+      <h4>Week 3: Layer 3 catches what neither lower layer knew to check for</h4>
+
+      <p><strong>The change.</strong> No code change. The agent has been running stably. The Layer 2 eval suite passes at 0.821 (baseline) on every nightly run.</p>
+
+      <p><strong>What happened.</strong> Over 10 days, the thumbs-down rate on technical-support tickets drifts from 8% to 13%. The escalation rate on technical-support tickets stays flat. Investigation reveals: a vendor SaaS that the technical-support agent uses for documentation lookup has changed their docs site structure. The agent's web-fetch tool now returns pages where the relevant content is buried below new marketing material at the top of each page. The agent reads the top of the page and answers based on outdated overview content, missing the technically-correct detailed sections lower down.</p>
+
+      <p><strong>How it was caught.</strong> Layer 3's thumbs-down-rate dashboard caught the drift. The metric crossed its alert threshold (baseline + 2σ for 24 hours) and pinged the on-call engineer. Investigation pulled the affected traces (chapter 2.1), surfaced the pattern that all the bad answers came from queries that had used <code class="inline">fetch_docs</code> against the affected vendor, and identified the root cause.</p>
+
+      <p><strong>The fix.</strong> The team patched the tool's content-extraction logic to skip marketing material and prioritize technical content blocks. Crucially: <em>they also added two queries to the Layer 2 eval set</em> — one that requires fetching from this vendor and synthesizing detailed technical content, one that exercises the content-extraction logic specifically. The new tests would catch a future regression of the same shape.</p>
+
+      <div class="observe">
+        <div class="label">What this trace teaches</div>
+        <p>Layer 3 caught what neither lower layer could have caught. Layer 1 saw nothing wrong (tool calls succeeded, outputs validated). Layer 2 had no query in its set that exercised this failure mode — the eval set was built before this vendor's docs changed. The only way to know the agent was failing was to watch real users' reactions on real production traffic. After the fix, the new Layer 2 cases close the gap: this specific failure shape can't recur silently. The feedback loop from Layer 3 to Layer 2 turned a one-time production issue into permanent coverage.</p>
+      </div>
+
+      <h4>What the three weeks teach together</h4>
+
+      <p>Three regressions, three layers, three different failure types — each catchable only at its specific layer:</p>
+
+      <ul>
+        <li>The contract regression in week 1 would have been a quality bug at Layer 2 (slow, expensive) and a user-facing bug at Layer 3 (very expensive). Layer 1 caught it in seconds.</li>
+        <li>The quality regression in week 2 would have shipped if only Layer 1 existed. Layer 2 caught it before merge. Layer 3 would have caught it eventually, but only after users had received bad routing.</li>
+        <li>The drift in week 3 had no way to be caught by Layers 1 or 2 alone. Only continuous production monitoring saw it. The fix then included a Layer 2 update so the same drift couldn't slip past unnoticed again.</li>
+      </ul>
+
+      <p>This is the architectural value of having all three layers. Each catches a class of failure the others structurally can't. Each contributes to the others (Layer 3 informs Layer 2's curation; Layer 2 ensures Layer 3's baseline is meaningful). The cost of running all three is modest compared to the cost of shipping any of these regressions to production without catching them — and modest compared to the cost of ad-hoc post-hoc bug investigation when something went wrong.</p>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 3.2</div>
+      <h3>Deliverable</h3>
+      <p>A working understanding of evals as a three-layer architecture, not a single activity. Layer 1 (deterministic checks, every commit, seconds and cents) catches contract violations. Layer 2 (offline judge suite, PRs and releases, minutes and dollars) catches quality regressions. Layer 3 (production telemetry, continuous, real-time) catches what your eval set didn't know to look for. The feedback loop from Layer 3 to Layer 2 makes the system robust over time. A clear picture of what each layer specifically catches that the others can't, and the cost discipline that keeps each layer sustainable.</p>
+      <ul class="checklist">
+        <li>Layer 1 suite: dozens of pytest-style checks on every commit, full suite under 30s</li>
+        <li>Layer 1 covers schema, citations, tool-call correctness, budget compliance, forbidden actions, refusal patterns</li>
+        <li>Layer 2 suite: 30–100 curated queries across tiers (easy / typical / hard / edge / calibration)</li>
+        <li>Layer 2 grades on five dimensions: task completion, accuracy, quality, trajectory, edge cases</li>
+        <li>Two-tier cadence: fast subset on every PR, full suite on PRs that need it + release gates</li>
+        <li>Layer 2 with judge calibration tracked, prompt caching applied, batch API for offline runs</li>
+        <li>Layer 3 dashboard with three tiers (alert-worthy / daily / weekly) including sampled judge scores</li>
+        <li>Layer 3 → Layer 2 feedback discipline: every production fix includes a Layer 2 PR</li>
+        <li>Eval-to-prod gap measured: Layer 2 score vs Layer 3 sampled estimate</li>
+        <li>Quarterly grooming of the Layer 2 eval set: refresh 10–20%, drop obsolete cases</li>
+        <li>Production query sampling pipeline that respects PII; samples flow into Layer 2 candidate set</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('e1')">
+        <div class="dir">← prev</div>
+        <div class="title">3.1 Eval-driven development</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('e3')">
+        <div class="dir">next →</div>
+        <div class="title">3.3 LLM-as-judge</div>
+      </button>
+    </div>
+  </section>

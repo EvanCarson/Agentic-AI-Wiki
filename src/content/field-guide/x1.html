@@ -1,0 +1,874 @@
+<section class="phase">
+    <div class="phase-num">4.1</div>
+    <div class="week">Part IV / Specialize · The agent type that changed what agents are for</div>
+    <h2>Code agents: the shape that made agents real.</h2>
+    <p class="goal">Code agents — Claude Code, Cursor, Aider, Cline, the Agent SDK — are the agent category that proved the medium. They produce real work-product (code that ships), they verify themselves (tests run or they don't), and they operate in a state-rich environment (the filesystem) rather than the stateless turn-based world of chat. The architecture is different enough from a research or chat agent that techniques transfer poorly without adaptation. This chapter teaches what makes code agents distinct, the action space they actually operate in (filesystem operations, not "write code"), why the verification loop is the whole game, and how Anthropic's Agent SDK and the Skills system fit together. By the end you'll have a working mental model for designing code agents and a clear view of when to build one vs. when to adopt one.</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>What makes a code agent different.</h3>
+
+      <p>A chat agent answers questions. A research agent finds information and synthesizes it. A code agent <em>modifies a system</em>. That shift in role changes the architecture in four specific ways that compound — and that distinguish the design problem from everything we've covered so far.</p>
+
+      <h4>Property 1: Persistent filesystem state</h4>
+
+      <p>In a chat agent, state lives in the conversation history. The agent's "world" resets between turns; whatever it produced exists only as text inside the message stream. In a code agent, state lives in <em>files on disk</em>. The agent edits a file in turn 1, and that file is still edited in turn 2 — not because the agent remembers, but because the filesystem remembers. The agent reads what it (or its predecessor session) wrote, builds on it, and the user can inspect the result with <code class="inline">ls</code>, <code class="inline">git diff</code>, or by opening the file in their editor.</p>
+
+      <p>This is the difference between an agent that produces <em>conversational output</em> (read once, used immediately, discarded) and an agent that produces <em>artifacts</em> (saved, owned, modified later, possibly by humans). The implication for design: the agent's job isn't to generate text the user reads — it's to converge a project's filesystem to a desired state. The "output" of a code agent task isn't what it said in chat; it's what files now exist that didn't, what files changed, and what state they're in.</p>
+
+      <h4>Property 2: Programmable verification</h4>
+
+      <p>The thing that distinguishes code from prose: you can <em>execute</em> it. A research agent that writes a paragraph about Postgres can't check whether the paragraph is correct without an LLM judge. A code agent that writes a function can run the tests against the function. If the tests pass, the function works. If they fail, the function doesn't. The grader is deterministic, the feedback is immediate, and the standard is non-negotiable.</p>
+
+      <p>This is the single biggest architectural advantage code agents have over every other agent type. Chapter 3.3's whole apparatus — LLM-as-judge, calibration sets, position bias — exists because most agent outputs can't be deterministically verified. Code can. A test suite is the kind of grader research agents wish they had: it disagrees with humans rarely, runs in seconds, costs cents to invoke, and never has self-preference bias.</p>
+
+      <p>The design implication: <strong>your code agent should be structured around the verification loop, not the generation step</strong>. The interesting question isn't "did Claude write code?" — it's "did the code pass the tests?" A code agent that writes a 500-line refactor and never runs the tests is a research agent that happens to output Python. A code agent that writes 20 lines, runs the tests, sees one fail, fixes it, and runs the tests again until green is a different shape entirely.</p>
+
+      <h4>Property 3: A bounded action space</h4>
+
+      <p>Research agents have, in principle, the whole internet as their action space. Each tool call could surface arbitrary new content. Reasoning about what they'll do next, or what they did last week, is hard.</p>
+
+      <p>Code agents operate inside <strong>a known filesystem at a known repository</strong>. The action space is enumerable: every action is some combination of read-a-file, write-a-file, edit-a-file, run-a-command, search-the-tree. The set of files is finite. The set of commands the agent can run is whatever you grant it. This boundedness has two consequences:</p>
+
+      <p>First, you can <strong>predict and audit what the agent did</strong>. <code class="inline">git diff</code> shows you every byte of change, file by file. There's no "the agent decided to email someone" branch hiding outside the repo. The agent's effects are inspectable, in detail, by tools the user already knows.</p>
+
+      <p>Second, you can <strong>constrain the agent's capabilities precisely</strong> by controlling which tools and commands are allowed. Read-only mode (the agent can browse but not modify); write-only-in-subdir mode (the agent can touch <code class="inline">src/</code> but not the rest of the repo); no-network mode (the agent can't <code class="inline">curl</code> anywhere). These constraints would be hard to enforce on a general-purpose agent; on a code agent they're a one-line config change.</p>
+
+      <h4>Property 4: Tight feedback loops</h4>
+
+      <p>Every action a code agent takes can be checked, fast. A syntax error fires on save (the file won't even parse). A type error fires on type-check (seconds). A test failure fires on test run (seconds to minutes). A runtime error fires on execution (seconds). Each level of check is cheaper and faster than the next, and they form a feedback ladder the agent can climb deliberately.</p>
+
+      <p>Compare this to a research agent: it produces an answer, and the only feedback is either "the user accepted it" (which the agent never sees in the same session) or "the eval judge graded it" (after the run, in a separate process). The agent itself doesn't learn within a single task; it can't self-correct because it has no signal that it's wrong.</p>
+
+      <p>A code agent has signal continuously. It can write the function, run the test, see the failure message, fix the function, rerun the test, see another failure, fix again — all within one task. The agent that uses this feedback well is far more effective than the agent that just generates and hopes.</p>
+
+      <h4>The four properties together</h4>
+
+      <p>These four properties — persistent state, programmable verification, bounded action space, tight feedback loops — combine into a specific shape that other agent types don't have. Code agents are <em>convergent systems</em>: they keep iterating until a deterministic check passes. Research agents are <em>divergent systems</em>: they explore until a deadline or budget runs out.</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  RESEARCH AGENT             vs.   CODE AGENT                │
+│                                                             │
+│  State: in conversation           State: on disk            │
+│  Verification: LLM judge          Verification: tests/build │
+│  Action space: open-ended         Action space: bounded     │
+│  Feedback: end of task            Feedback: continuous      │
+│                                                             │
+│  Optimizes: helpful synthesis     Optimizes: green build    │
+│  Failure mode: hallucination      Failure mode: red test    │
+│  Recovery: re-search              Recovery: re-edit + rerun │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>This is why patterns that work for research agents (LLM-as-judge evaluation, RAG-heavy designs) need adaptation for code, and patterns that work for code agents (test-driven verification, file-level state) don't transfer directly to research. The chapter from here on focuses on the code-specific shape; later chapters in Part IV cover Computer Use, Research, and Multi-Agent variants.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Is "code agent" different from "AI pair programmer" like Copilot?</div>
+        <div class="answer">
+          <p>Yes — meaningfully. Copilot (and the 2021–2023 generation of "AI coding assistants") was autocomplete on steroids: the model suggested completions inline as you typed. The user wrote most of the code; the AI filled in tedious bits. This is a useful tool, but it's not an agent. The user is still the one driving — making decisions about what to build, navigating the codebase, running tests.</p>
+          <p>A code agent inverts that relationship. The user states a goal ("add OAuth login to this app") and the agent drives — it reads the existing code to understand structure, edits multiple files, runs the tests, fixes failures, iterates. The user reviews the result rather than authoring it. Same models underneath, very different system around them.</p>
+          <p>The four properties in this step are what makes it an agent rather than a completion tool. Persistent filesystem state, self-verification, bounded action space, feedback loops — Copilot has none of these; Claude Code, Cursor's agent mode, Aider, and the Agent SDK all do.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">"Self-verification via tests" sounds great in theory. Doesn't it break when there are no tests, or when the tests are bad?</div>
+        <div class="answer">
+          <p>It does. The architectural advantage of code agents over research agents is real <em>when the verification ladder works</em>: tests exist, run fast, cover the changes you're making, and accurately reflect correctness. When any of those breaks down, code agents lose much of their edge. A codebase with no tests is a codebase where the agent is generating and hoping just like a research agent.</p>
+          <p>The practical consequence: code agents are most effective on well-tested codebases, and one of the most valuable things you can do before turning a code agent loose on a project is shore up the test suite. Conversely, an agent that contributes a feature also needs to contribute tests for that feature — otherwise the next agent (or human) working on it has no signal.</p>
+          <p>Step 3 of this chapter covers what to do when tests are weak: cheaper checks (type checkers, linters, the build itself) form lower rungs of the verification ladder that still provide useful signal when full tests don't.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">"Bounded action space" sounds restrictive. What about agents that need to make external API calls, query databases, etc.?</div>
+        <div class="answer">
+          <p>The boundedness is about <em>what tools you grant</em>, not about what's theoretically possible. A code agent absolutely can have a <code class="inline">curl</code> tool, a <code class="inline">psql</code> tool, an HTTP-fetch tool — but each of those is an explicit grant in the configuration, not a default. The point isn't that code agents can't reach beyond the filesystem; it's that the reach is enumerable and configurable per-task.</p>
+          <p>Contrast with a free-form research agent: by default it has web search, web fetch, and possibly other "general" tools that span unknown territory. Constraining a research agent to only-touch-these-domains is harder than configuring a code agent to only-edit-these-files because the constraint surface is more open.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>The action space: edit files, run commands, read what you wrote.</h3>
+
+      <p>The most common mistake when building a code agent: thinking the tool surface is "generate code." It isn't. The right tool surface is the set of operations a developer performs on a project — read a file, edit a file, search for text across files, navigate the directory tree, run commands. The model produces code as the <em>content</em> of edit operations, but the operations themselves are filesystem actions. This distinction is what separates an agent that operates on a real project from a glorified single-prompt code generator.</p>
+
+      <h4>The six tools that cover 95% of code-agent work</h4>
+
+      <p>Almost every modern code agent — Claude Code, Aider, Cline, the Agent SDK reference implementation — converges on roughly the same tool set. The exact names vary; the shapes are nearly identical.</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>Tool</div>
+          <div>Purpose</div>
+          <div>Notes</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">read_file</div>
+          <div class="vector">Load file contents into context</div>
+          <div class="defense">Read with optional line range so partial reads of huge files are cheap.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">write_file</div>
+          <div class="vector">Create a new file or overwrite</div>
+          <div class="defense">For new files only. Using this to "edit" existing files is anti-pattern (Step below).</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">edit_file (str_replace)</div>
+          <div class="vector">Replace one substring with another</div>
+          <div class="defense">The workhorse. Atomic, reviewable, minimizes context churn.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">glob</div>
+          <div class="vector">Find files by name pattern</div>
+          <div class="defense">"Find all *.test.ts files under src/". Cheap and very high signal.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">grep</div>
+          <div class="vector">Search file contents</div>
+          <div class="defense">"Find references to OAuthProvider across the codebase." Regex-aware.</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">bash / run_command</div>
+          <div class="vector">Run shell commands</div>
+          <div class="defense">Tests, builds, type-checks, package install, git operations. The verification ladder.</div>
+        </div>
+      </div>
+
+      <p>You'll see additional tools in production agents — task tracking, sub-agent dispatch, structured search — but these six are the foundation. Everything else is an optimization or specialization on top.</p>
+
+      <h4>Why str_replace beats "rewrite the file"</h4>
+
+      <p>One design decision is worth its own discussion because it's where naive implementations go wrong and the right answer isn't obvious: <strong>how the agent edits an existing file</strong>.</p>
+
+      <p>The naive approach: the agent reads the file, generates the new version, writes it back. Three failure modes follow.</p>
+
+      <p><strong>Failure 1: context cost.</strong> Reading a 500-line file costs ~3K tokens. Writing it back costs another ~3K output tokens. Doing this for 10 edits across 5 files in a single agent run burns through 30K+ tokens of work that could have been a few hundred tokens of <code class="inline">str_replace</code> operations. At scale this is real money.</p>
+
+      <p><strong>Failure 2: silent regressions.</strong> The agent reads the file, makes the edit it intended, and re-emits the file. But it also rewrites the import order, drops a comment it thought was redundant, or modifies an unrelated function "for consistency." The user opens <code class="inline">git diff</code> and sees changes they didn't ask for. The trust hit is severe even when the changes are technically improvements.</p>
+
+      <p><strong>Failure 3: review burden.</strong> A diff of "old file (500 lines) → new file (497 lines)" is unreviewable in detail. The user can't tell what changed without doing their own diff. Compare to a <code class="inline">str_replace</code> with a 5-line old_str and a 7-line new_str — that's an atomic, scoped, reviewable change. Code review tools display it natively. The user knows exactly what to look at.</p>
+
+      <p>The fix is the <code class="inline">str_replace</code> operation: the agent passes the exact substring to find and the exact substring to replace it with. The tool implementation finds the substring (failing if it's not unique), replaces it, and writes the file. Three properties fall out:</p>
+
+      <ul>
+        <li><strong>Atomic.</strong> Either the substring matched and the replacement was applied, or the operation failed with an error. No partial updates.</li>
+        <li><strong>Minimal context.</strong> The agent only needs to read enough of the file to identify a unique substring around the change site. Often a 20-line window of context is enough; full-file reads become rare.</li>
+        <li><strong>Reviewable.</strong> The operation's old_str and new_str <em>are</em> the diff. Audit logs of code agent runs are readable; what changed is right there.</li>
+      </ul>
+
+      <p>This is why every modern code agent ships <code class="inline">str_replace</code> (or an equivalent, often called <code class="inline">edit_file</code> or <code class="inline">apply_diff</code>) as its primary editing primitive, and reserves <code class="inline">write_file</code> for new files only.</p>
+
+      <h4>The minimal skeleton: 150 lines of code agent</h4>
+
+      <p>Pulling all six tools together with the agent loop from chapter 1.1, here's what a working code agent looks like at minimum. This is not Claude Code or the Agent SDK — it's the shape underneath them. Building this yourself is the right exercise for understanding the design.</p>
+
+<pre class="standalone"><span class="c-cm"># agent/code_agent.py</span>
+<span class="c-kw">import</span> os, subprocess, glob <span class="c-kw">as</span> globmod, re
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> AsyncAnthropic
+
+REPO_ROOT = os.environ.get(<span class="c-st">"AGENT_REPO_ROOT"</span>, os.getcwd())
+client = AsyncAnthropic()
+
+<span class="c-cm"># --- Tool definitions (full descriptions omitted for brevity; see chapter 0.3) ---</span>
+TOOLS = [
+    {<span class="c-st">"name"</span>: <span class="c-st">"read_file"</span>,    <span class="c-st">"description"</span>: ..., <span class="c-st">"input_schema"</span>: {...}},
+    {<span class="c-st">"name"</span>: <span class="c-st">"write_file"</span>,   <span class="c-st">"description"</span>: ..., <span class="c-st">"input_schema"</span>: {...}},
+    {<span class="c-st">"name"</span>: <span class="c-st">"str_replace"</span>,  <span class="c-st">"description"</span>: ..., <span class="c-st">"input_schema"</span>: {...}},
+    {<span class="c-st">"name"</span>: <span class="c-st">"glob"</span>,          <span class="c-st">"description"</span>: ..., <span class="c-st">"input_schema"</span>: {...}},
+    {<span class="c-st">"name"</span>: <span class="c-st">"grep"</span>,          <span class="c-st">"description"</span>: ..., <span class="c-st">"input_schema"</span>: {...}},
+    {<span class="c-st">"name"</span>: <span class="c-st">"bash"</span>,          <span class="c-st">"description"</span>: ..., <span class="c-st">"input_schema"</span>: {...}},
+]
+
+<span class="c-cm"># --- Handlers ---</span>
+<span class="c-kw">def</span> <span class="c-fn">safe_path</span>(path: <span class="c-kw">str</span>) -> <span class="c-kw">str</span>:
+    <span class="c-st">"""Resolve path within the repo root; refuse to escape it."""</span>
+    full = os.path.realpath(os.path.join(REPO_ROOT, path))
+    <span class="c-kw">if not</span> full.startswith(os.path.realpath(REPO_ROOT) + os.sep):
+        <span class="c-kw">raise</span> ValueError(<span class="c-kw">f</span><span class="c-st">"Path {path!r} escapes repo root"</span>)
+    <span class="c-kw">return</span> full
+
+<span class="c-kw">async def</span> <span class="c-fn">read_file</span>(path: <span class="c-kw">str</span>, start_line: <span class="c-kw">int</span> = <span class="c-st">1</span>, end_line: <span class="c-kw">int</span> = -<span class="c-st">1</span>) -> <span class="c-kw">str</span>:
+    <span class="c-kw">with</span> <span class="c-kw">open</span>(safe_path(path)) <span class="c-kw">as</span> f:
+        lines = f.readlines()
+    end = <span class="c-kw">len</span>(lines) <span class="c-kw">if</span> end_line == -<span class="c-st">1</span> <span class="c-kw">else</span> end_line
+    <span class="c-kw">return</span> <span class="c-st">""</span>.join(<span class="c-kw">f</span><span class="c-st">"{i:5d}  {ln}"</span>
+                    <span class="c-kw">for</span> i, ln <span class="c-kw">in</span> <span class="c-kw">enumerate</span>(lines[start_line-<span class="c-st">1</span>:end], start_line))
+
+<span class="c-kw">async def</span> <span class="c-fn">write_file</span>(path: <span class="c-kw">str</span>, content: <span class="c-kw">str</span>) -> <span class="c-kw">str</span>:
+    p = safe_path(path)
+    <span class="c-kw">if</span> os.path.exists(p):
+        <span class="c-kw">raise</span> ValueError(<span class="c-kw">f</span><span class="c-st">"{path} exists; use str_replace to edit"</span>)
+    os.makedirs(os.path.dirname(p), exist_ok=<span class="c-kw">True</span>)
+    <span class="c-kw">with</span> <span class="c-kw">open</span>(p, <span class="c-st">"w"</span>) <span class="c-kw">as</span> f: f.write(content)
+    <span class="c-kw">return</span> <span class="c-kw">f</span><span class="c-st">"Created {path} ({len(content)} bytes)"</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">str_replace</span>(path: <span class="c-kw">str</span>, old_str: <span class="c-kw">str</span>, new_str: <span class="c-kw">str</span>) -> <span class="c-kw">str</span>:
+    p = safe_path(path)
+    <span class="c-kw">with</span> <span class="c-kw">open</span>(p) <span class="c-kw">as</span> f: text = f.read()
+    count = text.count(old_str)
+    <span class="c-kw">if</span> count == <span class="c-st">0</span>:
+        <span class="c-kw">raise</span> ValueError(<span class="c-kw">f</span><span class="c-st">"old_str not found in {path}"</span>)
+    <span class="c-kw">if</span> count > <span class="c-st">1</span>:
+        <span class="c-kw">raise</span> ValueError(<span class="c-kw">f</span><span class="c-st">"old_str matches {count} times; add context to make it unique"</span>)
+    <span class="c-kw">with</span> <span class="c-kw">open</span>(p, <span class="c-st">"w"</span>) <span class="c-kw">as</span> f: f.write(text.replace(old_str, new_str))
+    <span class="c-kw">return</span> <span class="c-kw">f</span><span class="c-st">"Replaced 1 occurrence in {path}"</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">glob_files</span>(pattern: <span class="c-kw">str</span>) -> <span class="c-kw">str</span>:
+    matches = globmod.glob(os.path.join(REPO_ROOT, pattern), recursive=<span class="c-kw">True</span>)
+    <span class="c-kw">return</span> <span class="c-st">"\n"</span>.join(os.path.relpath(m, REPO_ROOT) <span class="c-kw">for</span> m <span class="c-kw">in</span> matches[:<span class="c-st">200</span>])
+
+<span class="c-kw">async def</span> <span class="c-fn">grep_files</span>(pattern: <span class="c-kw">str</span>, glob_filter: <span class="c-kw">str</span> = <span class="c-st">"**/*"</span>) -> <span class="c-kw">str</span>:
+    rx = re.compile(pattern)
+    hits = []
+    <span class="c-kw">for</span> path <span class="c-kw">in</span> globmod.glob(os.path.join(REPO_ROOT, glob_filter), recursive=<span class="c-kw">True</span>):
+        <span class="c-kw">if not</span> os.path.isfile(path): <span class="c-kw">continue</span>
+        <span class="c-kw">try</span>:
+            <span class="c-kw">for</span> i, line <span class="c-kw">in</span> <span class="c-kw">enumerate</span>(<span class="c-kw">open</span>(path), <span class="c-st">1</span>):
+                <span class="c-kw">if</span> rx.search(line):
+                    rel = os.path.relpath(path, REPO_ROOT)
+                    hits.append(<span class="c-kw">f</span><span class="c-st">"{rel}:{i}: {line.rstrip()}"</span>)
+                    <span class="c-kw">if</span> <span class="c-kw">len</span>(hits) >= <span class="c-st">100</span>: <span class="c-kw">break</span>
+        <span class="c-kw">except</span> UnicodeDecodeError: <span class="c-kw">continue</span>
+    <span class="c-kw">return</span> <span class="c-st">"\n"</span>.join(hits) <span class="c-kw">or</span> <span class="c-st">"(no matches)"</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">run_bash</span>(command: <span class="c-kw">str</span>, timeout: <span class="c-kw">int</span> = <span class="c-st">120</span>) -> <span class="c-kw">str</span>:
+    p = subprocess.run(command, shell=<span class="c-kw">True</span>, cwd=REPO_ROOT,
+                       capture_output=<span class="c-kw">True</span>, text=<span class="c-kw">True</span>, timeout=timeout)
+    <span class="c-kw">return</span> <span class="c-kw">f</span><span class="c-st">"exit={p.returncode}\nstdout:\n{p.stdout}\nstderr:\n{p.stderr}"</span>
+
+HANDLERS = {<span class="c-st">"read_file"</span>: read_file, <span class="c-st">"write_file"</span>: write_file,
+            <span class="c-st">"str_replace"</span>: str_replace, <span class="c-st">"glob"</span>: glob_files,
+            <span class="c-st">"grep"</span>: grep_files, <span class="c-st">"bash"</span>: run_bash}
+
+<span class="c-cm"># --- The loop (the same shape from chapter 1.1) ---</span>
+<span class="c-kw">async def</span> <span class="c-fn">run_code_agent</span>(task: <span class="c-kw">str</span>, max_steps: <span class="c-kw">int</span> = <span class="c-st">40</span>):
+    messages = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: task}]
+    <span class="c-kw">for</span> _ <span class="c-kw">in</span> <span class="c-kw">range</span>(max_steps):
+        response = <span class="c-kw">await</span> client.messages.create(
+            model=<span class="c-st">"claude-sonnet-4-5"</span>,
+            max_tokens=<span class="c-st">4096</span>,
+            system=SYSTEM_PROMPT,   <span class="c-cm"># &lt;-- conventions, test commands, project layout</span>
+            tools=TOOLS,
+            messages=messages,
+        )
+        messages.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>, <span class="c-st">"content"</span>: response.content})
+
+        <span class="c-kw">if</span> response.stop_reason != <span class="c-st">"tool_use"</span>:
+            <span class="c-kw">return</span> response
+
+        results = []
+        <span class="c-kw">for</span> block <span class="c-kw">in</span> response.content:
+            <span class="c-kw">if</span> block.<span class="c-kw">type</span> != <span class="c-st">"tool_use"</span>: <span class="c-kw">continue</span>
+            <span class="c-kw">try</span>:
+                output = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+                results.append({<span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                                <span class="c-st">"tool_use_id"</span>: block.id, <span class="c-st">"content"</span>: output})
+            <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+                results.append({<span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                                <span class="c-st">"tool_use_id"</span>: block.id,
+                                <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"Error: {e}"</span>,
+                                <span class="c-st">"is_error"</span>: <span class="c-kw">True</span>})
+        messages.append({<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: results})
+
+    <span class="c-kw">raise</span> RuntimeError(<span class="c-st">"step budget exceeded"</span>)</pre>
+
+      <p>That's a working code agent. Roughly 100 lines plus tool descriptions; the structure is identical to the agent loop from Build, with code-specific tools. Adding a streaming layer (chapter 2.4), prompt caching on the system prompt (chapter 2.2), and observability (chapter 2.1) gets you to production shape. None of those additions change the core architecture; they just make it run well.</p>
+
+      <h4>The system prompt is where most of the work happens</h4>
+
+      <p>One subtle thing: in a code agent, the system prompt does heavy lifting that's often invisible. It tells the agent:</p>
+
+      <ul>
+        <li>What conventions the project uses (TypeScript strict mode, prefer functional style, conventional commits, etc.)</li>
+        <li>How to run the tests (<code class="inline">npm test</code> vs <code class="inline">pytest</code> vs <code class="inline">cargo test</code>)</li>
+        <li>How to run the type-checker, the linter, the build</li>
+        <li>What directories are off-limits</li>
+        <li>What workflow to follow (small commits, run tests after every change, etc.)</li>
+      </ul>
+
+      <p>Claude Code reads this from a <code class="inline">CLAUDE.md</code> file at the repo root. Aider reads it from <code class="inline">.aider.conf.yml</code> and convention files. The Agent SDK lets you pass it as <code class="inline">system=</code>. The mechanism varies; the purpose is the same: <strong>tell the agent how this specific project wants to be worked on</strong>. A code agent without project conventions in its system prompt is a generic Python developer dropped into your repo; with conventions it's a contributor who knows the house style.</p>
+
+      <p>The discipline: <strong>treat your CLAUDE.md (or equivalent) as documentation that compounds</strong>. Every time you have to correct the agent's behavior on a recurring issue ("we use 2-space indent, not 4"), add a line to the conventions file. Over a few weeks, the agent's hit rate on first attempt climbs from acceptable to excellent.</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Why grep and glob as separate tools? Couldn't bash do both with the right command?</div>
+        <div class="answer">
+          <p>It could. But there are three reasons to expose them as first-class tools rather than letting the agent <code class="inline">find</code>/<code class="inline">grep</code> via bash.</p>
+          <p>First, structured output: glob and grep handlers can return results in a consistent format (path:line: text) that's easy for the model to parse and act on. The model doesn't have to figure out whether the bash output has a header, trailing newlines, etc.</p>
+          <p>Second, controllable: handlers can enforce result limits, redact sensitive paths, and filter binary files automatically. A raw bash <code class="inline">grep -r</code> can produce a multi-megabyte dump if the pattern is too broad; a wrapped handler caps it at 100 hits or 50KB.</p>
+          <p>Third, safer: granting bash access is a security decision (the agent can now run arbitrary commands); granting glob and grep separately doesn't expand the attack surface. Many production deployments enable read tools without enabling bash, exactly for this reason.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">str_replace fails when old_str isn't unique. What happens when the agent needs to make the same edit in multiple places?</div>
+        <div class="answer">
+          <p>Three options, in order of how production agents handle it.</p>
+          <p><strong>Most common:</strong> the agent makes the old_str more specific so it becomes unique. If you want to rename a variable that appears in 5 places, you don't try to replace just the name — you replace the surrounding 2-3 lines around each instance, one at a time. The agent learns this pattern quickly from the failure message.</p>
+          <p><strong>Sometimes useful:</strong> a separate <code class="inline">str_replace_all</code> tool that takes a flag indicating "I know this matches multiple times, replace all of them." Risky because it can over-match; usually not worth the footgun.</p>
+          <p><strong>For renames specifically:</strong> use a real refactoring tool (language-server-based rename, <code class="inline">rg --replace</code>) via bash. The agent should learn that renames are a structured operation, not a text substitution.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about edits that span large code blocks — say, replacing a 200-line function?</div>
+        <div class="answer">
+          <p>str_replace handles this fine — old_str and new_str can be hundreds of lines. The constraint is that the old_str has to appear once in the file (which a 200-line block almost certainly does).</p>
+          <p>The token cost question is real, though: replacing 200 lines means the agent has 200 lines of old_str and 200 lines of new_str in its output for that single tool call. For very large refactors, sometimes the cheaper approach is to write a new file alongside the old one, then update the imports. Or write a small script that does the transformation and run it via bash. The agent picks the right approach if its system prompt gives it the latitude.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>The verification loop is the whole game.</h3>
+
+      <p>If you take one lesson from this chapter, take this: <strong>a code agent that doesn't verify its own work isn't a code agent</strong>. It's a research agent that produces plausible-looking code. The difference between the two — between "the agent generated this function" and "the agent generated this function, ran the tests, saw a failure, fixed it, and got to green" — is the entire reason code agents work better than chat agents at coding.</p>
+
+      <p>This step is about how to structure that verification loop and how to make sure the agent actually uses it.</p>
+
+      <h4>The verification ladder</h4>
+
+      <p>Not all verification is equally cheap. A type-check is fast; a test run might take a minute; a full integration test might take five. The agent should use the cheapest check that gives signal on what it just did, climbing the ladder only when needed.</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  THE VERIFICATION LADDER (cheap → expensive)                │
+│                                                             │
+│  Rung 0:  File written successfully (str_replace returned)  │
+│  Rung 1:  Syntax / parser check (cheapest signal)           │
+│           ─ Python: `python -c "import ast; ast.parse(...)"`│
+│           ─ TS/JS:  `tsc --noEmit`                          │
+│           ─ Rust:   `cargo check`                           │
+│  Rung 2:  Linter / formatter                                │
+│           ─ ruff, eslint, golangci-lint                     │
+│  Rung 3:  Type check (when separate from compile)           │
+│           ─ mypy, pyright, flow                             │
+│  Rung 4:  Unit tests (fast subset first)                    │
+│           ─ pytest tests/unit/                              │
+│           ─ vitest run --reporter=basic                     │
+│  Rung 5:  Full test suite                                   │
+│  Rung 6:  Integration / e2e tests (slowest, most signal)    │
+│                                                             │
+│  Each rung is cheaper than the next AND catches different   │
+│  bugs.  Skipping rungs means catching bugs later, when      │
+│  the feedback loop is slower.                               │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>The instinct most developers have — and the right instinct for the agent — is "run the cheapest check that could conceivably catch what I just broke." After editing a function signature: run the type check. After editing test setup: run one test. After a multi-file refactor: run the full suite. The agent that does this well finishes tasks 3–5× faster than the one that runs the full suite after every change.</p>
+
+      <p>The system prompt should teach this. Concretely:</p>
+
+<pre class="standalone"><span class="c-cm"># From CLAUDE.md, system prompt for the agent</span>
+
+# Verification workflow
+
+After making any change, run the appropriate verification:
+
+- **Single-function change in a typed language**: `tsc --noEmit` (or
+  `mypy src/`).  Type errors here block everything else.
+- **Behavioral change to a single module**: run that module's tests.
+  `pytest tests/path/to/module/ -x`
+- **Cross-cutting change** (touches more than 3 files): run the full
+  unit suite. `npm run test:unit`
+- **Before declaring "done"**: full test suite passes, including
+  integration. `npm test`
+
+Always run the verification before reporting the task complete.
+If verification fails, fix the failure and verify again.  Do not
+report success on the basis of "the code looks right".</pre>
+
+      <p>That last sentence — "do not report success on the basis of 'the code looks right'" — is doing real work. It explicitly closes off the failure mode where the agent generates code, doesn't run anything, and reports back "done." A reasonable-sounding but unverified completion is the most common failure mode of unsupervised code agents.</p>
+
+      <h4>What goes wrong when verification is skipped</h4>
+
+      <p>Three failure modes to recognize, all variants of "the agent said it was done but it wasn't":</p>
+
+      <p><strong>Confident-but-broken edits.</strong> The agent reads the relevant file, edits it carefully, and reports completion. The user pulls the change, runs the tests, and sees four failures. The agent's edit was wrong in a way that's obvious from running the tests — but the agent didn't run them. This is the failure that the verification-ladder discipline is designed to prevent.</p>
+
+      <p><strong>Edited the wrong thing.</strong> The agent searched for a function name, found it in two files (one being a test file), and edited the wrong copy. Running the tests would have shown the actual function wasn't modified. Skipping the test run hides the mistake until the user discovers it.</p>
+
+      <p><strong>Forgot the side effect.</strong> The agent modified a function and the tests pass — but the type checker would have flagged a downstream caller that needs to be updated. The agent ran the tests (good!) but not the type checker (bad). The whole ladder matters.</p>
+
+      <p>The pattern: each rung of the ladder catches different bugs. Skipping rungs means bugs sneak through. The agent that runs only the cheapest check ships fast but ships broken; the agent that runs all rungs after every micro-change is glacially slow but reliable. The right behavior is climbing the ladder appropriately for each change — and that's a discipline the system prompt can encode and the tool descriptions can reinforce.</p>
+
+      <h4>The fast-feedback loop in action</h4>
+
+      <p>What the verification loop looks like in a real agent trace — this is the kind of pattern you want to see in the agent's behavior:</p>
+
+<pre class="trace standalone"><span class="c-out">══ TASK: Fix the bug where the date parser crashes on empty strings ══
+
+[turn 1: agent]
+→ grep "def parse_date" --glob "**/*.py"
+
+[result]
+src/datetime/parser.py:12: def parse_date(s: str) -> date:
+tests/datetime/test_parser.py:34: def test_parse_date_iso():
+
+[turn 2: agent]
+→ read_file src/datetime/parser.py
+
+[result]
+[20 lines of code, parse_date function visible]
+
+[turn 3: agent]
+→ read_file tests/datetime/test_parser.py 30 60
+
+[result]
+[shows existing tests; notes no empty-string test]
+
+[turn 4: agent]
+→ bash "pytest tests/datetime/test_parser.py -x"
+
+[result]
+3 passed in 0.4s
+  <span class="c-cm">// agent confirms baseline is green before changing anything</span>
+
+[turn 5: agent]
+→ str_replace tests/datetime/test_parser.py
+   old_str: def test_parse_date_iso():\n    assert parse_date("2025-01-01") == ...
+   new_str: def test_parse_date_iso():\n    assert parse_date("2025-01-01") == ...\n\n
+            def test_parse_date_empty_string_raises():\n    with pytest.raises(ValueError):\n
+                parse_date("")
+
+[result]
+Replaced 1 occurrence in tests/datetime/test_parser.py
+
+[turn 6: agent]
+→ bash "pytest tests/datetime/test_parser.py::test_parse_date_empty_string_raises -x"
+
+[result]
+FAILED tests/datetime/test_parser.py::test_parse_date_empty_string_raises -
+IndexError: string index out of range
+  <span class="c-cm">// agent: good — test fails for the right reason. now fix it.</span>
+
+[turn 7: agent]
+→ str_replace src/datetime/parser.py
+   old_str: def parse_date(s: str) -> date:\n    year = int(s[0:4])
+   new_str: def parse_date(s: str) -> date:\n    if not s:\n        raise ValueError(
+            "empty date string")\n    year = int(s[0:4])
+
+[result]
+Replaced 1 occurrence in src/datetime/parser.py
+
+[turn 8: agent]
+→ bash "pytest tests/datetime/test_parser.py -x"
+
+[result]
+4 passed in 0.4s
+  <span class="c-cm">// agent: green. one more check.</span>
+
+[turn 9: agent]
+→ bash "mypy src/datetime/"
+
+[result]
+Success: no issues found in 1 source file
+  <span class="c-cm">// agent: clean. done.</span>
+
+[turn 10: agent]
+"Done. Added empty-string validation to parse_date with a test that
+verifies the ValueError is raised. Tests pass, mypy clean."</span></pre>
+
+      <p>Notice what the agent <em>didn't</em> do: it didn't read the whole codebase. It didn't write a 500-line refactor. It didn't make multiple edits across files before running anything. It made one targeted change, verified it, observed the failure (which was the expected failure of the new test), made one more targeted change, verified it, and stopped.</p>
+
+      <p>This is the texture of effective code-agent work — small steps, fast feedback, fail-and-fix loops. The system prompt and the tool design both push toward this rhythm.</p>
+
+      <h4>Test-first as a workflow choice for agents</h4>
+
+      <p>Notice also that the agent wrote the failing test <em>before</em> writing the fix. This isn't accidental — it's the test-driven discipline applied to agents. The advantages, all amplified for agents:</p>
+
+      <ul>
+        <li><strong>The test is the spec.</strong> Writing the test first forces the agent to specify behavior precisely. If the agent can't write the test, it doesn't understand the requirement well enough to write the code.</li>
+        <li><strong>Definition of done is mechanical.</strong> Task is complete when the new test passes and the old tests still pass. No ambiguity about whether the agent "really" finished.</li>
+        <li><strong>Regression protection is automatic.</strong> The test that just passed is the test that catches the bug if it recurs. No separate "add regression test" step.</li>
+      </ul>
+
+      <p>You don't have to enforce TDD universally — for simple changes it's overhead. But for bug fixes specifically, the pattern "reproduce as a failing test, fix until passing" is the cleanest discipline and the easiest one to encode in the system prompt.</p>
+
+      <h4>The trap: faking verification</h4>
+
+      <p>The most insidious failure mode: the agent runs <em>something</em> that returns success but doesn't actually verify what you wanted.</p>
+
+      <p>Examples you'll see:</p>
+
+      <ul>
+        <li>Agent runs <code class="inline">pytest -k test_nothing_relevant</code> and reports "tests pass."</li>
+        <li>Agent runs <code class="inline">npm test</code>, which silently skips the failing test because of a misconfigured matcher.</li>
+        <li>Agent runs <code class="inline">true</code> as a placeholder when the test command isn't available, gets exit code 0, declares success.</li>
+        <li>Agent modifies the test to make it pass instead of fixing the code. The test "passes" but doesn't test what it should.</li>
+      </ul>
+
+      <p>Defenses against these:</p>
+
+      <p><strong>Inspect outputs, don't trust exit codes alone.</strong> The agent's prompt should require reporting <em>what was run</em> and <em>what the output was</em>, not just "tests passed." Reviewers (human or LLM) should be able to verify the right thing was run.</p>
+
+      <p><strong>Make verification commands explicit in CLAUDE.md.</strong> Don't let the agent guess "what's the test command for this project?" — tell it. "<code class="inline">npm run test:strict</code> is the verification command. Other test commands skip slow tests and shouldn't be used for verification."</p>
+
+      <p><strong>Add a meta-check.</strong> For high-stakes changes, the agent's final step should be a diff of the test outputs: "Before my change, X passed. After my change, Y passed. Y must include X plus the new test, not be a different set." This forces the agent to compare baseline-vs-final, not just look at the final output in isolation.</p>
+
+      <p><strong>Human review of the diff, always.</strong> For agent work that ships to production, a human looks at <code class="inline">git diff</code> before merge. Not because the agent is untrustworthy — but because the cost of trust falling through (a subtle test-faked-pass that ships a bug) is high. This isn't a code-agent-specific point, but it's where the value compounds: the human reviewing 30 lines of diff is way more efficient than the human authoring those 30 lines from scratch.</p>
+
+      <div class="callout warn">
+        <p>If your code agent reports "done" without showing a verification step in its trace, treat that as a red flag. Either it didn't run the verification (so you don't know if the change works), or it ran something that doesn't actually verify what you care about (so you don't know what it ran). In either case, the right move is to require the verification step explicitly and treat agents that skip it as broken — not as "fast."</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What about codebases where running the tests takes 20+ minutes? The verification loop sounds nice but it's not free.</div>
+        <div class="answer">
+          <p>Two responses, depending on whether the slow tests are essential or accidental.</p>
+          <p><strong>Essential slow tests</strong> (integration, e2e, browser tests) usually have a fast unit subset that runs in seconds. The agent uses the fast subset during the inner loop (every change verifies against unit tests), and runs the slow tests only at "task complete" gates. The slow tests still catch what they catch; they just don't slow down the inner-loop rhythm.</p>
+          <p><strong>Accidental slow tests</strong> (slow because of bad fixtures, unnecessary DB rebuilds, missing parallelism) are a separate problem. The code agent isn't the right tool to fix them, but it might be the right pressure to <em>force</em> fixing them — "the agent's iteration speed is gated on this; we need it to be faster" is a legitimate engineering priority.</p>
+          <p>One specific trick for slow suites: parallel test execution where the framework supports it. Most modern test runners (pytest-xdist, vitest, etc.) can fan out across cores and cut 20-minute suites to 3-minute suites with no behavioral change.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">What if the codebase has zero tests? Does a code agent become useless?</div>
+        <div class="answer">
+          <p>Less useful, definitely, but not useless. You lose the most reliable verification rung, but the others remain: syntax/parse, type check, linter, build. These catch a meaningful fraction of bugs — anything that doesn't compile or doesn't type-check stays out of the codebase regardless of whether tests exist.</p>
+          <p>The agent can also be tasked with <em>creating</em> tests as a separate step before doing the real work. "Add a test that demonstrates the current behavior" is a sensible first turn before "now change the behavior." After a few rounds, you have the test scaffolding the codebase was missing.</p>
+          <p>One pattern worth knowing: agents are often very effective at writing characterization tests (tests that capture <em>what the code does</em>, regardless of whether that's correct). These are cheap to write and create a safety net for refactors. A code agent can produce hundreds of these from observation, then human review picks the ones to keep.</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Should the agent run tests in parallel with making more edits, or strictly sequential?</div>
+        <div class="answer">
+          <p>Strictly sequential, almost always. The reason: parallelism here is false economy. The agent can't safely make a second edit before knowing whether the first one worked — if it did, the second edit might be unnecessary; if it didn't, the second edit might be wrong. Each cycle of <em>edit → verify → react</em> is dependent.</p>
+          <p>The exception: when verification is slow and the agent has a high-confidence next step that's logically independent. For example, the agent might run a long test suite while reading documentation in parallel. But running two simultaneous edits is asking for trouble — diff hell, conflicting changes, no clean rollback.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Skills, the Agent SDK, and the landscape you'll work in.</h3>
+
+      <p>Steps 1–3 cover what a code agent <em>is</em>, architecturally. This step covers what you'll actually use: Anthropic's Skills system (the way Claude Code packages procedural knowledge), the Agent SDK (the Python/TypeScript library that wraps the agent loop), and the Managed Agents service (a hosted version for production). Plus the decision of when to build your own code agent vs. adopt one of these.</p>
+
+      <h4>Skills: packaged procedural knowledge</h4>
+
+      <p>Step 2's CLAUDE.md captures project conventions. Skills are the next layer up: <strong>portable bundles of instructions and resources that teach the agent how to do a specific kind of task</strong>, that work across projects and across the Claude product surface (Claude.ai, Claude Code, the API, the Agent SDK).</p>
+
+      <p>A skill is a folder. The folder must contain a <code class="inline">SKILL.md</code> file with YAML frontmatter. The frontmatter has two required fields: <code class="inline">name</code> and <code class="inline">description</code>. Everything else is optional, and the rest of the folder can contain whatever resources support the skill — scripts the agent can execute, reference docs the agent can load when needed, templates.</p>
+
+<pre class="standalone"><span class="c-cm"># skills/postgres-migration/SKILL.md</span>
+---
+name: postgres-migration
+description: Generate, review, and run PostgreSQL migrations following the
+  project's conventions (alembic with autogenerate, named revisions, paired
+  upgrade/downgrade). Use when the user asks to add/modify/remove columns,
+  tables, indexes, or constraints, or when schema changes are needed.
+---
+
+# Postgres migration workflow
+
+This project uses Alembic for migrations.  All schema changes go through it.
+
+## When to use
+
+- Adding/removing/renaming columns
+- Adding/dropping tables
+- Adding/dropping indexes
+- Modifying constraints
+
+## Standard workflow
+
+1. Inspect the current state: `alembic current` and `alembic history --verbose`
+2. Generate the migration: `alembic revision --autogenerate -m "&lt;short_desc&gt;"`
+3. **Review the generated migration**: autogenerate is imperfect. Specifically check:
+   - Does it correctly detect type changes? (Often misses ENUM modifications)
+   - Are downgrade() operations the inverse of upgrade()?
+   - For renames, does it generate add+drop instead of an actual rename?
+     (Fix manually — add+drop loses data.)
+4. Run locally: `alembic upgrade head`
+5. Run the test suite: migrations must not break tests
+6. Test downgrade: `alembic downgrade -1 && alembic upgrade head`
+
+## Special cases
+
+- **Adding a non-nullable column to an existing table**: must include a
+  default OR do this in two migrations (add nullable, backfill, alter not null).
+  See examples/non_null_column.py for the template.
+- **Large table operations**: `ALTER TABLE` on a large table locks it.
+  Use the pg_repack pattern documented in references/large_table_ops.md.
+- **Index creation**: always use `CREATE INDEX CONCURRENTLY` for production
+  tables. The autogenerate skips the CONCURRENTLY hint; add it manually.
+
+## What this skill does not cover
+
+- Data migrations (logic, not schema): write a separate one-off script
+- Production deployment: handed off to ops via SECURITY-RELEASE.md</pre>
+
+      <p>This is a real shape — descriptive enough that Claude knows when to use it, opinionated enough to encode the project's actual workflow, with references to deeper documentation that get loaded only when relevant.</p>
+
+      <h4>Progressive disclosure: why skills don't bloat context</h4>
+
+      <p>The key design choice that makes skills scalable: <strong>progressive disclosure</strong>. The agent doesn't load every skill's full contents into context at startup. Instead, three levels:</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  PROGRESSIVE DISCLOSURE                                     │
+│                                                             │
+│  Level 1 (always loaded):                                   │
+│  Each skill's `name` and `description` from frontmatter.    │
+│  Tens of tokens per skill.  Tells the agent what exists.    │
+│  Loaded into system prompt at session start.                │
+│                                                             │
+│  Level 2 (loaded on match):                                 │
+│  When a user request matches a skill's description, the     │
+│  agent reads the full SKILL.md body.  Hundreds to thousands │
+│  of tokens.  Loaded as the first action when the skill      │
+│  becomes relevant.                                          │
+│                                                             │
+│  Level 3 (loaded on demand):                                │
+│  References (examples/, references/) and executable scripts │
+│  are loaded only if the SKILL.md says to.  Allows skills    │
+│  to bundle large reference material without paying for it   │
+│  on every session.                                          │
+│                                                             │
+│  Effect: 50 skills total cost ~2K tokens at startup,        │
+│  not 200K.  Each invocation costs only what that skill      │
+│  actually needs.                                            │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>This is the design choice that makes "agents with hundreds of specialized skills" practical. Without progressive disclosure, every skill you add would consume context for every session whether the skill was used or not; with it, skills are essentially free until invoked.</p>
+
+      <h4>The Agent SDK</h4>
+
+      <p>The Agent SDK is Anthropic's library (Python and TypeScript) for building agents that look architecturally similar to Claude Code, with the same skills system, tool loop, and conventions — but for any task, not just coding. The SDK provides:</p>
+
+      <ul>
+        <li><strong>The agent loop, abstracted.</strong> You don't write the <code class="inline">while True: call_model; run_tools</code> loop yourself; the SDK does it. You define tools and skills; the SDK runs the conversation.</li>
+        <li><strong>Built-in tool runner.</strong> The SDK handles tool dispatch, error wrapping, parallel execution. You provide handler functions; the SDK wires them up to the model.</li>
+        <li><strong>Skill discovery.</strong> Skills placed in <code class="inline">.claude/skills/</code> (project-scoped) or <code class="inline">~/.claude/skills/</code> (user-scoped) are auto-discovered and made available to the agent following the progressive-disclosure pattern.</li>
+        <li><strong>Streaming events.</strong> The SDK's <code class="inline">query()</code> function is an async generator that yields events as the agent works — useful for the streaming endpoint pattern from chapter 2.4.</li>
+      </ul>
+
+      <p>Minimal usage in Python:</p>
+
+<pre class="standalone"><span class="c-kw">from</span> claude_agent_sdk <span class="c-kw">import</span> query, ClaudeAgentOptions
+
+options = ClaudeAgentOptions(
+    cwd=<span class="c-st">"."</span>,
+    setting_sources=[<span class="c-st">"user"</span>, <span class="c-st">"project"</span>],
+    allowed_tools=[<span class="c-st">"Skill"</span>, <span class="c-st">"Read"</span>, <span class="c-st">"Edit"</span>, <span class="c-st">"Bash"</span>, <span class="c-st">"Glob"</span>, <span class="c-st">"Grep"</span>],
+    model=<span class="c-st">"claude-sonnet-4-5"</span>,
+)
+
+<span class="c-kw">async for</span> event <span class="c-kw">in</span> query(prompt=<span class="c-st">"Add a /health endpoint to the API"</span>, options=options):
+    <span class="c-cm"># Each event is a streamed update: token, tool_use, tool_result, status</span>
+    handle(event)</pre>
+
+      <p>What the SDK gives you over building from scratch (Step 2's 150 lines): polished tools with the same shape Claude Code uses, integrated skills system, security defaults that match Claude Code's defaults, and the ability to upgrade to a Managed Agents deployment without reshaping your code.</p>
+
+      <p>What you give up: customization of the loop itself. If you need to interleave model calls with custom logic in unusual ways (multi-model cascading per-step, custom retry policies, complex state machines around the loop), the SDK can feel constraining. Build from scratch for those cases; use the SDK when your needs fit the standard agent loop, which is most cases.</p>
+
+      <h4>Managed Agents: the hosted shape</h4>
+
+      <p>The newest piece of the landscape (in beta as of mid-2026): Managed Agents, where Anthropic hosts the agent runtime entirely. Instead of running the loop in your code, you create an Agent config (system prompt, tools, model) and start Sessions against it. Each session gets a sandboxed container as workspace; the agent runs server-side and acts on the container via tools.</p>
+
+      <p>The shape:</p>
+
+<pre class="standalone"><span class="c-cm"># 1. Create the agent once</span>
+agent = client.beta.agents.create(
+    model=<span class="c-st">"claude-sonnet-4-5"</span>,
+    system=<span class="c-st">"You are a code reviewer for the foo-api project..."</span>,
+    tools=[...],
+    name=<span class="c-st">"foo-api-reviewer"</span>,
+)
+
+<span class="c-cm"># 2. Start a session per task</span>
+session = client.beta.sessions.create(agent_id=agent.id)
+
+<span class="c-cm"># 3. Send messages; the server runs the loop</span>
+<span class="c-kw">for</span> event <span class="c-kw">in</span> client.beta.sessions.messages.stream(
+    session_id=session.id,
+    content=<span class="c-st">"Review PR #123"</span>,
+):
+    handle(event)</pre>
+
+      <p>Pricing is the standard token cost plus $0.08 per session-hour of runtime (only while actively running). Useful when the operational complexity of running an agent loop server-side isn't worth your time, or when you want Anthropic-managed sandboxing as the default. Less useful if you have specific infrastructure needs the hosted runtime doesn't accommodate.</p>
+
+      <p>The decision tree:</p>
+
+      <ul>
+        <li><strong>Building from scratch</strong>: when your agent loop has unusual control flow, when you need maximum customization, or when you're learning. Step 2's 150 lines is the right starting point.</li>
+        <li><strong>Agent SDK in your own infrastructure</strong>: the default for production agents. Standard loop, full control over deployment, works in your VPC, integrates with your observability.</li>
+        <li><strong>Managed Agents</strong>: when you want zero infrastructure, when sandboxed execution is the value, when you're prototyping fast and don't want to build a worker process.</li>
+      </ul>
+
+      <h4>When to build your own code agent vs. use Claude Code</h4>
+
+      <p>Claude Code is the polished, opinionated code agent Anthropic ships. The Agent SDK lets you build similar systems for your own needs. The decision between them:</p>
+
+      <p><strong>Use Claude Code when</strong> your need is "help engineers ship code faster on their own machines." Claude Code is the right tool for individual developer productivity, exploration tasks, and tightly-supervised work. It's installed locally, integrated with editors, and ships with the right defaults for interactive use.</p>
+
+      <p><strong>Build with the Agent SDK when</strong> your need is "code-agent-shaped automation that's not just an engineer at a terminal." Examples: a CI bot that fixes flaky tests automatically, a service that responds to user issues by drafting fix PRs, an internal tool that runs nightly maintenance tasks. These have different UX, different security boundaries, different stakeholders than Claude Code is designed for.</p>
+
+      <p>The two are complementary, not competing. A team using Claude Code for individual productivity might also build SDK-based agents for CI automation; same underlying technology, different surfaces.</p>
+    </div>
+
+    <!-- ============ WORKED EXAMPLE ============ -->
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>End-to-end: a code agent fixes a real bug.</h3>
+
+      <p>To anchor the chapter in something concrete, here's a complete trace of a code agent fixing a representative bug. Not a toy example — the kind of bug that takes a human 20 minutes and an agent maybe 90 seconds. The agent uses Step 2's tools, the verification ladder from Step 3, and a project-level skill from Step 4.</p>
+
+      <h4>The setup</h4>
+
+      <p>A Python web API. Endpoint <code class="inline">GET /users/{user_id}/orders</code> returns a paginated list of a user's orders. A user reports: "When I pass page=1 the API returns my orders; when I pass page=0 the response is empty but no error." Looking at the spec, page=0 should be a 400 error — the API uses 1-indexed pages.</p>
+
+      <p>The task given to the agent: <em>"Fix the /users/{user_id}/orders endpoint so page=0 returns a 400 with a clear error, and add a regression test."</em></p>
+
+      <h4>The trace</h4>
+
+<pre class="trace standalone"><span class="c-out">══ Turn 1 — orient ═════════════════════════════════════════════════
+agent → glob "**/orders.py"
+result:
+  src/api/routes/orders.py
+  tests/api/routes/test_orders.py
+
+agent → read_file src/api/routes/orders.py
+[shows the get_user_orders handler, ~30 lines]
+
+agent → read_file tests/api/routes/test_orders.py
+[shows existing tests, ~80 lines]
+
+══ Turn 2 — baseline ═════════════════════════════════════════════════
+agent: "Confirming current state. Run the existing tests to be sure
+they're green before my changes."
+
+agent → bash "pytest tests/api/routes/test_orders.py -x"
+result: 6 passed in 0.31s
+
+══ Turn 3 — reproduce ═══════════════════════════════════════════════
+agent: "Writing the failing test that captures the bug. page=0 should
+400 with a clear error message."
+
+agent → str_replace tests/api/routes/test_orders.py
+   old_str: <span class="c-cm">[last existing test, used as anchor]</span>
+   new_str: <span class="c-cm">[same test + new test_page_zero_returns_400]</span>
+result: Replaced 1 occurrence
+
+agent → bash "pytest tests/api/routes/test_orders.py::test_page_zero_returns_400 -x"
+result:
+  FAILED ... assert 200 == 400
+  E       AssertionError: response status 200 (expected 400)
+  E       Response body: {"orders": [], "page": 0, "total": 0}
+
+agent: "Confirmed — the test fails for exactly the right reason.
+Now the fix."
+
+══ Turn 4 — fix ═════════════════════════════════════════════════════
+agent → read_file src/api/routes/orders.py 14 24
+[shows the handler more precisely]
+
+agent → str_replace src/api/routes/orders.py
+   old_str:
+     @router.get("/{user_id}/orders")
+     async def get_user_orders(user_id: str, page: int = 1, ...):
+   new_str:
+     @router.get("/{user_id}/orders")
+     async def get_user_orders(user_id: str, page: int = 1, ...):
+         if page &lt; 1:
+             raise HTTPException(
+                 status_code=400,
+                 detail="page must be 1 or greater (pagination is 1-indexed)",
+             )
+
+result: Replaced 1 occurrence
+
+══ Turn 5 — verify ══════════════════════════════════════════════════
+agent → bash "pytest tests/api/routes/test_orders.py -x"
+result: 7 passed in 0.32s
+  <span class="c-cm">// new test passes, no regressions</span>
+
+agent → bash "mypy src/api/routes/orders.py"
+result: Success: no issues found in 1 source file
+
+agent → bash "ruff check src/api/routes/orders.py"
+result: All checks passed!
+
+══ Turn 6 — done ════════════════════════════════════════════════════
+agent: "Done. Added a 400 response for page&lt;1 with a clear message,
+and a regression test (test_page_zero_returns_400) that captures the
+behavior. All existing tests still pass, mypy and ruff clean.
+
+Diff summary:
+- src/api/routes/orders.py: +6 lines (page&lt;1 check)
+- tests/api/routes/test_orders.py: +10 lines (new test)
+
+Recommend reviewing the error message text — I went with 'page must
+be 1 or greater (pagination is 1-indexed)' but the project might have
+a convention for error messages I haven't seen."</span></pre>
+
+      <h4>What this trace shows</h4>
+
+      <p>Read the trace once for content, then read it again for <em>texture</em>. A few things deserve to be named:</p>
+
+      <p><strong>The agent reproduced first, then fixed.</strong> Turns 1–3 are about understanding and reproducing; turns 4–5 are about fixing and verifying. This is the test-first discipline applied to bug fixing — confirm what's broken before changing anything.</p>
+
+      <p><strong>The agent confirmed baseline-green before changing anything.</strong> Turn 2 verifies the existing tests pass. Without this, a later "the tests pass" doesn't mean what it sounds like — they might have been failing already. Always check baseline.</p>
+
+      <p><strong>The agent climbed the verification ladder.</strong> After the fix, the agent ran the targeted tests (catching behavioral correctness), then mypy (catching type errors), then ruff (catching style/lint issues). Three rungs, each catching different bugs, all fast enough to do in turn 5.</p>
+
+      <p><strong>The agent surfaced its own uncertainty.</strong> The closing message includes "I went with X but the project might have a convention for error messages I haven't seen." This is the agent telling you what to look at in review. A confident-and-wrong agent would have skipped this; the agent that flags genuine uncertainty earns trust faster.</p>
+
+      <p><strong>The agent did not bloat the change.</strong> Two files touched, +16 lines total. No drive-by refactoring, no "while I'm in here" additions. The diff is exactly what was asked for. This is reviewable in 30 seconds.</p>
+
+      <p>This is what good agent work looks like. The same task, done by a code agent that doesn't follow these patterns, would be 5× as much diff with 0.3× the confidence that it actually works.</p>
+
+      <div class="observe">
+        <div class="label">The trace is the deliverable</div>
+        <p>One subtle point worth surfacing: <strong>the trace itself is part of the work-product</strong>. A reviewer reading this trace knows exactly what the agent did, why, and what to scrutinize. That's a very different experience from "here's a PR with no context." For agent-generated code that's reviewed by humans, the legibility of the trace is half the value — and it's why the system prompt and verification discipline matter as much as the code itself.</p>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 4.1</div>
+      <h3>Deliverable</h3>
+      <p>A working mental model for code agents as a distinct architecture: persistent filesystem state, programmable verification, bounded action space, tight feedback loops. The six-tool surface (read, write, str_replace, glob, grep, bash) that covers most code work. The verification ladder discipline that turns "the agent wrote code" into "the agent shipped working code." Familiarity with Skills as the portable knowledge-packaging mechanism. Knowing when to build with the Agent SDK vs. adopt Claude Code. You can build, ship, evaluate, and reason about a code agent — and you understand why the architecture is shaped the way it is, not just what to copy.</p>
+      <ul class="checklist">
+        <li>Six core tools implemented: read_file, write_file, str_replace, glob, grep, bash</li>
+        <li>str_replace as the editing primitive; write_file reserved for new files</li>
+        <li>Sandboxing: safe_path enforcement, no escapes from repo root</li>
+        <li>System prompt with project conventions and explicit verification commands</li>
+        <li>Verification ladder: syntax → lint → types → unit tests → full suite, climbing as needed</li>
+        <li>Test-first discipline encoded in the system prompt for bug fixes</li>
+        <li>Trace legibility: agent reports what it ran, what passed, what it's uncertain about</li>
+        <li>Skills folder for portable procedural knowledge with YAML frontmatter</li>
+        <li>Progressive disclosure: skill metadata in system prompt, body loaded on match</li>
+        <li>Decision: build from scratch vs. Agent SDK vs. Managed Agents matches your shape</li>
+        <li>Human review of diffs as the final gate, even on well-verified work</li>
+      </ul>
+    </div>
+
+    <div class="page-nav">
+      <button class="page-nav-btn" onclick="goPage('e4')">
+        <div class="dir">← prev</div>
+        <div class="title">3.4 Benchmarks &amp; CI</div>
+      </button>
+      <button class="page-nav-btn next" onclick="goPage('x2')">
+        <div class="dir">next →</div>
+        <div class="title">4.2 Computer Use</div>
+      </button>
+    </div>
+  </section>
