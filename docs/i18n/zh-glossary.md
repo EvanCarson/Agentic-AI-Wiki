@@ -53,6 +53,21 @@ Applied consistently across all 22 bodies; reviewers enforce it.
 | delta | 增量（delta） |
 | schema | 模式（schema） |
 
+## Markup-specific handling (decided during f1/f2 review — apply to all bodies)
+- `<div class="diagram">` ASCII art: leave in-art aligned labels in **English**.
+  CJK glyphs are double-width and break the fixed-width character grid. Translate
+  only the explanatory prose around the diagram, not labels inside it.
+- `<div class="threat-grid">` (and any CSS-grid prose table): this is **prose** —
+  translate every cell (headers + body), structure/classes byte-identical.
+- `<div class="observe">`, `.callout`, `.deliverable` etc.: their inner
+  `<div class="label">…</div>` text is a **visible heading → translate it**.
+  (`class="label"` is the attribute and stays; the text node is prose.)
+- `<div class="q">` "Question" and `<div class="tag">` "End of chapter 0.X":
+  repeated structural identifiers — leave in **English** (consistent convention
+  across all bodies; do not translate).
+- All other visible text nodes (headings, paragraphs, lists, captions,
+  blockquotes, table cells, prose around inline `<code>`): translate.
+
 ## Process per body
 translate → independent review (accuracy, glossary, HTML/code fidelity,
 completeness, register) → fix → re-review until pass.
