@@ -25,3 +25,13 @@ test('does not include the trailing script block as a page', () => {
   const pages = extractPages(SAMPLE);
   assert.ok(!pages.some(p => p.html.includes('const x=1')));
 });
+
+test('strips the dead legacy .page-nav block from a page body', () => {
+  const sample = `<div class="page" data-page="z1"><p>keep me</p><div class="page-nav"><button onclick="goPage('x')">dead</button></div></div>`;
+  const pages = extractPages(sample);
+  const z1 = pages.find(p => p.page === 'z1');
+  assert.ok(z1);
+  assert.ok(z1.html.includes('keep me'));
+  assert.ok(!z1.html.includes('page-nav'));
+  assert.ok(!z1.html.includes('goPage'));
+});
