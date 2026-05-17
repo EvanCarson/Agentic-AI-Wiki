@@ -35,3 +35,8 @@ test('strips the dead legacy .page-nav block from a page body', () => {
   assert.ok(!z1.html.includes('page-nav'));
   assert.ok(!z1.html.includes('goPage'));
 });
+
+test('OUT_DIR points at the en/ locale subdirectory', async () => {
+  const mod = await import('../extract-chapters.mjs');
+  assert.ok(mod.OUT_DIR.replace(/\\/g, '/').endsWith('src/content/field-guide/en'));
+});
