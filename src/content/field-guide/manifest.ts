@@ -67,6 +67,7 @@ export function chapterBySlug(slug: string): FlatChapter | undefined {
 export function chapterTitle(c: { title: Localized }, locale: Locale): string {
   return c.title[locale];
 }
+// Accepts a Part ({name}) or a flattened CHAPTERS entry ({partName}); the flatMap renames name->partName.
 /** Localized part name. */
 export function partName(p: { name: Localized } | { partName: Localized }, locale: Locale): string {
   return 'name' in p ? p.name[locale] : p.partName[locale];
