@@ -1,0 +1,644 @@
+<section class="phase">
+    <div class="phase-num">3.2</div>
+    <div class="week">Part III / Evaluate · The architecture, not the activity</div>
+    <h2>评估（eval）的三个层次：何时运行哪一层，以及为何每层单独都不够用。</h2>
+    <p class="goal">第 3.1 章讲授了在发布前进行评估的纪律。第 3.3 章讲授了让你能够大规模评分的评判机制。本章讲授连接两者的架构：<strong>评估分为三个不同的层次</strong>，每个层次有其自身的节奏、范围、成本，以及它所捕获的失败类型。大多数生产级智能体（agent）需要全部三层；将任何一层当作其他层的替代品，正是团队在生产中发现回归（regression）的方式——而他们原以为自己的评估会捕获到这些问题。读完本章，你将了解哪些检查属于哪个层次、每个层次擅长和不擅长什么，以及如何将各层组合成一个能快速、低成本地捕获重要问题的反馈系统。</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>为何评估分为三个层次。</h3>
+
+      <p>软件工程中的测试金字塔隐喻——底部是单元测试，中间是集成测试，顶部是端到端测试——部分适用于智能体评估。其形状相似：底部廉价且快速的测试在每次变更时运行；顶部昂贵且缓慢的测试很少运行，但能覆盖廉价测试无法触及的范围。结构上如出一辙。</p>
+
+      <p>隐喻失效之处在于：<strong>智能体输出是非确定性的，真实标签（ground truth）往往是主观的，而生产环境会暴露任何离线测试都无法预测的失败</strong>。因此，智能体版本的金字塔在顶部有一个传统软件测试所没有的第三个角色：将生产可观测性（observability）作为第一等公民的评估层，而不仅仅是监控。你不是用可观测性取代测试——而是两者兼做，让一者为另一者提供信息。</p>
+
+      <h4>三个层次，一览无余</h4>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  THE THREE LAYERS                                                │
+│                                                                  │
+│   Layer 3:    PRODUCTION TELEMETRY (always on)                   │
+│               Real traffic, real users.                          │
+│               No ground truth, statistical signal.               │
+│               Catches: drift, novel failures, production-only    │
+│               failure modes (load, edge cases, real users).      │
+│                                                                  │
+│        ▲                                                         │
+│        │  signal feeds back into Layer 2                         │
+│        │                                                         │
+│                                                                  │
+│   Layer 2:    OFFLINE JUDGE-BASED EVAL SUITE                     │
+│               Curated queries, full agent runs, LLM judges.      │
+│               Slow ($, minutes-hours), high signal.              │
+│               Catches: behavioral regressions, quality changes,  │
+│               judgment-level failures.                           │
+│                                                                  │
+│        ▲                                                         │
+│        │  runs on PRs that need it; before releases              │
+│        │                                                         │
+│                                                                  │
+│   Layer 1:    DETERMINISTIC CHECKS                               │
+│               Schema, format, structural correctness.            │
+│               Fast (seconds), cheap ($0), zero ambiguity.        │
+│               Catches: malformed outputs, contract violations,   │
+│               broken tool calls, budget violations.              │
+│                                                                  │
+│  Runs on:    every commit, every PR, every push                  │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>这是结构性图景。每个层次都有其自身的纪律——什么属于该层、其节奏如何、它专门捕获哪类失败。</p>
+
+      <h4>区分各层的四个属性</h4>
+
+      <p>四条轴线捕捉了各层的差异。理解每条轴线有助于你判断某个特定检查应放在哪里。</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>属性</div>
+          <div>第 1 层（确定性）</div>
+          <div>第 2 层（评判套件）</div>
+          <div>第 3 层（生产）</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">节奏</div>
+          <div class="vector">每次变更</div>
+          <div class="defense">PR / 定时 / 预发布</div>
+          <div class="vector">持续，始终开启</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">速度</div>
+          <div class="vector">秒级</div>
+          <div class="defense">分钟到小时</div>
+          <div class="vector">实时</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">成本（cost）</div>
+          <div class="vector">几乎为零</div>
+          <div class="defense">每次运行 $1–$200</div>
+          <div class="vector">计算 + 存储；查询费用已计入</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">真实标签</div>
+          <div class="vector">有——精确</div>
+          <div class="defense">有——已标注</div>
+          <div class="vector">无——统计信号</div>
+        </div>
+      </div>
+
+      <p>从这些轴线中浮现出的规律：随着层次升高，成本和信号质量都会提升，而反馈速度则下降。你希望在能被检测到的最低层次捕获失败——既因为更便宜，也因为反馈回路更快。</p>
+
+      <h4>每层的专长</h4>
+
+      <p>不同的失败模式出现在不同的层次，将各层当作替代品会留下空缺。</p>
+
+      <p><strong>第 1 层捕获：</strong>输出模式（schema）违规、缺少引用、工具调用（tool use）与模式不匹配、预算超支、与禁止响应匹配的拒绝模式。这些事情有明确的对错之分。破坏其中一项的回归会在数秒内被 CI 在合并前捕获。捕获成本低，修复成本也低。</p>
+
+      <p><strong>第 2 层捕获：</strong>不违反任何确定性检查但产生<em>更差答案</em>的行为变化。一个语法上正确但将准确率降低 4 个百分点的新提示词（prompt）；一次模型替换产生了格式正确但帮助性更低的响应；一次工具描述变更悄然改变了智能体的路由。这些只能通过端到端运行智能体并对输出质量进行评分来检测。第 1 层看不到它们，因为结构上没有任何问题。</p>
+
+      <p><strong>第 3 层捕获：</strong>随时间发生的漂移、评估集中不存在的新型失败模式、仅在生产中出现的条件（真实用户查询、真实网络延迟（latency）、真实工具故障、真实对抗性输入）。第 3 层检测中最重要的类别：<em>真实用户发送的、而你的评估集未曾预见的查询</em>。第 2 层基于固定的精选集进行评分；第 3 层揭示该集合的缺失之处。</p>
+
+      <h4>为何每层不可替代</h4>
+
+      <p>诱惑——尤其是在项目初期——是只投入一层并将其视为足够。三种可预见的失败模式随之而来。</p>
+
+      <p><strong>"我们有第 2 层；不需要第 1 层。"</strong> 第 2 层既慢又贵。在每次提交上运行它并不可行。因此，提交会以延迟的时间表仅通过第 2 层发布，而基础正确性检查（输出应能解析为 JSON）本可捕获该漏洞——但只是在数小时后、合并之后、部署（deployment）之后。第 1 层在 PR 上 5 秒内就能捕获。跳过第 1 层会让第 2 层的反馈回路比应有的更慢。</p>
+
+      <p><strong>"我们有第 1 层；目前已够用。"</strong> 第 1 层快速且廉价，因此很容易止步于此。但第 1 层根据定义只能捕获确定性失败——而智能体中大多数质量回归并非确定性失败。智能体会产生格式良好但<em>更差</em>的输出；第 1 层会愉快地通过。止步于第 1 层的团队会持续发布质量回归，因为他们的测试检测不到这些问题。</p>
+
+      <p><strong>"我们有第 1 层和第 2 层；生产监控是运维的事，不是工程的事。"</strong> 反向错误。没有第 3 层，你就没有关于智能体在用户实际发送的查询上表现如何的信号——而这些查询不可避免地与你精选评估集中的内容不同。真实用户会触及评估集中未包含的边界情况。生产流量模式会随时间变化。智能体在你未测量的流量细分上的质量会悄然下降。第 3 层是捕获这一切的手段——并将空缺反馈回第 2 层的精选过程，形成闭环。</p>
+
+      <h4>金字塔形状：底部多，顶部少</h4>
+
+      <p>健康的生产智能体中，各层检查的比例遵循倒金字塔模式：</p>
+
+      <ul>
+        <li><strong>第 1 层</strong>：数十到数百个独立的确定性检查。每个运行时间以毫秒计。每次提交运行全部。</li>
+        <li><strong>第 2 层</strong>：30–100 个精选查询的评估套件（eval suite）。每次运行都是完整的智能体调用。在选定的 PR 和发布节奏上运行。</li>
+        <li><strong>第 3 层</strong>：对 100% 生产流量的持续指标监控。采样进行深度分析。始终开启的仪表盘。</li>
+      </ul>
+
+      <p>读懂这些比例：第 1 层有许多廉价快速的检查，第 2 层有较少但更彻底的检查，第 3 层有广泛的统计观测。按此顺序构建系统——先第 1 层，再第 2 层，再第 3 层——是自然的演进，因为每层都是上一层的基础。第 2 层的评估建立在第 1 层确保的结构化输出之上。第 3 层的指标依赖于第 2 层使其成为常规的仪器化模式。</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我的团队做了几个月的"评估"，但没有全部三层。我们最可能缺少哪一层？</div>
+        <div class="answer">
+          <p>跨团队的统计规律：大多数团队只有第 2 层。叙事通常是："我们需要评估智能体，来构建一个带评判者的测试集吧。"这会让你得到一个第 2 层系统。第 1 层和第 3 层很容易被跳过，因为第 2 层已经产出了可见的数字。</p>
+          <p>诊断方法：你是否有 CI，能在数秒内对模式回归发出失败信号，还是说这个漏洞只有在运行完整评估套件时才会被发现？那就是第 1 层的空缺。你是否有生产仪表盘，能在明天智能体的每查询成本或用户差评率飙升时发出警报？那就是第 3 层的空缺。</p>
+          <p>人们通常遗漏的两层恰恰是最容易设置的两层。关键在于将它们视为独立的关注点，而非评估套件的附带思考。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">这与第 3.1 章的评估节奏图真的不同吗？</div>
+        <div class="answer">
+          <p>互补，而非重复。第 3.1 章讲的是节奏——何时运行评估、如何解读它们、如何预测后再衡量。本章讲的是底层结构：存在哪些类型的评估，以及哪种类型服务于哪种目的。3.1 的评估节奏图主要描述了第 2 层（离线精选查询套件）。本章则说：那是三层中的一层，你还需要其他两层。</p>
+          <p>两章合在一起给你提供了两个组件——实践的节奏（3.1）以及底层系统的架构（3.2）。团队可以在任何一层之上执行 3.1 的节奏；节奏是相同的，但你测量的对象取决于你正在使用哪一层。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">这些层次是 LLM 智能体特有的，还是可以推广到其他机器学习系统？</div>
+        <div class="answer">
+          <p>结构可以推广——确定性检查 + 离线基准（benchmark）+ 生产监控是跨机器学习系统（分类器、推荐系统等）的通用模式。LLM 智能体特有的是每层的<em>相对重要性</em>。</p>
+          <p>对于分类器，第 2 层（基于标注测试集的离线基准）承担大部分工作；确定性检查较为次要。对于 LLM 智能体，第 1 层（模式、格式、结构性）捕获的总失败比例更高，因为输出空间更丰富，结构上可能出错的地方更多。第 3 层也更重要，因为智能体面对开放式输入（分类器的评估集是生产的合理代理；智能体的精选评估集从来都不是）。</p>
+          <p>因此各层形状相同；权重不同。对于智能体而言：比预期更多的第 1 层，健壮的第 2 层，以及在前几次发布后驱动大部分迭代循环的第 3 层。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>第 1 层：确定性检查。</h3>
+
+      <p>这是每个人都投入不足的层次，因为它感觉不像"评估"——它感觉像"测试"。这恰恰是正确的框架。<strong>第 1 层评估是智能体的单元测试</strong>：小而专注的检查，运行时间以毫秒计，捕获特定回归，并在每次提交时运行。它们几乎不花什么成本，并能防止相当一部分漏洞——否则这些漏洞需要昂贵的第 2 层运行才能检测到。</p>
+
+      <p>人们陷入的陷阱：认为智能体不能有单元测试风格的检查，因为它们的输出是非确定性的。<em>它们的输出是非确定性的；它们的契约不是。</em> 智能体的工具调用（tool calling）应始终与模式匹配。它的引用应始终指向真实来源。它的预算绝不能超支。这些是确定性属性，无论模型做出什么决定，在每次运行时都成立——这意味着它们可以廉价地进行测试。</p>
+
+      <h4>属于第 1 层的类别</h4>
+
+      <p>六个具体类别，每类附有检查示例：</p>
+
+      <p><strong>模式验证。</strong> 智能体的结构化输出与其声明的模式匹配。工具调用具有正确的参数类型。调查结果对象包含所有必填字段。JSON 输出通过验证。对智能体产生的每个输出运行模式检查；标记任何违规。</p>
+
+      <p><strong>引用的存在性与格式。</strong> 智能体输出中的每条引用都指向对话中出现过的源 URL 或文档 ID。没有捏造的 URL。没有格式错误的引用令牌（token）。对引用格式运行正则 / 结构性检查，并对智能体可访问的实际来源进行查找检查。</p>
+
+      <p><strong>工具调用的正确性。</strong> 工具名称在工具集中存在。必填参数已提供。参数值通过模式的枚举 / 范围 / 模式约束。工具使用 ID 在请求和响应之间匹配。这是第 0.3 章协议级纪律的自动化版本。</p>
+
+      <p><strong>预算合规性。</strong> 智能体保持在其工具调用预算、令牌预算、时间预算之内。触及预算上限的运行不一定是失败——但<em>超出</em>上限的运行是你执行代码中的漏洞（第 1.1 章的步骤预算）。</p>
+
+      <p><strong>禁止动作检查。</strong> 智能体绝不调用黑名单中的工具。绝不访问沙箱之外的路径。绝不产生与禁止模式匹配的输出（例如泄露 API 密钥、原始 PII）。这些是否定断言——永远不应出现的事情——而且检查成本低廉。</p>
+
+      <p><strong>拒绝模式。</strong> 当智能体拒绝请求时，它通过系统支持的结构化拒绝路径这样做，而不是产生看似答案实则不是的自由文本。"表面同意实则拒绝"的拒绝是两全其失；检查结构化形式可以捕获这一点。</p>
+
+      <h4>第 1 层检查的具体形态</h4>
+
+      <p>第 1 层检查是<em>普通代码</em>，而非基于 LLM 的代码。重点是快速、廉价且无歧义。合理的第 1 层套件是一个测试函数目录，每个函数对一次智能体运行的一个属性进行断言。</p>
+
+<pre class="standalone"><span class="c-cm"># tests/layer1/test_output_contracts.py</span>
+<span class="c-kw">import</span> pytest
+<span class="c-kw">from</span> agent <span class="c-kw">import</span> run_agent
+<span class="c-kw">from</span> agent.schemas <span class="c-kw">import</span> ResearchOutput
+<span class="c-kw">from</span> jsonschema <span class="c-kw">import</span> validate
+
+<span class="c-cm"># Property: every agent output validates against its declared schema.</span>
+<span class="c-fn">@pytest.mark.parametrize</span>(<span class="c-st">"query"</span>, [
+    <span class="c-st">"What is the capital of France?"</span>,           <span class="c-cm"># trivial</span>
+    <span class="c-st">"Summarize this PDF in three points."</span>,        <span class="c-cm"># typical</span>
+    <span class="c-st">"Find all bugs in this commit's changes."</span>,     <span class="c-cm"># complex</span>
+])
+<span class="c-kw">async def</span> <span class="c-fn">test_output_validates_against_schema</span>(query):
+    result = <span class="c-kw">await</span> run_agent(query)
+    validate(instance=result, schema=ResearchOutput.schema())
+    <span class="c-cm"># Passes if the agent's output is structurally valid.</span>
+    <span class="c-cm"># Fails immediately if any field is the wrong type or missing.</span>
+
+
+<span class="c-cm"># Property: every cited URL appears in the conversation's source list.</span>
+<span class="c-kw">async def</span> <span class="c-fn">test_no_fabricated_citations</span>():
+    query = <span class="c-st">"Summarize recent EV battery progress with citations."</span>
+    result = <span class="c-kw">await</span> run_agent(query)
+    cited_urls = {c[<span class="c-st">"source_url"</span>] <span class="c-kw">for</span> c <span class="c-kw">in</span> result[<span class="c-st">"claims"</span>]}
+    seen_urls = collect_seen_urls(result[<span class="c-st">"trace"</span>])
+    fabricated = cited_urls - seen_urls
+    <span class="c-kw">assert not</span> fabricated, <span class="c-kw">f</span><span class="c-st">"Agent cited URLs it never accessed: {fabricated}"</span>
+
+
+<span class="c-cm"># Property: tool calls never exceed the configured budget.</span>
+<span class="c-kw">async def</span> <span class="c-fn">test_budget_enforcement</span>():
+    result = <span class="c-kw">await</span> run_agent(<span class="c-st">"Complex multi-step research query"</span>,
+                              tool_budget=<span class="c-st">15</span>)
+    <span class="c-kw">assert</span> result[<span class="c-st">"tool_calls_made"</span>] &lt;= <span class="c-st">15</span>
+
+
+<span class="c-cm"># Property: the agent never calls tools from the blocklist.</span>
+FORBIDDEN_TOOLS = {<span class="c-st">"send_email"</span>, <span class="c-st">"delete_record"</span>, <span class="c-st">"transfer_funds"</span>}
+
+<span class="c-kw">async def</span> <span class="c-fn">test_no_forbidden_tools</span>():
+    result = <span class="c-kw">await</span> run_agent(<span class="c-st">"Read-only research request"</span>)
+    used = {c[<span class="c-st">"tool_name"</span>] <span class="c-kw">for</span> c <span class="c-kw">in</span> result[<span class="c-st">"trace"</span>][<span class="c-st">"tool_calls"</span>]}
+    <span class="c-kw">assert not</span> (used &amp; FORBIDDEN_TOOLS), \
+        <span class="c-kw">f</span><span class="c-st">"Agent used forbidden tools: {used &amp; FORBIDDEN_TOOLS}"</span></pre>
+
+      <p>这些看起来像普通的 pytest 测试，因为它们<em>就是</em>普通的 pytest 测试。它们与其他测试一起存放在代码库中，在每次提交时运行，快速失败，并产生清晰的错误信息。维护成本低——当一个检查开始失败时，你通常能在几分钟内知道原因。</p>
+
+      <h4>第 1 层捕获了其他地方难以捕获的什么</h4>
+
+      <p>第 1 层专门防止的回归类别：<strong>无声的契约违规</strong>。这些漏洞中，智能体的行为以一种破坏下游消费者的方式发生变化，却没有产生明显错误的输出。</p>
+
+      <p>已在生产智能体中发生的具体示例：</p>
+
+      <ul>
+        <li>一次模型替换（Sonnet → Haiku 以降低成本）导致智能体偶尔产生 <code class="inline">"confidence": "moderate"</code>，而不是模式允许的值（<code class="inline">"high" | "medium" | "low"</code>）。输出看起来合理；下游解析器默默地将其视为缺失。第 1 层在第一次运行时就捕获了这个问题；第 2 层可能会错过它，如果评判者没有检查那个特定字段的话。</li>
+        <li>一次提示词编辑导致智能体在其工具调用周围添加解释性文本，破坏了一个期望纯函数调用输出的下游工具追踪（trace）分析器。第 1 层（断言工具调用与精确模式匹配）捕获了它；第 2 层（语义质量评分）没有。</li>
+        <li>对引用提取提示词的变更导致智能体以 <code class="inline">[1] [2]</code> 脚注风格而非内联 URL 风格发出引用。文本对人类（以及对 LLM 评判者）阅读起来很好；但引用导出工具生成了空的 CSV 文件。第 1 层捕获了它；第 2 层没有。</li>
+      </ul>
+
+      <p>规律：这些回归不会显著改变<em>质量</em>，它们改变的是<em>契约符合性</em>。第 2 层评分质量；第 1 层评分契约。两者都重要。</p>
+
+      <h4>第 1 层无法捕获什么</h4>
+
+      <p>为完整起见，列出第 1 层在结构上盲目的失败类型。将第 1 层视为足够意味着这些会漏过去：</p>
+
+      <ul>
+        <li><strong>格式良好的输出中的质量回归。</strong> 智能体的答案是错误的答案，但 JSON 有效，引用存在，且没有工具被误用。第 1 层说通过；答案仍然是错的。</li>
+        <li><strong>细微的判断偏移。</strong> 一个新提示词让智能体在不确定的声明上略微更自信，或略微更啰嗦，或略微不太可能升级边缘情况。这些出现在聚合质量指标中，而不是任何单个结构性检查中。</li>
+        <li><strong>跨查询的分布性问题。</strong> "在这 50 个测试上有效"并不意味着"在下一个 500 个用户查询上有效"。第 1 层测试特定案例；它无法泛化。</li>
+      </ul>
+
+      <p>这些是第 2 层的用武之地。两层的关系：第 1 层说"智能体仍有一个有效的契约"；第 2 层说"智能体在该契约内仍能产出好答案"。两个问题都重要；两层都存在，因为每层回答其中一个。</p>
+
+      <h4>纪律：将第 1 层测试作为功能工作的一部分来编写</h4>
+
+      <p>把第 1 层做对的团队，对待它的方式与对待普通代码的单元测试一样：<em>每个新行为都要有一个测试</em>。新工具？测试模式验证通过。新输出字段？测试它出现在输出中。新拒绝路径？测试拒绝模式匹配。新预算？测试它被执行。</p>
+
+      <p>这听起来显而易见；这是团队快速推进时容易漂移的纪律。跳过它的结果是：第 1 层套件覆盖了 6 个月前的功能，并默默地遗漏了本周功能上的回归。修复方法与代码单元测试相同——如果你有纪律就用 TDD，否则就补充覆盖，但始终要快速弥补差距。</p>
+
+      <div class="callout tip">
+        <p>如果你的第 1 层套件运行时间超过 30 秒，说明有问题——要么你把第 2 层风格的检查偷渡进了这个廉价层（本应是确定性的检查内藏着 LLM 评判者调用），要么你把完整的智能体调用作为第 1 层的一部分在运行（那些属于第 2 层）。第 1 层检查应该在捕获的输出上测试契约，而不是生成新的输出。如果你需要一个输出来进行检查，就缓存智能体在早先运行中的响应；这样可以保持检查的快速，并使失败原因显而易见。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我可以在第 1 层检查工具调用<em>序列</em>吗？"智能体应始终在获取之前先搜索"？</div>
+        <div class="answer">
+          <p>有时可以——问题在于序列约束究竟是真正的结构性约束，还是质量偏好。"工具 X 必须在工具 Y 之前"可以是第 1 层断言，如果该约束是硬性的（智能体的 API 要求 Y 跟在 X 之后），或者违反它总是表示一个漏洞的话。</p>
+          <p>"智能体通常应只获取相关 URL"不是第 1 层的材料——那是第 2 层处理的质量判断。界线在于：第 1 层捕获<em>绝不应发生</em>的违规，而非<em>应很少发生</em>的模式。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">如何处理非确定性输出的第 1 层测试？模型在不同运行中可能产生略有不同的模式。</div>
+        <div class="answer">
+          <p>两种模式。第一，<strong>不变量检查</strong>：无论具体输出如何，某些属性总是成立（输出通过模式验证、引用未被捏造、预算被遵守）。这些在非确定性输出上运行良好，因为不变量与具体值无关。</p>
+          <p>第二，<strong>基于属性的测试</strong>：对同一输入多次运行智能体，并检查所有运行是否满足相同的不变量。如果 10 次运行中有 9 次通过模式验证，1 次不通过，那就是第 1 层漏洞——不变量应每次都成立。第 0.3 章的严格模式使模式不变量几乎有保证；没有它，你可能会看到偶发的违规，值得捕获。</p>
+          <p>无论哪种方式，你都不是在断言"输出是 X"——你是在断言"输出具有属性 P"。属性在非确定性中是稳定的，而具体值则不然。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">不稳定的第 1 层测试怎么办——95% 时间通过的检查？</div>
+        <div class="answer">
+          <p>不稳定的第 1 层测试是智能体或测试本身的漏洞。第 1 层的全部意义在于确定性——如果你检查的属性依赖于模型的行为，它实际上就不是第 1 层属性，你把它归错类了。</p>
+          <p>诊断：这个测试检查的是契约（应 100% 通过，句号）还是质量标准（取决于模型的行为）？如果是契约，找到它不稳定的原因并修复。如果是质量，将其移到第 2 层，在那里统计评估是合适的。</p>
+          <p>让不稳定的测试积累会毒化水源——团队不再信任 CI 信号，调查失败的反射变弱，真正的漏洞被忽视为"可能是不稳定的"。在第 1 层坚守零不稳定性的底线。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>第 2 层：离线评判者评估套件。</h3>
+
+      <p>这是大多数团队已有的层次，通常无限定地称之为"评估"。也是第 3.1 章和第 3.3 章深入介绍的层次——3.1 章讲授了使用它的纪律（假设、预测、裁决），3.3 章讲授了评分机制（LLM 作为评判者（LLM-as-judge）加校准）。本步骤将两者置于语境之中：<strong>第 2 层捕获通过第 1 层但产生更差答案的行为变化</strong>，运行速度比第 1 层更慢、成本更高，并有特定的成本和精选纪律来决定该层是否可持续。</p>
+
+      <h4>按类别划分，什么属于这里</h4>
+
+      <p>第 2 层评估是在一组精选的代表性查询上进行完整智能体运行，并由 LLM 评判者沿多个维度对输出进行评分。五类检查属于这里：</p>
+
+      <p><strong>任务完成度。</strong> 智能体是否成功完成了分配给它的任务？它是否返回了实质性答案、适当升级，还是优雅地失败？二值或分级；可由评判者检查（"智能体是否解决了用户的问题？"）。</p>
+
+      <p><strong>事实准确性。</strong> 当智能体做出声明时，这些声明是否正确？当它引用来源时，这些来源是否真正支持这些声明？第 4.3 章的引用忠实性检查在这里。可编程地获取来源；由 LLM 评判者给出裁决。</p>
+
+      <p><strong>质量判断。</strong> "答案好吗？"——由带有评分标准的 LLM 评判者评分。第 3.3 章的成对和逐点模式适用于此。评判者应在留出的校准集上（同样来自第 3.3 章）针对人类进行校准。</p>
+
+      <p><strong>轨迹合理性。</strong> 智能体通往答案的路径是否有意义？工具调用顺序合理，没有冗余搜索，没有明显浪费的步骤。评判者可以通过查看追踪来评估这一点。</p>
+
+      <p><strong>边缘情况处理。</strong> 一小组精选的棘手查询（模糊输入、提示词注入尝试、超出范围的请求、对抗性用户），其中正确行为是特定的。智能体在每个上的表现是否正确？</p>
+
+      <h4>第 2 层套件的形态</h4>
+
+      <p>典型的成熟第 2 层设置如下：</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  LAYER 2 EVAL SUITE — TYPICAL SHAPE                              │
+│                                                                  │
+│  Curated query set: 30–100 examples                              │
+│  ├─ "easy" tier:        ~15 (basic functionality regression)     │
+│  ├─ "typical" tier:     ~25 (representative production traffic)  │
+│  ├─ "hard" tier:        ~15 (challenging multi-step queries)     │
+│  ├─ "edge case" tier:   ~10 (refusals, ambiguity, adversarial)   │
+│  └─ "calibration" tier: ~15 (hand-labeled for judge validation)  │
+│                                                                  │
+│  Grading dimensions:                                             │
+│  ├─ task_completion         (binary or 0-1 graded)               │
+│  ├─ factual_accuracy        (citation faithfulness, 0-1)         │
+│  ├─ answer_quality          (judge with rubric, 1-4 scale)       │
+│  ├─ trajectory_sensibility  (judge over trace, 0-1)              │
+│  └─ edge_case_correctness   (specific assertions per example)    │
+│                                                                  │
+│  Per run:                                                        │
+│  ├─ Full agent invocation per query                              │
+│  ├─ Judges (with both-orderings discipline from chapter 3.3)     │
+│  ├─ Per-dimension scores + overall composite                     │
+│  └─ Cost: typically $1-$200 depending on agent complexity        │
+│                                                                  │
+│  Cadence:                                                        │
+│  ├─ "fast subset" (5–10 queries): run on every PR                │
+│  ├─ "full suite": run on selected PRs, scheduled, pre-release    │
+│  └─ "multi-run" (3× on noisy metrics): for release decisions     │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>这是第 3.1 章所描述的架构。第 3.3 章的 LLM 作为评判者方法论驱动了评分。第 2 层是前几章的机制实际运行的地方。</p>
+
+      <h4>双层节奏：快速子集 vs 完整套件</h4>
+
+      <p>让第 2 层在 CI 中可持续的纪律：在每个 PR 上运行的<strong>快速子集</strong>，以及更少运行的<strong>完整套件</strong>。快速子集是 5–10 个查询，选择以廉价方式覆盖主要维度；它在 2–5 分钟内运行，花费几分钱。完整套件是 30–100 个查询；在 20–60 分钟内运行，花费更多。</p>
+
+      <p>如何选择快速子集：选择每个主要维度各覆盖一次的查询。一个简单的任务完成测试，一个典型的引用忠实性测试，一个轨迹合理性测试，等等。快速子集的工作不是全面覆盖——而是对你最关心的维度进行回归检测。如果快速子集捕获了回归，你就不需要完整套件来确认。</p>
+
+      <p>完整套件运行于：</p>
+
+      <ul>
+        <li>当变更值得时（提示词重写、模型替换、检索变更），由 PR 标签（<code class="inline">eval-full</code>）触发。</li>
+        <li>按计划（每晚或每周）运行，不论 PR 活动，捕获漂移。</li>
+        <li>任何生产发布之前，作为发布门控。</li>
+        <li>对于发布门控决策，对噪声指标进行三次运行并取平均值（第 3.1 章的多次运行模式）。</li>
+      </ul>
+
+      <p>这种双层结构为你提供了快速的 PR 反馈（快速子集在几分钟内发出回归信号）和彻底的发布信心（完整套件在重要时提供高质量数字）。</p>
+
+      <h4>第 2 层的成本纪律</h4>
+
+      <p>第 2 层是评估成本可能失控的层次。每个查询都是一次完整的智能体运行加评判者调用——根据智能体复杂程度，通常每个查询花费 $0.10–$5。乘以 30–100 个查询，乘以每个触发完整套件的 PR，乘以多次运行平均，你可能面临每个发布周期数百美元的费用。</p>
+
+      <p>保持这个可管理的纪律：</p>
+
+      <p><strong>积极缓存。</strong> 将第 2.2 章的提示词缓存应用于智能体的系统提示词和评判者的系统提示词。对于多次运行的稳定评估套件，输入令牌的缓存命中率应在 70% 以上。评估套件成本比未缓存降低 50% 以上。</p>
+
+      <p><strong>合理调整子集大小。</strong> 快速子集应足够小，以便在每个 PR 上的 2–5 分钟内运行。完整套件应足够小，以便你实际上会按照你想要的节奏运行它。一个没人运行的"全面" 500 查询套件比一个每次发布都运行的 50 查询套件更糟糕。</p>
+
+      <p><strong>尽可能使用廉价评判者。</strong> 评判者调用并不总是需要能力最强的模型。引用忠实性检查（"这个来源是否支持这个声明？"）足够简单，Haiku 就够用了。使用复杂评分标准的答案质量评分受益于 Sonnet。把昂贵的评判者留给需要它们的维度。</p>
+
+      <p><strong>在可行时批量处理。</strong> 批量 API（第 2.2 章）以 50% 的折扣适用于非时间敏感的评估运行。每晚或每周的完整套件运行可以使用批量处理，将成本减半。预发布运行通常需要标准延迟。</p>
+
+      <h4>精选问题</h4>
+
+      <p>第 2 层最难的部分不是运行评估——而是<em>维护精选查询集</em>。三种力量随时间对抗一个好的评估集：</p>
+
+      <p><strong>评估与生产之间的漂移。</strong> 你的评估集捕获了你构建它时智能体的预期用例。六个月后，真实用户在问不同的问题。智能体在评估集上可能得分 0.85，在实际生产查询上得分 0.65。修复方法：持续采样生产流量并将代表性案例添加到评估集中。第 3 层 → 第 2 层的反馈回路（本章的第 4 步）。</p>
+
+      <p><strong>对评估集的过拟合。</strong> 团队根据分数进行迭代。随着时间的推移，提示词变更会针对"评估套件通过"而不是"真实用户获得更好答案"进行优化。这是评估形式的古德哈特定律。防御措施：定期刷新评估集（每季度替换 10–20% 的新案例），保留一些查询不参与迭代循环（仅用于发布门控决策），并关注评估集分数与第 3 层生产指标之间的差距。</p>
+
+      <p><strong>维护负担。</strong> 集合中的每个查询都需要保持相关性，其预期行为保持准确，且不变得过时（关于已废弃功能的查询毫无用处）。季度性地整理评估集——审查每个查询，删除过时的，更新预期行为——是真正的工程工作。跳过它会让套件逐渐衰退。</p>
+
+      <p>诚实的框架：第 2 层评估集是一段软件，与生产代码有相同的维护需求。将其视为一次构建永不修改的团队最终会得到一个分数不反映现实的套件。将其视为活的事物的团队则能无限期地维持有用的信号。</p>
+
+      <h4>第 2 层专门捕获什么</h4>
+
+      <p>第 2 层检测而第 1 层无法检测的失败类别：</p>
+
+      <ul>
+        <li><strong>提示词编辑导致的质量漂移。</strong> 一个小的提示词变更使智能体在某个可衡量的维度上略微变差。第 1 层什么都看不到；第 2 层看到分数下降。</li>
+        <li><strong>模型替换导致的质量漂移。</strong> 在需要 Sonnet 推理能力的步骤上将其换成 Haiku。输出仍然通过验证；质量下降。</li>
+        <li><strong>轨迹回归。</strong> 智能体现在进行 8 次工具调用，而之前只进行 4 次，或对一类查询选择了错误的工具。第 1 层看不到这一点；第 2 层在轨迹合理性分数中捕获它。</li>
+        <li><strong>边缘情况回归。</strong> 一次变更在改善常见情况的同时，代价是正确处理拒绝或对抗性输入的能力下降。评估集的"边缘情况"层级专门用于捕获这一点。</li>
+      </ul>
+
+      <p>规律：任何"输出更差但仍格式良好"的失败都在第 2 层。</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">精选查询集应该多大？50 个真的够吗？</div>
+        <div class="answer">
+          <p>50 是一个合理的起点，支持四层结构（15 个简单 + 25 个典型 + 10 个边缘）。对于范围稳定的成熟智能体，这能提供有意义的信号——大多数回归会在多个查询中浮现。从统计角度看，50 个查询上的 4 个百分点下降是可检测的。</p>
+          <p>何时增加：随着智能体扩展范围（新工具、新领域、新用户细分），每个细分增加 10–20 个查询。多领域智能体最终可能达到 100–200 个查询。超过这个范围，你通常付出而学到的更少——在某个点上，更多的查询不会按比例提升信号，你的时间更好地用在第 3 层的生产反馈上。</p>
+          <p>何时缩减：如果一些查询总是通过或总是失败，它们没有提供信号。用实际能区分当前智能体状态的案例替换它们。正确的大小是集合中每个查询都能告诉你关于智能体当前状态的有用信息的大小。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">评估集应该包含真实用户查询还是合成查询？</div>
+        <div class="answer">
+          <p>两者都要，以真实为主。合成查询适合测试你可以描述但未自然出现过的特定行为（边缘情况、对抗性输入、拒绝）。真实用户查询更适合集合的大部分，因为它们捕获了智能体服务的实际分布。</p>
+          <p>隐私问题：真实用户查询可能包含 PII。修复方法是脱敏——用占位符替换具体个人数据，同时保留结构形状（"用户 [USER_ID] 想要退款 [ORDER_ID]"）。这保留了评估信号，同时删除了 PII。对于某些类别的智能体，即使是结构形状也会泄露信息；在这些情况下，编写与真实分布匹配的合成版本。</p>
+          <p>纯合成的评估集是一个警告信号。它们倾向于捕获团队想象用户做什么，而这与用户实际做什么系统性地不同。仅有合成集的评估与生产的差距很大。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">第 3.3 章提到的 LLM 评判者偏差——这不会影响第 2 层分数吗？</div>
+        <div class="answer">
+          <p>会——这正是第 3.3 章的校准纪律至关重要的原因。偏差在第 2 层不会消失；它只是潜伏在分数里。评估集结构中的"校准层"（15 个手动标注的查询）专门用于随时间追踪评判者的准确性。当校准一致性下降时，你知道评判者已经漂移，第 2 层分数需要考虑到这一点来解读。</p>
+          <p>纪律：在每次完整套件运行时同时进行校准。将校准一致性作为记分板中的指标报告。如果它降到阈值以下（第 3.3 章中的 70–80%），暂停基于评判者的决策，直到评判者重新校准。</p>
+          <p>没有这个，你的第 2 层数字是在一个悄然移动的刻度尺上的分数。有了它，你就能区分评判者何时改变了与智能体何时改变了。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>第 3 层：生产遥测。</h3>
+
+      <p>第 1 层捕获契约违规。第 2 层捕获对精选集的质量回归。<strong>第 3 层捕获你的评估集不知道该寻找什么的问题。</strong>真实用户流量会暴露你的想象力未能生成的边缘情况、你的基准无法捕获的分布漂移，以及只在生产中存在的新兴失败模式。没有第 3 层，你的评估告诉你"智能体通过了我们的测试"——它们不能告诉你"用户正在获得价值"。这是两种不同的陈述；两者都重要；第 3 层是你会错过的那一半。</p>
+
+      <h4>没有真实标签时你能测量什么</h4>
+
+      <p>生产流量没有标签。你不知道某个响应是否"好"——没有人类对其进行评分，没有评判者对其运行（或者如果有，在每个查询上运行代价昂贵）。第 3 层必须从它拥有的有限信息中提取信号。</p>
+
+      <p>六类可在真实流量上测量的信号，按推断难度递增排列：</p>
+
+      <p><strong>1. 运营指标（始终可轻松获取）。</strong>延迟、成本、错误率、令牌使用量、缓存命中率、工具调用次数。这些来自你的可观测性基础设施（第 2.1 章），无需额外工作。它们不会告诉你任何关于质量的信息，但会告诉你结构上何时出了问题——成本飙升意味着失控的智能体循环，延迟飙升意味着工具缓慢或模型拥塞。对这些设置警报；它们是你最快的生产预警系统。</p>
+
+      <p><strong>2. 工具调用模式。</strong>智能体使用哪些工具，以什么比例，以什么错误率？突然的变化——"智能体本周开始调用 search_docs 的频率是之前的 3 倍"——通常意味着某些东西发生了变化（用户查询分布、上游提示词、工具的行为）。捕获这些变化；调查原因。</p>
+
+      <p><strong>3. 行为分布。</strong>每次查询的工具调用次数、升级率、拒绝率、输出长度分布。这些告诉你智能体在聚合层面的行为。分布变化通常是信号——平均研究运行从 12 次工具调用跃升至 18 次；拒绝率从 8% 降至 3%。每个都值得调查。</p>
+
+      <p><strong>4. 用户来源的信号。</strong>点赞/差评、重试率、移交前对话长度、对链接来源的点击率。这些有噪声但是真实的——当用户差评率是平常的 2 倍时，某些东西已经退步了。信号是统计性的，而非每次查询；你需要足够的量才能清晰地看到它。</p>
+
+      <p><strong>5. 下游结果。</strong>用户是否完成了智能体正在帮助完成的任务？支持工单是否在没有人工升级的情况下得到解决？用户下周是否回来了？这些是最接近真实质量信号的——它们衡量智能体是否创造了真实价值——但它们是延迟的（你一周后才知道）且与许多其他因素混杂。将它们作为检查，而非主要信号。</p>
+
+      <p><strong>6. 采样质量评估。</strong>对生产流量的随机样本运行第 2 层风格的评判者。样本足够小以便可负担（比如 1% 的查询），但在规模上足够大以具有统计意义。你获得了"评估集对今天的流量会怎么说？"的持续读数。随着差距的开大，捕获评估与生产之间的差距。</p>
+
+      <h4>第 3 层仪表盘的形态</h4>
+
+      <p>生产智能体仪表盘的样子，专注于实际发出问题信号的指标：</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  LAYER 3 DASHBOARD — METRICS TO TRACK                            │
+│                                                                  │
+│  Tier 1: Always-on, alert-worthy                                 │
+│  ├─ error_rate              alert: &gt;2% over 5min                │
+│  ├─ latency_p95             alert: &gt;90th percentile of baseline │
+│  ├─ cost_per_query          alert: drift &gt;30% from baseline     │
+│  └─ thumbs_down_rate        alert: &gt;baseline + 2σ              │
+│                                                                  │
+│  Tier 2: Daily reviewed, trend-watched                           │
+│  ├─ tool_call_distribution  per tool, week-over-week             │
+│  ├─ escalation_rate         segmented by query type              │
+│  ├─ refusal_rate            segmented by query type              │
+│  ├─ avg_tokens_per_query    drift catches context bloat          │
+│  ├─ cache_hit_rate          drift catches anti-pattern regression│
+│  └─ unique_tool_call_chains diversity drops signal converged loops│
+│                                                                  │
+│  Tier 3: Weekly reviewed, deeper investigation                   │
+│  ├─ sampled_judge_scores    1% of queries, graded offline        │
+│  ├─ user_retry_rate         per conversation                     │
+│  ├─ outcomes_complete       did the user finish their task       │
+│  └─ eval_to_prod_gap        Layer 2 score vs Layer 3 estimate    │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>三个层级的指标，按不同节奏查看。第 1 级在深夜出问题时叫醒你。第 2 级是你的每日检查。第 3 级告知你的迭代循环——这些数字告诉你下一步要做什么。</p>
+
+      <h4>从第 3 层到第 2 层的反馈回路</h4>
+
+      <p>这是将一切联系在一起的纪律。第 3 层揭示你的评估集不知道的内容；第 2 层是这些知识被编码以用于未来回归检测的地方。循环如下：</p>
+
+      <div class="diagram">┌──────────────────────────────────────────────────────────────────┐
+│  THE PRODUCTION → EVAL FEEDBACK LOOP                             │
+│                                                                  │
+│  1. Layer 3 surfaces signal of a quality issue                   │
+│     (thumbs-down spike, low sampled judge scores in a            │
+│     particular segment, unusual tool-call pattern)               │
+│                                                                  │
+│  2. Engineer investigates: pulls the relevant production traces  │
+│     (chapter 2.1's observability), reads what the agent did      │
+│     and why                                                      │
+│                                                                  │
+│  3. Identifies the root cause and the failure pattern            │
+│                                                                  │
+│  4. Adds representative example(s) to the Layer 2 eval set       │
+│     This is the critical step — without it, the same issue       │
+│     can recur                                                    │
+│                                                                  │
+│  5. Fixes the issue (prompt change, tool fix, etc.)              │
+│                                                                  │
+│  6. Layer 2 now catches the regression if it returns. Layer 3    │
+│     continues monitoring; the cycle repeats for the next         │
+│     surfacing of an issue                                        │
+└──────────────────────────────────────────────────────────────────┘</div>
+
+      <p>这使三层系统随时间保持健壮。没有反馈回路，第 2 层就会变成一组跟不上现实的静态检查。有了它，每一个在生产中暴露的问题都会产生永久的测试覆盖。</p>
+
+      <p>纪律：当你调查生产问题时，在你为其添加第 2 层案例之前，修复是不完整的。"在生产中修复了"而没有"添加到评估套件"意味着漏洞可以悄然回归。工程节奏：每一个导致修复的第 3 层警报，也会导致一个小的第 2 层 PR。</p>
+
+      <h4>第 3 层专门捕获什么</h4>
+
+      <p>第 3 层检测而较低层次无法检测的失败类别：</p>
+
+      <ul>
+        <li><strong>分布漂移。</strong>你的评估集分布与真实流量分布不匹配，随着用户发现使用智能体的新方式，差距不断扩大。第 3 层的采样评判暴露这个差距。没有第 3 层，你不知道它正在发生。</li>
+        <li><strong>新型失败模式。</strong>智能体遇到了你的评估集未预见的查询类型，并产生了糟糕的输出。没有先前的测试覆盖它，没有评判者对其评分。第 3 层的用户信号（差评、重试率、留存率）即使在单个案例被错过时，也会在聚合层面暴露这一点。</li>
+        <li><strong>随时间漂移。</strong>模型被更新，工具被供应商修改，检索（retrieval）语料库漂移。智能体的质量在数周或数月内悄然变化。第 3 层的持续监控以第 2 层（在快照上运行）无法做到的方式捕获这一点。</li>
+        <li><strong>对抗性使用。</strong>真实用户以你的评估集未包含的方式探测智能体。其中一些探测成功地提取了意外行为。第 3 层对工具调用序列和输出格式的模式检测可以标记这一点。</li>
+      </ul>
+
+      <p>对于向许多用户发布的智能体，第 3 层是前几个月后大部分迭代循环信息的来源。你发布时的评估集大部分已经被覆盖；你在第 6 个月会发现的内容存在于生产流量中。</p>
+    </div>
+
+    <!-- ============ WORKED EXAMPLE ============ -->
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>一次回归在每个层次依次被捕获。</h3>
+
+      <p>为本章的所有内容提供落地示例：一个有代表性的智能体项目、三个真实形态的回归，每个在不同的层次被捕获。目的是展示每个层次的信号在实践中的样子——以及当某个层次缺失时会有什么漏过去。</p>
+
+      <h4>智能体概况</h4>
+
+      <p>一家金融科技 SaaS 的客户支持智能体，类似第 4.4 章的例子。三个专业化对等智能体（计费、技术支持、账户管理）加上一个路由层，三层（第 1 层、第 2 层和第 3 层）均已部署。我们将观察三周内三次回归冲击该系统。</p>
+
+      <h4>第 1 周：第 1 层捕获契约回归</h4>
+
+      <p><strong>变更内容。</strong>对计费智能体的提示词进行了编辑：添加了一句话，鼓励在拒绝退款时使用更具同理心的措辞。</p>
+
+      <p><strong>发生了什么。</strong>新提示词有时导致智能体将其结构化响应包裹在道歉性散文中——智能体发出的不是 <code class="inline">{"action": "decline", "reason": "..."}</code>，而是 <code class="inline">"I'm sorry, but here's what I can do: {"action": "decline", "reason": "..."}"</code>。模式验证器拒绝了该响应，因为外层文本破坏了 JSON 解析。</p>
+
+      <p><strong>如何被捕获。</strong>CI 在 PR 上运行了第 1 层测试。模式验证测试在 8 次代表性智能体运行中的 3 次上失败。CI 阻止了合并。工程师看到了失败，阅读了新提示词，注意到了问题，回滚了变更。从 PR 提交到发现漏洞的总时间：4 分钟。</p>
+
+      <div class="observe">
+        <div class="label">这条追踪所揭示的</div>
+        <p>第 1 层以低廉的成本即时捕获契约回归。没有浪费的智能体运行，没有消耗评判者时间，没有影响生产流量。工程师甚至不需要理解底层失败——"模式验证器失败了"就足以调查变更。对比同一回归绕过第 1 层的情况：它会在数小时后被第 2 层捕获（当完整套件运行时），会消耗一部分评估预算，并会阻止发布而非阻止 PR。第 1 层是契约问题上最小可能的反馈回路。</p>
+      </div>
+
+      <h4>第 2 周：第 2 层捕获质量回归</h4>
+
+      <p><strong>变更内容。</strong>路由智能体的模型从 Sonnet 换成了 Haiku，以降低成本。PR 描述："尝试用 Haiku 做路由——应该便宜且快速。"</p>
+
+      <p><strong>发生了什么。</strong>Haiku 的分类大多正确，但大约每 12 张工单就有 1 张被错误路由——将一个含有技术背景的计费查询发送给纯计费智能体，后者产生了正确的计费答案，但遗漏了底层的技术问题。第 1 层什么都看不到（路由发出了有效的结构化输出；计费智能体发出了有效的结构化输出）。但用户得到的答案实际上没有解决他们的问题。</p>
+
+      <p><strong>如何被捕获。</strong>由于该变更修改了核心组件，PR 被标记为 <code class="inline">eval-full</code>。第 2 层运行。在套件的 50 个查询中，有 4 个被设计用来测试跨域路由（第 4.4 章的模式）。在其中 3 个上，基于 Haiku 的新路由分类错误。完整套件报告如下：</p>
+
+<pre class="trace standalone"><span class="c-out">## 📊 eval-results
+
+vs main (e7b3c20)
+**overall: 0.821 → 0.768 (-0.053) ↓ [REAL]**
+
+|  metric                   |  base  |   pr   |  delta  | verdict |
+| ------------------------- | ------ | ------ | ------- | ------- |
+|  task_completion          | 0.880  | 0.840  | -0.040  |   ✓ REAL|
+|  factual_accuracy         | 0.940  | 0.940  |  0.000  |   ✓     |
+|  answer_quality           | 0.810  | 0.790  | -0.020  | noise   |
+|  trajectory_sensibility   | 0.780  | 0.620  | -0.160  |   ✓ REAL|
+|  edge_case_correctness    | 0.700  | 0.640  | -0.060  |   ✓ REAL|
+
+cost: $1.84 (full suite)  ·  runtime: 22m</span></pre>
+
+      <p>轨迹合理性的下降是决定性证据——它衡量的是"智能体通往答案的路径是否合理"，而在跨域案例上，路由后处理的路径现在是错误的。审查者评论道："看起来 Haiku 对跨域案例的路由有误。保留 Sonnet 进行路由，或者训练一个定制的 Haiku 微调路由器；无论哪种方式，这个 PR 都不能按原样发布。"作者关闭了 PR，并附上了学习笔记。</p>
+
+      <div class="observe">
+        <div class="label">这条追踪所揭示的</div>
+        <p>第 2 层捕获了第 1 层看不到的内容：格式良好但更差的输出。智能体从未违反任何契约；它只是产生了未能真正满足用户需求的答案。唯一检测到这一点的方法是在代表性查询上运行完整的智能体，并由评判者对轨迹进行评分。没有第 2 层，变更就会发布，路由失败会出现在生产中，用户会得到错误的帮助——这是一种代价高得多的学习方式。</p>
+      </div>
+
+      <h4>第 3 周：第 3 层捕获了两个较低层次都不知道要检查的问题</h4>
+
+      <p><strong>变更内容。</strong>没有代码变更。智能体一直稳定运行。第 2 层评估套件在每次每晚运行时都通过 0.821（基准）。</p>
+
+      <p><strong>发生了什么。</strong>在 10 天内，技术支持工单的差评率从 8% 漂移到 13%。技术支持工单的升级率保持不变。调查发现：技术支持智能体用于文档查询的一家供应商 SaaS 更改了其文档网站结构。智能体的 web-fetch 工具现在返回的页面中，相关内容埋在每个页面顶部新的营销材料下面。智能体读取页面顶部并基于过时的概述内容作答，错过了页面较低位置技术上正确的详细部分。</p>
+
+      <p><strong>如何被捕获。</strong>第 3 层的差评率仪表盘捕获了这次漂移。该指标超过了其警报阈值（基准 + 2σ，持续 24 小时）并通知了值班工程师。调查拉取了受影响的追踪（第 2.1 章的可观测性），找出了所有糟糕答案都来自使用 <code class="inline">fetch_docs</code> 访问受影响供应商的查询这一模式，并确定了根本原因。</p>
+
+      <p><strong>修复方案。</strong>团队修补了工具的内容提取逻辑，跳过营销材料并优先处理技术内容块。关键是：<em>他们还向第 2 层评估集添加了两个查询</em>——一个需要从该供应商获取并合成详细技术内容，一个专门测试内容提取逻辑。新测试将在同类回归再次发生时捕获它。</p>
+
+      <div class="observe">
+        <div class="label">这条追踪所揭示的</div>
+        <p>第 3 层捕获了两个较低层次都不可能捕获的内容。第 1 层什么都看不到（工具调用成功，输出通过验证）。第 2 层在其集合中没有能触发这种失败模式的查询——评估集是在这家供应商的文档发生变化之前构建的。了解智能体正在失败的唯一方式是观察真实用户在真实生产流量上的反应。修复之后，新的第 2 层案例弥合了差距：这种特定的失败形态再也不能悄然发生。从第 3 层到第 2 层的反馈回路将一次性的生产问题变成了永久的覆盖。</p>
+      </div>
+
+      <h4>三周共同揭示的内容</h4>
+
+      <p>三次回归，三个层次，三种不同的失败类型——每种只能在其特定层次被捕获：</p>
+
+      <ul>
+        <li>第 1 周的契约回归在第 2 层会是一个质量漏洞（缓慢、昂贵），在第 3 层会是一个面向用户的漏洞（非常昂贵）。第 1 层在数秒内就捕获了它。</li>
+        <li>第 2 周的质量回归如果只有第 1 层存在，就会被发布出去。第 2 层在合并前就捕获了它。第 3 层最终也会捕获它，但只有在用户收到了错误路由之后。</li>
+        <li>第 3 周的漂移根本没有办法被第 1 层或第 2 层单独捕获。只有持续的生产监控才能看到它。修复之后包含了第 2 层的更新，这样同样的漂移就不会再悄然漏过了。</li>
+      </ul>
+
+      <p>这是拥有全部三层的架构价值所在。每层捕获其他层在结构上无法捕获的一类失败。每层为其他层做贡献（第 3 层告知第 2 层的精选；第 2 层确保第 3 层的基准是有意义的）。运行全部三层的成本与将这些回归中的任何一个发布到生产而不捕获的成本相比微不足道——与出问题后进行专项事后漏洞调查的成本相比也微不足道。</p>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 3.2</div>
+      <h3>交付物</h3>
+      <p>对评估作为三层架构而非单一活动的深刻理解。第 1 层（确定性检查，每次提交，秒级和分钱级）捕获契约违规。第 2 层（离线评判套件，PR 和发布，分钟级和美元级）捕获质量回归。第 3 层（生产遥测，持续，实时）捕获你的评估集不知道要寻找的内容。从第 3 层到第 2 层的反馈回路使系统随时间保持健壮。对每层专门捕获其他层无法捕获的内容，以及保持每层可持续的成本纪律，有清晰的认识。</p>
+      <ul class="checklist">
+        <li>第 1 层套件：在每次提交时运行数十个 pytest 风格的检查，完整套件在 30 秒内完成</li>
+        <li>第 1 层覆盖：模式、引用、工具调用正确性、预算合规性、禁止动作、拒绝模式</li>
+        <li>第 2 层套件：跨层级（简单 / 典型 / 困难 / 边缘 / 校准）的 30–100 个精选查询</li>
+        <li>第 2 层在五个维度上评分：任务完成、准确性、质量、轨迹、边缘情况</li>
+        <li>双层节奏：每个 PR 上的快速子集，需要时在 PR 上运行完整套件 + 发布门控</li>
+        <li>第 2 层：评判者校准已追踪，提示词缓存已应用，离线运行使用批量 API</li>
+        <li>第 3 层仪表盘：三个层级（值得警报 / 每日 / 每周），包含采样评判分数</li>
+        <li>第 3 层 → 第 2 层的反馈纪律：每次生产修复都包含一个第 2 层 PR</li>
+        <li>评估与生产差距的测量：第 2 层分数 vs 第 3 层采样估计</li>
+        <li>季度性整理第 2 层评估集：刷新 10–20%，删除过时案例</li>
+        <li>遵守 PII 规定的生产查询采样管道；样本流入第 2 层候选集</li>
+      </ul>
+    </div>
+
+
+  </section>
