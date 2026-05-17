@@ -5,9 +5,9 @@ import { parse } from 'node-html-parser';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-/** Parse HTML, return [{ page, html }] for every <div class="page" data-page>. */
+/** Parse HTML, return [{ page, html }] for every <div> with class "page" and a data-page attribute. */
 export function extractPages(htmlString) {
-  const root = parse(htmlString, { comment: false });
+  const root = parse(htmlString, { comment: true });
   const nodes = root.querySelectorAll('div.page[data-page]');
   return nodes.map(n => ({
     page: n.getAttribute('data-page'),
