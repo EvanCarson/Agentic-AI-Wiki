@@ -11,7 +11,10 @@ Applied consistently across all 22 bodies; reviewers enforce it.
 2. Keep every HTML tag, attribute, class, id, `data-*`, and `href` unchanged.
    Translate only human-readable text nodes and visible prose.
 3. Established technical terms: on first use in a body, write
-   `中文（English）`; thereafter use 中文 alone.
+   `中文（English）`; thereafter use 中文 alone. The parenthetical MUST be the
+   **English** source term, never the Chinese repeated. Correct:
+   `延迟（latency）`, `提示词（prompt）`, `上下文窗口（context window）`.
+   WRONG: `延迟（延迟）`, `提示词（提示词）`.
 4. Do not translate: product/API names (Anthropic, OpenAI, Claude, GPT),
    library names, CLI flags, file paths, numbers, identifiers.
 5. Preserve inline `<code>…</code>` payloads (identifiers/symbols) verbatim;
