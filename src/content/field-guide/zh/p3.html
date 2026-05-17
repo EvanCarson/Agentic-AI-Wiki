@@ -1,0 +1,597 @@
+<section class="phase">
+    <div class="phase-num">1.3</div>
+    <div class="week">Part I / Build · Week 3</div>
+    <h2>让它可控、可并行、可中断。</h2>
+    <p class="goal">现在添加在第一阶段刻意跳过的功能。每一项都针对你在追踪（trace）中观察到的具体失败模式——而非假设性问题。并行工具调用（parallel tool calls）、用于上下文隔离（context isolation）的子智能体（subagent）、规划、以及中断。</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>启用并行工具调用。</h3>
+
+      <p>回顾你第一阶段的追踪记录。智能体（智能体）有多少次在搜索明显独立的内容时仍按顺序执行？"查找关于 X 的文档"→ 等待 → "查找关于 Y 的文档"→ 等待。每次等待都是一次到模型的往返加上一次到工具的往返。并行工具调用（parallel tool calls）将总延迟（latency）压缩为一次往返。</p>
+
+      <p>两套 API 都支持每轮多次工具调用——模型在单次响应中返回多个 <code class="inline">tool_use</code>（或 <code class="inline">function_call</code>）块。你的循环只需并发执行这些调用，并将每个结果与正确的调用 ID 配对。</p>
+
+      <h4>变更：异步执行</h4>
+
+      <p>我们使用 Python 的 <code class="inline">asyncio</code> 并发运行工具处理程序。处理程序本身不必是异步的——我们用 <code class="inline">asyncio.to_thread</code> 包装同步函数。</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># agent/loop.py — parallel-capable</span>
+<span class="c-kw">import</span> asyncio
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> AsyncAnthropic
+
+client = AsyncAnthropic()
+
+<span class="c-kw">async def</span> <span class="c-fn">run_one_tool</span>(block):
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> asyncio.to_thread(
+            HANDLERS[block.name], **block.input
+        )
+        <span class="c-kw">return</span> {
+            <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+            <span class="c-st">"tool_use_id"</span>: block.id,
+            <span class="c-st">"content"</span>: <span class="c-kw">str</span>(result),
+        }
+    <span class="c-kw">except</span> <span class="c-kw">Exception</span> <span class="c-kw">as</span> e:
+        <span class="c-kw">return</span> {
+            <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+            <span class="c-st">"tool_use_id"</span>: block.id,
+            <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"error: {e}"</span>,
+            <span class="c-st">"is_error"</span>: <span class="c-kw">True</span>,
+        }
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_query, max_steps=<span class="c-st">10</span>):
+    messages = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_query}]
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(max_steps):
+        response = <span class="c-kw">await</span> client.messages.create(
+            model=<span class="c-st">"claude-sonnet-4-5"</span>,
+            max_tokens=<span class="c-st">4096</span>,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+        )
+        messages.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>,
+                         <span class="c-st">"content"</span>: response.content})
+
+        tool_blocks = [b <span class="c-kw">for</span> b <span class="c-kw">in</span> response.content
+                       <span class="c-kw">if</span> b.type == <span class="c-st">"tool_use"</span>]
+        <span class="c-kw">if</span> <span class="c-kw">not</span> tool_blocks:
+            <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"halted"</span>}
+
+        <span class="c-cm"># Check for submit_answer first (don't run others)</span>
+        <span class="c-kw">for</span> b <span class="c-kw">in</span> tool_blocks:
+            <span class="c-kw">if</span> b.name == <span class="c-st">"submit_answer"</span>:
+                <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"answered"</span>, **b.input}
+
+        <span class="c-cm"># PARALLEL: run all tool blocks at once</span>
+        results = <span class="c-kw">await</span> asyncio.gather(
+            *[run_one_tool(b) <span class="c-kw">for</span> b <span class="c-kw">in</span> tool_blocks]
+        )
+        messages.append({<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: results})
+
+    <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"step_limit"</span>}</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># agent/loop.py — parallel-capable</span>
+<span class="c-kw">import</span> asyncio, json
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> AsyncOpenAI
+
+client = AsyncOpenAI()
+
+<span class="c-kw">async def</span> <span class="c-fn">run_one_tool</span>(call):
+    args = json.loads(call.arguments)
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> asyncio.to_thread(
+            HANDLERS[call.name], **args
+        )
+        output = <span class="c-kw">str</span>(result)
+    <span class="c-kw">except</span> <span class="c-kw">Exception</span> <span class="c-kw">as</span> e:
+        output = <span class="c-kw">f</span><span class="c-st">"error: {e}"</span>
+    <span class="c-kw">return</span> {
+        <span class="c-st">"type"</span>: <span class="c-st">"function_call_output"</span>,
+        <span class="c-st">"call_id"</span>: call.call_id,
+        <span class="c-st">"output"</span>: output,
+    }
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_query, max_steps=<span class="c-st">10</span>):
+    input_items = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+                    <span class="c-st">"content"</span>: user_query}]
+
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(max_steps):
+        response = <span class="c-kw">await</span> client.responses.create(
+            model=<span class="c-st">"gpt-5.5"</span>,
+            instructions=SYSTEM_PROMPT,
+            tools=TOOLS,
+            input=input_items,
+        )
+        <span class="c-kw">for</span> item <span class="c-kw">in</span> response.output:
+            input_items.append(item.model_dump())
+
+        calls = [i <span class="c-kw">for</span> i <span class="c-kw">in</span> response.output
+                 <span class="c-kw">if</span> i.type == <span class="c-st">"function_call"</span>]
+        <span class="c-kw">if</span> <span class="c-kw">not</span> calls:
+            <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"halted"</span>}
+
+        <span class="c-kw">for</span> call <span class="c-kw">in</span> calls:
+            <span class="c-kw">if</span> call.name == <span class="c-st">"submit_answer"</span>:
+                <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"answered"</span>,
+                        **json.loads(call.arguments)}
+
+        <span class="c-cm"># PARALLEL: run all calls at once</span>
+        results = <span class="c-kw">await</span> asyncio.gather(
+            *[run_one_tool(c) <span class="c-kw">for</span> c <span class="c-kw">in</span> calls]
+        )
+        input_items.extend(results)
+
+    <span class="c-kw">return</span> {<span class="c-st">"status"</span>: <span class="c-st">"step_limit"</span>}</pre>
+      </div>
+
+      <h4>观察行为变化</h4>
+
+      <p>用第一阶段的多跳问题重新运行。模型现在知道它可以扇出（API 会告知它并行调用可用），因此它往往会自动利用这一能力。</p>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"How does PgBouncer transaction pooling
+   interact with prepared statements?"</span></pre>
+
+<pre class="trace"><span class="c-out">──────────────────── Step 0 ────────────────────
+┌─ thinking ─────────────────────────────────────┐
+│ I need info on two separate topics. I'll       │
+│ search for both in parallel.                   │
+└────────────────────────────────────────────────┘
+→ search_docs({'query': 'PgBouncer transaction pooling'})
+→ search_docs({'query': 'prepared statements PostgreSQL'})
+
+[both run concurrently, ~180ms total]
+
+──────────────────── Step 1 ────────────────────
+→ fetch_doc({'chunk_id': 'pgbouncer-modes::1'})
+→ fetch_doc({'chunk_id': 'sql-prepare::0'})
+
+[both run concurrently, ~40ms total]
+
+──────────────────── Step 2 ────────────────────
+→ submit_answer({...})
+
+status: answered (3 steps)</span></pre>
+
+      <div class="observe">
+        <div class="label">发生了什么变化</div>
+        <p>5 步降至 3 步。完成了相同的工作，却只用了一半的往返次数。对于每次调查要进行 20–50 次工具调用的生产级智能体而言，并行化能大幅压缩运行时间——对于检索（retrieval）密集型工作流，往往能提速 3–5 倍。</p>
+        <p>代价：处理程序必须可以安全地并发执行。<code class="inline">search_docs</code> 和 <code class="inline">fetch_doc</code> 都是纯读操作——没问题。如果你有一个会写入共享文件的 <code class="inline">save_note</code> 工具，则需要加锁。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">模型是否总会并行化，还是我需要在提示词（prompt）中指示它？</div>
+        <div class="answer">
+          <p>两个模型在调用明显独立（不同主题的不同搜索）时都会并行化。对于模棱两可的情况，你可以在系统提示词中加入这样的引导："当你需要查询多个不相关主题的信息时，请并行搜索，而非顺序执行。"</p>
+          <p>不要过度提示并行化——有时顺序执行才是正确的。"先搜索 X，再根据结果搜索 Y。"是一个合理的计划，并行化反而会破坏它。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我的处理程序要做 I/O（HTTP 调用）。<code class="inline">asyncio.to_thread</code> 用错了吗？</div>
+        <div class="answer">
+          <p>能用，但不是最优解。<code class="inline">to_thread</code> 将同步函数移到工作线程执行，对于阻塞 I/O 来说是可行的，但每个调用都会消耗一个线程。如果你有原生异步处理程序（如 <code class="inline">httpx.AsyncClient</code>），应直接用 <code class="inline">await</code> 调用它们。</p>
+          <p>对于第一阶段的子字符串扫描处理程序，<code class="inline">to_thread</code> 是正确的，因为它们是受 CPU 限制的单线程 Python 代码。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>添加用于上下文隔离的子智能体。</h3>
+
+      <p>这是现代智能体设计中最重要的模式，也是最难做好的。问题在于：主智能体的上下文窗口（context window）十分宝贵。一旦填满原始搜索结果、抓取的文档和冗长的工具输出，质量就会崩溃。模型会丢失原始问题的线索，难以厘清事实，并开始重复自身。</p>
+
+      <p>解决方案：<strong>将研究任务委托给子智能体</strong>。子智能体有自己独立的上下文窗口。它针对一项具体任务进行深度研究，积累所需的中间状态，然后将压缩摘要返回给父智能体。父智能体永远不会接触原始工作内容。</p>
+
+<div class="diagram">┌──────────────────────────────────────────────────────────┐
+│  MAIN AGENT (~10k context)                               │
+│                                                          │
+│  query: "Compare PgBouncer and HAProxy for Postgres      │
+│          connection pooling, with version notes"         │
+│                                                          │
+│  ├── spawn("research PgBouncer modes")     ─→  50k ctx   │
+│  │     └─ returns: 1500-token summary + citations        │
+│  │                                                       │
+│  ├── spawn("research HAProxy with Postgres") ─→ 40k ctx  │
+│  │     └─ returns: 1200-token summary + citations        │
+│  │                                                       │
+│  └── synthesize comparison + check version notes         │
+└──────────────────────────────────────────────────────────┘</div>
+
+      <p>这一模式正是 Claude 的 Research 功能、Perplexity 的深度研究以及 OpenAI 研究智能体底层的工作方式。</p>
+
+      <h4>实现：子智能体只是递归</h4>
+
+      <p>添加一个新工具：<code class="inline">spawn_subagent(task, focus)</code>。处理程序以该任务为查询递归调用 <code class="inline">run_agent</code>，但使用不同的系统提示词，并移除 spawn 工具（以防止无限递归）。</p>
+
+<pre class="standalone"><span class="c-cm"># agent/tools.py — add to TOOLS list</span>
+{
+    <span class="c-st">"name"</span>: <span class="c-st">"spawn_subagent"</span>,
+    <span class="c-st">"description"</span>: (
+        <span class="c-st">"Delegate a focused research task to a subagent. "</span>
+        <span class="c-st">"The subagent has its own context window, runs its "</span>
+        <span class="c-st">"own retrieval, and returns a concise summary with "</span>
+        <span class="c-st">"citations. Use when researching multiple topics "</span>
+        <span class="c-st">"that would each require many sources."</span>
+    ),
+    <span class="c-st">"input_schema"</span>: {  <span class="c-cm"># or "parameters" for OpenAI</span>
+        <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+        <span class="c-st">"properties"</span>: {
+            <span class="c-st">"task"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+                     <span class="c-st">"description"</span>: <span class="c-st">"the question to research"</span>},
+            <span class="c-st">"focus"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+                      <span class="c-st">"description"</span>: <span class="c-st">"what aspect matters most"</span>},
+        },
+        <span class="c-st">"required"</span>: [<span class="c-st">"task"</span>],
+    },
+}</pre>
+
+<pre class="standalone"><span class="c-cm"># agent/subagent.py</span>
+SUBAGENT_PROMPT = <span class="c-st">"""You are a research subagent.
+Your task: {task}
+Focus on: {focus}
+
+You have search_docs, fetch_doc, and submit_answer.
+You cannot spawn further subagents.
+
+Return a summary under 1500 tokens with citations.
+Be dense — the parent agent only sees what you submit."""</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">spawn_subagent</span>(task: <span class="c-kw">str</span>, focus: <span class="c-kw">str</span> = <span class="c-st">""</span>) -> <span class="c-kw">dict</span>:
+    <span class="c-cm"># Same loop, different prompt, restricted tools</span>
+    sub_tools = [t <span class="c-kw">for</span> t <span class="c-kw">in</span> TOOLS
+                 <span class="c-kw">if</span> t.get(<span class="c-st">"name"</span>) != <span class="c-st">"spawn_subagent"</span>]
+    sub_prompt = SUBAGENT_PROMPT.format(task=task, focus=focus)
+    result = <span class="c-kw">await</span> run_agent(
+        user_query=task,
+        system_prompt=sub_prompt,
+        tools=sub_tools,
+        max_steps=<span class="c-st">15</span>,
+    )
+    <span class="c-kw">return</span> {
+        <span class="c-st">"summary"</span>: result.get(<span class="c-st">"answer"</span>, <span class="c-st">""</span>),
+        <span class="c-st">"citations"</span>: result.get(<span class="c-st">"citations"</span>, []),
+        <span class="c-st">"steps_used"</span>: result.get(<span class="c-st">"steps_used"</span>, <span class="c-st">0</span>),
+    }</pre>
+
+      <h4>来看看比较查询的效果</h4>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"Compare PgBouncer modes for use with
+   prepared statements and ORM features"</span></pre>
+
+<pre class="trace"><span class="c-out">──────────────────── Step 0 ────────────────────
+┌─ thinking ─────────────────────────────────────┐
+│ This needs deep research on (1) PgBouncer      │
+│ modes and (2) prepared statements / ORM         │
+│ implications. I'll spawn two subagents in      │
+│ parallel to keep my context lean.              │
+└────────────────────────────────────────────────┘
+→ spawn_subagent(task='Explain all three PgBouncer
+    pool modes in detail',
+    focus='which features each mode breaks')
+→ spawn_subagent(task='How do prepared statements
+    and ORM features interact with connection pooling',
+    focus='session vs transaction scoping')
+
+   [each subagent runs its own ~10-step investigation
+    in its own context window, in parallel]
+
+──────────────────── Step 1 ────────────────────
+   subagent A returned: 1400-token summary citing
+     pgbouncer-modes::0, pgbouncer-modes::1,
+     pgbouncer-modes::2, pgbouncer-features::3
+   subagent B returned: 1200-token summary citing
+     sql-prepare::0, libpq-prepare::1,
+     pgbouncer-features::4
+
+┌─ thinking ─────────────────────────────────────┐
+│ I have both research summaries. Synthesizing.  │
+└────────────────────────────────────────────────┘
+→ submit_answer({
+    'answer': 'PgBouncer offers three pool modes...
+    Session pooling is safe for all features but
+    limits concurrency. Transaction pooling breaks
+    prepared statements, SET LOCAL, advisory locks...
+    ORMs that rely on prepared statement caches
+    (SQLAlchemy, Django ORM) require session mode
+    or PREPARE workarounds...',
+    'citations': ['pgbouncer-modes::0', ...]
+  })
+
+status: answered (2 steps, but subagents ran 18 internal steps)</span></pre>
+
+      <div class="observe">
+        <div class="label">为何这是一种不同的智能体架构</div>
+        <p>主智能体只进行了 <em>2 个可见步骤</em>。但在底层，两个子智能体各自执行了 9 个步骤。总工作量是 20 次模型调用——然而主上下文窗口只接收了约 3000 个令牌（token）的摘要，而非 80,000 个令牌的原始研究内容。</p>
+        <p>如果没有子智能体，同样的调查要么会触碰上下文限制，要么因为模型被大量中间结果淹没而给出质量下降的答案。有了子智能体，主智能体始终保持敏锐，因为它只读取<em>最终答案</em>，而非工作草稿。</p>
+      </div>
+
+      <div class="callout warn">
+        <p><strong>限制递归深度。</strong>子智能体的工具列表明确排除了 <code class="inline">spawn_subagent</code>。如果不这样做，一个行为异常的模型可能会生成生成子智能体的子智能体，你会在凌晨 3 点发现 API 额度耗尽时才意识到这一点。深度=1 对几乎所有场景都足够。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">主智能体何时<em>不应该</em>生成子智能体？</div>
+        <div class="answer">
+          <p>对于简单查询，生成子智能体只会增加开销——你为一次子智能体的编排和额外的模型调用付出成本，而单次搜索本可直接回答。智能体只应在任务具有能从隔离中受益的子结构时才生成子智能体：</p>
+          <ul>
+            <li>比较两件或多件事物（每件事物对应一个子智能体）</li>
+            <li>需要围绕某一窄域主题进行大量工具调用的调查</li>
+            <li>中间结果体量庞大、需要压缩摘要的任务</li>
+          </ul>
+          <p>你可以在系统提示词中明确这一点："仅在研究各自需要 4 次以上工具调用的主题时使用子智能体。对于简单查询，直接搜索。"</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">这与直接并行运行多次搜索有何不同？</div>
+        <div class="answer">
+          <p>并行工具调用让智能体在<em>工具调用层面</em>扇出。子智能体让它在<em>调查层面</em>扇出。这是两个不同层次的并行性，可以组合使用：</p>
+          <ul>
+            <li>并行工具调用：一个模型决定"同时搜索 X、Y、Z"，并自行读取全部三个结果。</li>
+            <li>子智能体：主模型将"研究 X"委托给自身的一个副本，该副本运行自己的多步骤调查，并进行自己的并行搜索。</li>
+          </ul>
+          <p>两者都要用。子智能体内部使用并行工具调用。主智能体同时使用子智能体和并行工具调用。这种组合正是让深度研究智能体快速运转的关键。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>添加规划步骤（用户可编辑）。</h3>
+
+      <p>对于复杂查询——多跳、比较型、模糊型——在执行前生成一个计划会很有帮助。原因有二：其一，模型在预先确定调查方向后，往往能给出更好的结果；其二，用户可以在智能体消耗大量令牌走错方向之前编辑计划。这个编辑步骤正是"可控"在实践中的真正含义。</p>
+
+      <h4>规划器：一次专注的模型调用</h4>
+
+<pre class="standalone">PLANNER_PROMPT = <span class="c-st">"""You are planning an investigation.
+Given a user's question, produce a numbered plan of
+3-5 steps describing how an agent should research
+the answer.
+
+Each step should be one of:
+- SEARCH: a specific keyword search
+- COMPARE: comparing two things found via search
+- VERIFY: confirming a claim with a second source
+- SYNTHESIZE: combining findings into the answer
+
+For simple lookups (one fact, one doc), output
+exactly the word: SIMPLE
+
+Output the plan or SIMPLE, nothing else."""</span></pre>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># agent/planner.py</span>
+<span class="c-kw">async def</span> <span class="c-fn">make_plan</span>(query: <span class="c-kw">str</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>] | <span class="c-kw">None</span>:
+    response = <span class="c-kw">await</span> client.messages.create(
+        model=<span class="c-st">"claude-sonnet-4-5"</span>,
+        max_tokens=<span class="c-st">512</span>,
+        system=PLANNER_PROMPT,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: query}],
+    )
+    text = response.content[<span class="c-st">0</span>].text.strip()
+    <span class="c-kw">if</span> text == <span class="c-st">"SIMPLE"</span>: <span class="c-kw">return</span> <span class="c-kw">None</span>
+    <span class="c-kw">return</span> [line <span class="c-kw">for</span> line <span class="c-kw">in</span> text.split(<span class="c-st">"\n"</span>) <span class="c-kw">if</span> line.strip()]</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># agent/planner.py</span>
+<span class="c-kw">async def</span> <span class="c-fn">make_plan</span>(query: <span class="c-kw">str</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>] | <span class="c-kw">None</span>:
+    response = <span class="c-kw">await</span> client.responses.create(
+        model=<span class="c-st">"gpt-5.5"</span>,
+        instructions=PLANNER_PROMPT,
+        input=query,
+    )
+    text = response.output_text.strip()
+    <span class="c-kw">if</span> text == <span class="c-st">"SIMPLE"</span>: <span class="c-kw">return</span> <span class="c-kw">None</span>
+    <span class="c-kw">return</span> [line <span class="c-kw">for</span> line <span class="c-kw">in</span> text.split(<span class="c-st">"\n"</span>) <span class="c-kw">if</span> line.strip()]</pre>
+      </div>
+
+      <h4>用户编辑循环</h4>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">run_with_plan</span>(query: <span class="c-kw">str</span>):
+    plan = <span class="c-kw">await</span> make_plan(query)
+    <span class="c-kw">if</span> plan <span class="c-kw">is</span> <span class="c-kw">None</span>:
+        <span class="c-cm"># Simple query — skip planning</span>
+        <span class="c-kw">return</span> <span class="c-kw">await</span> run_agent(query)
+
+    console.print(<span class="c-st">"\n[bold]Proposed plan:[/]"</span>)
+    <span class="c-kw">for</span> i, step <span class="c-kw">in</span> <span class="c-kw">enumerate</span>(plan, <span class="c-st">1</span>):
+        console.print(<span class="c-kw">f</span><span class="c-st">"  {i}. {step}"</span>)
+    console.print(<span class="c-st">"\n[Enter] approve  [e] edit  [s] skip plan"</span>)
+    choice = <span class="c-kw">input</span>(<span class="c-st">"> "</span>).strip().lower()
+
+    <span class="c-kw">if</span> choice == <span class="c-st">"e"</span>:
+        plan = edit_plan_interactive(plan)
+    <span class="c-kw">elif</span> choice == <span class="c-st">"s"</span>:
+        <span class="c-kw">return</span> <span class="c-kw">await</span> run_agent(query)
+
+    plan_block = <span class="c-st">"\n"</span>.join(<span class="c-kw">f</span><span class="c-st">"{i+1}. {s}"</span>
+                            <span class="c-kw">for</span> i, s <span class="c-kw">in</span> <span class="c-kw">enumerate</span>(plan))
+    enriched = <span class="c-kw">f</span><span class="c-st">"{query}\n\nFollow this plan:\n{plan_block}"</span>
+    <span class="c-kw">return</span> <span class="c-kw">await</span> run_agent(enriched)</pre>
+
+      <h4>实际效果</h4>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"Compare auth approaches in Postgres
+   for a web app, focused on changes since version 14"</span></pre>
+
+<pre class="trace"><span class="c-out">Proposed plan:
+  1. SEARCH: authentication methods PostgreSQL pg_hba
+  2. SEARCH: scram-sha-256 vs md5 password auth
+  3. SEARCH: PostgreSQL 14 15 16 release notes auth
+  4. COMPARE: trade-offs of each method for web apps
+  5. SYNTHESIZE: recommendation with version caveats
+
+[Enter] approve  [e] edit  [s] skip plan
+> e
+
+Editing plan. Current step 1: SEARCH: authentication...
+[Enter] keep  [r] replace  [d] delete  [a] add after
+> r
+New step 1: SEARCH: pg_hba.conf authentication methods
+
+[Enter] keep  [r] replace  [d] delete  [a] add after
+> [Enter] (keeps step 2)
+...
+
+Approved plan:
+  1. SEARCH: pg_hba.conf authentication methods
+  2. SEARCH: scram-sha-256 vs md5 password auth
+  3. SEARCH: PostgreSQL 14 15 16 release notes auth
+  4. COMPARE: trade-offs for web apps
+  5. SYNTHESIZE: recommendation with version caveats
+
+──────────────── starting agent ────────────────
+→ search_docs({'query': 'pg_hba.conf authentication
+                          methods'})
+...</span></pre>
+
+      <div class="observe">
+        <div class="label">为何允许用户编辑至关重要</div>
+        <p>模型的初始计划是合理的，但真正熟悉 Postgres 的用户可能知道，搜索的具体术语应该是"pg_hba.conf"，而非"authentication methods"。编辑第 1 步省去了智能体本来需要的 1–2 次后续搜索。</p>
+        <p>这就是可控性的调节把手。没有它，智能体的计划是个黑箱，你只能在它消耗 10 次模型调用<em>之后</em>才能批评。有了它，你可以在任何昂贵的工作发生之前修正方向。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">每次都要求用户审批计划，难道不会拖慢速度吗？</div>
+        <div class="answer">
+          <p>这正是规划器对不需要计划的查询输出 <code class="inline">SIMPLE</code> 的原因。"Postgres 用哪个端口？"会得到 <code class="inline">SIMPLE</code>；"比较三个版本间的变化"则会生成计划。对于简单问题，用户永远不会看到计划。</p>
+          <p>对于非简单查询，计划审批步骤大约需要 10 秒，但在捕获到错误方向的调查时，能节省数十次 API 调用。除了最简单的情况（规划器会自动跳过）之外，这对所有人都是净收益。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>让运行可中断、可恢复。</h3>
+
+      <p>漫长的调查可能需要数分钟。你希望能够暂停运行、查看智能体目前的决策、编辑看起来有误的工具结果，然后从断点处恢复。这正是真正的智能体 SDK 所提供的能力。自己构建它，你才能真正理解哪些状态是关键的。</p>
+
+      <p>诀窍：<strong>在每次迭代后将消息持久化到磁盘</strong>。消息历史<em>就是</em>智能体的状态。只要有历史记录，就可以恢复。</p>
+
+<pre class="standalone"><span class="c-cm"># agent/state.py</span>
+<span class="c-kw">import</span> json, uuid
+<span class="c-kw">from</span> pathlib <span class="c-kw">import</span> Path
+
+<span class="c-kw">class</span> <span class="c-fn">RunState</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, run_id: <span class="c-kw">str</span> = <span class="c-kw">None</span>):
+        self.run_id = run_id <span class="c-kw">or</span> <span class="c-kw">str</span>(uuid.uuid4())[:<span class="c-st">8</span>]
+        self.path = Path(<span class="c-kw">f</span><span class="c-st">"runs/{self.run_id}.jsonl"</span>)
+        self.path.parent.mkdir(exist_ok=<span class="c-kw">True</span>)
+
+    <span class="c-kw">def</span> <span class="c-fn">checkpoint</span>(self, step: <span class="c-kw">int</span>, history: <span class="c-kw">list</span>):
+        <span class="c-kw">with</span> self.path.<span class="c-kw">open</span>(<span class="c-st">"a"</span>) <span class="c-kw">as</span> f:
+            f.write(json.dumps({
+                <span class="c-st">"step"</span>: step,
+                <span class="c-st">"history"</span>: history,
+            }, default=<span class="c-kw">str</span>) + <span class="c-st">"\n"</span>)
+
+    <span class="c-kw">def</span> <span class="c-fn">resume</span>(self) -> <span class="c-kw">list</span>:
+        <span class="c-kw">if</span> <span class="c-kw">not</span> self.path.exists():
+            <span class="c-kw">return</span> []
+        last = <span class="c-kw">None</span>
+        <span class="c-kw">with</span> self.path.<span class="c-kw">open</span>() <span class="c-kw">as</span> f:
+            <span class="c-kw">for</span> line <span class="c-kw">in</span> f:
+                last = json.loads(line)
+        <span class="c-kw">return</span> last[<span class="c-st">"history"</span>] <span class="c-kw">if</span> last <span class="c-kw">else</span> []</pre>
+
+      <h4>接入循环</h4>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(query, max_steps=<span class="c-st">10</span>, run_id=<span class="c-kw">None</span>):
+    state = RunState(run_id)
+    history = state.resume() <span class="c-kw">or</span> [
+        {<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: query}
+    ]
+    start_step = (<span class="c-kw">len</span>(state.resume()) // <span class="c-st">2</span>) <span class="c-kw">if</span> state.resume() <span class="c-kw">else</span> <span class="c-st">0</span>
+
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(start_step, max_steps):
+        response = <span class="c-kw">await</span> client.messages.create(...)
+        history.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>, ...})
+        <span class="c-cm"># ... dispatch tools, append results ...</span>
+        state.checkpoint(step, history)  <span class="c-cm"># persist every step</span>
+
+    <span class="c-kw">return</span> {<span class="c-st">"run_id"</span>: state.run_id, ...}</pre>
+
+      <h4>现在你可以做到的事</h4>
+
+      <p>在运行途中停止（Ctrl-C）。稍后恢复：</p>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"Compare auth methods..."</span>
+   <span class="c-cm"># ... runs for a few steps, you hit Ctrl-C ...</span>
+   ^C  Interrupted at step 3. Run ID: a4f7c2e1
+
+$ python scripts/run.py --resume a4f7c2e1
+   <span class="c-cm"># resumes from step 4, history intact</span></pre>
+
+      <p>或者检查运行记录并编辑某个工具结果：</p>
+
+<pre class="shell standalone">$ python scripts/inspect.py a4f7c2e1
+
+Step 2: search_docs({'query': 'auth methods'})
+  → returned 5 chunks, but the top one is wrong
+  → press [e] to edit the result before resuming
+  > e
+  
+  Editing tool_result at step 2...
+  [edit in your editor]
+  
+  Resumed. Re-running from step 3 with edited result.</pre>
+
+      <div class="callout tip">
+        <p>这是智能体"时间旅行调试"的基础。当第四阶段的评估（评估）发现某个失败查询时，你会想要检查<em>智能体究竟在哪一步走错了方向</em>，并尝试修复——不同的提示词、不同的工具结果、不同的参数——而无需重新运行失败点之前的昂贵步骤。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">这不就是真正的智能体 SDK 所做的事吗？</div>
+        <div class="answer">
+          <p>是的。Anthropic 的 Agent SDK 和 OpenAI 的 Agents SDK 都内置了运行状态持久化以及从任意检查点恢复的能力。你现在已经自己构建了该机制的最小化版本。</p>
+          <p>这样一来，当你日后采用某个 SDK 时，你会清楚地知道它的抽象层究竟在做什么——也会知道当它的设计选择不符合你的需求时，你该在哪里自行构建定制方案。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">为什么用 JSONL 而不是数据库？</div>
+        <div class="answer">
+          <p>JSONL 是追加写入的，人类可读，并且能在各种崩溃场景中存活。你可以 <code class="inline">cat</code> 一个运行文件，grep 特定的工具调用，或者对比两次运行。SQLite 也可行，还能提供更方便的查询——当你有数百次运行需要跨运行分析时可以切换。</p>
+          <p>在当前规模下，JSONL 是正确的起点。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of week 3</div>
+      <h3>交付物</h3>
+      <p>一个能够在复杂查询前进行规划、并行扇出搜索、在子智能体中隔离深度研究、并支持暂停与恢复的智能体。第一阶段相同的 10 个问题，应当呈现出质性不同（更快、更简洁）的行为。</p>
+      <ul class="checklist">
+        <li>异步并行工具执行</li>
+        <li>带深度限制的子智能体生成</li>
+        <li>带用户可编辑计划的规划器</li>
+        <li>JSONL 检查点 + 从任意步骤恢复</li>
+        <li>追踪对比：测试集上第二阶段 vs 第三阶段</li>
+      </ul>
+    </div>
+
+
+  </section>
