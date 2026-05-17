@@ -10,5 +10,5 @@ export default defineConfig({
     locales: ['en', 'zh'],
     routing: { prefixDefaultLocale: false },
   },
-  integrations: [mdx(), sitemap({ i18n: { defaultLocale: 'en', locales: { en: 'en', zh: 'zh' } } })],
+  integrations: [mdx(), sitemap({ i18n: { defaultLocale: 'en', locales: { en: 'en', zh: 'zh-Hans' } } })],
 });
