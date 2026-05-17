@@ -65,9 +65,14 @@ Applied consistently across all 22 bodies; reviewers enforce it.
 - `<div class="observe">`, `.callout`, `.deliverable` etc.: their inner
   `<div class="label">…</div>` text is a **visible heading → translate it**.
   (`class="label"` is the attribute and stays; the text node is prose.)
-- `<div class="q">` "Question" and `<div class="tag">` "End of chapter 0.X":
-  repeated structural identifiers — leave in **English** (consistent convention
-  across all bodies; do not translate).
+- `<div class="q">` "Question" and `<div class="tag">` "End of chapter 0.X"
+  / "End of week N": repeated structural identifiers — leave in **English**
+  (consistent convention across all bodies; do not translate).
+- `<div class="question">…</div>` (the actual Q&A prompt text, distinct from
+  the `.q` "Question" label) IS visible prose → **translate it**. Its sibling
+  `<div class="answer">` is also prose → translate.
+- `<div class="step-num">STEP N</div>` and `WORKED EXAMPLE` labels: leave
+  **English**; the `<h3>`/`<h4>` heading that follows is prose → translate.
 - All other visible text nodes (headings, paragraphs, lists, captions,
   blockquotes, table cells, prose around inline `<code>`): translate.
 
