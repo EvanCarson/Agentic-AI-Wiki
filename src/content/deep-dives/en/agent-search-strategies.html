@@ -1,0 +1,74 @@
+<section class="phase">
+  <div class="phase-num">D5</div>
+  <div class="week">Deep Dive · Architectures &amp; Patterns</div>
+  <h2>Search strategies — branching over trajectories.</h2>
+  <p class="goal">When a single trajectory is too fragile, you explore several and select the best. Best-of-N, self-consistency, tree-of-thought and graph-of-thought are points on one spectrum: spend more inference compute to widen the search, then pay a selector to pick. This essay covers the spectrum, the multiplicative cost, and the load-bearing dependency on a usable scoring signal.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The unifying idea: generate candidates, then select.</h3>
+
+    <p>Single-trajectory patterns (ReAct, plan-and-execute) commit to one path. If an early step is wrong, the whole run is wrong. Search patterns hedge by exploring multiple paths and choosing among them. Every search method answers three questions: <em>how do we branch</em> (sample N independent answers, or expand a tree of partial states), <em>how do we score</em> a node or a finished candidate, and <em>how do we select</em> the winner. Get the scoring wrong and the whole family collapses — that is the recurring theme.</p>
+
+    <ul>
+      <li><strong>Best-of-N / rejection sampling.</strong> Generate N independent attempts, score each, return the best. No structure shared between attempts. Embarrassingly parallel.</li>
+      <li><strong>Self-consistency.</strong> Sample N chains of thought, take the majority answer. The "scorer" is a vote — works only when the answer space is small and discrete (final numeric answer, label).</li>
+      <li><strong>Tree-of-thought (ToT).</strong> Decompose the problem into steps; at each step generate several candidate continuations, score partial states, and search (BFS/DFS/beam) with backtracking. Spends compute where the problem is hard.</li>
+      <li><strong>Graph-of-thought (GoT).</strong> Generalizes the tree to a DAG: thoughts can be merged and refined, not only branched. Powerful for problems where partial solutions should be combined; the most engineering-heavy.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The shape of a tree search.</h3>
+
+<pre class="standalone"><span class="c-cm"># Tree-of-thought, beam search variant</span>
+frontier = [<span class="c-fn">root</span>(task)]
+<span class="c-kw">for</span> depth <span class="c-kw">in</span> <span class="c-fn">range</span>(MAX_DEPTH):
+    candidates = []
+    <span class="c-kw">for</span> node <span class="c-kw">in</span> frontier:
+        <span class="c-kw">for</span> thought <span class="c-kw">in</span> generator.<span class="c-fn">expand</span>(node, k=BRANCH):
+            child = node.<span class="c-fn">extend</span>(thought)
+            child.score = <span class="c-fn">evaluate</span>(child)     <span class="c-cm"># the load-bearing call</span>
+            candidates.<span class="c-fn">append</span>(child)
+    frontier = <span class="c-fn">top_k</span>(candidates, BEAM_WIDTH)  <span class="c-cm"># prune; backtrack implicit</span>
+    <span class="c-kw">if</span> <span class="c-fn">any</span>(c.is_solution <span class="c-kw">for</span> c <span class="c-kw">in</span> frontier):
+        <span class="c-kw">break</span>
+<span class="c-kw">return</span> <span class="c-fn">best</span>(frontier)</pre>
+
+    <p>Note the cost: model calls scale as roughly <code class="inline">BRANCH × BEAM_WIDTH × MAX_DEPTH</code>, and each node also pays an <code class="inline">evaluate()</code> call. A modest tree (branch 3, beam 3, depth 4) is on the order of dozens of model calls for one answer. This is not a tweak; it is a different cost regime.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The scoring signal decides whether any of this works.</h3>
+
+    <p>Every search method's quality is capped by the quality of its evaluator. The hierarchy of signals, best to worst:</p>
+
+    <ul>
+      <li><strong>Ground-truth verifier</strong> (tests pass, equation balances, tool succeeds). Search shines here — it is parallel hypothesis testing against an oracle. This is where ToT/best-of-N give their largest, most reliable gains.</li>
+      <li><strong>Structured rubric / programmatic heuristic.</strong> Decent when the rubric is concrete and discriminative.</li>
+      <li><strong>LLM-as-judge self-evaluation.</strong> Weak and biased. The judge often cannot rank candidates better than chance on the hard cases that motivated search in the first place. Best-of-N over a bad judge just finds the answer the judge is most confident about, not the correct one.</li>
+      <li><strong>Majority vote (self-consistency).</strong> Works only when the correct answer is the modal sample. Fails when the model is systematically biased toward a wrong answer — voting amplifies the bias.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>The dominant anti-pattern: deploying tree search with an LLM self-evaluator on a task with no external check. You pay 30x the inference cost to explore a space you cannot navigate, and the selector confidently returns a wrong leaf. Before adding branching, prove you have a discriminative scorer. Architecture amplifies a signal; it cannot manufacture one.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>When to reach for search — and when not.</h3>
+
+    <p><strong>Use it when:</strong> the task has a verifiable or sharply discriminable answer (competitive math, code with tests, constraint satisfaction, planning/puzzles); single-pass accuracy is the bottleneck and you have measured it; latency and cost budgets can absorb a 5–30x multiplier; the value of a correct answer dwarfs the inference cost.</p>
+
+    <p><strong>Avoid it when:</strong> outputs are open-ended with no discriminative scorer (free-form writing, advice) — branching just samples more unverifiable text; the task is latency-sensitive or high-QPS — the cost multiplier is unaffordable; a cheaper pattern already clears the quality bar. Always exhaust ReAct and a verifier-backed reflection loop before introducing tree search; it is the heaviest pattern in this section and the easiest to deploy where it does not pay.</p>
+
+    <div class="callout tip">
+      <p>Pragmatic ladder: start with best-of-N (trivial to add, embarrassingly parallel, often 80% of the gain). Move to self-consistency only for small discrete answer spaces. Reserve full ToT/GoT for problems where partial-state scoring and backtracking demonstrably beat independent samples — that is a minority of real workloads.</p>
+    </div>
+
+    <p>The honest tradeoff: <strong>search buys robustness against unlucky single trajectories at a multiplicative inference cost, and it pays off strictly in proportion to how good your scorer is.</strong> With a ground-truth verifier it is one of the strongest levers available; without one it is the most expensive way to be confidently wrong.</p>
+  </div>
+</section>

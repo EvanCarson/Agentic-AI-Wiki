@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">M3</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>Memory types: episodic, semantic, procedural &mdash; and the scratchpad.</h2>
+  <p class="goal">"Long-term memory" is not one thing. Effective agents keep at least three functionally distinct kinds of memory plus a within-task scratchpad, each written, indexed, and retrieved differently. Storing them in one undifferentiated blob is why so many memory systems retrieve confidently irrelevant junk.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three durable kinds, one transient one.</h3>
+
+    <p>The taxonomy is borrowed from cognitive science but earns its place operationally: each kind answers a different question and therefore needs a different retrieval cue.</p>
+
+    <ul>
+      <li><strong>Episodic</strong> &mdash; "what happened." Time-stamped records of specific events: this user asked X, the agent ran tool Y, it returned error Z, the fix was W. Answers <em>"have I seen this situation before, and what happened?"</em></li>
+      <li><strong>Semantic</strong> &mdash; "what is true." Distilled, time-invariant facts: the user's timezone, the database is Postgres 16, the deploy policy. Answers <em>"what do I know about the world / user / system?"</em></li>
+      <li><strong>Procedural</strong> &mdash; "how to do it." Reusable skills and routines the agent has acquired or been given: the steps to roll back a migration, a checklist for triaging an incident. Answers <em>"how do I accomplish this kind of task?"</em></li>
+      <li><strong>Scratchpad (working)</strong> &mdash; transient reasoning state for the <em>current</em> task only: a plan, a running tally, intermediate results. Not persisted by default; it dies with the task unless something in it is promoted to one of the three durable kinds.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The test for which kind a piece of information is: ask what query should retrieve it. "When did we last deploy?" &rarr; episodic. "What is the deploy policy?" &rarr; semantic. "How do I deploy?" &rarr; procedural. If the same string would be the answer to all three, you have not distilled it yet.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Type the memory at write time.</h3>
+
+    <p>Tag every memory with its kind on write. This single field changes how it is indexed, scored, decayed, and retrieved &mdash; downstream code branches on it.</p>
+
+<pre class="standalone"><span class="c-cm"># memory/types.py</span>
+<span class="c-kw">from</span> enum <span class="c-kw">import</span> Enum
+<span class="c-kw">from</span> dataclasses <span class="c-kw">import</span> dataclass
+
+<span class="c-kw">class</span> <span class="c-fn">Kind</span>(Enum):
+    EPISODIC   = <span class="c-st">"episodic"</span>
+    SEMANTIC   = <span class="c-st">"semantic"</span>
+    PROCEDURAL = <span class="c-st">"procedural"</span>
+
+<span class="c-fn">@dataclass</span>
+<span class="c-kw">class</span> <span class="c-fn">Memory</span>:
+    text: <span class="c-kw">str</span>
+    kind: Kind
+    ts: <span class="c-kw">float</span>            <span class="c-cm"># event time (episodic) / write time</span>
+    salience: <span class="c-kw">float</span>      <span class="c-cm"># importance, drives decay &amp; eviction</span>
+    last_used: <span class="c-kw">float</span>     <span class="c-cm"># for recency-aware scoring</span>
+    source: <span class="c-kw">str</span>          <span class="c-cm"># turn id / user / derived</span></pre>
+
+    <p>Why kind drives behavior:</p>
+
+    <ul>
+      <li><strong>Episodic</strong> ages: recency matters, and old episodes are decayed or summarized. Retrieval is similarity <em>plus</em> a recency term.</li>
+      <li><strong>Semantic</strong> should <em>not</em> age out by time &mdash; a stable fact stays true. But it must be <em>updated in place</em> when it changes (the user moved timezones), not appended, or you accumulate contradictions.</li>
+      <li><strong>Procedural</strong> is rarely retrieved by semantic similarity to a goal; it is keyed by <em>task type</em>. Retrieve by "what kind of task am I doing" not "what words are in the goal."</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Reflection: turning episodes into semantics.</h3>
+
+    <p>Raw episodes accumulate fast and individually carry little signal. The technique from the <em>Generative Agents</em> line of work (Park et al., 2023) is <strong>reflection</strong>: periodically run a model pass over recent episodes and synthesize higher-level, durable conclusions &mdash; promoting episodic memory into semantic memory.</p>
+
+<pre class="standalone"><span class="c-cm"># memory/reflect.py</span>
+REFLECT = <span class="c-st">"""Here are recent events the agent observed:
+{episodes}
+
+Infer up to 3 durable, general conclusions that will
+still be true and useful in future, unrelated tasks.
+Output one per line. No speculation, no restatement
+of a single event."""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">reflect</span>(episodes: <span class="c-kw">list</span>[Memory], llm) -> <span class="c-kw">list</span>[Memory]:
+    joined = <span class="c-st">"\n"</span>.join(<span class="c-kw">f</span><span class="c-st">"- {e.text}"</span> <span class="c-kw">for</span> e <span class="c-kw">in</span> episodes)
+    out = llm(REFLECT.format(episodes=joined))
+    <span class="c-kw">return</span> [
+        Memory(text=line.strip(<span class="c-st">"- "</span>), kind=Kind.SEMANTIC,
+               ts=now(), salience=<span class="c-st">0.7</span>, last_used=now(),
+               source=<span class="c-st">"reflection"</span>)
+        <span class="c-kw">for</span> line <span class="c-kw">in</span> out.splitlines() <span class="c-kw">if</span> line.strip()
+    ]</pre>
+
+    <p>Reflection is the engine that keeps long-term memory <em>small and high-signal</em>: dozens of low-value episodes collapse into a handful of high-value semantic facts. The original episodes can then be aggressively decayed because their durable content has been extracted. Without reflection, episodic memory grows linearly forever and retrieval quality decays with it.</p>
+
+    <div class="callout tip">
+      <p>Run reflection on a cadence tied to volume, not wall-clock: e.g. every N new episodes, or when episodic store size crosses a threshold. Tie it to the same trigger as compaction so the two operations stay coherent.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The scratchpad: structured working state, not a chat log.</h3>
+
+    <p>The scratchpad is short-term, but it deserves its own treatment because the failure mode is specific: agents that "think out loud" into the message history bury the actual plan under reasoning prose, and on later turns cannot find their own decisions.</p>
+
+    <p>Keep the scratchpad as a small, <em>structured</em>, explicitly rewritten object &mdash; not an ever-growing append log:</p>
+
+<pre class="trace"><span class="c-out">SCRATCHPAD (rewritten each turn, ~300 tok cap)
+  goal:     migrate users table to add `tier` column
+  plan:     [x] write migration  [x] test on staging
+            [ ] get approval     [ ] apply to prod
+  facts:    prod deploys gated on staging check (semantic)
+            migration is reversible (verified turn 4)
+  open:     awaiting approver response</span></pre>
+
+    <p>Rewriting beats appending: the model regenerates the scratchpad each turn, which forces it to drop resolved items and surface open ones. At task end, a single pass extracts anything durable from <code class="inline">facts</code> into semantic memory and the outcome into episodic memory; the rest is discarded.</p>
+
+    <div class="callout warn">
+      <p>Do not let the scratchpad and the message history both try to be the working memory. Pick one as authoritative. A common, robust choice: history is an immutable event log; the scratchpad is the single mutable "current understanding," and only the scratchpad plus the last few raw turns enter the working set.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>How the four interact.</h3>
+
+    <p>A turn in a mature agent touches all four:</p>
+
+    <ul>
+      <li><strong>Procedural</strong> retrieved by task type tells the agent <em>how</em> to proceed.</li>
+      <li><strong>Semantic</strong> retrieved by goal tells it the <em>constraints and facts</em> that apply.</li>
+      <li><strong>Episodic</strong> retrieved by situation similarity tells it <em>what happened last time</em> something like this was attempted.</li>
+      <li><strong>Scratchpad</strong> holds the live plan and is rewritten as the task progresses.</li>
+    </ul>
+
+    <p>Separating them is not bureaucratic neatness &mdash; it is what lets each be retrieved by the right cue and decayed on the right schedule. The next essays cover how retrieval actually surfaces these (<code class="inline">retrieval-augmented-memory</code>), how the stores are kept bounded (<code class="inline">context-compaction</code>), and which backends fit which kind (<code class="inline">memory-stores</code>).</p>
+  </div>
+</section>

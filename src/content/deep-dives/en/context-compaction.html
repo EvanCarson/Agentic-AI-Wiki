@@ -1,0 +1,122 @@
+<section class="phase">
+  <div class="phase-num">M5</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>Context compaction: summarization, eviction, and hierarchical memory.</h2>
+  <p class="goal">A long-running agent's trajectory grows without bound; the window does not. Compaction is the set of techniques that shrink history while preserving the information needed to keep going. Done well it is invisible; done badly it silently amnesia-s the agent mid-task. This is the operation that makes truly long-horizon agents possible.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The compaction ladder: cheapest survivable technique first.</h3>
+
+    <p>Compaction is not one move. It is a ladder of increasingly lossy techniques; apply the gentlest one that keeps you under budget, and only escalate when it is not enough.</p>
+
+    <ul>
+      <li><strong>Truncation</strong> &mdash; drop the oldest turns wholesale. Cheapest, lossiest, and only safe if the dropped content was already persisted to long-term memory. Never truncate as your only mechanism.</li>
+      <li><strong>Deduplication / pruning</strong> &mdash; remove redundant tool outputs, repeated retrievals, superseded plan versions. High value, near-zero risk: you are deleting noise, not signal.</li>
+      <li><strong>Summarization</strong> &mdash; replace a span of turns with a model-generated synopsis. The workhorse. Lossy but information-preserving if scoped correctly.</li>
+      <li><strong>Hierarchical summarization</strong> &mdash; summaries of summaries, so even very old history survives as a thin trace. The technique that unlocks effectively unbounded horizons.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Order matters. Prune before you summarize (do not pay a model to summarize duplicate junk). Summarize before you truncate (do not delete what you have not yet distilled). Truncate only what is both summarized <em>and</em> persisted.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Scoped summarization that preserves what the agent needs.</h3>
+
+    <p>A generic "summarize the conversation" prompt loses exactly the things an agent needs: open loops, decisions and their reasons, error causes, hard constraints. Compaction summarization must be <em>task-structured</em>, not prose-structured.</p>
+
+<pre class="standalone"><span class="c-cm"># memory/compact.py</span>
+COMPACT = <span class="c-st">"""Compress the following agent turns into a
+structured state summary. Preserve, do not narrate:
+
+DECISIONS:  choices made and the reason for each
+FACTS:      durable facts established (mark source turn)
+OPEN:       unfinished sub-tasks / unanswered questions
+ERRORS:     failures seen and their root cause
+CONSTRAINTS:rules that must still hold
+
+Drop: pleasantries, superseded plans, raw tool dumps
+already reflected in FACTS. Be terse. No prose.
+
+TURNS:
+{turns}"""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">summarize_span</span>(turns: <span class="c-kw">list</span>[<span class="c-kw">dict</span>], llm) -> <span class="c-kw">str</span>:
+    body = <span class="c-st">"\n"</span>.join(fmt(t) <span class="c-kw">for</span> t <span class="c-kw">in</span> turns)
+    <span class="c-kw">return</span> llm(COMPACT.format(turns=body), max_tokens=<span class="c-st">600</span>)</pre>
+
+    <p>The structured headers are the contract. A summary that keeps <code class="inline">OPEN</code> and <code class="inline">CONSTRAINTS</code> verbatim-faithful can replace 40 turns of history and the agent continues correctly. A summary that paraphrases them loses the thread &mdash; the classic "the agent forgot it was not allowed to touch prod" failure.</p>
+
+    <div class="callout warn">
+      <p>Never summarize the <em>current</em> open loop. Compaction operates on <em>resolved or aged</em> history. The active sub-task and the last few turns stay verbatim in the working set &mdash; summarizing the thing you are mid-way through is how agents lose their place.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Hierarchical memory: the MemGPT-style tiering.</h3>
+
+    <p>The decisive idea, articulated by Packer et al. in <em>MemGPT</em> (2023): treat the context window like RAM and external storage like disk, with the agent itself (via tools) managing paging between tiers. Three tiers:</p>
+
+<pre class="trace"><span class="c-out">TIER 0  WORKING   in-window, verbatim, fully attended
+                  &rarr; current task, last k turns, scratchpad
+TIER 1  RECALL    out-of-window, fast retrieval
+                  &rarr; recent summaries, indexed episodics
+TIER 2  ARCHIVE   out-of-window, cold, summary-of-summaries
+                  &rarr; old-task traces, thin durable residue
+
+paging: WORKING --evict--&gt; summarize --&gt; RECALL --age--&gt; ARCHIVE
+        ARCHIVE --recall on demand--&gt; RECALL --promote--&gt; WORKING</span></pre>
+
+    <p>Crucially, the agent has <em>tools</em> to move data between tiers &mdash; it can choose to "remember this" (write to recall), "what did we decide about X" (search archive), or "page this back in." Memory management becomes part of the agent's action space, not just an invisible framework behind it. That is what makes the horizon effectively unbounded: the agent can always reach further back, it just pays a retrieval round-trip to do so.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Triggering: compact on pressure, not on a timer.</h3>
+
+    <p>Compaction is expensive (a model call) and lossy. Trigger it from <em>budget pressure</em>, with hysteresis so you do not thrash on the boundary.</p>
+
+<pre class="standalone"><span class="c-cm"># memory/compactor.py</span>
+<span class="c-kw">class</span> <span class="c-fn">Compactor</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, budget, hi=<span class="c-st">0.85</span>, lo=<span class="c-st">0.60</span>):
+        self.budget = budget
+        self.hi, self.lo = hi, lo   <span class="c-cm"># hysteresis band</span>
+
+    <span class="c-kw">def</span> <span class="c-fn">maybe_compact</span>(self, history) -> <span class="c-kw">list</span>:
+        used = ntok(history) / self.budget.working
+        <span class="c-kw">if</span> used &lt; self.hi:
+            <span class="c-kw">return</span> history          <span class="c-cm"># under pressure threshold</span>
+        keep_recent = tail_until(history, self.lo)
+        old = history[:-<span class="c-kw">len</span>(keep_recent)]
+        <span class="c-kw">if</span> <span class="c-kw">not</span> old:
+            <span class="c-kw">return</span> history          <span class="c-cm"># nothing safe to compact</span>
+        persist_to_longterm(old)    <span class="c-cm"># write BEFORE you shrink</span>
+        digest = summarize_span(old, llm)
+        <span class="c-kw">return</span> [{<span class="c-st">"role"</span>: <span class="c-st">"system"</span>,
+                 <span class="c-st">"content"</span>: <span class="c-st">"[compacted history]\n"</span> + digest}] \
+               + keep_recent</pre>
+
+    <p>The hysteresis band (compact at 85% full, down to 60%) prevents the pathological case where every turn nudges over the line and triggers a fresh, expensive summarization that barely buys headroom. Compact in chunks that buy real slack.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Verify the compaction, because lossy is not the same as broken.</h3>
+
+    <p>Every compaction is a place where the agent can silently lose a fact and you will only find out three turns later when it does something forbidden. Treat compaction like any other lossy transform: verify it.</p>
+
+    <ul>
+      <li><strong>Constraint survival check.</strong> Maintain an explicit list of hard constraints out-of-band. After compaction, assert each one still appears (semantically) in the digest; if not, re-inject it verbatim.</li>
+      <li><strong>Open-loop survival check.</strong> Count open sub-tasks before and after. A drop is a red flag, not a feature.</li>
+      <li><strong>Round-trip eval.</strong> Offline, ask known questions answerable only from pre-compaction history, against the post-compaction state. Track the answer-rate as a first-class metric (see <code class="inline">evaluating-memory</code>).</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>The cheapest robust safeguard: keep hard constraints and the current open-loop list in a small, never-compacted pinned block at the top of the working set. Compaction then physically cannot eat them, no matter how aggressive it gets. Spend tokens here &mdash; it is the highest-leverage budget you have.</p>
+    </div>
+  </div>
+</section>

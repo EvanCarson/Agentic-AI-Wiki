@@ -1,0 +1,130 @@
+<section class="phase">
+  <div class="phase-num">P2</div>
+  <div class="week">Deep-Dives · Protocols &amp; Interop</div>
+  <h2>Function/tool calling standards: JSON Schema as the shared substrate.</h2>
+  <p class="goal">Every major model provider grounds tool calling in the same idea: describe a function with JSON Schema, let the model emit a structured call, execute it, feed the result back. This essay dissects that contract, the schema dialect that actually matters in practice, and where providers genuinely differ versus where they only rename things.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The universal contract.</h3>
+
+    <p>Strip away provider branding and tool calling is four steps that have been stable since 2023:</p>
+    <ul>
+      <li><strong>Declare.</strong> The caller sends the model a list of tools, each with a name, a natural-language description, and a JSON Schema for its parameters.</li>
+      <li><strong>Select.</strong> The model, given the conversation, decides whether to call a tool and emits a structured call: a tool name plus a JSON arguments object intended to validate against that tool's schema.</li>
+      <li><strong>Execute.</strong> Your code — never the model — runs the actual function with those arguments and produces a result.</li>
+      <li><strong>Return.</strong> The result is appended to the conversation, correlated to the call by an opaque ID, and the loop continues until the model answers without calling a tool.</li>
+    </ul>
+
+    <p>The model never executes anything. It only produces a <em>request</em> to call a function. This separation is the entire security and reliability story of tool calling: the schema constrains what the model can ask for, and your handler decides what actually happens.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>JSON Schema is the lingua franca — but a subset of it.</h3>
+
+    <p>The shared substrate across OpenAI, Anthropic, Google, and essentially every open-model tool-calling convention is <strong>JSON Schema</strong> (the IETF draft family). A tool's parameters are a JSON Schema <code class="inline">object</code> with typed <code class="inline">properties</code>, a <code class="inline">required</code> list, and optional constraints like <code class="inline">enum</code>, <code class="inline">minimum</code>, <code class="inline">format</code>, and nested objects/arrays.</p>
+
+<pre class="standalone"><span class="c-cm"># A provider-neutral tool schema (the part everyone agrees on)</span>
+{
+  <span class="c-st">"name"</span>: <span class="c-st">"create_ticket"</span>,
+  <span class="c-st">"description"</span>: <span class="c-st">"Open a support ticket. Use only after the "</span>
+                 <span class="c-st">"user has confirmed the summary."</span>,
+  <span class="c-st">"parameters"</span>: {
+    <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+    <span class="c-st">"properties"</span>: {
+      <span class="c-st">"title"</span>:    {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>, <span class="c-st">"maxLength"</span>: <span class="c-st">120</span>},
+      <span class="c-st">"severity"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+                    <span class="c-st">"enum"</span>: [<span class="c-st">"low"</span>, <span class="c-st">"normal"</span>, <span class="c-st">"high"</span>, <span class="c-st">"urgent"</span>]},
+      <span class="c-st">"component"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+      <span class="c-st">"steps"</span>: {
+        <span class="c-st">"type"</span>: <span class="c-st">"array"</span>,
+        <span class="c-st">"items"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+        <span class="c-st">"description"</span>: <span class="c-st">"Ordered reproduction steps."</span>
+      }
+    },
+    <span class="c-st">"required"</span>: [<span class="c-st">"title"</span>, <span class="c-st">"severity"</span>],
+    <span class="c-st">"additionalProperties"</span>: <span class="c-kw">false</span>
+  }
+}</pre>
+
+    <p>The practical caveat: providers support a <em>subset</em> of full JSON Schema, and the subsets are not identical. Exotic constructs — <code class="inline">$ref</code> recursion, <code class="inline">oneOf</code>/<code class="inline">allOf</code> composition, <code class="inline">patternProperties</code>, conditional <code class="inline">if/then</code> — may be silently ignored, rejected, or only honoured in a "strict" mode. The safe interoperable core is: scalar types, <code class="inline">enum</code>, arrays, nested objects, <code class="inline">required</code>, and clear descriptions. Treat anything beyond that as provider-specific until verified.</p>
+
+    <div class="callout tip">
+      <p>The single highest-leverage field is <code class="inline">description</code> — for the tool <em>and</em> every parameter. The model selects and fills tools largely from prose, not from types. A precise description ("ISO-8601 date; omit for 'today'") prevents more bad calls than any structural constraint.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Where providers differ: the envelope, not the schema.</h3>
+
+    <p>The schema body is portable. The <em>wrapper</em> around it is not. The Field Guide's Tool Use chapter walks the on-the-wire shapes in detail; here is the protocol-level summary:</p>
+
+    <div class="code-tabs">
+      <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+      <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+    </div>
+    <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># Anthropic Messages API — tool declaration</span>
+{
+  <span class="c-st">"name"</span>: <span class="c-st">"create_ticket"</span>,
+  <span class="c-st">"description"</span>: <span class="c-st">"Open a support ticket."</span>,
+  <span class="c-st">"input_schema"</span>: { <span class="c-cm">/* the JSON Schema object */</span> }
+}
+<span class="c-cm"># Model emits a `tool_use` content block:</span>
+<span class="c-cm">#   {type:"tool_use", id:"toolu_…", name, input:{…}}</span>
+<span class="c-cm"># You return a `tool_result` block keyed by tool_use_id.</span></pre>
+    </div>
+    <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># OpenAI Responses API — tool declaration</span>
+{
+  <span class="c-st">"type"</span>: <span class="c-st">"function"</span>,
+  <span class="c-st">"name"</span>: <span class="c-st">"create_ticket"</span>,
+  <span class="c-st">"description"</span>: <span class="c-st">"Open a support ticket."</span>,
+  <span class="c-st">"parameters"</span>: { <span class="c-cm">/* the JSON Schema object */</span> }
+}
+<span class="c-cm"># Model emits a `function_call` item with stringified</span>
+<span class="c-cm"># `arguments`; you return a `function_call_output`</span>
+<span class="c-cm"># item keyed by call_id.</span></pre>
+    </div>
+
+    <p>The differences that actually matter for an interop layer:</p>
+    <ul>
+      <li><strong>Key naming.</strong> <code class="inline">input_schema</code> vs <code class="inline">parameters</code>; <code class="inline">input</code> (parsed object) vs <code class="inline">arguments</code> (JSON string you must parse).</li>
+      <li><strong>The type discriminator.</strong> OpenAI tags tools with <code class="inline">"type": "function"</code> because it also offers built-in tools (web search, file search, computer use) alongside user functions. Anthropic has one tool kind, so no discriminator.</li>
+      <li><strong>Strict mode.</strong> OpenAI's <code class="inline">"strict": true</code> with <code class="inline">additionalProperties: false</code> constrains decoding so arguments provably match the schema. Anthropic enforces conformance differently and does not need this flag. Strict mode also narrows the accepted schema subset — a deliberate trade of expressiveness for guarantees.</li>
+      <li><strong>Correlation IDs.</strong> <code class="inline">tool_use_id</code> vs <code class="inline">call_id</code> — same concept (match a result to its call, essential for parallel calls), different name.</li>
+      <li><strong>History model.</strong> Anthropic's strict role-alternating <code class="inline">messages</code> with content blocks vs OpenAI's flat list of typed <code class="inline">input</code> items correlated by ID.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>An adapter is small because the core is shared.</h3>
+
+    <p>Because the schema is portable and only the envelope differs, a provider-neutral tool definition plus thin per-provider adapters is the standard interop pattern. You author each tool once, in a neutral form, and render it into each provider's wrapper.</p>
+
+<pre class="standalone"><span class="c-cm"># One neutral definition, rendered per provider</span>
+<span class="c-kw">def</span> <span class="c-fn">to_anthropic</span>(t):
+    <span class="c-kw">return</span> {<span class="c-st">"name"</span>: t.name,
+            <span class="c-st">"description"</span>: t.description,
+            <span class="c-st">"input_schema"</span>: t.schema}
+
+<span class="c-kw">def</span> <span class="c-fn">to_openai</span>(t):
+    <span class="c-kw">return</span> {<span class="c-st">"type"</span>: <span class="c-st">"function"</span>,
+            <span class="c-st">"name"</span>: t.name,
+            <span class="c-st">"description"</span>: t.description,
+            <span class="c-st">"parameters"</span>: t.schema,
+            <span class="c-st">"strict"</span>: <span class="c-kw">True</span>}
+<span class="c-cm"># Same t.schema (the interoperable JSON Schema core)</span>
+<span class="c-cm"># feeds both. Parsing the call back is the only</span>
+<span class="c-cm"># other place the envelope leaks.</span></pre>
+
+    <p>This is precisely the seam that the Model Context Protocol formalises: instead of every agent author writing these adapters and every tool author redescribing their function per provider, MCP makes the tool description a protocol artefact a server publishes once. The next essays follow that thread. The takeaway here: tool calling has a real, stable standard at its core — JSON Schema plus a four-step request/execute/return loop — and the provider differences are a thin, well-understood translation layer, not a fundamental incompatibility.</p>
+
+    <div class="callout warn">
+      <p>Schema-valid is not the same as safe. The schema bounds the <em>shape</em> of arguments, never their intent. <code class="inline">{"path": "../../etc/passwd"}</code> is perfectly valid against <code class="inline">{"type":"string"}</code>. Argument validation against business rules and authorization happens in your handler — see the Safety &amp; Agentic Security track for the threat model.</p>
+    </div>
+  </div>
+</section>

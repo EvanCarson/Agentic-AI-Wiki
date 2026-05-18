@@ -1,0 +1,126 @@
+<section class="phase">
+  <div class="phase-num">M2</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>Short-term vs long-term memory: the working context and the store behind it.</h2>
+  <p class="goal">Agents need two distinct memory systems with different lifetimes, costs, and failure modes. Short-term memory is the in-prompt working context &mdash; fast, fully attended, ephemeral. Long-term memory is an external store &mdash; durable, large, but only useful when the right slice is retrieved back in. Conflating the two is the most common memory-architecture mistake.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Two systems, drawn from cognitive analogy &mdash; used carefully.</h3>
+
+    <p>The human analogy is a useful starting frame, not a blueprint. Working memory holds a handful of items under active manipulation; long-term memory is vast, durable, and accessed by cued recall. For agents the mapping is concrete:</p>
+
+    <ul>
+      <li><strong>Short-term memory = the context window.</strong> The current system prompt, recent turns, fresh tool results, the scratchpad. It is read at full fidelity by attention on every token. It vanishes the moment the request returns &mdash; nothing persists unless you write it somewhere.</li>
+      <li><strong>Long-term memory = an external store.</strong> A vector index, key-value store, graph, or plain files. It survives across turns, sessions, and process restarts. The model cannot "see" it; it must be queried and the result spliced into short-term memory to have any effect.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The decisive difference is not size or durability &mdash; it is <em>attention</em>. Short-term memory is what the model actually computes over this turn. Long-term memory is inert until retrieval promotes a slice of it into short-term memory.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Short-term memory: what earns a slot.</h3>
+
+    <p>Working context is the scarcest resource you have (see <code class="inline">context-budgeting</code>). Treat admission as a decision with a cost. A practical policy: content earns a working-set slot only if it is <strong>needed for the next decision</strong>, not merely <em>related to the task</em>.</p>
+
+    <p>Concretely, the working set on a typical turn should hold:</p>
+
+    <ul>
+      <li>The task / current user goal &mdash; always.</li>
+      <li>The last <em>k</em> turns verbatim &mdash; recency dominates relevance for in-flight reasoning.</li>
+      <li>Open loops: pending tool calls, unfinished sub-goals, unresolved questions.</li>
+      <li>A small, explicitly maintained scratchpad of decisions and facts the agent itself flagged as durable.</li>
+    </ul>
+
+    <p>Everything else &mdash; resolved sub-tasks, stale tool output, turns older than <em>k</em> &mdash; is a candidate for eviction to long-term memory.</p>
+
+<pre class="standalone"><span class="c-cm"># memory/working_set.py</span>
+<span class="c-kw">from</span> collections <span class="c-kw">import</span> deque
+
+<span class="c-kw">class</span> <span class="c-fn">WorkingSet</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, max_turns: <span class="c-kw">int</span> = <span class="c-st">12</span>):
+        self.turns: deque = deque(maxlen=max_turns)
+        self.scratchpad: <span class="c-kw">list</span>[<span class="c-kw">str</span>] = []  <span class="c-cm"># durable, agent-curated</span>
+
+    <span class="c-kw">def</span> <span class="c-fn">add_turn</span>(self, turn: <span class="c-kw">dict</span>) -> <span class="c-kw">dict</span> | <span class="c-kw">None</span>:
+        evicted = self.turns[<span class="c-st">0</span>] <span class="c-kw">if</span> <span class="c-kw">len</span>(self.turns) == self.turns.maxlen <span class="c-kw">else</span> <span class="c-kw">None</span>
+        self.turns.append(turn)
+        <span class="c-kw">return</span> evicted   <span class="c-cm"># caller persists it to long-term memory</span>
+
+    <span class="c-kw">def</span> <span class="c-fn">note</span>(self, fact: <span class="c-kw">str</span>) -> <span class="c-kw">None</span>:
+        <span class="c-cm"># Agent explicitly promotes a fact it must not forget.</span>
+        self.scratchpad.append(fact)</pre>
+
+    <p>The eviction path is the load-bearing detail. Dropping a turn off the end of a <code class="inline">deque</code> without persisting it is amnesia; dropping it <em>after</em> writing a durable trace to long-term memory is forgetting-with-recall, which is what you want.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Long-term memory: when to write, when to recall.</h3>
+
+    <p>Two independent decisions, and most bad memory systems get them backwards by writing everything and recalling everything.</p>
+
+    <h4>When to write</h4>
+
+    <p>Do not persist raw transcripts indiscriminately &mdash; that is a slow leak that pollutes future retrieval. Write when content has <em>durable value beyond this turn</em>:</p>
+
+    <ul>
+      <li>Stable facts about the user, environment, or task ("deploys are gated on the staging check").</li>
+      <li>Outcomes and their causes &mdash; what was tried, what worked, what failed and why (episodic).</li>
+      <li>Reusable procedures the agent derived (procedural).</li>
+      <li>Explicit user instructions to remember.</li>
+    </ul>
+
+    <h4>When to recall</h4>
+
+    <p>Recall is triggered by the <em>current need</em>, not by a schedule. Before a turn, form a retrieval query from the active goal and pull only the top few items that clear a relevance threshold. Recalling marginally-relevant memories is not free &mdash; it spends working-set budget and adds distractors that measurably degrade reasoning.</p>
+
+<pre class="standalone"><span class="c-cm"># memory/longterm.py</span>
+<span class="c-kw">class</span> <span class="c-fn">LongTermMemory</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, store, embedder):
+        self.store = store          <span class="c-cm"># vector / kv / graph backend</span>
+        self.embed = embedder
+
+    <span class="c-kw">def</span> <span class="c-fn">write</span>(self, text: <span class="c-kw">str</span>, kind: <span class="c-kw">str</span>, meta: <span class="c-kw">dict</span>) -> <span class="c-kw">None</span>:
+        <span class="c-kw">if</span> <span class="c-kw">not</span> self._is_durable(text, kind):
+            <span class="c-kw">return</span>                     <span class="c-cm"># write gate: skip ephemera</span>
+        self.store.upsert(
+            vector=self.embed(text),
+            payload={<span class="c-st">"text"</span>: text, <span class="c-st">"kind"</span>: kind, **meta,
+                     <span class="c-st">"ts"</span>: now()},
+        )
+
+    <span class="c-kw">def</span> <span class="c-fn">recall</span>(self, goal: <span class="c-kw">str</span>, k: <span class="c-kw">int</span> = <span class="c-st">5</span>,
+               min_score: <span class="c-kw">float</span> = <span class="c-st">0.35</span>) -> <span class="c-kw">list</span>[<span class="c-kw">dict</span>]:
+        hits = self.store.search(self.embed(goal), k=k * <span class="c-st">3</span>)
+        hits = [h <span class="c-kw">for</span> h <span class="c-kw">in</span> hits <span class="c-kw">if</span> h.score &gt;= min_score]
+        <span class="c-kw">return</span> hits[:k]      <span class="c-cm"># threshold THEN truncate</span></pre>
+
+    <div class="callout warn">
+      <p>The single most common long-term-memory failure: an unbounded write path. Every turn is appended, the store fills with near-duplicate transcript noise, retrieval recall@k collapses, and the agent gets <em>worse</em> the longer it runs. The write gate is not optional.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The promotion / demotion cycle.</h3>
+
+    <p>Healthy agents continuously move information between the two systems. The cycle, once per turn:</p>
+
+<pre class="trace"><span class="c-out">1. RECALL   query long-term with current goal &rarr; candidate memories
+2. PROMOTE  splice top-k (above threshold) into working set
+3. REASON   model acts over working set, produces new turn
+4. DEMOTE   evict oldest / resolved working-set items
+5. WRITE    persist demoted items that pass the durability gate
+            &rarr; loop</span></pre>
+
+    <p>This is the same fault-in / page-out loop from <code class="inline">context-budgeting</code>, now with an explicit durability gate on the write side and a relevance threshold on the read side. Get those two filters right and the rest of the memory stack &mdash; types, stores, compaction &mdash; is tuning. Get them wrong and no vector database will save you.</p>
+
+    <div class="callout tip">
+      <p>Test the two systems independently. For short-term: does the agent keep the right things in-window across a long task? For long-term: given a known fact written 50 turns ago, is it recalled when relevant? Different metrics, different fixes &mdash; covered in <code class="inline">evaluating-memory</code>.</p>
+    </div>
+  </div>
+</section>

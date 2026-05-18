@@ -1,0 +1,87 @@
+<section class="phase">
+  <div class="phase-num">D7</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>工具使用循环与错误恢复。</h2>
+  <p class="goal">本节每种模式都调用工具，而工具会失败：超时、参数畸形、空结果、部分成功。一种架构能否在现实面前存活，正是在这里——在架构图省略的错误处理层——被决定的。本文涵盖失败分类法、恢复循环，以及有副作用工具的持久性问题。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>工具失败的分类法——因为每类需要不同回应。</h3>
+
+    <p>"工具失败了"不可执行。生产级智能体必须区分失败类别，因为正确恢复因类而异，混淆它们是大多数智能体不稳定的根因：</p>
+
+    <ul>
+      <li><strong>调用畸形。</strong>模型产出违反 schema 或语义无效（错误日期、不存在的 ID）的参数。恢复：把精确的结构化错误返回给模型让它重试——这是模型恢复得最好的失败。</li>
+      <li><strong>瞬时基础设施故障。</strong>超时、503、限流、网络抖动。恢复：带指数退避的确定性重试，<em>在 harness 中，而非通过模型</em>。模型永远不该看到瞬时抖动。</li>
+      <li><strong>空/无用结果。</strong>调用成功但返回无用之物（无搜索命中、空列表）。恢复：这是推理问题而非错误——作为观察暴露出来，让模型重新表述或换方法。</li>
+      <li><strong>硬语义失败。</strong>权限拒绝、资源不存在、前置条件不满足。恢复：通常重试无法恢复；模型必须重规划或升级给人。</li>
+      <li><strong>部分成功。</strong>一个批量/多项工具对部分项成功、对其他项失败。恢复：最难的情形——返回结构化的逐项结果，让智能体能在成功子集上行动并就其余作决定。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>主导的生产反模式：把这一切坍缩为一个喂回模型的通用 <code class="inline">"Error: something went wrong"</code> 字符串。模型分不清一个该忽略的瞬时抖动与一个必须升级的权限失败，于是要么无限重试要么放弃——两者看起来都像一个挂起或"笨"的智能体。错误分类法不是润色；它是鲁棒智能体与不稳定智能体之间的差别。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>恢复循环：分层，模型为最外环。</h3>
+
+<pre class="standalone"><span class="c-cm"># Tool dispatch with layered recovery</span>
+<span class="c-kw">def</span> <span class="c-fn">dispatch</span>(call):
+    <span class="c-kw">try</span>:
+        args = schema.<span class="c-fn">validate</span>(call.args)              <span class="c-cm"># layer 0: pre-flight</span>
+    <span class="c-kw">except</span> SchemaError <span class="c-kw">as</span> e:
+        <span class="c-kw">return</span> <span class="c-fn">tool_error</span>(<span class="c-st">"INVALID_ARGS"</span>, e.detail)   <span class="c-cm"># → model retries</span>
+
+    <span class="c-kw">for</span> attempt <span class="c-kw">in</span> <span class="c-fn">range</span>(MAX_RETRIES):              <span class="c-cm"># layer 1: deterministic</span>
+        <span class="c-kw">try</span>:
+            <span class="c-kw">return</span> <span class="c-fn">ok</span>(TOOLS[call.name](**args))
+        <span class="c-kw">except</span> Transient <span class="c-kw">as</span> e:
+            <span class="c-fn">backoff</span>(attempt)                        <span class="c-cm"># model never sees this</span>
+        <span class="c-kw">except</span> HardFailure <span class="c-kw">as</span> e:
+            <span class="c-kw">return</span> <span class="c-fn">tool_error</span>(<span class="c-st">"UNRECOVERABLE"</span>, e.reason)  <span class="c-cm"># → model replans</span>
+    <span class="c-kw">return</span> <span class="c-fn">tool_error</span>(<span class="c-st">"EXHAUSTED_RETRIES"</span>, call.name)   <span class="c-cm"># → model replans</span></pre>
+
+    <p>原则：<strong>在能恢复的最低层确定性地恢复；只把真正需要推理的升级给模型。</strong>schema 校验在任何副作用前捕获畸形调用。重试循环不可见地吸收瞬时故障。只有硬语义失败与重试耗尽才到达模型——作为它能推理的结构化观察，永不是原始堆栈跟踪。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>错误消息就是提示词。把它工程化。</h3>
+
+    <p>当一个错误确实到达模型，那条消息<em>就是</em>引导下一动作的提示词片段。含糊的错误产出乱抓式重试；具体的错误产出有针对性的纠正。对比：</p>
+
+<pre class="trace standalone"><span class="c-err">BAD:  Error: request failed</span>
+<span class="c-out">GOOD: INVALID_ARGS on create_ticket: field "priority" must be one
+      of [low, medium, high, urgent]; received "P1". Re-call with a
+      valid value.</span></pre>
+
+    <p>好的消息陈述了错误类别、出错字段、约束、收到的值与纠正动作。给出这个，模型几乎完美地从畸形调用中恢复；给"request failed"则几乎从不。这是智能体错误处理中投资回报最高的一环，也是最常被跳过的一环。</p>
+
+    <div class="callout tip">
+      <p>让你的工具层以固定、可解析的形状返回错误（<code class="inline">{code, field, constraint, received, hint}</code>）。它改善模型恢复，让失败类别可度量，并让你能按类别告警（<code class="inline">UNRECOVERABLE</code> 激增是事故；<code class="inline">INVALID_ARGS</code> 激增是提示/schema bug）。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>副作用：幂等性、持久性与真相。</h3>
+
+    <p>只读工具宽恕重试。有副作用的工具（发邮件、扣款、改动生产）不宽恕——盲目重试会重复发送。让恢复安全的纪律：</p>
+
+    <ul>
+      <li><strong>幂等键。</strong>从预期效果派生一个键；工具在服务端去重。现在 harness 重试层对变更调用也安全。</li>
+      <li><strong>工具结果是真相，而非模型的信念。</strong>只有当工具返回成功，智能体才"认为"邮件发出去了。状态转移跟随工具结果，绝不跟随模型的叙述——一个在失败调用后说"完成"的模型，就是经典的静默损坏 bug。</li>
+      <li><strong>长/关键流程用持久执行。</strong>持久化轨迹（一个工作流/检查点引擎），使计划中途崩溃从最后完成的步骤恢复，而非重跑副作用。这就是为何 plan-and-execute 显式、可持久化的计划对高风险工作在运维上比内存中的 ReAct 历史更安全。</li>
+      <li><strong>补偿动作。</strong>当一个多步流程中途失败且已提交副作用时，智能体需要显式的回滚/补偿工具——对"钱已转走"没有自动撤销。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>横切要点。</h3>
+
+    <p>错误恢复不是你选择的模式；它是决定你所选模式在生产中是否奏效的那一层。ReAct 的循环、plan-and-execute 的重规划、反思的校验器、路由器的兜底——没有有纪律的错误分类法、确定性的低层恢复、工程化的错误消息和幂等的副作用，每一种都会退化成抖动、静默损坏或挂起的智能体。诚实的权衡很直白：<strong>这一层不光鲜，且缺席于每张架构图，而生产智能体可靠性的大部分实际上正是在这里被赢得或输掉。</strong></p>
+  </div>
+</section>

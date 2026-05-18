@@ -1,0 +1,99 @@
+<section class="phase">
+  <div class="phase-num">M7</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>Evaluating memory quality &mdash; and the pitfalls it catches.</h2>
+  <p class="goal">Memory systems fail silently. The agent still answers, still acts, still looks fine in a demo &mdash; while quietly recalling a stale fact, obeying a poisoned memory, or having forgotten a constraint during compaction. You cannot tune what you do not measure. This essay defines memory-specific metrics and the failure modes they exist to catch.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why generic eval misses memory bugs.</h3>
+
+    <p>End-to-end task-success eval will eventually catch a broken memory system, but late, noisily, and without telling you <em>which</em> layer broke. Memory failures are diffuse: a wrong recall on turn 12 surfaces as a bad action on turn 30. You need eval that isolates the memory stack from the agent's reasoning, with probes targeted at each operation: write, recall, compaction, update.</p>
+
+    <div class="callout">
+      <p>Principle: every memory operation that can lose or distort information gets its own dataset and its own metric. Aggregate task success is the integration test; these are the unit tests.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The core memory metrics.</h3>
+
+    <ul>
+      <li><strong>Recall@k (memory)</strong> &mdash; with a known fact written N turns ago and a query that should surface it, is it in the top k? The single most important number. Track it as a function of store size and turn-distance &mdash; a system that is fine at 100 memories and broken at 50,000 is the normal failure trajectory.</li>
+      <li><strong>Recall precision / distractor rate</strong> &mdash; of the memories injected into context, what fraction were actually relevant? High recall with low precision poisons reasoning with confident-looking junk.</li>
+      <li><strong>Constraint survival</strong> &mdash; after a compaction, do all hard constraints still hold in the resulting state? Measured as a strict pass/fail per constraint per compaction.</li>
+      <li><strong>Staleness rate</strong> &mdash; when a fact has been updated, what fraction of subsequent recalls return the <em>old</em> value? Directly measures the update path.</li>
+      <li><strong>Write precision</strong> &mdash; of everything written to long-term memory, what fraction was actually durable-worthy? Low write precision is the leading indicator of future recall collapse.</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># eval/memory_eval.py</span>
+<span class="c-kw">def</span> <span class="c-fn">recall_at_k</span>(mem, probes, k=<span class="c-st">5</span>) -> <span class="c-kw">float</span>:
+    <span class="c-cm"># probe = (fact_id, query, turns_ago) injected earlier</span>
+    hit = <span class="c-st">0</span>
+    <span class="c-kw">for</span> p <span class="c-kw">in</span> probes:
+        got = mem.recall(p.query, k=k)
+        hit += <span class="c-kw">int</span>(p.fact_id <span class="c-kw">in</span> {g.id <span class="c-kw">for</span> g <span class="c-kw">in</span> got})
+    <span class="c-kw">return</span> hit / <span class="c-kw">len</span>(probes)
+
+<span class="c-kw">def</span> <span class="c-fn">staleness_rate</span>(mem, updates) -> <span class="c-kw">float</span>:
+    <span class="c-cm"># update = (key, old_val, new_val); recall after update</span>
+    stale = <span class="c-st">0</span>
+    <span class="c-kw">for</span> u <span class="c-kw">in</span> updates:
+        v = mem.recall(u.key, k=<span class="c-st">1</span>)[<span class="c-st">0</span>].text
+        stale += <span class="c-kw">int</span>(u.old_val <span class="c-kw">in</span> v <span class="c-kw">and</span> u.new_val <span class="c-kw">not</span> <span class="c-kw">in</span> v)
+    <span class="c-kw">return</span> stale / <span class="c-kw">len</span>(updates)</pre>
+
+    <p>Run these against a synthetic long-horizon trajectory (hundreds of turns, planted facts, planted updates, planted constraints) on every change to the memory stack. This is the harness the weight-tuning in <code class="inline">retrieval-augmented-memory</code> and the triggers in <code class="inline">context-compaction</code> are tuned against.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Pitfall: context poisoning.</h3>
+
+    <p>A wrong, hallucinated, or adversarial statement gets written to long-term memory, is later recalled with the same authority as a true memory, and propagates &mdash; the agent reasons from it, produces output consistent with it, which may itself get written back. A self-reinforcing falsehood.</p>
+
+    <ul>
+      <li><strong>Gate the write path:</strong> do not persist model-generated claims as semantic fact without grounding. An inference is stored as <em>inferred</em>, not as <em>fact</em> (the provenance tagging from <code class="inline">retrieval-augmented-memory</code>).</li>
+      <li><strong>Never put recalled memory in the authoritative system block:</strong> it is evidence, not policy. Poisoning a hint is recoverable; poisoning an instruction is obedience.</li>
+      <li><strong>Eval probe:</strong> inject a known-false memory, then measure how often it surfaces in answers and whether the agent ever writes a derived falsehood back. Poisoning that cannot propagate back to the store is contained.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Pitfall: stale memory.</h3>
+
+    <p>A fact was true when written and is now wrong &mdash; the user changed teams, the API version bumped, the policy was revised. The memory system confidently recalls the obsolete value. This is the failure the append-only vector store guarantees and the in-place key-value update (<code class="inline">memory-stores</code>) prevents.</p>
+
+    <ul>
+      <li><strong>Update in place for semantic memory:</strong> one key, one current value. New observation overwrites, it does not accumulate.</li>
+      <li><strong>Timestamp and prefer-recent on conflict:</strong> when two memories disagree, recency breaks the tie, and surface the disagreement rather than silently picking one.</li>
+      <li><strong>Eval probe:</strong> the staleness-rate metric above. A non-zero staleness rate means the update path is broken &mdash; a P0, because the agent is now confidently wrong.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Pitfall: retrieval drift and compaction amnesia.</h3>
+
+    <p>Two failures that share a signature &mdash; the system <em>looks</em> healthy because it still returns plausible results &mdash; and so are invisible without targeted probes.</p>
+
+    <ul>
+      <li><strong>Retrieval drift:</strong> a cue built once at task start keeps recalling early, now-irrelevant memories while the task has moved on. Caught by measuring recall@k <em>as a function of turn-distance into the task</em>, not just at turn 1. A curve that decays mid-task is drift. Fix: rebuild the cue from current state every turn.</li>
+      <li><strong>Compaction amnesia:</strong> a constraint or open loop is dropped during summarization and the agent proceeds as if it never existed. Caught by the constraint-survival and open-loop-survival checks from <code class="inline">context-compaction</code>. Fix: a pinned, never-compacted block for hard constraints and active loops.</li>
+    </ul>
+
+    <pre class="trace"><span class="c-out">memory eval report  (synthetic 300-turn trajectory)
+  recall@5 @ store=1k        0.91   ok
+  recall@5 @ store=50k       0.58   FAIL  &larr; redundancy collapse
+  recall@5 by turn-distance: t1 0.94  t150 0.61  FAIL &larr; drift
+  staleness rate             0.00   ok    (kv in-place update)
+  constraint survival        18/20  FAIL  &larr; compaction dropped 2
+  write precision            0.41   WARN  &larr; tighten write gate</span></pre>
+
+    <div class="callout tip">
+      <p>This report is the deliverable. A memory system is not "done" when it works in a ten-turn demo &mdash; it is done when these numbers hold on a synthetic long-horizon trajectory at the store size and task length you will actually run in production. Measure first; every other essay in this section is a knob you turn against this dashboard.</p>
+    </div>
+  </div>
+</section>

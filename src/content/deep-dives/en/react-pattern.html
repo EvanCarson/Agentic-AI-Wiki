@@ -1,0 +1,82 @@
+<section class="phase">
+  <div class="phase-num">D2</div>
+  <div class="week">Deep Dive · Architectures &amp; Patterns</div>
+  <h2>ReAct — interleaving reasoning and acting.</h2>
+  <p class="goal">ReAct is the workhorse of production agents: a loop where the model alternates between thinking and calling tools, each tool result reshaping the next thought. This essay covers the actual control flow, why interleaving beats reason-then-act, and the failure modes that bite at scale.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The core idea: thought and action share one trajectory.</h3>
+
+    <p>ReAct, from Yao et al. (2022), synergizes <em>reasoning</em> (chain-of-thought) and <em>acting</em> (tool calls / environment interaction) in a single interleaved stream. The model emits a thought, then an action, observes the result, emits the next thought conditioned on that observation, and repeats until it decides to answer. The key insight is that reasoning and acting reinforce each other: reasoning decides which action to take and how to interpret messy results; actions inject external facts that correct the reasoning before it compounds into a hallucination.</p>
+
+    <p>Contrast the two failure modes ReAct sits between. Pure chain-of-thought reasons fluently but is untethered — it confidently invents facts. Pure act-only loops (call a tool, call another) ground every step in reality but cannot decompose a hard question or recover from an irrelevant result. Interleaving gets grounding <em>and</em> deliberation in one trajectory.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The loop, explicitly.</h3>
+
+    <p>With modern tool-calling APIs you do not prompt the literal strings "Thought:"/"Action:" — the model's reasoning lives in its text content and the action is a structured tool call. The structure is identical:</p>
+
+<pre class="standalone"><span class="c-cm"># The ReAct loop — framework-free</span>
+history = [user_query]
+<span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-fn">range</span>(MAX_STEPS):
+    resp = model.<span class="c-fn">call</span>(history, tools=TOOLS)   <span class="c-cm"># thought + maybe action</span>
+    history.<span class="c-fn">append</span>(resp)
+
+    <span class="c-kw">if</span> resp.stop_reason == <span class="c-st">"final_answer"</span>:
+        <span class="c-kw">return</span> resp.text                       <span class="c-cm"># model chose to stop</span>
+
+    <span class="c-kw">for</span> call <span class="c-kw">in</span> resp.tool_calls:           <span class="c-cm"># act</span>
+        obs = <span class="c-fn">run_tool</span>(call.name, call.args)
+        history.<span class="c-fn">append</span>(tool_result(call.id, obs))  <span class="c-cm"># observe</span>
+    <span class="c-cm"># loop: next thought is conditioned on obs</span>
+
+<span class="c-kw">raise</span> <span class="c-fn">StepBudgetExceeded</span>(history)            <span class="c-cm"># bounded by construction</span></pre>
+
+    <p>Three properties make this production-grade. It is <strong>bounded</strong> (the step budget caps cost and runaway loops). It is <strong>observable</strong> (every thought and observation is in <code class="inline">history</code> — your trace is the data structure itself). And it is <strong>resumable</strong> if you persist <code class="inline">history</code> between steps.</p>
+
+    <div class="callout tip">
+      <p>The single highest-leverage instrumentation: log <code class="inline">history</code> after every step with the step index. Ninety percent of ReAct debugging is reading the trajectory and finding the step where the thought stopped being grounded in the last observation.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>When ReAct pays off.</h3>
+
+    <ul>
+      <li><strong>Open-ended information tasks</strong> where the next action genuinely depends on the last result: research, debugging, multi-hop QA, customer-support triage. If you cannot write the plan in advance, ReAct's per-step adaptivity is exactly the right tool.</li>
+      <li><strong>Noisy or partial tool results</strong> where the model must reason about whether a result is relevant before deciding what to do next.</li>
+      <li><strong>Small-to-moderate tool sets</strong> (roughly 3–15 tools) where the model can reliably select among them per step.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Failure modes — and the mitigations that actually work.</h3>
+
+    <p>ReAct's adaptivity is also its liability. The named failure modes, in rough order of how often they ship to production:</p>
+
+    <ul>
+      <li><strong>Looping / thrashing.</strong> The agent re-runs near-identical actions because each observation fails to advance the goal. Mitigation: a step budget (always), plus a cheap loop detector that flags repeated (tool, normalized-args) tuples and injects a "you have tried this; change approach or stop" message.</li>
+      <li><strong>Context rot on long trajectories.</strong> The history grows until early grounding facts are buried or evicted, and the model drifts. Mitigation: periodic context compaction — summarize old steps into a durable scratchpad, keep recent steps verbatim.</li>
+      <li><strong>Premature commitment.</strong> The model decides it has the answer after one weak observation. Mitigation: a reflection or verifier gate before <code class="inline">final_answer</code> (covered in its own essay) — do not solve this inside the ReAct prompt alone.</li>
+      <li><strong>Tool-selection errors at scale.</strong> With many similar tools the model picks the wrong one. Mitigation: a routing layer in front of the loop (its own essay) rather than more prose in the system prompt.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>Anti-pattern: "fix it in the system prompt." Each failure above has a structural mitigation. Piling instructions ("don't repeat actions, verify before answering, pick the right tool") into the prompt produces a brittle wall of text that the model follows inconsistently and that you cannot test. Prefer a loop-detector, a verifier node, and a router — code you can unit-test.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When NOT to use plain ReAct.</h3>
+
+    <p>ReAct is the wrong default when the task has a <em>known, stable structure</em>. If you already know the five steps to onboard a customer, per-step re-deliberation is wasted latency and a chance to go off-script — use plan-and-execute or a hard-coded workflow with model calls at the leaves. ReAct also degrades on long-horizon tasks: with no global plan it loses the thread after ~15–25 steps. And for tasks with verifiable answers (code, math), a single ReAct pass underperforms a search or evaluator-optimizer loop that exploits the cheap correctness signal.</p>
+
+    <p>The honest one-line tradeoff: <strong>ReAct buys maximal adaptivity at the cost of global coherence and predictable cost.</strong> The patterns in the following essays each reclaim some coherence by reintroducing structure ReAct deliberately omits.</p>
+  </div>
+</section>

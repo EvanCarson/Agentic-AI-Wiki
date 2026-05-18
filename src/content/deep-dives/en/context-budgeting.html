@@ -1,0 +1,137 @@
+<section class="phase">
+  <div class="phase-num">M1</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>Engineering the context window: budgeting, ordering, and position effects.</h2>
+  <p class="goal">The context window is the only memory an LLM truly has at inference time. Everything else &mdash; vector stores, scratchpads, databases &mdash; exists to decide what goes into that window. Treat the window as a scarce, engineered resource with an explicit budget, not as a bag you keep stuffing until it overflows.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The context problem, stated precisely.</h3>
+
+    <p>An LLM is a pure function of its input tokens. It has no hidden state that survives between calls. A long-running agent &mdash; one that browses, calls tools, and reasons over many turns &mdash; generates an <em>unbounded</em> trajectory: messages, tool results, observations, intermediate reasoning. The window is <em>finite</em> (200K, 1M, whatever). The entire discipline of context engineering is the management of that mismatch.</p>
+
+    <p>Three forces act against you as the trajectory grows:</p>
+
+    <ul>
+      <li><strong>Hard limit:</strong> past the window size, the request fails or silently truncates.</li>
+      <li><strong>Cost &amp; latency:</strong> attention is roughly linear-to-superlinear in tokens; a 150K-token prompt is slow and expensive on every single turn, not once.</li>
+      <li><strong>Quality decay:</strong> even well within the limit, models attend unevenly. Relevant facts buried in the middle of a huge context are effectively invisible &mdash; the "lost in the middle" effect.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>A bigger context window does not solve the context problem. It raises the ceiling and makes the quality-decay problem worse, because now you <em>can</em> stuff 800K tokens of mostly-irrelevant history into every turn and watch accuracy quietly fall.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Give every turn an explicit token budget.</h3>
+
+    <p>Before any clever retrieval or summarization, you need a number. Decide, per turn, how many tokens each <em>category</em> of content is allowed. Everything else gets compacted, dropped, or moved to external memory.</p>
+
+<pre class="standalone"><span class="c-cm"># context/budget.py</span>
+<span class="c-kw">from</span> dataclasses <span class="c-kw">import</span> dataclass
+
+<span class="c-fn">@dataclass</span>
+<span class="c-kw">class</span> <span class="c-fn">ContextBudget</span>:
+    total: <span class="c-kw">int</span>            <span class="c-cm"># model window minus a safety margin</span>
+    reserve_output: <span class="c-kw">int</span>   <span class="c-cm"># tokens kept free for the response</span>
+    system: <span class="c-kw">int</span>           <span class="c-cm"># instructions, persona, policies</span>
+    tools: <span class="c-kw">int</span>            <span class="c-cm"># tool schemas / definitions</span>
+    long_term: <span class="c-kw">int</span>       <span class="c-cm"># retrieved memories &amp; documents</span>
+    working: <span class="c-kw">int</span>         <span class="c-cm"># recent turns / scratchpad</span>
+
+    <span class="c-kw">def</span> <span class="c-fn">input_budget</span>(self) -> <span class="c-kw">int</span>:
+        <span class="c-kw">return</span> self.total - self.reserve_output
+
+    <span class="c-kw">def</span> <span class="c-fn">check</span>(self) -> <span class="c-kw">None</span>:
+        used = self.system + self.tools + self.long_term + self.working
+        <span class="c-kw">if</span> used &gt; self.input_budget():
+            <span class="c-kw">raise</span> <span class="c-fn">ValueError</span>(
+                <span class="c-kw">f</span><span class="c-st">"over budget by {used - self.input_budget()} tok"</span>)
+
+<span class="c-cm"># Example: 200K window, conservative split.</span>
+BUDGET = ContextBudget(
+    total=<span class="c-st">200_000</span>, reserve_output=<span class="c-st">8_000</span>,
+    system=<span class="c-st">3_000</span>, tools=<span class="c-st">4_000</span>,
+    long_term=<span class="c-st">60_000</span>, working=<span class="c-st">120_000</span>,
+)</pre>
+
+    <p>The exact numbers are workload-specific and you will tune them with evals. The discipline is what matters: every category has a ceiling, and the assembler is <em>forced</em> to make a choice when a category overflows instead of letting the prompt grow without bound.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Order content for position, not for convenience.</h3>
+
+    <p>Transformers do not weight all positions equally. Empirically, content at the <strong>start</strong> and <strong>end</strong> of the context is recalled far more reliably than content in the middle. Two practical consequences:</p>
+
+    <ul>
+      <li><strong>Stable, authoritative content goes at the front:</strong> system instructions, the task definition, tool contracts. These also benefit from prompt caching because they do not change between turns.</li>
+      <li><strong>The most decision-relevant content goes at the end:</strong> the current question, the freshest tool results, the top retrieved chunks. This is the last thing the model reads before it generates.</li>
+      <li><strong>Bulk, lower-confidence material goes in the middle</strong> &mdash; and you accept it may be under-attended, so it should never be the sole carrier of a critical fact.</li>
+    </ul>
+
+    <p>A useful assembly template, front to back:</p>
+
+<pre class="trace"><span class="c-out">[ system + policies ]        &larr; stable, cached, authoritative
+[ tool definitions ]         &larr; stable, cached
+[ retrieved long-term memory] &larr; bulk; ranked best-last
+[ compacted older turns ]    &larr; summary, not raw
+[ recent working turns ]     &larr; verbatim, high fidelity
+[ current user / task turn ] &larr; last token the model reads</span></pre>
+
+    <div class="callout tip">
+      <p>If a fact is critical &mdash; a constraint the agent must never violate &mdash; do not rely on it surviving in the middle of a 100K-token prompt. Restate it in the system block <em>and</em> immediately before the action that depends on it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Measure utilization, not just whether it fit.</h3>
+
+    <p>"It didn't error" is not success. Instrument the assembler so every turn records how the budget was spent and how much of it was actually used by the model.</p>
+
+<pre class="standalone"><span class="c-cm"># context/assemble.py</span>
+<span class="c-kw">def</span> <span class="c-fn">assemble</span>(budget, system, tools, memories, history, task):
+    parts, used = [], {}
+
+    parts.append(system);           used[<span class="c-st">"system"</span>] = ntok(system)
+    parts.append(tools);            used[<span class="c-st">"tools"</span>]  = ntok(tools)
+
+    <span class="c-cm"># Fill long-term up to its ceiling, best-ranked LAST.</span>
+    mem = fit(memories, budget.long_term, keep=<span class="c-st">"tail"</span>)
+    parts.append(mem);              used[<span class="c-st">"long_term"</span>] = ntok(mem)
+
+    <span class="c-cm"># Working set: verbatim recent, compact the overflow.</span>
+    work = fit(history, budget.working, keep=<span class="c-st">"tail"</span>,
+               overflow=compact)
+    parts.append(work);             used[<span class="c-st">"working"</span>] = ntok(work)
+
+    parts.append(task)              <span class="c-cm"># always last, never dropped</span>
+
+    log_metrics(used, budget)       <span class="c-cm"># for offline analysis</span>
+    <span class="c-kw">return</span> <span class="c-st">"\n\n"</span>.join(parts)</pre>
+
+    <p>Track these over a representative eval set:</p>
+
+    <ul>
+      <li><strong>Fill ratio per category</strong> &mdash; is <code class="inline">long_term</code> always saturated while <code class="inline">working</code> is half empty? Rebalance.</li>
+      <li><strong>Eviction rate</strong> &mdash; how often is content dropped, and does task success correlate with what got dropped?</li>
+      <li><strong>Position of the answer-bearing content</strong> &mdash; if the chunk that answered the question was at position 0.5 (dead middle), expect failures and reorder.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The mental model: context as a working set.</h3>
+
+    <p>Borrow the term from operating systems. A process has a huge virtual address space but a small physical RAM; the OS keeps the <em>working set</em> &mdash; the pages actually needed right now &mdash; resident and pages the rest to disk. An agent has an unbounded trajectory but a small context window; context engineering keeps the working set in-window and pages the rest to external memory (vector store, KV store, files), faulting it back in via retrieval when needed.</p>
+
+    <p>Everything in the rest of this section &mdash; short- vs long-term memory, memory types, retrieval-augmented memory, compaction, memory stores, evaluation &mdash; is a strategy for one of three operations: <strong>what to keep resident</strong>, <strong>what to page out</strong>, and <strong>how to fault the right thing back in</strong>. Budgeting is the accounting layer that makes those decisions explicit and measurable.</p>
+
+    <div class="callout">
+      <p>Rule of thumb: if you cannot say, in tokens, how much of your context is system vs tools vs memory vs working set on a typical turn, you are not engineering context &mdash; you are hoping. Start with the budget.</p>
+    </div>
+  </div>
+</section>

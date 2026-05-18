@@ -1,0 +1,76 @@
+<section class="phase">
+  <div class="phase-num">D6</div>
+  <div class="week">Deep Dive · Architectures &amp; Patterns</div>
+  <h2>Routing &amp; dispatch — selection, fan-out, parallelism.</h2>
+  <p class="goal">A router classifies an input and dispatches it to the right handler, model, or sub-agent. It is the cheapest structural fix for tool-selection errors and the foundation of multi-agent systems. This essay covers classifier vs. tool-call routing, parallel fan-out with a gather, and the failure modes of the routing layer itself.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why a router, instead of more prose in the prompt.</h3>
+
+    <p>As a single ReAct agent's tool set grows past roughly a dozen, two things degrade: tool-selection accuracy (the model confuses similar tools) and context cost (every tool schema is in every call). The instinct is to add instructions to the system prompt. The structural fix is to put a <strong>router</strong> in front: a small, cheap, testable component that decides <em>which</em> capability handles this input, then hands off with only that capability's tools in scope.</p>
+
+    <p>The win is separation of concerns. The router's only job is classification — you can unit-test it with a labeled set and measure routing accuracy directly. Each handler sees a narrow, clean context. Anthropic's "Building effective agents" names this the routing workflow and recommends it precisely when inputs fall into distinct categories better handled separately.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Two implementations.</h3>
+
+    <p><strong>Classifier router.</strong> A dedicated cheap-model call (or an embedding + nearest-centroid, or even a fine-tuned classifier) maps the input to a route label. Deterministic-ish, fast, independently testable, observable. Preferred when routes are stable and enumerable.</p>
+
+    <p><strong>Tool-call router.</strong> The orchestrating model is given each route as a "tool"; calling the tool <em>is</em> the routing decision. More flexible (the model can route mid-conversation with full context) but the decision is entangled with generation and harder to test in isolation.</p>
+
+<pre class="standalone"><span class="c-cm"># Classifier router with an explicit fallback</span>
+route = classifier.<span class="c-fn">label</span>(query, allowed=ROUTES, confidence=<span class="c-kw">True</span>)
+<span class="c-kw">if</span> route.confidence &lt; THRESHOLD:
+    <span class="c-kw">return</span> <span class="c-fn">handle</span>(<span class="c-st">"fallback"</span>, query)        <span class="c-cm"># general agent / ask to clarify</span>
+handler = HANDLERS[route.label]               <span class="c-cm"># narrow tools, narrow prompt</span>
+<span class="c-kw">return</span> handler.<span class="c-fn">run</span>(query)</pre>
+
+    <div class="callout tip">
+      <p>Always define an explicit low-confidence fallback route. The most common production routing bug is the absence of one: an out-of-distribution query gets force-fit into the closest label and fails confidently inside the wrong handler. A fallback that asks for clarification or invokes a generalist is mandatory, not optional.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Fan-out and parallelism.</h3>
+
+    <p>Routing's sibling is <strong>fan-out</strong>: instead of choosing one handler, dispatch to several concurrently and gather. Anthropic distinguishes two forms — <em>sectioning</em> (split a task into independent subtasks run in parallel, then aggregate) and <em>voting</em> (run the same task several times for diverse outputs, then reconcile).</p>
+
+<pre class="standalone"><span class="c-cm"># Sectioning fan-out: independent subtasks, parallel, then gather</span>
+subtasks = planner.<span class="c-fn">split</span>(task)            <span class="c-cm"># must be genuinely independent</span>
+results  = parallel_map(<span class="c-kw">lambda</span> s: <span class="c-fn">handle</span>(<span class="c-fn">route</span>(s), s), subtasks)
+<span class="c-kw">return</span> aggregator.<span class="c-fn">merge</span>(task, results)    <span class="c-cm"># a real reconciliation step</span></pre>
+
+    <p>Parallel fan-out is a pure latency/throughput win <em>only when subtasks are truly independent</em>. The aggregator is not a formality: merging partial results, resolving conflicts between branches, and deduplicating is itself a model task that fails if treated as string concatenation.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Failure modes of the routing layer.</h3>
+
+    <ul>
+      <li><strong>Misroute, then confident failure.</strong> Wrong label sends the query to a handler that lacks the right tools; it produces a fluent wrong answer. Mitigation: measure routing accuracy as a first-class metric; add a confidence threshold + fallback; let handlers signal "this isn't mine" to bounce back to the router (a re-route budget prevents ping-pong).</li>
+      <li><strong>Route proliferation.</strong> Routes multiply until the classifier itself is unreliable and overlapping. Mitigation: keep routes coarse and orthogonal; prefer a few broad handlers over many narrow ones; merge routes the classifier confuses.</li>
+      <li><strong>Boundary inputs.</strong> Queries that legitimately span two routes get arbitrarily assigned. Mitigation: allow multi-label routing into a fan-out, or escalate to a generalist for genuinely cross-cutting requests.</li>
+      <li><strong>False parallelism.</strong> Fanning out subtasks that are actually dependent yields branches that contradict each other and an aggregator that cannot reconcile them. Mitigation: only parallelize a verified independent set; everything with dependencies stays sequential.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>A router is a single point of failure with leverage: every downstream handler is gated by its accuracy. It deserves its own labeled eval set and dashboard, the same scrutiny you would give an authentication check. An unmeasured router silently caps the quality of the entire system.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When to use it — and when it is overkill.</h3>
+
+    <p><strong>Use routing when:</strong> inputs fall into distinct categories that genuinely benefit from different prompts, tools, or models; the tool set is too large for one reliable agent; you want to send cheap queries to a cheap model and hard ones to a strong one (cost routing); or you are building toward multi-agent and need the dispatch primitive.</p>
+
+    <p><strong>Skip it when:</strong> there are only a handful of tools a single agent selects reliably — a router adds a hop, a failure surface, and an eval burden for no gain. Routing is the first structural pattern to add as a single agent strains, but adding it before that strain is measurable is premature optimization with a real maintenance cost.</p>
+
+    <p>The honest tradeoff: <strong>routing buys clean context, testable dispatch, cost control, and a path to multi-agent — at the price of an extra hop and a high-leverage component that itself must be monitored.</strong> It is the connective tissue of the orchestration patterns in the next essay.</p>
+  </div>
+</section>

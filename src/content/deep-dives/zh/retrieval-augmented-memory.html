@@ -1,0 +1,113 @@
+<section class="phase">
+  <div class="phase-num">M4</div>
+  <div class="week">深入解析 · 记忆与上下文工程</div>
+  <h2>检索增强记忆：以嵌入＋检索作为回忆机制。</h2>
+  <p class="goal">长期记忆是惰性的，除非有东西取出正确的切片并把它拼接进工作上下文。那次取出是一个检索问题——与 RAG 同样的机制，但带有记忆特有的转折：查询是智能体自身不断演变的状态，时近性和显著性与相似度同等重要，而一次糟糕的回忆会主动毒化推理，而不只是没用。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>回忆即检索。复用栈，更换输入。</h3>
+
+    <p>如果你读过实战指南的<em>检索</em>章节，机制是熟悉的：切块、嵌入、索引、混合检索、重排序。记忆回忆复用了全部这些。改变的是你<em>索引什么</em>以及<em>如何查询</em>：</p>
+
+    <ul>
+      <li><strong>语料是智能体自己的历史</strong>，而非一个静态文档集。它每轮增长，必须保持有界（见 <code class="inline">context-compaction</code>）。</li>
+      <li><strong>查询不是用户的问题。</strong>它是从当前目标、活跃子任务和草稿区派生出的构造线索——智能体的"心境"，而非它最后一句话。</li>
+      <li><strong>排序不是纯相似度。</strong>一条记忆的价值是相似度<em>加上</em>时近性<em>加上</em>显著性——改编自 <em>Generative Agents</em> 的检索评分。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>从智能体状态构造回忆查询，而非从最后一条消息。</h3>
+
+    <p>把用户最后一条消息嵌入然后当作记忆查询，是最常见的错误。相关的记忆往往与<em>任务</em>有关，而非与<em>措辞</em>有关。构造一个显式线索：</p>
+
+<pre class="standalone"><span class="c-cm"># memory/recall_query.py</span>
+<span class="c-kw">def</span> <span class="c-fn">build_cue</span>(state) -> <span class="c-kw">str</span>:
+    <span class="c-cm"># A compact natural-language description of what the</span>
+    <span class="c-cm"># agent is trying to do RIGHT NOW &mdash; this is what we embed.</span>
+    <span class="c-kw">return</span> (
+        <span class="c-kw">f</span><span class="c-st">"Goal: {state.goal}\n"</span>
+        <span class="c-kw">f</span><span class="c-st">"Current step: {state.active_subtask}\n"</span>
+        <span class="c-kw">f</span><span class="c-st">"Open questions: {'; '.join(state.open_loops)}"</span>
+    )</pre>
+
+    <p>对于用户字面措辞也重要的任务（一个特定错误字符串、一个标识符），运行混合检索——在原始话语上做词法检索，在构造线索上做稠密检索——然后融合，与检索章节中完全一样。线索处理"我在做什么"；词法分支捕获"用户敲入的确切令牌"。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>按相关性、时近性和显著性评分。</h3>
+
+    <p>纯余弦相似度检索出<em>最相似</em>的记忆，而那不是<em>最有用</em>的那条。一条相似度略低、但写于五轮前且被标记为重要的记忆，通常应当胜过一条过期的、勉强相关的近重复项。复合评分：</p>
+
+<pre class="standalone"><span class="c-cm"># memory/score.py</span>
+<span class="c-kw">import</span> math
+
+<span class="c-kw">def</span> <span class="c-fn">recency</span>(age_seconds: <span class="c-kw">float</span>, half_life: <span class="c-kw">float</span>) -> <span class="c-kw">float</span>:
+    <span class="c-kw">return</span> <span class="c-st">0.5</span> ** (age_seconds / half_life)
+
+<span class="c-kw">def</span> <span class="c-fn">score</span>(mem, sim: <span class="c-kw">float</span>, now: <span class="c-kw">float</span>,
+          w=(<span class="c-st">0.6</span>, <span class="c-st">0.25</span>, <span class="c-st">0.15</span>)) -> <span class="c-kw">float</span>:
+    rec = recency(now - mem.last_used, half_life=<span class="c-st">7</span> * <span class="c-st">86400</span>)
+    sal = mem.salience                      <span class="c-cm"># 0..1, set at write</span>
+    a, b, c = w
+    <span class="c-kw">return</span> a * sim + b * rec + c * sal
+
+<span class="c-kw">def</span> <span class="c-fn">recall</span>(store, cue, embed, now, k=<span class="c-st">5</span>) -> <span class="c-kw">list</span>:
+    cand = store.search(embed(cue), k=<span class="c-st">30</span>)        <span class="c-cm"># wide net</span>
+    ranked = <span class="c-kw">sorted</span>(
+        cand, key=<span class="c-kw">lambda</span> h: score(h.mem, h.sim, now),
+        reverse=<span class="c-kw">True</span>)
+    <span class="c-kw">for</span> h <span class="c-kw">in</span> ranked[:k]:
+        h.mem.last_used = now    <span class="c-cm"># used &rarr; refreshes recency</span>
+    <span class="c-kw">return</span> ranked[:k]</pre>
+
+    <p><code class="inline">last_used</code> 刷新创造了一个有用的动态：不断被检索的记忆保持"温热"、易于回忆；从不被检索的记忆冷却，成为驱逐候选。这白白得到一个访问频率信号，也是 <code class="inline">memory-stores</code> 中衰减逻辑的读取侧对应物。</p>
+
+    <div class="callout tip">
+      <p>权重取决于工作负载。一个执行长任务的编码智能体希望时近性高（最近 20 轮主导）。一个回忆用户偏好的个人助理希望显著性高（一个月前陈述的偏好仍然重要）。用 <code class="inline">evaluating-memory</code> 中的评估框架调优 <code class="inline">w</code>，不要猜一次就冻结。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>先阈值再截断，并对存活下来的内容做预算。</h3>
+
+    <p>排序列表与提示之间有两道不可妥协的关卡：</p>
+
+    <ul>
+      <li><strong>绝对相关性下限。</strong>只在丢掉所有低于最小复合分的项<em>之后</em>才取前 k 个。没有下限的"前 5 个"会在一个离题的轮次里，注入五条无关记忆并配上自信的表述。当没有任何东西相关时，空回忆才是正确且安全的。</li>
+      <li><strong>工作集预算。</strong>被回忆的记忆争夺 <code class="inline">context-budgeting</code> 中的 <code class="inline">long_term</code> 预算。如果存活者超额，把它们摘要成单一压缩块，而不是任意丢弃某些。</li>
+    </ul>
+
+<pre class="trace"><span class="c-out">recall("deploy the tier migration")
+  candidates: 30
+  after composite scoring + floor(0.35): 3 survive
+    [sem]  prod deploys gated on staging check   0.71
+    [epi]  last migration rollback was turn 41   0.52
+    [proc] migration apply checklist             0.48
+  18 below floor, dropped (correctly)
+  3 memories, 420 tok &mdash; under long_term budget, no compaction</span></pre>
+
+    <div class="callout warn">
+      <p>检索漂移：当智能体的状态在任务中途演变时，一个未更新的线索会持续回忆同样的早期记忆，而真正相关的记忆已经向前推进。每轮都从当前状态重建线索，而非在任务开始时构造一次。过期线索是一种静默的、累积的失效——它看起来像记忆系统"在工作"，因为它确实返回了结果。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>渲染检索到的记忆，让模型以正确方式信任它。</h3>
+
+    <p>回忆到的记忆如何被格式化进提示，决定了模型把它当作真理、提示，还是干扰项。三条规则：</p>
+
+    <ul>
+      <li><strong>标注来源与类型。</strong>"[回忆到的语义记忆，写于第 12 轮]"让模型恰当地为它加权，也让你能调试是哪条记忆驱动了某个决策。</li>
+      <li><strong>标记不确定性。</strong>一条反思出的结论是推断，不是事实。把它渲染为"先前推断"，这样模型不会把猜测当成圣旨。</li>
+      <li><strong>别把它放进权威的系统块。</strong>检索到的记忆是证据，不是策略。把一条回忆到的（且可能错误的）记忆放在模型期待不可变指令的位置，正是记忆毒化变成记忆<em>服从</em>的方式。</li>
+    </ul>
+
+    <p>检索增强记忆是整个栈的承重机制：类型决定存什么，存储决定存哪里，压缩保持其有界——但回忆才是真正在正确时刻把正确的过去摆在模型面前的那一步。如果回忆错了，其他每一层都是白费功夫。</p>
+  </div>
+</section>
