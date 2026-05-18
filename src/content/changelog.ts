@@ -15,6 +15,28 @@ const L = (en: string, zh: string): Localized => ({ en, zh });
 export const CHANGELOG: ChangelogEntry[] = [
   {
     date: '2026-05-18',
+    title: L('RAG coverage expansion', '扩充 RAG 相关内容'),
+    items: [
+      L('New advanced Deep-Dives: Advanced RAG Architectures, GraphRAG & Multi-Hop Retrieval, and RAG Pipeline Security — under a new "Retrieval & RAG" group.',
+        '新增进阶「深度剖析」：进阶 RAG 架构、GraphRAG 与多跳检索、RAG 管道安全 — 归入新的「检索与 RAG」分组。'),
+      L('Refreshed the Concepts "what is RAG" entry to the current long-context-vs-RAG routing consensus.',
+        '更新「概念」中的「什么是 RAG」词条，采用当前关于长上下文与 RAG 路由取舍的共识。'),
+      L('Field Guide updates: RAGAS evaluation vocabulary in the eval chapter; parent-document and late chunking in the retrieval chapter.',
+        '实战指南更新：评估章节加入 RAGAS 评测术语；检索章节加入父文档与延迟分块。'),
+    ],
+  },
+  {
+    date: '2026-05-18',
+    title: L('About page & Changelog', '关于页面与更新日志'),
+    items: [
+      L('Expanded About into a multi-section bilingual page: mission, what\'s covered, who maintains it, and contributing & contact.',
+        '将「关于」扩展为多板块双语页面：使命、涵盖内容、维护者，以及贡献与联系方式。'),
+      L('Introduced this Changelog, replacing the unused Posts section; the home page now links the latest entries.',
+        '引入本「更新日志」，替换未使用的「文章」板块；首页现在链接到最新条目。'),
+    ],
+  },
+  {
+    date: '2026-05-18',
     title: L('Concepts & Deep-Dives sections', '新增「概念」与「深度剖析」板块'),
     items: [
       L('Added the Concepts encyclopedia — 33 bilingual entries from AI foundations to the agent loop.',
