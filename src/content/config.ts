@@ -1,15 +1,5 @@
-import { defineCollection, z } from 'astro:content';
-
-// Only `posts` is a managed collection. Field-guide bodies are raw HTML
-// imported by glob and driven by manifest.ts (not a content collection).
-const posts = defineCollection({
-  type: 'content',
-  schema: z.object({
-    title: z.string(),
-    description: z.string(),
-    pubDate: z.coerce.date(),
-    draft: z.boolean().default(false),
-  }),
-});
-
-export const collections = { posts };
+// No managed Astro content collections.
+// Field-guide / concepts / deep-dives bodies are raw HTML imported by glob
+// and driven by their manifest.ts files. The site changelog is a curated
+// data module at src/content/changelog.ts.
+export const collections = {};
