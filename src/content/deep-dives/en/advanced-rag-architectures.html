@@ -1,0 +1,90 @@
+<section class="phase">
+  <div class="phase-num">R1</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Advanced RAG architectures: from retrieve-once to an agent that controls retrieval.</h2>
+  <p class="goal">Naive RAG fails in a specific, dangerous way: it retrieves the wrong chunks, splices them in with confident framing, and the model produces a fluent wrong answer. Every advanced technique below &mdash; corrective loops, self-critique, query transformation, fusion, reranking, full agentic RAG &mdash; is a different attack on that same failure. The unifying lesson is that none of them work without a trustworthy scorer deciding what counts as good retrieval.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The spectrum: naive &rarr; modular &rarr; agentic.</h3>
+
+    <p><strong>Naive RAG</strong> is one shot: embed the query, fetch top-k, stuff the context, generate. It works when the question maps cleanly to one passage and the corpus is clean. It breaks on multi-hop questions, ambiguous queries, distractor-heavy corpora, and anything where the right evidence is not lexically or semantically adjacent to the question.</p>
+
+    <p><strong>Modular RAG</strong> decomposes the pipeline into swappable stages &mdash; query transformation, hybrid retrieval, fusion, reranking, compression, generation &mdash; each independently tunable. It is still a fixed pipeline: the same stages run in the same order regardless of the query.</p>
+
+    <p><strong>Agentic RAG</strong> makes retrieval a decision the agent controls at runtime. The agent plans how many retrieval steps to take, which source or tool to query (vector store, SQL, web, a sub-agent), inspects what came back, reflects, and adapts &mdash; possibly re-querying with a different formulation or abandoning a dead source. The survey by Singh, Ehtesham, Kumar &amp; Talaei Khoei (<em>Agentic Retrieval-Augmented Generation: A Survey on Agentic RAG</em>, arXiv:2501.09136) organizes this space by agent cardinality, control structure, autonomy, and knowledge representation &mdash; useful as a map, but the practitioner takeaway is simpler: agentic RAG is RAG where a control loop, not a pipeline, owns retrieval. This is the same loop discussed in the <em>ReAct</em> deep dive, pointed at a knowledge base instead of generic tools.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Corrective RAG and Self-RAG: closing the loop on bad retrieval.</h3>
+
+    <p><strong>Corrective RAG (CRAG)</strong>, from Yan et al. (2024), inserts a lightweight retrieval evaluator between fetch and generate. It scores the retrieved documents against the query and routes to one of three actions: <em>Correct</em> (confident &mdash; refine and use the docs), <em>Ambiguous</em> (mixed &mdash; combine the docs with a web-search supplement), or <em>Incorrect</em> (low confidence &mdash; discard the docs entirely and fall back to web search). The evaluator is deliberately cheap (CRAG used a roughly 0.8B model) so the correction step does not dominate latency.</p>
+
+    <p><strong>Self-RAG</strong> (Asai et al., 2023) moves the decision into the model itself. The model is trained to emit <em>reflection tokens</em> that decide, on the fly, whether retrieval is needed at all, whether each retrieved passage is relevant, and whether its own draft is actually supported by the evidence. Where CRAG bolts an external evaluator onto an off-the-shelf model, Self-RAG bakes the retrieve-and-critique policy into the weights.</p>
+
+    <p>Both answer the same question &mdash; "should I trust what I just retrieved, and what do I do if I shouldn't?" &mdash; and both are only as good as the judgment signal. A miscalibrated evaluator that rates garbage as <em>Correct</em> turns CRAG into naive RAG with extra latency.</p>
+
+    <div class="callout warn">
+      <p>The evaluator is the load-bearing component, not the routing logic around it. Teams ship the branch structure and under-test the scorer, then wonder why correction never fires. Build a labeled set of (query, retrieved-docs, is-actually-relevant) and measure the evaluator's precision/recall <em>before</em> trusting any branch it controls. This is the same trustworthy-scorer requirement as the relevance floor in the <em>Retrieval-augmented memory</em> deep dive.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>A CRAG-style evaluate-then-branch loop.</h3>
+
+    <p>The whole family reduces to: retrieve, score, branch on the score, optionally recover, then generate &mdash; only on evidence that cleared the bar.</p>
+
+<pre class="standalone"><span class="c-cm"># corrective_rag.py — evaluate, then branch</span>
+<span class="c-kw">def</span> <span class="c-fn">corrective_rag</span>(query, retriever, evaluator, web, gen):
+    docs = retriever.<span class="c-fn">search</span>(query, k=<span class="c-st">8</span>)
+    grade = evaluator.<span class="c-fn">score</span>(query, docs)   <span class="c-cm"># 0..1 per corpus relevance</span>
+
+    <span class="c-kw">if</span> grade &gt;= <span class="c-st">0.70</span>:                      <span class="c-cm"># CORRECT</span>
+        evidence = <span class="c-fn">refine</span>(docs)            <span class="c-cm"># drop distractor strips</span>
+    <span class="c-kw">elif</span> grade &gt;= <span class="c-st">0.35</span>:                    <span class="c-cm"># AMBIGUOUS</span>
+        evidence = <span class="c-fn">refine</span>(docs) + web.<span class="c-fn">search</span>(query)
+    <span class="c-kw">else</span>:                                 <span class="c-cm"># INCORRECT</span>
+        evidence = web.<span class="c-fn">search</span>(<span class="c-fn">rewrite</span>(query))  <span class="c-cm"># discard, recover</span>
+
+    <span class="c-kw">if</span> <span class="c-kw">not</span> evidence:
+        <span class="c-kw">return</span> <span class="c-st">"insufficient evidence"</span>     <span class="c-cm"># abstain &gt; confabulate</span>
+    <span class="c-kw">return</span> gen.<span class="c-fn">answer</span>(query, evidence)</pre>
+
+    <p>The thresholds are not universal constants &mdash; they are tuned per system against the labeled set from Step 2. The abstain path matters as much as the branches: a system that returns "insufficient evidence" on a genuinely unanswerable query is correct, and far safer than one that always produces something.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Query transformation: rewriting, multi-query, HyDE.</h3>
+
+    <p>If the query is a bad probe into the index, no downstream stage recovers. Three common transforms:</p>
+
+    <ul>
+      <li><strong>Rewriting.</strong> Resolve pronouns, expand acronyms, strip conversational noise &mdash; turn "and what about its pricing?" into a standalone query. Low-risk, usually a net win for conversational RAG.</li>
+      <li><strong>Multi-query.</strong> Generate several paraphrases, retrieve for each, and merge. Raises recall on under-specified questions at the cost of more retrieval calls.</li>
+      <li><strong>HyDE</strong> (Hypothetical Document Embeddings). Have the model write a hypothetical answer, embed <em>that</em>, and retrieve with it &mdash; the synthetic answer is often closer in embedding space to real passages than the bare question is.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>HyDE is not a default. It reliably helps weak or zero-shot retrievers, but on a strong fine-tuned dense retriever it can <em>hurt</em>: the hypothetical document introduces a distribution shift and a chance to hallucinate the wrong entities, dragging retrieval off-target. Treat every query transform as a hypothesis to measure on your retriever and corpus, not a best practice to adopt blindly. This is a fast-moving, system-dependent result &mdash; the honest answer is "A/B it."</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Fusion and reranking: cheap recall, then expensive precision.</h3>
+
+    <p><strong>RAG-fusion / retrieval fusion</strong> runs multiple retrievals (different query formulations, or dense + lexical) and merges the ranked lists, typically with reciprocal rank fusion, so a document that ranks decently across several lists rises above one that spikes in a single noisy list. It is a recall-and-robustness move, not a precision one.</p>
+
+    <p>Precision comes from <strong>reranking</strong>. The two-stage pattern &mdash; a cheap bi-encoder (or BM25) retrieves a wide candidate set, then a <strong>cross-encoder</strong> that jointly attends to query and passage rescores the top ~50&ndash;100 &mdash; consistently beats any single-stage retriever. The cross-encoder is too slow to run over the whole corpus, which is exactly why it lives behind a cheap first stage: spend compute only where ranking actually decides the answer. In practice, two-stage retrieve-then-rerank is the highest-ROI upgrade for most underperforming naive-RAG systems, ahead of any of the cleverer techniques above. The agentic-RAG control loop here is conceptually a sibling of the patterns in the <em>Agent search strategies</em> deep dive and the Field Guide's <em>Retrieval</em> chapter &mdash; same evaluator-driven discipline, applied to knowledge instead of actions.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When to reach for which.</h3>
+
+    <p>Start with strong naive RAG plus two-stage reranking and query rewriting &mdash; this clears most production cases and is the cheapest, most predictable configuration. Add <strong>fusion</strong> when recall is the bottleneck (the right doc exists but ranks below the cutoff). Add <strong>CRAG-style correction</strong> when your corpus has real coverage gaps and a web fallback is acceptable &mdash; it directly attacks confident-wrong-answer-from-garbage. Reach for <strong>Self-RAG</strong> when you can train or fine-tune and want the retrieve/critique policy in the model rather than in orchestration code. Go <strong>fully agentic</strong> only when retrieval is genuinely multi-step or multi-source &mdash; comparisons across documents, multi-hop reasoning, choosing among heterogeneous tools &mdash; because the planning loop adds latency, cost, and new failure modes (looping, drift) for no benefit on single-hop questions. Treat HyDE and aggressive query expansion as measured experiments, never defaults. Across all of it, the invariant holds: the architecture is only as trustworthy as the scorer that decides what good retrieval means &mdash; build and validate that first, choose the architecture second.</p>
+  </div>
+</section>

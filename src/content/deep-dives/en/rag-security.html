@@ -1,0 +1,113 @@
+<section class="phase">
+  <div class="phase-num">S9</div>
+  <div class="week">Deep Dive · Safety, Alignment &amp; Agentic Security</div>
+  <h2>RAG pipeline security: the asymmetric-trust flaw retrieval introduces.</h2>
+  <p class="goal">Retrieval-augmented generation is sold as a grounding technique, and it is often quietly assumed to <em>reduce</em> prompt-injection risk by replacing the model's guesses with sourced facts. The opposite is closer to true: RAG opens a new, attacker-influenceable channel straight into the prompt. This essay names the central architectural flaw, walks the dominant RAG-specific risk classes for defenders, and gives a concrete trust-boundary design — concepts of attacks, not recipes for them.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The central flaw: asymmetric trust</h3>
+
+    <p>Every serious RAG deployment validates and guards user input — length limits, injection classifiers, content policy, sometimes a whole moderation stack. Then it retrieves documents from a vector store and splices them into the same prompt with no comparable scrutiny, because the corpus is "our data" and therefore "trusted." That asymmetry is the flaw. User input and retrieved context enter the identical token stream and the model reads them the same way, but only one side was treated as adversarial.</p>
+
+    <p>This is the same lesson as <code class="inline">prompt-injection</code>'s "instructions and data share one channel," applied one layer earlier: the corpus <em>is</em> an input. If anyone outside your trust boundary can influence what ends up in the index — public web crawls, user uploads, customer tickets, an editable wiki, a shared knowledge base — then "retrieved" is not a synonym for "trusted." It is untrusted input that skipped the front-door guard.</p>
+
+    <div class="callout danger">
+      <p>The single most important sentence in RAG security: <strong>retrieved text is untrusted input, validated less than user input but trusted more.</strong> Every defense below is a way of closing that gap. If you take nothing else, take this.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Corpus poisoning: few documents, large corpus</h3>
+
+    <p>The unintuitive result that defenders must internalize: poisoning a RAG knowledge base does not require controlling a large fraction of it. <em>PoisonedRAG</em> (Zou et al., USENIX Security 2025) showed that injecting on the order of a handful of crafted documents <em>per targeted question</em> can drive attack success around 90%, even when the corpus holds millions of documents. The attacker only needs their content to win retrieval for a specific query and then steer generation — corpus size is not the defense it feels like. A related availability-side variant ("Machine Against the RAG," jamming with blocker documents) instead suppresses correct answers rather than substituting them.</p>
+
+    <p>Defenders do not counter this by inspecting payloads; they counter it at the ingestion boundary, which is where trust is actually granted:</p>
+
+    <ul>
+      <li><strong>Provenance and source allowlists.</strong> Record where every chunk came from. Restrict ingestion to vetted sources; treat open-web and user-contributed content as a distinct, lower-trust tier — never silently merged with curated material.</li>
+      <li><strong>Curated, signed corpora.</strong> For high-stakes domains, sign curated document sets and verify signatures at index time so an unsigned or altered document cannot enter.</li>
+      <li><strong>Content sanitization at ingest.</strong> Strip or neutralize instruction-like and hidden content (HTML comments, zero-width characters, off-screen text) <em>before</em> embedding, not after retrieval.</li>
+      <li><strong>Anomaly / outlier detection on the index.</strong> Documents engineered to win retrieval for a target query often sit as embedding outliers or show duplicate-cluster patterns. Monitor the index, not just the inputs.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>"It is a million-document corpus, a few bad files can't matter" is the exact intuition the research refutes. Per-question poisoning success is roughly independent of corpus size. Plan ingestion controls as if a small, targeted injection is the expected case.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Indirect injection via retrieved content</h3>
+
+    <p>RAG does not eliminate prompt injection; it industrializes the indirect variant. OWASP GenAI lists Prompt Injection as <strong>LLM01:2025</strong>, the top risk, and retrieved documents are a first-class injection carrier: the malicious instruction lives in a benign-looking source the agent fetches and trusts, exactly the indirect pattern from <code class="inline">prompt-injection</code> — now triggered automatically by a similarity match rather than by an attacker conversing with the agent.</p>
+
+    <p><strong>CVE-2025-32711</strong> ("EchoLeak," patched by Microsoft, CVSS 9.3) is the canonical conceptual example of this class: a zero-click chain where untrusted content ingested through a RAG pipeline caused the assistant to surface and exfiltrate data from the user's context, with no user action. We reference it only at the class level — untrusted ingested content steering a privileged retrieval-grounded model toward data egress — because it composes <code class="inline">prompt-injection</code> with <code class="inline">data-exfiltration-risks</code>: the injection is the entry, an auto-fetched output channel is the exit. The fix space is structural, not a phrasing filter.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Embedding inversion: the store itself leaks</h3>
+
+    <p>An emerging confidentiality risk lives below the prompt, in the vector store. Embeddings are not a one-way hash; research on embedding inversion shows that a meaningful amount of the original text can be reconstructed from stored vectors. A vector database is therefore not a safe place to "anonymize" sensitive content — it is a lossy but partially reversible copy of it, often with weaker access control than the source system it was copied from.</p>
+
+    <ul>
+      <li><strong>Access control on the vector store</strong> at least as strict as on the source data; do not let RAG become a side door around row-level or document-level permissions.</li>
+      <li><strong>Encryption</strong> at rest and in transit for the index and its payloads.</li>
+      <li><strong>Minimize sensitive text in embeddings.</strong> Redact, tokenize, or exclude high-sensitivity fields before they are ever embedded; the cheapest leak to prevent is the data you never vectorized.</li>
+      <li><strong>Per-tenant / per-user partitioning</strong> so a retrieval can never cross an isolation boundary.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Defensive design: treat retrieved text as untrusted</h3>
+
+    <p>The unifying move is to make the implicit trust in retrieval explicit and bounded. Concretely:</p>
+
+    <ul>
+      <li><strong>Untrusted by default.</strong> Apply the same adversarial assumptions to retrieved chunks that you apply to user input — see <code class="inline">guardrails</code> for where these checks live.</li>
+      <li><strong>Structured, quoted context boundaries.</strong> Wrap retrieved content in clearly delimited, labeled blocks. A soft control (a payload can claim to close the block), worth doing as defense-in-depth, never the boundary you rely on.</li>
+      <li><strong>Least-privilege downstream tools.</strong> The damage of a successful retrieval injection is bounded by what the grounded model can then <em>do</em>; keep that set minimal, per the <code class="inline">agentic-threat-model</code>.</li>
+      <li><strong>Output filtering and provenance to the user.</strong> Scan generated output for exfiltration markup; show users which sources grounded an answer so a poisoned source is visible, not invisible.</li>
+      <li><strong>Monitoring.</strong> Alert on retrieval outliers, first-seen sources winning retrieval, and answer-then-egress tool sequences.</li>
+    </ul>
+
+    <p>A minimal trust-boundary wrapper makes the asymmetry impossible to forget in code:</p>
+
+    <pre class="standalone"><span class="c-cm"># Defensive shape: retrieved chunks cross an explicit boundary,</span>
+<span class="c-cm"># not an implicit one. Conceptual, not a drop-in library.</span>
+def ground(query, store):
+    chunks = store.search(query, tenant=current_tenant())  <span class="c-cm"># scoped retrieval</span>
+    safe = []
+    for c in chunks:
+        if not provenance_allowed(c.source):   <span class="c-cm"># source allowlist / tier</span>
+            continue
+        c = sanitize(c.text)                   <span class="c-cm"># strip hidden / instruction-like</span>
+        safe.append(wrap_untrusted(c, src=c.source))  <span class="c-cm"># labeled, quoted block</span>
+    <span class="c-cm"># planner sees only delimited UNTRUSTED context + cited sources;</span>
+    <span class="c-cm"># tools downstream are least-privilege regardless of content.</span>
+    return build_prompt(query, untrusted=safe, cite=True)</pre>
+
+    <div class="callout tip">
+      <p>RAG security is not a new discipline bolted onto retrieval — it is the existing agentic-security discipline, applied to a channel teams forgot was an input. Read this beside <code class="inline">prompt-injection</code>, <code class="inline">data-exfiltration-risks</code>, <code class="inline">agentic-threat-model</code>, and <code class="inline">guardrails</code>; the controls are the same, the entry point is the index.</p>
+    </div>
+
+    <div class="qa">
+      <div class="q">Question</div>
+      <div class="question">Doesn't RAG reduce hallucination, and therefore reduce risk?</div>
+      <div class="answer">
+        <p>It reduces one failure mode (unsourced fabrication) while adding another (attacker-sourced "facts"). A grounded wrong answer can be <em>more</em> dangerous than an ungrounded one because it arrives with a citation and the user's trust. Grounding improves accuracy on benign inputs; it does not make the corpus a trusted channel. Both properties are true at once — design for the second.</p>
+      </div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Question</div>
+      <div class="question">Our corpus is internal-only. Are we out of scope for poisoning?</div>
+      <div class="answer">
+        <p>Rarely. "Internal" usually still means ingest from ticketing systems, shared wikis, uploaded documents, email, and CRM notes — all writable by people, processes, or customers outside your trust boundary, and sometimes by an attacker who only needs to file a ticket. The question is not "is it internal?" but "who can cause a document to enter the index?" Answer that, and provenance and source tiers fall out of it.</p>
+      </div>
+    </div>
+  </div>
+</section>
