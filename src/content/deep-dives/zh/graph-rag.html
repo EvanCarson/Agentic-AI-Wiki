@@ -1,0 +1,101 @@
+<section class="phase">
+  <div class="phase-num">R2</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>GraphRAG 与多跳检索：当 top-k 切片回答不了问题时。</h2>
+  <p class="goal">扁平向量 RAG 检索与查询最相似的 <em>k</em> 个切片。对"文档关于 X 说了什么"这正是对的工具，对"整个语料里的主要主题是什么"或"是谁批准了那个搞坏了客户投诉的服务的变更"这正是错的工具。有些问题需要的是聚合或遍历，而不是相似度。GraphRAG 是这些问题的答案——而构建它的成本，正是它应当<em>仅仅</em>是这些问题的答案的理由。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>扁平 RAG 结构性地无法服务的两类查询。</h3>
+
+    <p>Top-k 相似度搜索有一个硬上限，任何重排器或更大的 <em>k</em> 都无法移除，因为失败的不是检索质量——而是这个操作的形状。</p>
+
+    <ul>
+      <li><strong>全局／主题型查询。</strong>"这 4,000 份事故报告里占主导的主题是什么？"答案不<em>在</em>任何一个切片里；它是整个语料的一个属性。Top-k 返回与"主题"一词最相似的五个切片，那是噪声。相似度无法<em>聚合</em>。</li>
+      <li><strong>关系型多跳查询。</strong>"是哪位工程师评审了那个引入了让值班被呼叫的回归的迁移？"回答这个需要在几乎不共享表面词汇的文档之间串起回归&nbsp;&rarr;&nbsp;迁移&nbsp;&rarr;&nbsp;评审者。每一跳的证据住在不同的切片里，没有任何单个切片与整个问题相似。相似度无法<em>遍历</em>。</li>
+    </ul>
+
+    <div class="callout">
+      <p>诊断性问题：<em>答案是包含在一小组段落里，还是关于多少段落彼此相关的一个函数？</em>若是前者，扁平 RAG（见 <code class="inline">advanced-rag-architectures</code>）是对的，图是过度工程。若是后者，再多的切片检索也拼不出它——你需要索引当前没有的结构。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>GraphRAG：在索引时抽取出的结构。</h3>
+
+    <p>微软的 GraphRAG（2024 年发布，<code class="inline">github.com/microsoft/graphrag</code>）让语料潜在的结构显式化。索引时一个 LLM 读取每个切片并抽取一张实体&ndash;关系图；一个社区检测算法（Leiden）把这张图划分成稠密连接实体的嵌套簇；然后 LLM 为每个社区写一份自然语言<em>摘要</em>。语料不再是一袋切片——它是一张图加上一层摘要的摘要的层级。</p>
+
+<pre class="standalone"><span class="c-cm"># graphrag/index_pipeline.py  (conceptual)</span>
+<span class="c-kw">def</span> <span class="c-fn">build_graph_index</span>(chunks):
+    triples = []
+    <span class="c-kw">for</span> ch <span class="c-kw">in</span> chunks:
+        <span class="c-cm"># LLM call per chunk: the expensive part.</span>
+        triples += llm_extract(ch, schema=<span class="c-st">"(entity, relation, entity)"</span>)
+
+    g = build_graph(triples)              <span class="c-cm"># merge co-referent entities</span>
+    communities = leiden(g)               <span class="c-cm"># hierarchical clusters</span>
+
+    summaries = {}
+    <span class="c-kw">for</span> c <span class="c-kw">in</span> communities:                  <span class="c-cm"># bottom-up: leaf summaries</span>
+        summaries[c.id] = llm_summarize(  <span class="c-cm"># roll up into parents</span>
+            entities=c.members, edges=c.internal_edges)
+    <span class="c-kw">return</span> g, communities, summaries      <span class="c-cm"># the queryable artefact</span></pre>
+
+    <p>查询时则按问题类别分流。<strong>本地搜索</strong>锚定在查询里点名的实体上，遍历它们的邻域（相关实体、连接关系、各自被抽取自的切片），并从那个聚焦的子图作答——这是多跳关系路径。<strong>全局搜索</strong>是对社区摘要的 map-reduce：每个相关社区摘要独立产出一个部分答案（map），这些部分被规约成一个语料级响应（reduce）——这是扁平 RAG 根本无法执行的主题聚合路径。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>无需预计算图的多跳检索。</h3>
+
+    <p>一张完整抽取的图不是遍历的唯一方式。更轻的模式是<strong>迭代式检索&ndash;推理循环</strong>：为当前子问题检索，让模型识别还缺什么，从那个缺口生成下一个查询，重复直到链条闭合。这里的"图"是在查询时由推理逐查询临场构建的——索引时什么都不构建。</p>
+
+<pre class="standalone"><span class="c-cm"># multihop/iterative.py</span>
+<span class="c-kw">def</span> <span class="c-fn">multihop_answer</span>(question, retrieve, llm, max_hops=<span class="c-st">4</span>):
+    facts, sub_q = [], question
+    <span class="c-kw">for</span> hop <span class="c-kw">in</span> <span class="c-kw">range</span>(max_hops):
+        ctx = retrieve(sub_q, k=<span class="c-st">5</span>)         <span class="c-cm"># flat vector search</span>
+        step = llm.reason(question, facts, ctx)
+        facts += step.new_facts
+        <span class="c-kw">if</span> step.is_sufficient:           <span class="c-cm"># chain closed</span>
+            <span class="c-kw">return</span> llm.synthesize(question, facts)
+        sub_q = step.next_query          <span class="c-cm"># the next hop</span>
+    <span class="c-kw">return</span> llm.synthesize(question, facts)  <span class="c-cm"># best effort</span></pre>
+
+    <p>这以零索引时图成本买到了大部分关系收益，代价是更高的<em>查询时</em>延迟与 token 开销（每个问题数次 LLM 往返）。当关系型查询只占流量少数时用它；只有当遍历是主导工作负载时，一张预计算图才挣回它的构建成本。更广义的知识图谱支撑检索——查询你已维护的一张策展 KG，或一张从结构化记录物化出的图——完全绕开抽取，<em>当图已存在时</em>是最便宜的选项。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>成本与陈旧化税。</h3>
+
+    <p>GraphRAG 的威力是在索引时买来的，而账单是真实的。抽取是<em>每个切片</em>一次或多次 LLM 调用，加上每个社区、每个层级的摘要——对大语料这实质上很昂贵，常常比把同样文本嵌入一次贵几个数量级。这个成本不是付一次就忘掉的。</p>
+
+    <div class="callout warn">
+      <p>陈旧化是被讨论不足的失效。扁平向量索引接受增量 upsert——新文档、新嵌入，完事。图不能局部更新：一个新文档就可能引入重塑社区边界的实体，进而让那些社区喂养的摘要失效。每天都在变的语料要么持续付重抽取的钱，要么从一张不再匹配源的图上提供答案。多数团队低估的不是构建成本，而是维护成本。</p>
+    </div>
+
+    <p>收益只有在一个特定画像下才抵得过这个税：语料<em>大</em>（主题没法略读出来）、<em>关系稠密</em>（实体确实互联）、且<em>相对稳定</em>（重抽取是偶尔的，不是持续的），并服务于真实占比的全局或多跳查询。去掉其中任何一个，经济账就反转了。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>何时不该用它，以及决策启发式。</h3>
+
+    <p>对一批相互独立文档的大多数问答——产品文档、支持知识库、政策 PDF——并不需要图。答案住在一个或少数几个段落里；带重排器的扁平混合检索更快、更便宜、增量轻而易举，而且一样准确。因为听起来有原则就动用图，与 <code class="inline">memory-stores</code> 中点名的过早精巧化是同一个错误：图是成本最高的选项，也是最常在其成本被论证之前就被采用的那个。</p>
+
+    <p>清晰的启发式：</p>
+
+    <ul>
+      <li><strong>扁平 RAG</strong>——答案包含在一小组段落里。默认选项。没有证据不要离开它。</li>
+      <li><strong>迭代多跳（无预计算图）</strong>——有些查询需要遍历，但它们是少数，而且语料经常变。在查询时逐问题付成本。</li>
+      <li><strong>GraphRAG（预计算图）</strong>——全局／主题型<em>或</em>稠密多跳查询是流量的持续占比，语料大且相对稳定，并且你已测得扁平检索在它们上损失了真实准确率。</li>
+      <li><strong>混合</strong>——现实的生产答案：把可扁平回答的查询路由到便宜路径，只让主题／关系型的进图或迭代循环。多数值得建图的语料，仍然在不用图的情况下回答了大多数问题。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>用一次查询类别审计来决定，而非直觉。采样真实查询，把每个标记为段落本地、多跳或主题型，并按类别测量扁平 RAG 的准确率。若段落本地这一类占主导且得分良好——常见情况——你不需要图。只为可证明失败的类别建图，并让其余一切绕开它路由。</p>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,101 @@
+<section class="phase">
+  <div class="phase-num">R2</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>GraphRAG &amp; multi-hop retrieval: when top-k chunks cannot answer the question.</h2>
+  <p class="goal">Flat vector RAG retrieves the <em>k</em> chunks most similar to the query. That is exactly the right tool for "what does the doc say about X" and exactly the wrong tool for "what are the main themes across the corpus" or "who approved the change that broke the service the customer complained about." Some questions need aggregation or traversal, not similarity. GraphRAG is the answer to those questions &mdash; and the cost of building it is the reason it should be the answer to <em>only</em> those questions.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Two query classes flat RAG structurally cannot serve.</h3>
+
+    <p>Top-k similarity search has a hard ceiling that no reranker or larger <em>k</em> removes, because the failure is not retrieval quality &mdash; it is the shape of the operation.</p>
+
+    <ul>
+      <li><strong>Global / thematic queries.</strong> "What are the dominant themes across these 4,000 incident reports?" The answer is not <em>in</em> any chunk; it is a property of the whole corpus. Top-k returns the five chunks most similar to the word "themes," which is noise. Similarity cannot <em>aggregate</em>.</li>
+      <li><strong>Relational multi-hop queries.</strong> "Which engineer reviewed the migration that introduced the regression the on-call paged about?" Answering this requires chaining regression&nbsp;&rarr;&nbsp;migration&nbsp;&rarr;&nbsp;reviewer across documents that share almost no surface vocabulary. Each hop's evidence lives in a different chunk, and no single chunk is similar to the full question. Similarity cannot <em>traverse</em>.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The diagnostic question: <em>is the answer contained in a small set of passages, or is it a function of how many passages relate to each other?</em> If the former, flat RAG (see <code class="inline">advanced-rag-architectures</code>) is correct and graphs are over-engineering. If the latter, no amount of chunk retrieval will assemble it &mdash; you need structure the index does not currently have.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>GraphRAG: structure extracted at index time.</h3>
+
+    <p>Microsoft's GraphRAG (released 2024, <code class="inline">github.com/microsoft/graphrag</code>) makes the corpus's latent structure explicit. At index time an LLM reads every chunk and extracts an entity&ndash;relationship graph; a community-detection algorithm (Leiden) partitions that graph into nested clusters of densely connected entities; then the LLM writes a natural-language <em>summary</em> of each community. The corpus is no longer a bag of chunks &mdash; it is a graph plus a hierarchy of summaries-of-summaries.</p>
+
+<pre class="standalone"><span class="c-cm"># graphrag/index_pipeline.py  (conceptual)</span>
+<span class="c-kw">def</span> <span class="c-fn">build_graph_index</span>(chunks):
+    triples = []
+    <span class="c-kw">for</span> ch <span class="c-kw">in</span> chunks:
+        <span class="c-cm"># LLM call per chunk: the expensive part.</span>
+        triples += llm_extract(ch, schema=<span class="c-st">"(entity, relation, entity)"</span>)
+
+    g = build_graph(triples)              <span class="c-cm"># merge co-referent entities</span>
+    communities = leiden(g)               <span class="c-cm"># hierarchical clusters</span>
+
+    summaries = {}
+    <span class="c-kw">for</span> c <span class="c-kw">in</span> communities:                  <span class="c-cm"># bottom-up: leaf summaries</span>
+        summaries[c.id] = llm_summarize(  <span class="c-cm"># roll up into parents</span>
+            entities=c.members, edges=c.internal_edges)
+    <span class="c-kw">return</span> g, communities, summaries      <span class="c-cm"># the queryable artefact</span></pre>
+
+    <p>Query time then splits by question class. <strong>Local search</strong> anchors on the entities named in the query, walks their neighbourhood (related entities, connecting relations, the chunks each was extracted from), and answers from that focused subgraph &mdash; this is the multi-hop relational path. <strong>Global search</strong> is a map-reduce over community summaries: each relevant community summary independently produces a partial answer (map), and those partials are reduced into one corpus-level response &mdash; this is the thematic-aggregation path that flat RAG cannot perform at all.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Multi-hop retrieval without a precomputed graph.</h3>
+
+    <p>A full extracted graph is not the only way to traverse. The lighter pattern is an <strong>iterative retrieve&ndash;reason loop</strong>: retrieve for the current sub-question, let the model identify what is still missing, generate the next query from that gap, and repeat until the chain closes. The "graph" here is constructed on the fly, per query, by reasoning &mdash; nothing is built at index time.</p>
+
+<pre class="standalone"><span class="c-cm"># multihop/iterative.py</span>
+<span class="c-kw">def</span> <span class="c-fn">multihop_answer</span>(question, retrieve, llm, max_hops=<span class="c-st">4</span>):
+    facts, sub_q = [], question
+    <span class="c-kw">for</span> hop <span class="c-kw">in</span> <span class="c-kw">range</span>(max_hops):
+        ctx = retrieve(sub_q, k=<span class="c-st">5</span>)         <span class="c-cm"># flat vector search</span>
+        step = llm.reason(question, facts, ctx)
+        facts += step.new_facts
+        <span class="c-kw">if</span> step.is_sufficient:           <span class="c-cm"># chain closed</span>
+            <span class="c-kw">return</span> llm.synthesize(question, facts)
+        sub_q = step.next_query          <span class="c-cm"># the next hop</span>
+    <span class="c-kw">return</span> llm.synthesize(question, facts)  <span class="c-cm"># best effort</span></pre>
+
+    <p>This buys most of the relational benefit with none of the index-time graph cost, at the price of higher <em>query-time</em> latency and token spend (several LLM round-trips per question). Use it when relational queries are a minority of traffic; a precomputed graph only earns its construction cost when traversal is the dominant workload. Knowledge-graph-backed retrieval more broadly &mdash; querying a curated KG you already maintain, or one materialised from structured records &mdash; sidesteps extraction entirely and is the cheapest option <em>when the graph already exists</em>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The cost and staleness tax.</h3>
+
+    <p>GraphRAG's power is bought at index time, and the bill is real. Extraction is one or more LLM calls <em>per chunk</em>, plus summarization per community and per hierarchy level &mdash; for a large corpus this is materially expensive, often orders of magnitude more than embedding the same text once. That cost is not paid once and forgotten.</p>
+
+    <div class="callout warn">
+      <p>Staleness is the under-discussed failure. Flat vector indexes accept an incremental upsert &mdash; new doc, new embeddings, done. A graph does not update locally: a single new document can introduce entities that re-shape community boundaries, which invalidates the summaries those communities feed. Corpora that change daily either pay continual re-extraction or serve answers from a graph that no longer matches the source. The maintenance cost, not the build cost, is what most teams underestimate.</p>
+    </div>
+
+    <p>The payoff justifies the tax only under a specific profile: a corpus that is <em>large</em> (so themes are not skim-able), <em>relationally dense</em> (entities genuinely interconnect), and <em>relatively stable</em> (re-extraction is occasional, not continuous), serving a real share of global or multi-hop queries. Remove any one of those and the economics invert.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When NOT to use it, and the decision heuristic.</h3>
+
+    <p>Most question-answering over a collection of independent documents &mdash; product docs, a support knowledge base, policy PDFs &mdash; does not need a graph. The answers live in one or a few passages; flat hybrid retrieval with a reranker is faster, cheaper, trivially incremental, and just as accurate. Reaching for a graph because it sounds principled is the same premature-sophistication error called out in <code class="inline">memory-stores</code>: the graph is the highest-cost option and the one most often adopted before its cost is justified.</p>
+
+    <p>The crisp heuristic:</p>
+
+    <ul>
+      <li><strong>Flat RAG</strong> &mdash; the answer is contained in a small set of passages. The default. Do not move off it without evidence.</li>
+      <li><strong>Iterative multi-hop (no precomputed graph)</strong> &mdash; some queries need traversal, but they are a minority and the corpus changes often. Pay the cost at query time, per question.</li>
+      <li><strong>GraphRAG (precomputed graph)</strong> &mdash; global/thematic <em>or</em> dense multi-hop queries are a sustained share of traffic, the corpus is large and relatively stable, and you have measured that flat retrieval loses real accuracy on them.</li>
+      <li><strong>Hybrid</strong> &mdash; the realistic production answer: route flat-answerable queries to the cheap path and only thematic/relational ones into the graph or the iterative loop. Most corpora that warrant a graph still answer the majority of questions without one.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Decide with a query-class audit, not intuition. Sample real queries, label each as passage-local, multi-hop, or thematic, and measure flat-RAG accuracy per class. If the passage-local class dominates and scores well &mdash; the common case &mdash; you do not need a graph. Build one only for the classes that demonstrably fail, and route everything else around it.</p>
+    </div>
+  </div>
+</section>

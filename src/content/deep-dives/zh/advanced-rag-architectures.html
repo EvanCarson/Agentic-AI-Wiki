@@ -1,0 +1,90 @@
+<section class="phase">
+  <div class="phase-num">R1</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>进阶 RAG 架构：从一次性检索到由智能体掌控检索。</h2>
+  <p class="goal">朴素 RAG 以一种特定且危险的方式失败：它检索出错误的切块，配上自信的表述拼接进上下文，模型于是产出一个流畅的错误答案。下文每一种进阶技术——纠正循环、自我批判、查询变换、融合、重排序、完整的智能体式 RAG——都是对同一种失败的不同攻击。统一的教训是：没有一个可信的评分器来判定什么算"好的检索"，它们全都不奏效。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>谱系：朴素 &rarr; 模块化 &rarr; 智能体式。</h3>
+
+    <p><strong>朴素 RAG</strong>是一次性的：嵌入查询、取前 k 个、塞进上下文、生成。当问题干净地映射到单个段落且语料干净时它有效。它在多跳问题、含糊查询、充满干扰项的语料，以及任何正确证据在词法或语义上不与问题相邻的情况下崩溃。</p>
+
+    <p><strong>模块化 RAG</strong>把流水线分解为可替换的阶段——查询变换、混合检索、融合、重排序、压缩、生成——每个阶段可独立调优。它仍是一条固定流水线：无论查询是什么，相同的阶段以相同顺序运行。</p>
+
+    <p><strong>智能体式 RAG</strong>把检索变成智能体在运行时掌控的决策。智能体规划要做多少次检索步骤、查询哪个源或工具（向量库、SQL、网络、子智能体），检查返回的内容，反思，并适应——可能用不同表述重新查询，或放弃一个走死的源。Singh、Ehtesham、Kumar 与 Talaei Khoei 的综述（<em>Agentic Retrieval-Augmented Generation: A Survey on Agentic RAG</em>，arXiv:2501.09136）按智能体基数、控制结构、自主性和知识表示来组织这一空间——作为地图很有用，但对实践者的要点更简单：智能体式 RAG 就是由一个控制循环（而非流水线）拥有检索的 RAG。这正是 <em>ReAct</em> 深入解析中讨论的那个循环，只是指向一个知识库而非通用工具。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>纠正式 RAG 与 Self-RAG：对糟糕检索闭环。</h3>
+
+    <p><strong>纠正式 RAG（CRAG）</strong>，出自 Yan 等人（2024），在取回与生成之间插入一个轻量检索评估器。它针对查询为检索到的文档打分，并路由到三种动作之一：<em>正确</em>（自信——精炼并使用这些文档）、<em>含糊</em>（混杂——把文档与一次网络搜索补充结合）、或<em>错误</em>（低置信——完全丢弃文档并回退到网络搜索）。该评估器刻意做得廉价（CRAG 用了一个约 0.8B 的模型），使纠正步骤不会主导延迟。</p>
+
+    <p><strong>Self-RAG</strong>（Asai 等人，2023）把决策移进模型自身。模型被训练为发出<em>反思令牌</em>，即时决定是否根本需要检索、每个检索到的段落是否相关，以及它自己的草稿是否真的被证据支持。CRAG 是把一个外部评估器栓到现成模型上，Self-RAG 则把"检索并批判"的策略烤进权重里。</p>
+
+    <p>两者回答的是同一个问题——"我该信任刚检索到的东西吗？如果不该，我怎么办？"——而两者都不会优于其判断信号。一个把垃圾评为<em>正确</em>的失准评估器，会把 CRAG 变成多了延迟的朴素 RAG。</p>
+
+    <div class="callout warn">
+      <p>评估器才是承重组件，而非围绕它的路由逻辑。团队交付了分支结构却没充分测试评分器，然后纳闷为何纠正从不触发。构建一个带标注的（查询、检索到的文档、是否真的相关）集合，并在信任它控制的任何分支<em>之前</em>测量评估器的精确率/召回率。这与<em>检索增强记忆</em>深入解析中的相关性下限是同一个可信评分器要求。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>一个 CRAG 式的"评估再分支"循环。</h3>
+
+    <p>整个家族都可归约为：检索、评分、按分数分支、可选地恢复，然后生成——只在清过门槛的证据上生成。</p>
+
+<pre class="standalone"><span class="c-cm"># corrective_rag.py — evaluate, then branch</span>
+<span class="c-kw">def</span> <span class="c-fn">corrective_rag</span>(query, retriever, evaluator, web, gen):
+    docs = retriever.<span class="c-fn">search</span>(query, k=<span class="c-st">8</span>)
+    grade = evaluator.<span class="c-fn">score</span>(query, docs)   <span class="c-cm"># 0..1 per corpus relevance</span>
+
+    <span class="c-kw">if</span> grade &gt;= <span class="c-st">0.70</span>:                      <span class="c-cm"># CORRECT</span>
+        evidence = <span class="c-fn">refine</span>(docs)            <span class="c-cm"># drop distractor strips</span>
+    <span class="c-kw">elif</span> grade &gt;= <span class="c-st">0.35</span>:                    <span class="c-cm"># AMBIGUOUS</span>
+        evidence = <span class="c-fn">refine</span>(docs) + web.<span class="c-fn">search</span>(query)
+    <span class="c-kw">else</span>:                                 <span class="c-cm"># INCORRECT</span>
+        evidence = web.<span class="c-fn">search</span>(<span class="c-fn">rewrite</span>(query))  <span class="c-cm"># discard, recover</span>
+
+    <span class="c-kw">if</span> <span class="c-kw">not</span> evidence:
+        <span class="c-kw">return</span> <span class="c-st">"insufficient evidence"</span>     <span class="c-cm"># abstain &gt; confabulate</span>
+    <span class="c-kw">return</span> gen.<span class="c-fn">answer</span>(query, evidence)</pre>
+
+    <p>这些阈值不是通用常数——它们针对每个系统、用 STEP 2 的标注集来调优。弃答路径与各分支同等重要：一个对真正无法回答的查询返回"证据不足"的系统是正确的，而且远比一个总是产出某种东西的系统安全。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>查询变换：重写、多查询、HyDE。</h3>
+
+    <p>如果查询本身是探入索引的糟糕探针，没有任何下游阶段能挽回。三种常见变换：</p>
+
+    <ul>
+      <li><strong>重写。</strong>消解代词、展开缩写、剥除对话噪声——把"那它的定价呢？"变成一个独立查询。低风险，对话式 RAG 通常净赚。</li>
+      <li><strong>多查询。</strong>生成若干改写，对每个分别检索，再合并。以更多检索调用为代价，提升欠规约问题的召回。</li>
+      <li><strong>HyDE</strong>（假设文档嵌入）。让模型写一个假设性答案，嵌入<em>那个</em>，再用它检索——合成答案在嵌入空间中往往比裸问题更接近真实段落。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>HyDE 不是默认项。它对弱的或零样本检索器可靠地有帮助，但在一个强的微调稠密检索器上它可能<em>有害</em>：假设文档引入了分布偏移，并有把实体幻觉错的机会，把检索拽偏目标。把每个查询变换当作一个要在你的检索器和语料上测量的假设，而非要盲目采纳的最佳实践。这是一个快速演变、依赖系统的结论——诚实的回答是"做 A/B"。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>融合与重排序：廉价的召回，再昂贵的精确。</h3>
+
+    <p><strong>RAG 融合 / 检索融合</strong>运行多次检索（不同查询表述，或稠密＋词法）并合并排序列表，通常用倒数排名融合，使一个在多个列表中都排得不错的文档高过一个仅在单个噪声列表中骤升的文档。这是召回与鲁棒性的招法，不是精确性的。</p>
+
+    <p>精确性来自<strong>重排序</strong>。两阶段模式——一个廉价的双编码器（或 BM25）检索一个宽候选集，然后一个联合关注查询与段落的<strong>交叉编码器</strong>对前 ~50&ndash;100 个重新打分——一贯地胜过任何单阶段检索器。交叉编码器太慢，无法在整个语料上运行，这正是它待在廉价第一阶段之后的原因：只在排序真正决定答案的地方花算力。实践中，两阶段"先检索后重排"对多数表现不佳的朴素 RAG 系统是投资回报最高的升级，优先于上文任何更巧妙的技术。这里的智能体式 RAG 控制循环，在概念上是<em>智能体检索策略</em>深入解析与实战指南<em>检索</em>章节中诸模式的兄弟——同样的评估器驱动纪律，应用于知识而非动作。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>何时该用哪一个。</h3>
+
+    <p>从强的朴素 RAG 加上两阶段重排序与查询重写起步——这清掉大多数生产场景，是最廉价、最可预测的配置。当召回是瓶颈时（正确文档存在但排在截断之下）加入<strong>融合</strong>。当你的语料有真实的覆盖缺口且网络回退可接受时，加入 <strong>CRAG 式纠正</strong>——它直接攻击"由垃圾得出的自信错误答案"。当你能训练或微调、并希望检索/批判策略在模型里而非编排代码里时，伸手去拿 <strong>Self-RAG</strong>。只有当检索确实是多步或多源时——跨文档比较、多跳推理、在异构工具间选择——才走<strong>完全智能体式</strong>，因为规划循环增加了延迟、成本和新的失败模式（循环、漂移），对单跳问题没有收益。把 HyDE 和激进的查询扩展当作要测量的实验，绝不当默认。贯穿全部的不变式成立：架构只与决定"什么算好检索"的那个评分器一样可信——先构建并验证它，再选择架构。</p>
+  </div>
+</section>
