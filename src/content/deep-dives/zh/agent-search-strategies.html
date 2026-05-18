@@ -1,0 +1,74 @@
+<section class="phase">
+  <div class="phase-num">D5</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>搜索策略——在轨迹上分支。</h2>
+  <p class="goal">当单一轨迹太脆弱时，你探索多条并择优。Best-of-N、自一致性（self-consistency）、思维树（tree-of-thought）与思维图（graph-of-thought）是同一谱系上的点：花更多推理算力拓宽搜索，再付一个选择器来挑选。本文涵盖这条谱系、乘性成本，以及对可用打分信号的承重依赖。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>统一思想：生成候选，再选择。</h3>
+
+    <p>单轨迹模式（ReAct、plan-and-execute）承诺单一路径。若早期某步错了，整次运行就错。搜索模式通过探索多条路径并从中选择来对冲。每种搜索方法回答三个问题：<em>如何分支</em>（采样 N 个独立答案，或展开一棵部分状态的树），<em>如何打分</em>一个节点或一个完成的候选，以及<em>如何选出</em>赢家。打分搞错，整个家族就崩塌——这是反复出现的主题。</p>
+
+    <ul>
+      <li><strong>Best-of-N / 拒绝采样。</strong>生成 N 个独立尝试，各自打分，返回最佳。尝试之间不共享结构。极易并行。</li>
+      <li><strong>自一致性。</strong>采样 N 条思维链，取多数答案。"打分器"是一次投票——仅当答案空间小且离散（最终数值答案、标签）时奏效。</li>
+      <li><strong>思维树（ToT）。</strong>把问题分解为步骤；每步生成多个候选续写，给部分状态打分，并搜索（BFS/DFS/beam）带回溯。在问题困难处花费算力。</li>
+      <li><strong>思维图（GoT）。</strong>把树推广为 DAG：想法可被合并与精化，而不仅分支。对部分解应被组合的问题很强大；工程量最重。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>一次树搜索的形态。</h3>
+
+<pre class="standalone"><span class="c-cm"># Tree-of-thought, beam search variant</span>
+frontier = [<span class="c-fn">root</span>(task)]
+<span class="c-kw">for</span> depth <span class="c-kw">in</span> <span class="c-fn">range</span>(MAX_DEPTH):
+    candidates = []
+    <span class="c-kw">for</span> node <span class="c-kw">in</span> frontier:
+        <span class="c-kw">for</span> thought <span class="c-kw">in</span> generator.<span class="c-fn">expand</span>(node, k=BRANCH):
+            child = node.<span class="c-fn">extend</span>(thought)
+            child.score = <span class="c-fn">evaluate</span>(child)     <span class="c-cm"># the load-bearing call</span>
+            candidates.<span class="c-fn">append</span>(child)
+    frontier = <span class="c-fn">top_k</span>(candidates, BEAM_WIDTH)  <span class="c-cm"># prune; backtrack implicit</span>
+    <span class="c-kw">if</span> <span class="c-fn">any</span>(c.is_solution <span class="c-kw">for</span> c <span class="c-kw">in</span> frontier):
+        <span class="c-kw">break</span>
+<span class="c-kw">return</span> <span class="c-fn">best</span>(frontier)</pre>
+
+    <p>注意成本：模型调用大致按 <code class="inline">BRANCH × BEAM_WIDTH × MAX_DEPTH</code> 增长，每个节点还要付一次 <code class="inline">evaluate()</code> 调用。一棵适度的树（分支 3、beam 3、深度 4）为一个答案就是数十次模型调用量级。这不是微调；这是另一个成本区间。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>打分信号决定这一切是否奏效。</h3>
+
+    <p>每种搜索方法的质量都被其评估器质量封顶。信号层级，由优到劣：</p>
+
+    <ul>
+      <li><strong>真相校验器</strong>（测试通过、方程平衡、工具成功）。搜索在此大放异彩——它是对照神谕的并行假设检验。这是 ToT/best-of-N 给出最大、最可靠收益之处。</li>
+      <li><strong>结构化标准 / 程序化启发式。</strong>当标准具体且有区分度时尚可。</li>
+      <li><strong>LLM 作为裁判的自评。</strong>弱且有偏。在最初促使搜索的那些困难案例上，裁判往往无法比随机更好地排序候选。在一个差裁判上做 best-of-N，只会找出裁判最自信的答案，而非正确答案。</li>
+      <li><strong>多数投票（自一致性）。</strong>仅当正确答案是众数样本时奏效。当模型系统性偏向某个错误答案时失效——投票放大该偏差。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>主导反模式：在一个没有外部检查的任务上，用 LLM 自评部署树搜索。你付出 30 倍推理成本去探索一个你无法导航的空间，而选择器自信地返回一个错误叶子。在加分支之前，先证明你有一个有区分度的打分器。架构放大信号；它无法制造信号。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>何时动用搜索——何时不要。</h3>
+
+    <p><strong>在以下情况使用：</strong>任务有可校验或可清晰区分的答案（竞赛数学、带测试的代码、约束满足、规划/谜题）；单趟准确率是瓶颈且你已度量过；延迟与成本预算能吸收 5–30 倍乘数；正确答案的价值远超推理成本。</p>
+
+    <p><strong>在以下情况避免：</strong>输出开放式且无有区分度的打分器（自由写作、建议）——分支只是采样更多不可校验的文本；任务对延迟敏感或高 QPS——成本乘数承受不起；更便宜的模式已达标。在引入树搜索前，务必先用尽 ReAct 和一个有校验器支撑的反思循环；它是本节最重的模式，也最容易被部署在不见效之处。</p>
+
+    <div class="callout tip">
+      <p>务实阶梯：从 best-of-N 开始（极易加入、极易并行，常占收益的 80%）。仅对小型离散答案空间转向自一致性。把完整 ToT/GoT 留给那些部分状态打分与回溯能明确优于独立采样的问题——那是真实工作负载中的少数。</p>
+    </div>
+
+    <p>诚实的权衡：<strong>搜索以乘性推理成本买入对抗不走运单一轨迹的鲁棒性，其见效严格与你的打分器有多好成正比。</strong>有真相校验器时它是可用的最强杠杆之一；没有时它是自信地犯错的最昂贵方式。</p>
+  </div>
+</section>

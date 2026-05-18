@@ -1,0 +1,103 @@
+<section class="phase">
+  <div class="phase-num">M6</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>Memory stores: vector, key-value, and graph tradeoffs &mdash; plus eviction.</h2>
+  <p class="goal">The backend you persist memory in determines what you can ask of it. Vector stores answer "what is similar," key-value stores answer "what is exactly this," graph stores answer "what is connected." Most production memory systems need two of the three, routed by memory kind. And whatever the backend, an unbounded store degrades retrieval &mdash; eviction is part of the design, not an afterthought.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three access patterns, three backends.</h3>
+
+    <ul>
+      <li><strong>Vector store</strong> (Chroma, Qdrant, pgvector, &hellip;) &mdash; approximate nearest-neighbour over embeddings. Strength: fuzzy, semantic recall &mdash; "find memories <em>like</em> this situation." Weakness: no exact lookup, no relational structure, recall quality degrades as the index fills with near-duplicates.</li>
+      <li><strong>Key-value store</strong> (Redis, a table, even a dict) &mdash; exact retrieval by a known key. Strength: <code class="inline">user:tz &rarr; "Europe/Berlin"</code> is O(1), unambiguous, trivially updatable in place. Weakness: you must know the key; no similarity, no discovery.</li>
+      <li><strong>Graph store</strong> (Neo4j, a triple store) &mdash; entities and typed relations. Strength: multi-hop &mdash; "who reported the bug that the migration fixed." Weakness: extraction is expensive and brittle, and most agent memory is not naturally relational.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Map backend to memory kind, not to fashion. <strong>Semantic facts</strong> &rarr; key-value (exact, updatable in place). <strong>Episodic memory</strong> &rarr; vector (recall by situation similarity). <strong>Procedural</strong> &rarr; key-value keyed by task type. Reach for a <strong>graph</strong> only when the queries are genuinely multi-hop relational &mdash; it is the highest-cost option and the one most often adopted prematurely.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>A unified memory interface over heterogeneous backends.</h3>
+
+    <p>The agent should not know or care which backend a memory lives in. Route on <code class="inline">kind</code> behind one interface; this also lets you swap backends without touching agent code.</p>
+
+<pre class="standalone"><span class="c-cm"># memory/store.py</span>
+<span class="c-kw">class</span> <span class="c-fn">MemoryStore</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, vec, kv, embed):
+        self.vec = vec      <span class="c-cm"># episodic: similarity recall</span>
+        self.kv = kv        <span class="c-cm"># semantic/procedural: exact key</span>
+        self.embed = embed
+
+    <span class="c-kw">def</span> <span class="c-fn">write</span>(self, m: Memory) -> <span class="c-kw">None</span>:
+        <span class="c-kw">if</span> m.kind <span class="c-kw">is</span> Kind.EPISODIC:
+            self.vec.upsert(self.embed(m.text), m.__dict__)
+        <span class="c-kw">else</span>:                            <span class="c-cm"># SEMANTIC / PROCEDURAL</span>
+            <span class="c-cm"># Key by stable identity &rarr; update in place,</span>
+            <span class="c-cm"># never accumulate contradictory copies.</span>
+            self.kv.put(m.key(), m.__dict__)
+
+    <span class="c-kw">def</span> <span class="c-fn">recall</span>(self, cue: <span class="c-kw">str</span>, kind: Kind, k=<span class="c-st">5</span>):
+        <span class="c-kw">if</span> kind <span class="c-kw">is</span> Kind.EPISODIC:
+            <span class="c-kw">return</span> self.vec.search(self.embed(cue), k=k)
+        <span class="c-kw">return</span> self.kv.get_prefix(kind.value)   <span class="c-cm"># scoped exact</span></pre>
+
+    <p>The <code class="inline">kv.put(m.key(), ...)</code> path is the quiet hero. Semantic memory written by key is <em>updated in place</em> when a fact changes &mdash; the user's timezone is one entry, not a growing pile of contradictory observations the retriever has to disambiguate. This single design choice eliminates an entire class of "the agent believes two conflicting things" bugs.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The unbounded-store failure, and why eviction is mandatory.</h3>
+
+    <p>Every memory system that "just keeps everything" degrades. The mechanism is concrete: as a vector index fills with semantically clustered near-duplicates (forty slightly different phrasings of the same event), nearest-neighbour search returns a tight cluster of redundant low-value hits and crowds out the one genuinely useful memory. Retrieval recall@k <em>falls</em> as the store grows. More memory makes the agent dumber.</p>
+
+    <div class="callout warn">
+      <p>"Storage is cheap so keep everything" is true for storage and false for retrieval. The cost of an unbounded memory store is not disk &mdash; it is collapsing recall precision and an agent that gets measurably worse the longer it runs. Bounded, curated memory beats exhaustive memory at every size.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Eviction and decay policies.</h3>
+
+    <p>Borrow from cache design, with a memory-specific twist: relevance, not just recency or frequency.</p>
+
+    <ul>
+      <li><strong>TTL / age decay</strong> &mdash; episodic memory loses salience over time; below a floor it is evicted (or first summarized, then evicted). Semantic memory does <em>not</em> age &mdash; it is superseded by update, not by time.</li>
+      <li><strong>LRU-by-access</strong> &mdash; the <code class="inline">last_used</code> refresh from <code class="inline">retrieval-augmented-memory</code> means never-recalled memories cool and become eviction targets. Frequently useful memories stay resident.</li>
+      <li><strong>Salience-weighted</strong> &mdash; explicitly important memories (user said "always remember") resist eviction regardless of age or access. Salience is a floor on lifetime.</li>
+      <li><strong>Redundancy collapse</strong> &mdash; the most memory-specific policy: periodically cluster near-duplicates and merge each cluster into one canonical memory. This is reflection (<code class="inline">memory-types</code>) doing double duty as garbage collection.</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># memory/evict.py</span>
+<span class="c-kw">def</span> <span class="c-fn">decayed_salience</span>(m, now) -> <span class="c-kw">float</span>:
+    <span class="c-kw">if</span> m.kind <span class="c-kw">is</span> <span class="c-kw">not</span> Kind.EPISODIC:
+        <span class="c-kw">return</span> m.salience                 <span class="c-cm"># semantic: no time decay</span>
+    age = now - m.last_used
+    <span class="c-kw">return</span> m.salience * <span class="c-st">0.5</span> ** (age / (<span class="c-st">14</span> * <span class="c-st">86400</span>))
+
+<span class="c-kw">def</span> <span class="c-fn">sweep</span>(store, now, floor=<span class="c-st">0.15</span>, max_n=<span class="c-st">50_000</span>):
+    items = store.all()
+    <span class="c-kw">for</span> m <span class="c-kw">in</span> items:
+        <span class="c-kw">if</span> decayed_salience(m, now) &lt; floor:
+            summarize_then_drop(store, m)   <span class="c-cm"># distil, not delete</span>
+    <span class="c-kw">if</span> store.count() &gt; max_n:                <span class="c-cm"># hard cap backstop</span>
+        evict_lowest_score(store, store.count() - max_n)</pre>
+
+    <div class="callout tip">
+      <p>Eviction should almost always be <em>summarize-then-drop</em>, not <em>delete</em>. Distil the evicted memory's durable residue into semantic memory (or a coarse archive summary) first. Hard delete only true noise &mdash; pleasantries, exact duplicates, superseded values. You are compressing the past, not erasing it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Choosing, in practice.</h3>
+
+    <p>A pragmatic default that covers the large majority of agents: <strong>key-value for semantic and procedural memory, vector for episodic memory, eviction-by-decay on the vector tier, in-place update on the key-value tier.</strong> Add a graph only when you have concrete queries that are inherently multi-hop relational and you have measured that flattening them into vector or KV loses real accuracy.</p>
+
+    <p>Do not start with a graph because it sounds principled, and do not start with a single giant vector store because it sounds simple &mdash; the first is over-engineered, the second silently rots. The store is infrastructure; route by memory kind, bound every tier, and let <code class="inline">evaluating-memory</code> tell you when a backend choice is actually costing you accuracy.</p>
+  </div>
+</section>

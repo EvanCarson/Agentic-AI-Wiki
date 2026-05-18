@@ -1,0 +1,87 @@
+<section class="phase">
+  <div class="phase-num">D3</div>
+  <div class="week">Deep Dive · Architectures &amp; Patterns</div>
+  <h2>Plan-and-execute — decompose, then run.</h2>
+  <p class="goal">Plan-and-execute commits to a multi-step plan up front, then executes each step, replanning only when reality diverges. It trades ReAct's per-step adaptivity for global coherence and cost predictability. This essay covers the planner/executor split, replanning strategies, and when the up-front plan becomes a liability.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The planner/executor split.</h3>
+
+    <p>Plan-and-execute separates two concerns that ReAct fuses. A <strong>planner</strong> — usually one strong-model call — reads the task and emits an explicit, ordered list of subtasks. An <strong>executor</strong> then runs each subtask, often with a cheaper model or a ReAct loop scoped to that single step. The plan is a first-class artifact: you can log it, show it to a user for approval, diff it across runs, and resume from a failed step.</p>
+
+    <p>The lineage runs from least-to-most and decomposition prompting through Plan-and-Solve (Wang et al., 2023), which showed that explicitly generating a plan before solving reduces missing-step and calculation errors versus undifferentiated chain-of-thought. The production value is less about raw accuracy and more about <em>control</em>: a plan is a contract you can inspect before any irreversible action runs.</p>
+
+<pre class="standalone"><span class="c-cm"># Planner output — a typed, inspectable artifact</span>
+plan = [
+  {<span class="c-st">"id"</span>: 1, <span class="c-st">"task"</span>: <span class="c-st">"fetch customer's last 3 invoices"</span>, <span class="c-st">"tool"</span>: <span class="c-st">"billing_api"</span>},
+  {<span class="c-st">"id"</span>: 2, <span class="c-st">"task"</span>: <span class="c-st">"compute total overdue amount"</span>, <span class="c-st">"deps"</span>: [1]},
+  {<span class="c-st">"id"</span>: 3, <span class="c-st">"task"</span>: <span class="c-st">"draft a payment-reminder email"</span>, <span class="c-st">"deps"</span>: [2]},
+]</pre>
+
+    <div class="callout tip">
+      <p>Make the plan a typed object with explicit <code class="inline">deps</code>, not a prose list. Dependencies let the executor parallelize independent steps and let you render a clean approval UI. Prose plans cannot be parallelized or validated.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The execution loop and the replanning question.</h3>
+
+    <p>The naive executor walks the plan in dependency order and stops on first failure. The interesting engineering is what happens <em>when a step fails or returns something the plan did not anticipate</em>. This is the central design decision of the pattern, and there are three established strategies:</p>
+
+    <ul>
+      <li><strong>Static plan (no replanning).</strong> Execute exactly the plan; on failure, abort and surface the partial result. Cheapest and most predictable. Correct only when the environment is stable and steps rarely fail.</li>
+      <li><strong>Replan-on-failure.</strong> When a step fails, feed the planner the original task, the plan, and the failure, and ask for a revised remaining plan. Bounded by a replan budget. The pragmatic default for most production systems.</li>
+      <li><strong>Plan-and-reflect (continuous).</strong> After every step, a lightweight check asks "does the remaining plan still make sense given what we just learned?" and replans if not. Most adaptive, closest to ReAct, highest cost. The LLMCompiler / ReWOO line of work optimizes the static-plan end by resolving an argument-dependency graph so independent calls run in parallel.</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># Replan-on-failure executor</span>
+<span class="c-kw">while</span> plan.has_pending():
+    step = plan.<span class="c-fn">next_ready</span>()              <span class="c-cm"># deps satisfied</span>
+    result = <span class="c-fn">execute</span>(step)
+    <span class="c-kw">if</span> result.ok:
+        plan.<span class="c-fn">mark_done</span>(step, result)
+    <span class="c-kw">elif</span> replans_used &lt; REPLAN_BUDGET:
+        plan = planner.<span class="c-fn">revise</span>(task, plan, failed=step, why=result.error)
+        replans_used += 1
+    <span class="c-kw">else</span>:
+        <span class="c-kw">return</span> <span class="c-fn">partial</span>(plan)              <span class="c-cm"># fail loud, with what we have</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>When plan-and-execute pays off.</h3>
+
+    <ul>
+      <li><strong>Multi-stage tasks with stable structure</strong> — ETL-style pipelines, onboarding flows, report generation — where the shape is knowable up front and coherence across steps matters more than per-step improvisation.</li>
+      <li><strong>Cost-sensitive workloads.</strong> One expensive planner call plus many cheap executor calls is far cheaper than a strong model re-deliberating every step as in ReAct.</li>
+      <li><strong>Human-in-the-loop / high-stakes actions.</strong> The explicit plan is a natural approval checkpoint before anything irreversible (sending money, mutating production) runs.</li>
+      <li><strong>Parallelizable work.</strong> A dependency graph lets independent steps run concurrently — a structural latency win ReAct cannot match because it discovers steps one at a time.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>When it actively hurts.</h3>
+
+    <p>The up-front plan is the pattern's strength and its core liability. Concrete failure modes:</p>
+
+    <ul>
+      <li><strong>Plan-reality divergence.</strong> On genuinely open-ended tasks the planner cannot foresee the steps, so it emits a plausible-looking but wrong plan, and the executor faithfully marches off a cliff. Symptom: high replan rate. If you are replanning every step, you have reinvented ReAct with extra latency — switch patterns.</li>
+      <li><strong>Stale-plan execution.</strong> A static-plan executor keeps running steps whose premises were invalidated by an earlier step's surprising result. This is the most dangerous mode because it fails silently with a confident wrong output.</li>
+      <li><strong>Planner overconfidence on under-specified tasks.</strong> Vague inputs yield vague plans the executor cannot ground. Mitigation: a clarification step before planning, or a planner that is allowed to emit "insufficient information."</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>The diagnostic metric for this pattern is <strong>replan rate</strong>. Near 0% means a static plan is fine. Moderate and bounded is healthy replan-on-failure. Consistently high means the task is not actually decomposable in advance and you are paying planning overhead for nothing — drop to ReAct.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The honest tradeoff.</h3>
+
+    <p>Plan-and-execute buys <strong>global coherence, cost predictability, parallelism, and an inspectable approval point</strong> in exchange for <strong>adaptivity and an extra failure surface (the plan can be wrong before a single step runs)</strong>. Choose it when the task's structure is more knowable than its details. Choose ReAct when the details are discoverable only by acting. In practice many systems nest them: a planner produces the skeleton, and each executor step is itself a small bounded ReAct loop — coherence at the macro scale, adaptivity at the micro scale.</p>
+  </div>
+</section>

@@ -1,0 +1,97 @@
+<section class="phase">
+  <div class="phase-num">B5</div>
+  <div class="week">Concepts · Core Building Blocks</div>
+  <h2>Tool / function calling explained.</h2>
+  <p class="goal">A language model can only emit text. Tool calling (a.k.a. function calling) is the protocol that turns "emit text" into "do things in the world": the model requests a function, your code runs it, and the result goes back into context. This entry explains the exact request/response shape, the loop it implies, why the model never executes anything itself, and the design rules that keep tool-using agents safe.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The model proposes; your code disposes.</h3>
+
+    <p>The single most important fact: <strong>the model does not call your function. It outputs a structured request asking you to call it.</strong> There is no code execution inside the model. Tool calling is a disciplined text protocol with three steps:</p>
+
+    <ul>
+      <li>You describe the available tools (name, purpose, parameter schema) in the request.</li>
+      <li>The model, instead of answering in prose, may emit a <em>tool-use</em> message: "call <code class="inline">get_weather</code> with <code class="inline">{"city": "Paris"}</code>."</li>
+      <li>Your application executes the real function, then sends the result back as a <em>tool-result</em> message. The model continues, now able to use that result.</li>
+    </ul>
+
+    <p>Everything the model does is still next-token prediction. It was post-trained to emit a specific JSON-shaped structure when a tool would help; the "calling" is your code reacting to that structure.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The wire shape.</h3>
+
+<pre class="standalone"><span class="c-cm"># 1. You declare tools in the request</span>
+tools = [{
+  <span class="c-st">"name"</span>: <span class="c-st">"get_weather"</span>,
+  <span class="c-st">"description"</span>: <span class="c-st">"Current weather for a city. Use when asked about weather."</span>,
+  <span class="c-st">"input_schema"</span>: {
+    <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+    <span class="c-st">"properties"</span>: {<span class="c-st">"city"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>}},
+    <span class="c-st">"required"</span>: [<span class="c-st">"city"</span>]
+  }
+}]</pre>
+
+<pre class="trace standalone"><span class="c-out"># 2. Model replies with a tool-use request (not prose)
+{ "type": "tool_use", "id": "t_01", "name": "get_weather",
+  "input": { "city": "Paris" } }
+
+# 3. YOUR code runs get_weather("Paris") and returns a tool_result
+{ "type": "tool_result", "tool_use_id": "t_01",
+  "content": "12C, light rain" }
+
+# 4. Model now answers in prose, grounded in the result
+"It's 12C with light rain in Paris right now."</span></pre>
+
+    <p>The tool <em>description</em> and parameter schema are prompt engineering, not boilerplate. The model decides whether and how to call a tool based almost entirely on that text. A vague description ("does stuff with users") produces unreliable calling; a precise one ("Fetch a user by ID. Use only when you have a numeric user_id; do not guess IDs") produces reliable calling.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The loop this implies.</h3>
+
+    <p>One tool call is rarely the end. The result may prompt another call, then another, until the model has enough to answer. That cycle — model → tool request → execute → result → model — repeated until the model emits a final answer instead of a tool request, is the <strong>agent loop</strong> (covered in the Agentic AI section). Tool calling is the primitive; the loop is the pattern built on it. Two consequences for beginners:</p>
+    <ul>
+      <li><strong>You own the loop.</strong> The API does not auto-execute. You write the code that detects a tool-use message, runs the function, appends the result, and calls the model again.</li>
+      <li><strong>You need a stop condition.</strong> A buggy tool that always errors can make the model retry forever. Always cap iterations.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Why this primitive is powerful.</h3>
+
+    <p>Tool calling removes three structural weaknesses of a bare LLM:</p>
+    <ul>
+      <li><strong>Stale knowledge → live data.</strong> The model's training has a cutoff. A <code class="inline">search</code> or <code class="inline">get_account</code> tool gives it current facts instead of memorized guesses.</li>
+      <li><strong>Bad at exact computation → real computation.</strong> Models are unreliable at arithmetic and precise logic. A <code class="inline">calculator</code> or <code class="inline">run_sql</code> tool offloads exactness to code that is actually exact.</li>
+      <li><strong>Can't act → can act.</strong> <code class="inline">send_email</code>, <code class="inline">create_ticket</code>, <code class="inline">deploy</code> — tools are how an LLM affects the world rather than only describing it.</li>
+    </ul>
+    <p>This is also the through-line of this section: RAG is essentially a retrieval tool wired into context; structured output is the same JSON-shaping machinery pointed at the final answer instead of a function call.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The safety rules that are not optional.</h3>
+
+    <div class="callout danger">
+      <p>A tool argument produced by the model is untrusted input. The model can be wrong, or steered by prompt injection in retrieved/tool content. Treat every tool call as if a stranger on the internet sent that request to your function.</p>
+    </div>
+
+    <ul>
+      <li><strong>Validate before executing.</strong> Re-check the arguments against the schema and your own business rules in code. Never pass model output straight into a shell, SQL string, or filesystem path.</li>
+      <li><strong>Least privilege.</strong> Expose the narrowest tool that does the job. <code class="inline">refund_order(order_id, amount)</code> with server-side limits, not <code class="inline">run_arbitrary_sql</code>.</li>
+      <li><strong>Gate irreversible actions.</strong> Deletes, payments, sends — require explicit confirmation or human approval. Capability limits hold even when the prompt is subverted; a sentence telling the model "be careful" does not.</li>
+      <li><strong>Return errors as data.</strong> When a tool fails, send a structured error back as the tool result so the model can react ("that user does not exist") rather than crashing the loop.</li>
+      <li><strong>Make tools idempotent where possible.</strong> The loop may retry; a retried <code class="inline">charge_card</code> must not double-charge.</li>
+    </ul>
+  </div>
+
+  <div class="deliverable">
+    <div class="tag">Takeaway</div>
+    <h3>Deliverable</h3>
+    <p>You understand tool calling as a text protocol: you declare tools with precise descriptions and schemas, the model emits a structured tool-use request, your code executes the real function and returns a tool-result, and the model continues grounded in it. You own the surrounding loop and its stop condition. You know it exists to fix stale knowledge, weak computation, and inability to act. And you treat every model-produced argument as untrusted: validate it, scope tools to least privilege, gate irreversible actions with capability limits rather than instructions, and make execution idempotent.</p>
+  </div>
+</section>

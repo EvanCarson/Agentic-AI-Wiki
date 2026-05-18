@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">M3</div>
+  <div class="week">深入解析 · 记忆与上下文工程</div>
+  <h2>记忆类型：情景、语义、程序性——以及草稿区。</h2>
+  <p class="goal">"长期记忆"不是单一的东西。高效的智能体至少保有三种功能上截然不同的记忆，外加一个任务内的草稿区，每一种的写入、索引和检索方式都不同。把它们存进一个不加区分的大团块，正是那么多记忆系统会自信地检索出无关垃圾的原因。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>三种持久的，一种短暂的。</h3>
+
+    <p>这个分类源自认知科学，但它在操作层面赢得了自己的位置：每一种回答一个不同的问题，因此需要不同的检索线索。</p>
+
+    <ul>
+      <li><strong>情景记忆（Episodic）</strong>——"发生了什么"。具体事件的带时间戳记录：这位用户问了 X，智能体运行了工具 Y，它返回了错误 Z，修复办法是 W。回答<em>"我以前见过这个情形吗，当时怎么了？"</em></li>
+      <li><strong>语义记忆（Semantic）</strong>——"什么是真的"。提炼出的、不随时间变化的事实：用户的时区、数据库是 Postgres 16、部署策略。回答<em>"关于世界／用户／系统我知道什么？"</em></li>
+      <li><strong>程序性记忆（Procedural）</strong>——"怎么做"。智能体获得或被赋予的可复用技能与例程：回滚一次迁移的步骤、分诊一起事故的检查清单。回答<em>"我该如何完成这类任务？"</em></li>
+      <li><strong>草稿区（工作）</strong>——仅用于<em>当前</em>任务的短暂推理状态：一个计划、一个累计计数、中间结果。默认不持久化；除非其中某项被提升为三种持久类型之一，否则它随任务消亡。</li>
+    </ul>
+
+    <div class="callout">
+      <p>判断一条信息属于哪一种的测试：问哪个查询应当检索到它。"我们上次部署是什么时候？" &rarr; 情景。"部署策略是什么？" &rarr; 语义。"我怎么部署？" &rarr; 程序性。如果同一个字符串会是这三个问题的共同答案，那你还没把它提炼出来。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>在写入时标注记忆类型。</h3>
+
+    <p>给每条记忆在写入时打上它的类型标签。这一个字段改变了它如何被索引、评分、衰减和检索——下游代码会基于它分支。</p>
+
+<pre class="standalone"><span class="c-cm"># memory/types.py</span>
+<span class="c-kw">from</span> enum <span class="c-kw">import</span> Enum
+<span class="c-kw">from</span> dataclasses <span class="c-kw">import</span> dataclass
+
+<span class="c-kw">class</span> <span class="c-fn">Kind</span>(Enum):
+    EPISODIC   = <span class="c-st">"episodic"</span>
+    SEMANTIC   = <span class="c-st">"semantic"</span>
+    PROCEDURAL = <span class="c-st">"procedural"</span>
+
+<span class="c-fn">@dataclass</span>
+<span class="c-kw">class</span> <span class="c-fn">Memory</span>:
+    text: <span class="c-kw">str</span>
+    kind: Kind
+    ts: <span class="c-kw">float</span>            <span class="c-cm"># event time (episodic) / write time</span>
+    salience: <span class="c-kw">float</span>      <span class="c-cm"># importance, drives decay &amp; eviction</span>
+    last_used: <span class="c-kw">float</span>     <span class="c-cm"># for recency-aware scoring</span>
+    source: <span class="c-kw">str</span>          <span class="c-cm"># turn id / user / derived</span></pre>
+
+    <p>为什么类型驱动行为：</p>
+
+    <ul>
+      <li><strong>情景记忆</strong>会老化：时近性重要，旧情景会被衰减或摘要。检索是相似度<em>加上</em>一个时近性项。</li>
+      <li><strong>语义记忆</strong>不应<em>因时间而过期</em>——一条稳定事实保持为真。但当它改变时（用户换了时区）必须<em>就地更新</em>，而不是追加，否则你会积累矛盾。</li>
+      <li><strong>程序性记忆</strong>很少通过与目标的语义相似度来检索；它以<em>任务类型</em>为键。按"我在做哪类任务"检索，而非"目标里有哪些词"。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>反思：把情景转化为语义。</h3>
+
+    <p>原始情景积累得很快，单条携带的信号却很少。源自 <em>Generative Agents</em> 一脉工作（Park 等，2023）的技术是<strong>反思</strong>（reflection）：周期性地对近期情景跑一遍模型，综合出更高层、更持久的结论——把情景记忆提升为语义记忆。</p>
+
+<pre class="standalone"><span class="c-cm"># memory/reflect.py</span>
+REFLECT = <span class="c-st">"""Here are recent events the agent observed:
+{episodes}
+
+Infer up to 3 durable, general conclusions that will
+still be true and useful in future, unrelated tasks.
+Output one per line. No speculation, no restatement
+of a single event."""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">reflect</span>(episodes: <span class="c-kw">list</span>[Memory], llm) -> <span class="c-kw">list</span>[Memory]:
+    joined = <span class="c-st">"\n"</span>.join(<span class="c-kw">f</span><span class="c-st">"- {e.text}"</span> <span class="c-kw">for</span> e <span class="c-kw">in</span> episodes)
+    out = llm(REFLECT.format(episodes=joined))
+    <span class="c-kw">return</span> [
+        Memory(text=line.strip(<span class="c-st">"- "</span>), kind=Kind.SEMANTIC,
+               ts=now(), salience=<span class="c-st">0.7</span>, last_used=now(),
+               source=<span class="c-st">"reflection"</span>)
+        <span class="c-kw">for</span> line <span class="c-kw">in</span> out.splitlines() <span class="c-kw">if</span> line.strip()
+    ]</pre>
+
+    <p>反思是让长期记忆<em>保持小而高信号</em>的引擎：数十条低价值情景坍缩为少数几条高价值语义事实。随后原始情景就可以被激进地衰减，因为其持久内容已被提取。没有反思，情景记忆会永远线性增长，检索质量随之衰减。</p>
+
+    <div class="callout tip">
+      <p>按与体量挂钩、而非按墙上时钟的节奏运行反思：例如每 N 条新情景，或当情景存储大小越过阈值时。把它绑定到与压缩相同的触发器上，让这两个操作保持一致。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>草稿区：结构化的工作状态，而非聊天记录。</h3>
+
+    <p>草稿区是短期的，但它值得单独对待，因为失效模式很具体：那些把推理"想出声"写进消息历史的智能体，会把真正的计划埋在大段推理散文之下，后续轮次中找不到自己的决策。</p>
+
+    <p>把草稿区保持为一个小的、<em>结构化的</em>、被显式重写的对象——而非不断增长的追加日志：</p>
+
+<pre class="trace"><span class="c-out">SCRATCHPAD (rewritten each turn, ~300 tok cap)
+  goal:     migrate users table to add `tier` column
+  plan:     [x] write migration  [x] test on staging
+            [ ] get approval     [ ] apply to prod
+  facts:    prod deploys gated on staging check (semantic)
+            migration is reversible (verified turn 4)
+  open:     awaiting approver response</span></pre>
+
+    <p>重写胜过追加：模型每轮重新生成草稿区，这迫使它丢掉已解决项并突出未闭合项。任务结束时，单次遍历把 <code class="inline">facts</code> 中任何持久内容抽取进语义记忆，把结果抽取进情景记忆；其余丢弃。</p>
+
+    <div class="callout warn">
+      <p>不要让草稿区和消息历史都试图充当工作记忆。选一个作为权威。一个常见且稳健的选择：历史是一份不可变的事件日志；草稿区是唯一可变的"当前理解"，并且只有草稿区加上最近几轮原始内容进入工作集。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>四者如何交互。</h3>
+
+    <p>成熟智能体的一轮会触及全部四者：</p>
+
+    <ul>
+      <li>按任务类型检索的<strong>程序性记忆</strong>告诉智能体<em>如何</em>推进。</li>
+      <li>按目标检索的<strong>语义记忆</strong>告诉它适用的<em>约束与事实</em>。</li>
+      <li>按情形相似度检索的<strong>情景记忆</strong>告诉它<em>上次</em>尝试类似的事时发生了什么。</li>
+      <li><strong>草稿区</strong>持有实时计划，随任务推进被重写。</li>
+    </ul>
+
+    <p>把它们分开不是官僚式的整洁——而是让每一种都能被正确的线索检索、按正确的节奏衰减的前提。后续文章会讲检索如何真正把它们浮现出来（<code class="inline">retrieval-augmented-memory</code>）、存储如何被保持有界（<code class="inline">context-compaction</code>），以及哪种后端适配哪一种记忆（<code class="inline">memory-stores</code>）。</p>
+  </div>
+</section>

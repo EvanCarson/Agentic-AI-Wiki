@@ -1,0 +1,82 @@
+<section class="phase">
+  <div class="phase-num">D2</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>ReAct——交错进行推理与行动。</h2>
+  <p class="goal">ReAct 是生产级智能体的主力：一个让模型在思考与调用工具之间交替的循环，每个工具结果都重塑下一次思考。本文涵盖真实的控制流、为什么交错优于先推理后行动，以及在规模化时会咬人的失败模式。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>核心思想：思考与行动共享一条轨迹。</h3>
+
+    <p>ReAct 出自 Yao 等人（2022），它在单一交错流中协同<em>推理</em>（思维链）与<em>行动</em>（工具调用/环境交互）。模型发出一个想法，然后一个动作，观察结果，基于该观察发出下一个想法，如此重复，直到它决定作答。关键洞见是推理与行动相互强化：推理决定采取哪个动作以及如何解读杂乱的结果；动作注入外部事实，在推理累积成幻觉之前纠正它。</p>
+
+    <p>对比 ReAct 居于其间的两种失败模式。纯思维链推理流畅但无锚定——它会自信地编造事实。纯行动循环（调一个工具，再调一个）把每一步都锚定在现实中，但无法分解一个困难问题，也无法从无关结果中恢复。交错在单一轨迹中同时获得锚定<em>与</em>审慎。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>明确写出这个循环。</h3>
+
+    <p>使用现代工具调用 API 时，你并不提示字面字符串 "Thought:"/"Action:"——模型的推理活在它的文本内容里，动作是一次结构化工具调用。结构是相同的：</p>
+
+<pre class="standalone"><span class="c-cm"># The ReAct loop — framework-free</span>
+history = [user_query]
+<span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-fn">range</span>(MAX_STEPS):
+    resp = model.<span class="c-fn">call</span>(history, tools=TOOLS)   <span class="c-cm"># thought + maybe action</span>
+    history.<span class="c-fn">append</span>(resp)
+
+    <span class="c-kw">if</span> resp.stop_reason == <span class="c-st">"final_answer"</span>:
+        <span class="c-kw">return</span> resp.text                       <span class="c-cm"># model chose to stop</span>
+
+    <span class="c-kw">for</span> call <span class="c-kw">in</span> resp.tool_calls:           <span class="c-cm"># act</span>
+        obs = <span class="c-fn">run_tool</span>(call.name, call.args)
+        history.<span class="c-fn">append</span>(tool_result(call.id, obs))  <span class="c-cm"># observe</span>
+    <span class="c-cm"># loop: next thought is conditioned on obs</span>
+
+<span class="c-kw">raise</span> <span class="c-fn">StepBudgetExceeded</span>(history)            <span class="c-cm"># bounded by construction</span></pre>
+
+    <p>三个性质让它达到生产级。它是<strong>有界的</strong>（步数预算限制成本与失控循环）。它是<strong>可观测的</strong>（每个想法与观察都在 <code class="inline">history</code> 中——你的 trace 就是数据结构本身）。如果你在步骤间持久化 <code class="inline">history</code>，它就是<strong>可恢复的</strong>。</p>
+
+    <div class="callout tip">
+      <p>杠杆最高的单一埋点：每步之后带步索引记录 <code class="inline">history</code>。ReAct 调试的九成就是读轨迹、找到想法不再锚定于上一个观察的那一步。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>ReAct 何时见效。</h3>
+
+    <ul>
+      <li><strong>开放式信息任务</strong>，下一动作确实取决于上一结果：研究、调试、多跳问答、客服分流。如果你无法预先写出计划，ReAct 的逐步适应性正是合适工具。</li>
+      <li><strong>嘈杂或不完整的工具结果</strong>，模型必须先推理某结果是否相关，再决定下一步做什么。</li>
+      <li><strong>中小规模工具集</strong>（大致 3–15 个工具），模型能在每步可靠地择一。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>失败模式——以及真正奏效的缓解措施。</h3>
+
+    <p>ReAct 的适应性也是它的隐患。这些有名字的失败模式，大致按它们投入生产的频率排序：</p>
+
+    <ul>
+      <li><strong>打转/抖动。</strong>智能体反复运行近乎相同的动作，因为每个观察都未推进目标。缓解：步数预算（始终要有），加上一个廉价的循环检测器，标记重复的（工具，归一化参数）元组并注入一条"你试过这个；换方法或停止"的消息。</li>
+      <li><strong>长轨迹上的上下文腐烂。</strong>历史增长到早期锚定事实被埋没或被驱逐，模型开始漂移。缓解：周期性上下文压缩——把旧步骤摘要进一个持久草稿区，最近步骤保留原文。</li>
+      <li><strong>过早承诺。</strong>模型在一个薄弱观察后就认定有了答案。缓解：在 <code class="inline">final_answer</code> 前加反思或校验门控（有专文）——不要只在 ReAct 提示词里解决它。</li>
+      <li><strong>规模化下的工具选择错误。</strong>工具相似且众多时模型选错。缓解：在循环前置一个路由层（有专文），而不是在系统提示词里堆更多散文。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>反模式："在系统提示词里修它"。上述每个失败都有结构性缓解。把指令（"别重复动作、作答前校验、选对工具"）堆进提示词，会产生一堵脆弱、模型时灵时不灵、你也无法测试的文字墙。优先用循环检测器、校验节点和路由器——可做单元测试的代码。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>何时不要用朴素 ReAct。</h3>
+
+    <p>当任务具有<em>已知且稳定的结构</em>时，ReAct 是错误的默认。如果你已经知道为客户开通服务的五个步骤，逐步重新审议就是浪费的延迟，也是偏离脚本的机会——改用 plan-and-execute 或在叶子处带模型调用的硬编码工作流。ReAct 在长视野任务上也会退化：没有全局计划，约 15–25 步后它会丢失主线。而对答案可校验的任务（代码、数学），单趟 ReAct 不如利用廉价正确性信号的搜索或评估者-优化者循环。</p>
+
+    <p>诚实的一句话权衡：<strong>ReAct 以全局连贯性与可预测成本为代价，买入最大的适应性。</strong>后续文章中的模式各自通过重新引入 ReAct 刻意省略的结构，找回一部分连贯性。</p>
+  </div>
+</section>

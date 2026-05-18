@@ -1,0 +1,87 @@
+<section class="phase">
+  <div class="phase-num">D3</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>Plan-and-execute——先分解，再运行。</h2>
+  <p class="goal">Plan-and-execute 预先承诺一个多步计划，然后执行每一步，只在现实偏离时才重新规划。它以 ReAct 的逐步适应性换取全局连贯性与成本可预测性。本文涵盖规划器/执行器拆分、重规划策略，以及预先计划何时成为负担。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>规划器/执行器拆分。</h3>
+
+    <p>Plan-and-execute 分离了 ReAct 融合在一起的两个关注点。一个<strong>规划器</strong>——通常是一次强模型调用——读取任务并发出显式的、有序的子任务列表。一个<strong>执行器</strong>随后运行每个子任务，常使用更便宜的模型或一个仅作用于该单步的 ReAct 循环。计划是一等产物：你可以记录它、给用户审批、跨运行做差异比较、从失败步骤恢复。</p>
+
+    <p>这一谱系从 least-to-most 与分解式提示，经由 Plan-and-Solve（Wang 等人，2023），后者表明在求解前显式生成计划，相比未分化的思维链能减少缺步与计算错误。其生产价值与其说在于原始准确率，不如说在于<em>控制</em>：计划是一份你可以在任何不可逆动作运行前检视的契约。</p>
+
+<pre class="standalone"><span class="c-cm"># Planner output — a typed, inspectable artifact</span>
+plan = [
+  {<span class="c-st">"id"</span>: 1, <span class="c-st">"task"</span>: <span class="c-st">"fetch customer's last 3 invoices"</span>, <span class="c-st">"tool"</span>: <span class="c-st">"billing_api"</span>},
+  {<span class="c-st">"id"</span>: 2, <span class="c-st">"task"</span>: <span class="c-st">"compute total overdue amount"</span>, <span class="c-st">"deps"</span>: [1]},
+  {<span class="c-st">"id"</span>: 3, <span class="c-st">"task"</span>: <span class="c-st">"draft a payment-reminder email"</span>, <span class="c-st">"deps"</span>: [2]},
+]</pre>
+
+    <div class="callout tip">
+      <p>把计划做成带显式 <code class="inline">deps</code> 的类型化对象，而非散文列表。依赖让执行器并行化独立步骤，也让你能渲染一个干净的审批界面。散文计划无法并行化或验证。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>执行循环与重规划问题。</h3>
+
+    <p>朴素执行器按依赖顺序走完计划，遇首个失败即停。有趣的工程在于<em>当某步失败或返回计划未预料之物时</em>会发生什么。这是该模式的核心设计决策，已有三种成熟策略：</p>
+
+    <ul>
+      <li><strong>静态计划（不重规划）。</strong>精确执行计划；失败则中止并暴露部分结果。最便宜、最可预测。仅当环境稳定且步骤罕有失败时正确。</li>
+      <li><strong>失败时重规划。</strong>某步失败时，把原任务、计划和失败喂给规划器，请求修订后的剩余计划。受重规划预算约束。多数生产系统的务实默认。</li>
+      <li><strong>规划并反思（持续）。</strong>每步之后，一个轻量检查问"鉴于刚学到的，剩余计划是否仍合理？"，若否则重规划。最具适应性，最接近 ReAct，成本最高。LLMCompiler / ReWOO 一脉的工作通过解析参数依赖图优化静态计划那一端，使独立调用并行运行。</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># Replan-on-failure executor</span>
+<span class="c-kw">while</span> plan.has_pending():
+    step = plan.<span class="c-fn">next_ready</span>()              <span class="c-cm"># deps satisfied</span>
+    result = <span class="c-fn">execute</span>(step)
+    <span class="c-kw">if</span> result.ok:
+        plan.<span class="c-fn">mark_done</span>(step, result)
+    <span class="c-kw">elif</span> replans_used &lt; REPLAN_BUDGET:
+        plan = planner.<span class="c-fn">revise</span>(task, plan, failed=step, why=result.error)
+        replans_used += 1
+    <span class="c-kw">else</span>:
+        <span class="c-kw">return</span> <span class="c-fn">partial</span>(plan)              <span class="c-cm"># fail loud, with what we have</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Plan-and-execute 何时见效。</h3>
+
+    <ul>
+      <li><strong>结构稳定的多阶段任务</strong>——ETL 式流水线、开通流程、报告生成——其形态预先可知，且跨步骤连贯性比逐步即兴更重要。</li>
+      <li><strong>成本敏感工作负载。</strong>一次昂贵的规划器调用加许多便宜的执行器调用，远比像 ReAct 那样每步用强模型重新审议便宜。</li>
+      <li><strong>人在环/高风险动作。</strong>显式计划是在任何不可逆操作（转账、改动生产）运行前的天然审批检查点。</li>
+      <li><strong>可并行工作。</strong>依赖图让独立步骤并发运行——这是 ReAct 无法匹敌的结构性延迟优势，因为它一次只发现一步。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>它何时反而有害。</h3>
+
+    <p>预先计划既是该模式的强项，也是其核心隐患。具体失败模式：</p>
+
+    <ul>
+      <li><strong>计划-现实偏离。</strong>在真正开放式的任务上规划器无法预见步骤，于是发出一个看似可信但错误的计划，执行器忠实地走下悬崖。症状：高重规划率。如果你每步都在重规划，你已用额外延迟重新发明了 ReAct——换模式。</li>
+      <li><strong>陈旧计划执行。</strong>静态计划执行器继续运行那些前提已被早前某步的意外结果作废的步骤。这是最危险的模式，因为它带着自信的错误输出静默失败。</li>
+      <li><strong>规划器在欠定任务上过度自信。</strong>含糊的输入产出执行器无法锚定的含糊计划。缓解：在规划前加一个澄清步骤，或允许规划器发出"信息不足"。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>该模式的诊断指标是<strong>重规划率</strong>。接近 0% 意味着静态计划没问题。适度且有界是健康的失败时重规划。持续偏高意味着任务实际上无法预先分解，你在白白支付规划开销——降级到 ReAct。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>诚实的权衡。</h3>
+
+    <p>Plan-and-execute 买入<strong>全局连贯性、成本可预测性、并行性以及一个可检视的审批点</strong>，代价是<strong>适应性与一个额外失败面（在任何一步运行前计划就可能是错的）</strong>。当任务的结构比其细节更可知时选它。当细节只能通过行动发现时选 ReAct。实践中许多系统嵌套二者：规划器产出骨架，每个执行器步骤本身是一个小的有界 ReAct 循环——宏观尺度上连贯，微观尺度上适应。</p>
+  </div>
+</section>

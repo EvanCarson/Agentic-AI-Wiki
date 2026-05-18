@@ -1,0 +1,113 @@
+<section class="phase">
+  <div class="phase-num">M4</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>Retrieval-augmented memory: embedding + retrieval as the recall mechanism.</h2>
+  <p class="goal">Long-term memory is inert until something fetches the right slice and splices it into the working context. That fetch is a retrieval problem &mdash; the same machinery as RAG, but with memory-specific twists: the query is the agent's own evolving state, recency and salience matter as much as similarity, and a bad recall actively poisons reasoning rather than just being unhelpful.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Recall is retrieval. Reuse the stack, change the inputs.</h3>
+
+    <p>If you have read the Field Guide's <em>Retrieval</em> chapter, the mechanics are familiar: chunk, embed, index, hybrid search, rerank. Memory recall reuses all of it. What changes is <em>what</em> you index and <em>how</em> you query:</p>
+
+    <ul>
+      <li><strong>The corpus is the agent's own history</strong>, not a static document set. It grows every turn and must stay bounded (see <code class="inline">context-compaction</code>).</li>
+      <li><strong>The query is not a user question.</strong> It is a constructed cue derived from the current goal, the active sub-task, and the scratchpad &mdash; the agent's "state of mind," not its last utterance.</li>
+      <li><strong>Ranking is not pure similarity.</strong> A memory's value is similarity <em>and</em> recency <em>and</em> salience &mdash; the <em>Generative Agents</em> retrieval score, adapted.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Construct the recall query from agent state, not the last message.</h3>
+
+    <p>Embedding the user's last message and calling it a memory query is the most common mistake. The relevant memory is often related to the <em>task</em>, not the <em>phrasing</em>. Build an explicit cue:</p>
+
+<pre class="standalone"><span class="c-cm"># memory/recall_query.py</span>
+<span class="c-kw">def</span> <span class="c-fn">build_cue</span>(state) -> <span class="c-kw">str</span>:
+    <span class="c-cm"># A compact natural-language description of what the</span>
+    <span class="c-cm"># agent is trying to do RIGHT NOW &mdash; this is what we embed.</span>
+    <span class="c-kw">return</span> (
+        <span class="c-kw">f</span><span class="c-st">"Goal: {state.goal}\n"</span>
+        <span class="c-kw">f</span><span class="c-st">"Current step: {state.active_subtask}\n"</span>
+        <span class="c-kw">f</span><span class="c-st">"Open questions: {'; '.join(state.open_loops)}"</span>
+    )</pre>
+
+    <p>For tasks where the literal user wording also matters (a specific error string, an identifier), run hybrid retrieval &mdash; lexical over the raw utterance, dense over the constructed cue &mdash; and fuse, exactly as in the Retrieval chapter. The cue handles "what am I doing"; the lexical arm catches "the exact token the user typed."</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Score by relevance, recency, and salience.</h3>
+
+    <p>Pure cosine similarity retrieves the <em>most similar</em> memory, which is not the <em>most useful</em> one. A memory that is slightly less similar but was written five turns ago and was flagged important should usually win over a stale, marginal near-duplicate. The composite score:</p>
+
+<pre class="standalone"><span class="c-cm"># memory/score.py</span>
+<span class="c-kw">import</span> math
+
+<span class="c-kw">def</span> <span class="c-fn">recency</span>(age_seconds: <span class="c-kw">float</span>, half_life: <span class="c-kw">float</span>) -> <span class="c-kw">float</span>:
+    <span class="c-kw">return</span> <span class="c-st">0.5</span> ** (age_seconds / half_life)
+
+<span class="c-kw">def</span> <span class="c-fn">score</span>(mem, sim: <span class="c-kw">float</span>, now: <span class="c-kw">float</span>,
+          w=(<span class="c-st">0.6</span>, <span class="c-st">0.25</span>, <span class="c-st">0.15</span>)) -> <span class="c-kw">float</span>:
+    rec = recency(now - mem.last_used, half_life=<span class="c-st">7</span> * <span class="c-st">86400</span>)
+    sal = mem.salience                      <span class="c-cm"># 0..1, set at write</span>
+    a, b, c = w
+    <span class="c-kw">return</span> a * sim + b * rec + c * sal
+
+<span class="c-kw">def</span> <span class="c-fn">recall</span>(store, cue, embed, now, k=<span class="c-st">5</span>) -> <span class="c-kw">list</span>:
+    cand = store.search(embed(cue), k=<span class="c-st">30</span>)        <span class="c-cm"># wide net</span>
+    ranked = <span class="c-kw">sorted</span>(
+        cand, key=<span class="c-kw">lambda</span> h: score(h.mem, h.sim, now),
+        reverse=<span class="c-kw">True</span>)
+    <span class="c-kw">for</span> h <span class="c-kw">in</span> ranked[:k]:
+        h.mem.last_used = now    <span class="c-cm"># used &rarr; refreshes recency</span>
+    <span class="c-kw">return</span> ranked[:k]</pre>
+
+    <p>The <code class="inline">last_used</code> refresh creates a useful dynamic: memories that keep getting retrieved stay "warm" and easy to recall; memories never retrieved cool down and become eviction candidates. This is an access-frequency signal for free, and it is the read-side counterpart to the decay logic in <code class="inline">memory-stores</code>.</p>
+
+    <div class="callout tip">
+      <p>The weights are workload-dependent. A coding agent on a long task wants recency high (the last 20 turns dominate). A personal assistant recalling user preferences wants salience high (a stated preference from a month ago still matters). Tune <code class="inline">w</code> with the eval harness in <code class="inline">evaluating-memory</code>, do not guess once and freeze it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Threshold before truncate, and budget what survives.</h3>
+
+    <p>Two non-negotiable gates between the ranked list and the prompt:</p>
+
+    <ul>
+      <li><strong>Absolute relevance floor.</strong> Take top-k <em>only after</em> dropping everything below a minimum composite score. "Top 5" with no floor will, on an off-topic turn, inject five irrelevant memories with confident framing. An empty recall is correct and safe when nothing is relevant.</li>
+      <li><strong>Working-set budget.</strong> Recalled memories compete for the <code class="inline">long_term</code> budget from <code class="inline">context-budgeting</code>. If the survivors exceed it, summarize them into a single compacted block rather than dropping arbitrary ones.</li>
+    </ul>
+
+<pre class="trace"><span class="c-out">recall("deploy the tier migration")
+  candidates: 30
+  after composite scoring + floor(0.35): 3 survive
+    [sem]  prod deploys gated on staging check   0.71
+    [epi]  last migration rollback was turn 41   0.52
+    [proc] migration apply checklist             0.48
+  18 below floor, dropped (correctly)
+  3 memories, 420 tok &mdash; under long_term budget, no compaction</span></pre>
+
+    <div class="callout warn">
+      <p>Retrieval drift: as the agent's state evolves mid-task, an unchanged cue keeps recalling the same early memories while the relevant ones have moved on. Rebuild the cue from current state every turn, not once at task start. A stale cue is a silent, compounding failure &mdash; it looks like the memory system is "working" because it returns results.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Render retrieved memory so the model trusts it correctly.</h3>
+
+    <p>How recalled memory is formatted into the prompt changes whether the model treats it as ground truth, as a hint, or as a distractor. Three rules:</p>
+
+    <ul>
+      <li><strong>Label provenance and kind.</strong> "[recalled semantic memory, written turn 12]" lets the model weight it appropriately and lets you debug which memory drove a decision.</li>
+      <li><strong>Mark uncertainty.</strong> A reflected conclusion is an inference, not a fact. Render it as "previously inferred" so the model does not treat a guess as gospel.</li>
+      <li><strong>Keep it out of the authoritative system block.</strong> Retrieved memory is evidence, not policy. Putting a recalled (and possibly wrong) memory where the model expects immutable instructions is how memory poisoning becomes memory <em>obedience</em>.</li>
+    </ul>
+
+    <p>Retrieval-augmented memory is the load-bearing mechanism of the whole stack: types decide what is stored, stores decide where, compaction keeps it bounded &mdash; but recall is what actually puts the right past in front of the model at the right moment. If recall is wrong, every other layer is wasted effort.</p>
+  </div>
+</section>

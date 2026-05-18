@@ -1,0 +1,96 @@
+<section class="phase">
+  <div class="phase-num">P7</div>
+  <div class="week">Deep Dive · Protocols &amp; Interop</div>
+  <h2>Building an interoperable agent: choosing and composing the protocols.</h2>
+  <p class="goal">This essay synthesises the track. It compares the approaches — raw provider tool calling, MCP, and agent-to-agent protocols like A2A — on what each is actually for, where they overlap and where they do not, and gives a practical decision rule plus an integration architecture for an agent that has to talk to everything.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three layers, three jobs — not three competitors.</h3>
+
+    <p>The most common confusion is treating tool calling, MCP, and A2A as alternatives. They operate at different layers of the same stack:</p>
+    <ul>
+      <li><strong>Provider tool calling</strong> is the <em>model-to-function</em> contract: how a single model emits a structured call against a JSON Schema and gets a result back. It is intra-process, provider-shaped, and the substrate everything else builds on.</li>
+      <li><strong>MCP</strong> is the <em>agent-to-tool/resource</em> contract: how a host reaches reusable, independently-built tool/resource/prompt servers over a negotiated JSON-RPC session. It standardises and externalises the integration so it is not re-authored per agent.</li>
+      <li><strong>A2A</strong> is the <em>agent-to-agent</em> contract: how an agent delegates opaque, possibly long-running, multi-turn work to a peer agent it does not own.</li>
+    </ul>
+
+<pre class="trace"><span class="c-out">user
+ └─ Host / Agent
+      ├─ provider tool calling  → model ⇄ functions   (in-process)
+      ├─ MCP client(s)          → tools/resources       (your systems)
+      └─ A2A client             → peer agents           (others' agents)
+   the same program is often an MCP host AND an A2A server</span></pre>
+
+    <p>They compose vertically. A typical production agent uses provider tool calling as its inner mechanism, MCP to source most of its tools and data without bespoke clients, and A2A when part of the job belongs to an agent someone else operates.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Overlap, gaps, and a decision rule.</h3>
+
+    <p>There is genuine overlap at one seam: "call another agent" can be modelled as a single provider tool, as an MCP tool, or as a true A2A task. They are not equivalent — they differ in what they can express:</p>
+    <ul>
+      <li><strong>As a provider tool / MCP tool:</strong> synchronous, single-shot, string-or-JSON in and out. Cheapest. Correct when the peer is effectively a stateless function and the call finishes within a request.</li>
+      <li><strong>As an A2A task:</strong> long-running, multi-turn (the peer can ask you questions), typed artifacts, opaque internal state. Necessary when the work outlives one request, needs clarification, or returns rich outputs.</li>
+    </ul>
+
+    <p>A practical decision rule:</p>
+
+<pre class="standalone"><span class="c-cm"># Pick the thinnest layer that expresses the interaction.</span>
+<span class="c-kw">if</span> capability lives in <span class="c-fn">your</span> process and is provider-shaped:
+    <span class="c-kw">use</span> provider tool calling directly
+<span class="c-kw">elif</span> it wraps a system, is reusable, may serve other agents:
+    <span class="c-kw">use</span> MCP (write/adopt a server once)
+<span class="c-kw">elif</span> it is another team's agent, or work is long /
+     multi-turn / richly-typed:
+    <span class="c-kw">use</span> A2A (task, messages, artifacts)
+<span class="c-kw">else</span>:
+    <span class="c-cm"># do not invent a protocol; reuse one of the above</span></pre>
+
+    <p>The honest gaps: none of these standardises <em>semantics</em>. Two MCP servers can both be conformant and expose incompatible tool vocabularies; an Agent Card tells you a peer's skills exist, not that they mean what you assume. Interop at the envelope layer does not buy interop at the task layer — that is still integration work, just integration work you do not have to re-plumb.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>A reference integration architecture.</h3>
+
+    <p>Pulling the track together into one shape. The agent has a single internal tool registry; every source — local functions, MCP servers, A2A peers — is normalised into it behind one interface, so the agent loop never branches per integration.</p>
+
+<pre class="standalone"><span class="c-cm"># One registry; sources normalised behind one shape</span>
+<span class="c-kw">class</span> <span class="c-fn">Capability</span>:
+    name: <span class="c-kw">str</span>
+    description: <span class="c-kw">str</span>          <span class="c-cm"># model-facing; highest leverage</span>
+    schema: <span class="c-kw">dict</span>              <span class="c-cm"># interoperable JSON Schema core</span>
+    invoke: Callable          <span class="c-cm"># hides local | MCP | A2A</span>
+
+registry = []
+registry += [wrap(fn)          <span class="c-kw">for</span> fn <span class="c-kw">in</span> LOCAL_TOOLS]
+registry += mcp_client.tools_list()        <span class="c-cm"># discovered</span>
+registry += a2a.skills_as_tools(agent_card) <span class="c-cm"># discovered</span>
+
+<span class="c-cm"># Agent loop sees ONE uniform list, renders it per</span>
+<span class="c-cm"># provider with the thin adapter from essay P2.</span>
+tools = [provider_render(c) <span class="c-kw">for</span> c <span class="c-kw">in</span> registry]</pre>
+
+    <p>This architecture is the M+N argument made concrete: each system is wrapped once (as a local handler, an MCP server, or an A2A peer), discovered at runtime, and presented to the model through a single normalised registry and the thin provider adapter from the tool-calling-standards essay. Adding a system adds a source, not a branch in the loop. Swapping the model swaps only the renderer.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>What you still owe after the protocol.</h3>
+
+    <p>Protocols deliver shape, discovery, and a uniform loop. They do not deliver correctness, safety, or trust — those remain your responsibility and sit on top of everything above.</p>
+    <ul>
+      <li><strong>Validation.</strong> Re-validate inputs (structure then semantics/authorization) at the boundary you own, and design outputs for consistency, economy, and actionable errors — regardless of any provider strict mode. See structured tool I/O.</li>
+      <li><strong>Policy over discovery.</strong> Discovery lists what is possible; you decide which servers/peers to connect, which capabilities to surface, and which require consent. "It was advertised" is not authorization. See capability discovery.</li>
+      <li><strong>Trust boundaries.</strong> Every connected server and every delegated peer can return content that steers your model and acts under granted authority. The threat model — prompt injection via tool output, confused-deputy, scoping, provenance, human-in-the-loop on high-impact actions — is developed in the Safety &amp; Agentic Security deep-dives. This track deliberately defers the depth and only marks the seams.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The track in one sentence: prefer a versioned, discoverable protocol over <code class="inline">M × N</code> hand-written bridges; pick the thinnest layer (provider tool calling → MCP → A2A) that expresses the interaction; normalise every source into one registry behind one interface; and remember that the protocol gives you the envelope while validation, policy, and trust remain yours to enforce.</p>
+    </div>
+
+    <p>Built this way, an agent gains new tools, data, and peer agents by adding a source rather than rewriting its loop, and changes its underlying model by swapping a renderer rather than its integrations — which was the entire point of having a protocol layer in the first place.</p>
+  </div>
+</section>

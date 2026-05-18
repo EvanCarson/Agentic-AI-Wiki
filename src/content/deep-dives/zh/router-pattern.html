@@ -1,0 +1,76 @@
+<section class="phase">
+  <div class="phase-num">D6</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>路由与分派——选择、扇出、并行。</h2>
+  <p class="goal">路由器对输入分类并分派到正确的处理器、模型或子智能体。它是工具选择错误最便宜的结构性修复，也是多智能体系统的基础。本文涵盖分类器路由与工具调用路由、带聚合的并行扇出，以及路由层自身的失败模式。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>为什么用路由器，而非在提示词里堆更多散文。</h3>
+
+    <p>当单一 ReAct 智能体的工具集增长到约一打以上，两件事会退化：工具选择准确率（模型混淆相似工具）与上下文成本（每次调用都带上每个工具 schema）。本能是往系统提示词里加指令。结构性修复是前置一个<strong>路由器</strong>：一个小、廉价、可测试的组件，决定<em>哪个</em>能力处理此输入，然后只把该能力的工具纳入作用域再交接。</p>
+
+    <p>收益是关注点分离。路由器唯一的工作是分类——你能用标注集对它做单元测试并直接度量路由准确率。每个处理器看到狭窄、干净的上下文。Anthropic 的《Building effective agents》把这称作路由工作流，并正是在输入落入更适合分开处理的不同类别时推荐它。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>两种实现。</h3>
+
+    <p><strong>分类器路由。</strong>一次专门的廉价模型调用（或嵌入+最近质心，甚至一个微调分类器）把输入映射到路由标签。偏确定、快、可独立测试、可观测。当路由稳定且可枚举时首选。</p>
+
+    <p><strong>工具调用路由。</strong>编排模型把每条路由作为一个"工具"给出；调用该工具<em>就是</em>路由决策。更灵活（模型能在对话中途带完整上下文路由）但决策与生成纠缠，更难独立测试。</p>
+
+<pre class="standalone"><span class="c-cm"># Classifier router with an explicit fallback</span>
+route = classifier.<span class="c-fn">label</span>(query, allowed=ROUTES, confidence=<span class="c-kw">True</span>)
+<span class="c-kw">if</span> route.confidence &lt; THRESHOLD:
+    <span class="c-kw">return</span> <span class="c-fn">handle</span>(<span class="c-st">"fallback"</span>, query)        <span class="c-cm"># general agent / ask to clarify</span>
+handler = HANDLERS[route.label]               <span class="c-cm"># narrow tools, narrow prompt</span>
+<span class="c-kw">return</span> handler.<span class="c-fn">run</span>(query)</pre>
+
+    <div class="callout tip">
+      <p>始终定义一个显式的低置信度兜底路由。最常见的生产路由 bug 就是没有它：一个分布外查询被强行塞进最接近的标签，并在错误处理器里自信地失败。一个请求澄清或调用通用智能体的兜底是必需的，不是可选的。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>扇出与并行。</h3>
+
+    <p>路由的兄弟是<strong>扇出</strong>：不选一个处理器，而是并发分派到多个再聚合。Anthropic 区分两种形式——<em>分段</em>（把任务拆成并行运行的独立子任务，再汇总）与<em>投票</em>（同一任务跑多次以获多样输出，再调和）。</p>
+
+<pre class="standalone"><span class="c-cm"># Sectioning fan-out: independent subtasks, parallel, then gather</span>
+subtasks = planner.<span class="c-fn">split</span>(task)            <span class="c-cm"># must be genuinely independent</span>
+results  = parallel_map(<span class="c-kw">lambda</span> s: <span class="c-fn">handle</span>(<span class="c-fn">route</span>(s), s), subtasks)
+<span class="c-kw">return</span> aggregator.<span class="c-fn">merge</span>(task, results)    <span class="c-cm"># a real reconciliation step</span></pre>
+
+    <p>并行扇出是纯粹的延迟/吞吐收益，<em>仅当子任务真正独立时</em>。聚合器不是形式：合并部分结果、解决分支间冲突、去重，本身就是一个模型任务，若当作字符串拼接处理就会失败。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>路由层的失败模式。</h3>
+
+    <ul>
+      <li><strong>误路由，然后自信失败。</strong>错误标签把查询送到一个缺少正确工具的处理器；它产出流畅的错误答案。缓解：把路由准确率作为一等指标度量；加置信度阈值+兜底；让处理器能发出"这不是我的"以弹回路由器（重路由预算防止乒乓）。</li>
+      <li><strong>路由膨胀。</strong>路由增多到分类器自身不可靠且重叠。缓解：保持路由粗粒度且正交；少数宽处理器优于众多窄处理器；合并分类器混淆的路由。</li>
+      <li><strong>边界输入。</strong>合理跨两条路由的查询被任意指派。缓解：允许多标签路由进入扇出，或对真正横切的请求升级到通才。</li>
+      <li><strong>伪并行。</strong>把实际相互依赖的子任务扇出，产出相互矛盾的分支与一个无法调和的聚合器。缓解：只并行化经验证的独立集合；一切有依赖者保持串行。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>路由器是一个有杠杆的单点故障：每个下游处理器都被它的准确率所门控。它值得拥有自己的标注评测集与看板，享受你给认证检查同等的审视。一个未被度量的路由器静默地封顶整个系统的质量。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>何时使用——何时过度。</h3>
+
+    <p><strong>在以下情况使用路由：</strong>输入落入确实受益于不同提示、工具或模型的不同类别；工具集大到单一智能体无法可靠选择；你想把廉价查询送到便宜模型、困难的送到强模型（成本路由）；或你正构建向多智能体演进并需要分派原语。</p>
+
+    <p><strong>在以下情况跳过：</strong>只有少数几个单一智能体能可靠选择的工具——路由器徒增一跳、一个失败面和一份评测负担而无收益。路由是单一智能体吃紧时第一个应加的结构性模式，但在那种吃紧可度量之前就加它，是带有真实维护成本的过早优化。</p>
+
+    <p>诚实的权衡：<strong>路由买入干净的上下文、可测试的分派、成本控制以及通往多智能体的路径——代价是额外一跳和一个自身必须被监控的高杠杆组件。</strong>它是下一篇编排模式的结缔组织。</p>
+  </div>
+</section>

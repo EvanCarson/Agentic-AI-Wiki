@@ -1,0 +1,87 @@
+<section class="phase">
+  <div class="phase-num">D7</div>
+  <div class="week">Deep Dive · Architectures &amp; Patterns</div>
+  <h2>Tool-use loops &amp; error recovery.</h2>
+  <p class="goal">Every pattern in this section calls tools, and tools fail: timeouts, malformed arguments, empty results, partial successes. Whether an architecture survives contact with reality is decided here, in the error-handling layer that diagrams omit. This essay covers the failure taxonomy, the recovery loop, and the durability concerns of side-effecting tools.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>A taxonomy of tool failures — because each needs a different response.</h3>
+
+    <p>"The tool failed" is not actionable. Production agents must distinguish failure classes, because the correct recovery differs by class and conflating them is the root cause of most agent flakiness:</p>
+
+    <ul>
+      <li><strong>Malformed call.</strong> The model produced arguments that violate the schema or are semantically invalid (bad date, nonexistent ID). Recovery: return a precise, structured error to the model and let it retry — this is the failure models recover from best.</li>
+      <li><strong>Transient infrastructure failure.</strong> Timeout, 503, rate limit, network blip. Recovery: deterministic retry with exponential backoff <em>in the harness, not via the model</em>. The model should never see a transient blip.</li>
+      <li><strong>Empty / unhelpful result.</strong> The call succeeded but returned nothing useful (no search hits, empty list). Recovery: this is a reasoning problem, not an error — surface it as an observation so the model can reformulate or change approach.</li>
+      <li><strong>Hard semantic failure.</strong> Permission denied, resource gone, precondition unmet. Recovery: usually unrecoverable by retry; the model must replan or escalate to a human.</li>
+      <li><strong>Partial success.</strong> A batch/multi-item tool succeeded for some items and failed for others. Recovery: the hardest case — return a structured per-item result so the agent can act on the successful subset and decide about the rest.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>The dominant production anti-pattern: collapsing all of these into a generic <code class="inline">"Error: something went wrong"</code> string fed back to the model. The model cannot distinguish a transient blip it should ignore from a permission failure it must escalate, so it either retries forever or gives up — both look like a hung or "dumb" agent. Error taxonomy is not polish; it is the difference between a robust agent and a flaky one.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The recovery loop: layered, with the model as the outermost ring.</h3>
+
+<pre class="standalone"><span class="c-cm"># Tool dispatch with layered recovery</span>
+<span class="c-kw">def</span> <span class="c-fn">dispatch</span>(call):
+    <span class="c-kw">try</span>:
+        args = schema.<span class="c-fn">validate</span>(call.args)              <span class="c-cm"># layer 0: pre-flight</span>
+    <span class="c-kw">except</span> SchemaError <span class="c-kw">as</span> e:
+        <span class="c-kw">return</span> <span class="c-fn">tool_error</span>(<span class="c-st">"INVALID_ARGS"</span>, e.detail)   <span class="c-cm"># → model retries</span>
+
+    <span class="c-kw">for</span> attempt <span class="c-kw">in</span> <span class="c-fn">range</span>(MAX_RETRIES):              <span class="c-cm"># layer 1: deterministic</span>
+        <span class="c-kw">try</span>:
+            <span class="c-kw">return</span> <span class="c-fn">ok</span>(TOOLS[call.name](**args))
+        <span class="c-kw">except</span> Transient <span class="c-kw">as</span> e:
+            <span class="c-fn">backoff</span>(attempt)                        <span class="c-cm"># model never sees this</span>
+        <span class="c-kw">except</span> HardFailure <span class="c-kw">as</span> e:
+            <span class="c-kw">return</span> <span class="c-fn">tool_error</span>(<span class="c-st">"UNRECOVERABLE"</span>, e.reason)  <span class="c-cm"># → model replans</span>
+    <span class="c-kw">return</span> <span class="c-fn">tool_error</span>(<span class="c-st">"EXHAUSTED_RETRIES"</span>, call.name)   <span class="c-cm"># → model replans</span></pre>
+
+    <p>The principle: <strong>recover deterministically at the lowest layer that can; only escalate to the model what genuinely requires reasoning.</strong> Schema validation catches malformed calls before any side effect. The retry loop absorbs transients invisibly. Only hard semantic failures and exhausted retries reach the model — as a structured observation it can reason about, never a raw stack trace.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Error messages are prompts. Engineer them.</h3>
+
+    <p>When an error does reach the model, that message <em>is</em> a prompt fragment that steers the next action. A vague error produces a flailing retry; a specific one produces a targeted correction. Compare:</p>
+
+<pre class="trace standalone"><span class="c-err">BAD:  Error: request failed</span>
+<span class="c-out">GOOD: INVALID_ARGS on create_ticket: field "priority" must be one
+      of [low, medium, high, urgent]; received "P1". Re-call with a
+      valid value.</span></pre>
+
+    <p>The good message states the error class, the offending field, the constraint, the received value, and the corrective action. Models recover from malformed calls almost perfectly when given this; almost never when given "request failed." This is the single highest-ROI piece of agent error handling and the one most often skipped.</p>
+
+    <div class="callout tip">
+      <p>Make your tool layer return errors in a fixed, parseable shape (<code class="inline">{code, field, constraint, received, hint}</code>). It improves model recovery, makes failure classes measurable, and lets you alert on classes (a spike in <code class="inline">UNRECOVERABLE</code> is an incident; a spike in <code class="inline">INVALID_ARGS</code> is a prompt/schema bug).</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Side effects: idempotency, durability, and the ground truth.</h3>
+
+    <p>Read-only tools forgive retries. Side-effecting tools (send email, charge card, mutate prod) do not — a blind retry double-sends. The disciplines that make recovery safe:</p>
+
+    <ul>
+      <li><strong>Idempotency keys.</strong> Derive a key from the intended effect; the tool dedupes server-side. Now the harness retry layer is safe for mutating calls.</li>
+      <li><strong>The tool result is ground truth, not the model's belief.</strong> The agent "thinks" it sent the email only if the tool returned success. State transitions follow tool results, never the model's narration — a model that says "done" after a failed call is the classic silent-corruption bug.</li>
+      <li><strong>Durable execution for long/critical flows.</strong> Persist the trajectory (a workflow/checkpoint engine) so a crash mid-plan resumes from the last completed step instead of re-running side effects. This is why plan-and-execute's explicit, persistable plan is operationally safer than an in-memory ReAct history for high-stakes work.</li>
+      <li><strong>Compensating actions.</strong> When a multi-step flow fails midway with committed side effects, the agent needs explicit rollback/compensation tools — there is no automatic undo for "money was moved."</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The cross-cutting takeaway.</h3>
+
+    <p>Error recovery is not a pattern you choose; it is the layer that determines whether the pattern you chose works in production. ReAct's loop, plan-and-execute's replanning, reflection's verifier, the router's fallback — every one degrades into thrash, silent corruption, or a hung agent without a disciplined error taxonomy, deterministic low-layer recovery, engineered error messages, and idempotent side effects. The honest tradeoff is blunt: <strong>this layer is unglamorous and absent from every architecture diagram, and it is where the majority of production agent reliability is actually won or lost.</strong></p>
+  </div>
+</section>

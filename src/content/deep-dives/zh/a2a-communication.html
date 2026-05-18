@@ -1,0 +1,95 @@
+<section class="phase">
+  <div class="phase-num">P4</div>
+  <div class="week">深入解析 · 协议与互操作</div>
+  <h2>智能体间通信：跨越不透明智能体的委派。</h2>
+  <p class="goal">MCP 把智能体连接到工具与数据。当一个智能体必须委派给<em>另一个智能体</em>——由别的团队构建、在别的技术栈上、藏在 API 之后、且不归你所有——一条不同的边就出现了。本文覆盖 Google 于 2025 年发布的 Agent2Agent（A2A）协议所具体化的智能体间互操作概念：智能体卡片、任务、消息与产物，以及长时间运行的异步工作。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>为什么智能体间不只是又一次工具调用。</h3>
+
+    <p>你可以把"调用另一个智能体"建模为一个工具：一个函数 <code class="inline">ask_billing_agent(query)</code>，返回文本。对简单、同步、无状态的请求，这没问题。但在那些让对端成为<em>智能体</em>而非函数的特性上，它会瓦解：</p>
+    <ul>
+      <li><strong>不透明性。</strong>远程智能体有自己的模型、工具与内部状态，你看不到也不应看到。你交换的是目标与结果，不是内部推理。</li>
+      <li><strong>持续时间。</strong>智能体工作可能耗时数秒或数小时（一个研究智能体、一个部署智能体）。交互必须比一次请求/响应活得更久。</li>
+      <li><strong>多轮协商。</strong>对端在能继续前可能需要追问澄清——是一段对话，不是一次调用。</li>
+      <li><strong>丰富的类型化输出。</strong>结果可能是文件、结构化记录或一串部分更新，而非字符串。</li>
+    </ul>
+
+    <p>智能体间协议的存在，就是为标准化<em>这一种</em>交互形态——对端之间不透明、可能长时间运行、多轮、富类型的委派——正如 MCP 标准化了智能体-工具那条边。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>发现：智能体卡片（Agent Card）。</h3>
+
+    <p>委派前你必须得知对端能做什么。A2A 的机制是<strong>智能体卡片</strong>：一份机器可读的 JSON 文档，发布在一个众所周知的 URL 上，公布该智能体的身份、端点、所支持的能力、它提供的技能，以及如何认证。它是 MCP 的 <code class="inline">initialize</code> 能力交换的智能体间对应物——能力发现，又一次作为头等步骤。</p>
+
+<pre class="standalone"><span class="c-cm"># Agent Card (served at /.well-known, illustrative shape)</span>
+{
+  <span class="c-st">"name"</span>: <span class="c-st">"invoice-reconciler"</span>,
+  <span class="c-st">"description"</span>: <span class="c-st">"Matches invoices to purchase orders."</span>,
+  <span class="c-st">"url"</span>: <span class="c-st">"https://agents.example.com/invoice"</span>,
+  <span class="c-st">"version"</span>: <span class="c-st">"2.0"</span>,
+  <span class="c-st">"capabilities"</span>: {<span class="c-st">"streaming"</span>: <span class="c-kw">true</span>,
+                   <span class="c-st">"pushNotifications"</span>: <span class="c-kw">true</span>},
+  <span class="c-st">"defaultInputModes"</span>:  [<span class="c-st">"text"</span>, <span class="c-st">"file"</span>],
+  <span class="c-st">"defaultOutputModes"</span>: [<span class="c-st">"text"</span>, <span class="c-st">"file"</span>],
+  <span class="c-st">"skills"</span>: [
+    {<span class="c-st">"id"</span>: <span class="c-st">"reconcile"</span>,
+     <span class="c-st">"description"</span>: <span class="c-st">"Reconcile an invoice batch against POs."</span>,
+     <span class="c-st">"inputModes"</span>: [<span class="c-st">"file"</span>], <span class="c-st">"outputModes"</span>: [<span class="c-st">"file"</span>]}
+  ]
+}</pre>
+
+    <p>卡片让客户端智能体在运行时决定对端是否合适、以及如何与之对话——请求哪个技能、接受哪些内容模态、对端是否流式、出示哪种认证方案。没有任何对端被硬编码进调用方。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>交互：任务、消息、产物。</h3>
+
+    <p>A2A 围绕几个持久概念组织委派。下列名称遵循 A2A 规范的词汇：</p>
+    <ul>
+      <li><strong>任务（Task）。</strong>工作单元，有自己的生命周期与稳定 id。任务历经若干状态——已提交、工作中、<em>需要输入</em>（对端需要你提供更多）、已完成、失败、已取消——使交互能超越单次 HTTP 请求而存续。</li>
+      <li><strong>消息（Message）。</strong>关于某任务的对话中的一轮，来自用户/客户端角色或智能体角色。消息携带<strong>部分（parts）</strong>（文本、文件或结构化数据），使通道多模态而非仅字符串。</li>
+      <li><strong>产物（Artifact）。</strong>远程智能体产出的类型化输出——生成的文件、结构化结果——同样由部分组成。结果是头等对象，不是字符串化的二进制块。</li>
+    </ul>
+
+<pre class="trace"><span class="c-out">client                          remote agent
+  │  message/send (task: reconcile, file)  │
+  ├───────────────────────────────────────>│ state: submitted → working
+  │                                         │
+  │  status: input-required                 │
+  │<────────────────────────────────────────┤ "which fiscal year?"
+  │  message/send (text: "FY2025")          │
+  ├───────────────────────────────────────>│ state: working
+  │  artifact: reconciled.csv               │
+  │<────────────────────────────────────────┤ state: completed</span></pre>
+
+    <p>关键在于，调用方永远看不到远程智能体的工具、模型或思维链——只看到任务状态、消息与产物。不透明性是设计，不是局限：正是它让独立构建的智能体得以组合。A2A 的传输是 HTTP 之上的 JSON-RPC（流式与推送通知选项见下），与 MCP 的 JSON-RPC 核心形成有意的对称。</p>
+
+    <div class="callout">
+      <p>MCP 与 A2A 互补，不竞争。一个合理心智模型：智能体用 <strong>MCP</strong> 触达自己的工具与数据，用 <strong>A2A</strong> 委派给对端智能体。同一个程序常常对其调用方是 A2A 服务器，对其工具是 MCP 宿主。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>长时间运行：流式与推送。</h3>
+
+    <p>因为智能体任务可能很慢，A2A 定义了避免在整段时长内阻塞连接的方式：</p>
+    <ul>
+      <li><strong>流式。</strong>若智能体卡片公布支持，客户端可订阅，并通过服务器发送事件流接收增量状态更新与产物分片——部分进展而非一次终态回复。这是长时间运行模式的智能体间侧面。</li>
+      <li><strong>推送通知。</strong>对以分钟或小时计的工作，客户端注册一个 webhook；远程智能体在任务状态变化时回调，于是双方都不必持有打开的连接。任务 id 是把回调系回原始请求的持久句柄。</li>
+    </ul>
+
+    <p>这就是任何健壮异步 API 所用的同一种长时间运行模式——持久资源 id、可轮询/可订阅的状态，以及带外完成信号——应用于自治对端。</p>
+
+    <div class="callout warn">
+      <p>委派给不透明对端就是委派<em>信任</em>。远程智能体的输出可操纵你的模型（一条间接提示注入路径），它在你授予的任何权限下行动，其身份依赖于其智能体卡片所声明的认证方案。智能体间身份、范围与"被混淆的代理"问题在"安全、对齐与智能体安全"深入探讨系列中处理；此处要点仅是：协议给了你接缝——任务边界、声明的认证、类型化产物——这些控制就构建在其上。</p>
+    </div>
+
+    <p>主线：智能体间互操作把贯穿本系列的同样三步泛化——发现（智能体卡片）、用经协商的契约调用（任务/消息/产物）、对长工作流式或回调——应用于刻意不透明的对端，使独立构建的智能体得以组合成系统。</p>
+  </div>
+</section>

@@ -1,0 +1,126 @@
+<section class="phase">
+  <div class="phase-num">M2</div>
+  <div class="week">深入解析 · 记忆与上下文工程</div>
+  <h2>短期与长期记忆：工作上下文及其背后的存储。</h2>
+  <p class="goal">智能体需要两套截然不同的记忆系统，它们的生命周期、成本和失效模式各不相同。短期记忆是提示内的工作上下文——快、被完全注意到、易逝。长期记忆是外部存储——持久、容量大，但只有当正确的切片被检索回来时才有用。把两者混为一谈是最常见的记忆架构错误。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>两套系统，源自认知类比——但要谨慎使用。</h3>
+
+    <p>人类类比是一个有用的起点框架，而非蓝图。工作记忆持有少数几个正在被主动操作的条目；长期记忆庞大、持久，通过线索回忆来访问。对智能体而言，这个映射是具体的：</p>
+
+    <ul>
+      <li><strong>短期记忆 = 上下文窗口。</strong>当前系统提示、最近几轮、新鲜的工具结果、草稿区。它在每个令牌上都被注意力以完整保真度读取。请求一返回它就消失——除非你把它写到某处，否则什么都不会留下。</li>
+      <li><strong>长期记忆 = 外部存储。</strong>向量索引、键值库、图、或纯文件。它跨轮、跨会话、跨进程重启而存活。模型"看不见"它；必须查询它，并把结果拼接进短期记忆，才会产生任何效果。</li>
+    </ul>
+
+    <div class="callout">
+      <p>决定性的区别不是容量或持久性——而是<em>注意力</em>。短期记忆是模型本轮真正计算的对象。长期记忆在检索把它的某个切片提升进短期记忆之前，是惰性的。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>短期记忆：什么才配占一个位置。</h3>
+
+    <p>工作上下文是你拥有的最稀缺资源（见 <code class="inline">context-budgeting</code>）。把准入当作一个有成本的决策。一条实用的策略：内容只有在<strong>下一步决策需要它</strong>时才赢得一个工作集位置，而不是仅仅<em>与任务相关</em>。</p>
+
+    <p>具体而言，典型一轮的工作集应当持有：</p>
+
+    <ul>
+      <li>任务／当前用户目标——始终。</li>
+      <li>最近 <em>k</em> 轮逐字内容——对于进行中的推理，时近性压过相关性。</li>
+      <li>未闭合的回路：待处理的工具调用、未完成的子目标、未解决的问题。</li>
+      <li>一个由智能体自身标记为需持久保留的决策与事实组成的、显式维护的小草稿区。</li>
+    </ul>
+
+    <p>其余一切——已解决的子任务、过期的工具输出、早于 <em>k</em> 轮的轮次——都是被驱逐到长期记忆的候选。</p>
+
+<pre class="standalone"><span class="c-cm"># memory/working_set.py</span>
+<span class="c-kw">from</span> collections <span class="c-kw">import</span> deque
+
+<span class="c-kw">class</span> <span class="c-fn">WorkingSet</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, max_turns: <span class="c-kw">int</span> = <span class="c-st">12</span>):
+        self.turns: deque = deque(maxlen=max_turns)
+        self.scratchpad: <span class="c-kw">list</span>[<span class="c-kw">str</span>] = []  <span class="c-cm"># durable, agent-curated</span>
+
+    <span class="c-kw">def</span> <span class="c-fn">add_turn</span>(self, turn: <span class="c-kw">dict</span>) -> <span class="c-kw">dict</span> | <span class="c-kw">None</span>:
+        evicted = self.turns[<span class="c-st">0</span>] <span class="c-kw">if</span> <span class="c-kw">len</span>(self.turns) == self.turns.maxlen <span class="c-kw">else</span> <span class="c-kw">None</span>
+        self.turns.append(turn)
+        <span class="c-kw">return</span> evicted   <span class="c-cm"># caller persists it to long-term memory</span>
+
+    <span class="c-kw">def</span> <span class="c-fn">note</span>(self, fact: <span class="c-kw">str</span>) -> <span class="c-kw">None</span>:
+        <span class="c-cm"># Agent explicitly promotes a fact it must not forget.</span>
+        self.scratchpad.append(fact)</pre>
+
+    <p>驱逐路径是承重的细节。从 <code class="inline">deque</code> 末端丢掉一轮而不持久化，是失忆；在<em>写入</em>一条持久痕迹到长期记忆<em>之后</em>再丢掉它，是"可回忆的遗忘"，这才是你想要的。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>长期记忆：何时写，何时回忆。</h3>
+
+    <p>两个独立的决策，而大多数糟糕的记忆系统把它们做反了——什么都写，什么都回忆。</p>
+
+    <h4>何时写</h4>
+
+    <p>不要不加区分地持久化原始记录——那是一场缓慢的泄漏，会污染未来的检索。当内容具有<em>超出本轮的持久价值</em>时才写：</p>
+
+    <ul>
+      <li>关于用户、环境或任务的稳定事实（"部署要通过预发布检查这一关"）。</li>
+      <li>结果及其原因——尝试了什么、什么有效、什么失败及为何失败（情景记忆）。</li>
+      <li>智能体推导出的可复用流程（程序性记忆）。</li>
+      <li>用户明确要求记住的指令。</li>
+    </ul>
+
+    <h4>何时回忆</h4>
+
+    <p>回忆由<em>当前需要</em>触发，而非按计划表。在一轮开始前，从活跃目标构造一个检索查询，只拉取通过相关性阈值的前几条。回忆勉强相关的记忆并非免费——它消耗工作集预算，并加入会可度量地损害推理的干扰项。</p>
+
+<pre class="standalone"><span class="c-cm"># memory/longterm.py</span>
+<span class="c-kw">class</span> <span class="c-fn">LongTermMemory</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, store, embedder):
+        self.store = store          <span class="c-cm"># vector / kv / graph backend</span>
+        self.embed = embedder
+
+    <span class="c-kw">def</span> <span class="c-fn">write</span>(self, text: <span class="c-kw">str</span>, kind: <span class="c-kw">str</span>, meta: <span class="c-kw">dict</span>) -> <span class="c-kw">None</span>:
+        <span class="c-kw">if</span> <span class="c-kw">not</span> self._is_durable(text, kind):
+            <span class="c-kw">return</span>                     <span class="c-cm"># write gate: skip ephemera</span>
+        self.store.upsert(
+            vector=self.embed(text),
+            payload={<span class="c-st">"text"</span>: text, <span class="c-st">"kind"</span>: kind, **meta,
+                     <span class="c-st">"ts"</span>: now()},
+        )
+
+    <span class="c-kw">def</span> <span class="c-fn">recall</span>(self, goal: <span class="c-kw">str</span>, k: <span class="c-kw">int</span> = <span class="c-st">5</span>,
+               min_score: <span class="c-kw">float</span> = <span class="c-st">0.35</span>) -> <span class="c-kw">list</span>[<span class="c-kw">dict</span>]:
+        hits = self.store.search(self.embed(goal), k=k * <span class="c-st">3</span>)
+        hits = [h <span class="c-kw">for</span> h <span class="c-kw">in</span> hits <span class="c-kw">if</span> h.score &gt;= min_score]
+        <span class="c-kw">return</span> hits[:k]      <span class="c-cm"># threshold THEN truncate</span></pre>
+
+    <div class="callout warn">
+      <p>最常见的长期记忆失效：无界的写入路径。每一轮都被追加，存储被几乎重复的记录噪声塞满，检索 recall@k 崩塌，智能体运行得越久反而<em>越差</em>。写入门控不是可选项。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>提升／降级循环。</h3>
+
+    <p>健康的智能体持续在两套系统之间搬运信息。这个循环，每轮一次：</p>
+
+<pre class="trace"><span class="c-out">1. RECALL   query long-term with current goal &rarr; candidate memories
+2. PROMOTE  splice top-k (above threshold) into working set
+3. REASON   model acts over working set, produces new turn
+4. DEMOTE   evict oldest / resolved working-set items
+5. WRITE    persist demoted items that pass the durability gate
+            &rarr; loop</span></pre>
+
+    <p>这与 <code class="inline">context-budgeting</code> 中的缺页换入／换出循环相同，现在在写入侧加了显式的持久性门控，在读取侧加了相关性阈值。把这两个过滤器做对，记忆栈的其余部分——类型、存储、压缩——都是调优。做错了，没有任何向量数据库能救你。</p>
+
+    <div class="callout tip">
+      <p>独立测试这两套系统。对于短期：智能体在一个长任务中是否始终把正确的东西留在窗口内？对于长期：给定一条 50 轮前写入的已知事实，相关时它是否被回忆出来？不同的指标，不同的修复——在 <code class="inline">evaluating-memory</code> 中详述。</p>
+    </div>
+  </div>
+</section>
