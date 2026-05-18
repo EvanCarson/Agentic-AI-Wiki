@@ -1,0 +1,629 @@
+<section class="phase">
+    <div class="phase-num">3.3</div>
+    <div class="week">Part III / Evaluate · The eval method that scales — and the one most teams get wrong</div>
+    <h2>LLM 作为评判者（LLM-as-judge）：何时有效，何时失真。</h2>
+    <p class="goal">用一个模型对另一个模型的输出评分，是唯一能够规模化进行评估（eval）的方式。它同时也是智能体（agent）评估中虚假置信感的最常见来源：评判者偏差（位置偏差、长度偏差、自我偏好、权威感偏差）会在悄无声息间将你的数字推向与质量毫无关系的方向。本章将具体讲解这四种偏差，以及真正能解决问题的两种顺序与跨系列规范，以及能告诉你何时信任评判者、何时回退到人工的校准协议。读完本章，你将拥有一个可审计的评判者流水线，并附有与人工评分者的一致性记录，以及何时可以仅凭评判者做决定的明确策略。</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>为什么你无法回避 LLM-as-judge。</h3>
+
+      <p>首先要回答的问题是：你是否根本需要一个模型评判者。说实话：这取决于你在衡量什么，对于大多数智能体指标，答案是需要。</p>
+
+      <p>三种评分方法之间的选择并非偏好问题——而是由你要检验的内容决定的：</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>检验内容</div>
+          <div>合适的评分工具</div>
+          <div>原因</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">代码正确性</div>
+          <div class="vector">运行测试</div>
+          <div class="defense">确定性的。无需评判者。<code class="inline">pass/fail</code> 即是真相。</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">引文 / 来源依据</div>
+          <div class="vector">与来源做字符串匹配</div>
+          <div class="defense">如果声明引用了来源，即已有依据。简单、确定性的。</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">检索（retrieval）召回率</div>
+          <div class="vector">与标注文档 ID 比对</div>
+          <div class="defense">你有答案键，做集合交集即可。</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">最终答案质量</div>
+          <div class="vector">LLM-as-judge</div>
+          <div class="defense">"智能体给出了好的答案吗？"没有确定性的检验方式。评判者是人工评分者的可规模化代理。</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">忠实度 / 幻觉（hallucination）</div>
+          <div class="vector">LLM-as-judge</div>
+          <div class="defense">"这个声明是否源自该来源？"需要规模化的阅读理解能力。</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">工具调用（tool use）轨迹质量</div>
+          <div class="vector">LLM-as-judge（+ 确定性检验）</div>
+          <div class="defense">"智能体的处理方式合理吗？"将结构性检查与判断力混合在一起。</div>
+        </div>
+      </div>
+
+      <p>关键区分：<strong>尽可能使用确定性评分工具</strong>（便宜、快速、精准）；<strong>其余情况回退到 LLM-as-judge</strong>（可规模化，但具有随机性和偏差）。常见的错误是将 LLM-as-judge 用于确定性评分工具本可处理的事情——为本不必要的问题支付评判者成本并引入评判者偏差。</p>
+
+      <h4>为什么不能只用人工评分的数学原理</h4>
+
+      <p>为什么不跳过评判者，直接让人工对所有内容评分？来算一算一个活跃智能体项目的数字。</p>
+
+      <p>50 道题的评估集。每道题需评分的轨迹两条（一条来自候选 PR，一条来自主分支）。每条轨迹三个质量维度（正确性、忠实度、有用性）。每周五个 PR。那就是：</p>
+
+      <pre class="standalone">50 × 2 × 3 × 5  =  1,500 human ratings / week</pre>
+
+      <p>按每次评分约 30 秒计算，这大约是每周 12.5 小时的人工评分时间——相当于一名工程师一天半的工作量——仅用于评估。这对于大多数团队来说已经太贵了。而且这还只是下限；一旦你想对比多个基线版本、扩大评估集，或评分更多维度，成本就会线性增长。让人工对每份输出都评分，根本行不通。</p>
+
+      <p>替代方案——用模型来评分——用小型模型每次评分成本大约 $0.01–0.05，几秒钟内完成，每周可扩展到 5 万次评分，且不会让任何人痛苦。代价正是你预期的：更便宜、更快、精度更低。本章的全部内容就是关于如何让"精度更低"变成"差距不大到让数字失去意义"。</p>
+
+      <h4>评判者也是需要被测试的代码</h4>
+
+      <p>这里有一个认知框架的转变，能将 LLM-as-judge 从陷阱变为可用工具：<strong>评判者是一个模型。评判者的准确率是可以衡量的。你在一个留出的校准集上将其与人工对比来衡量，就像你衡量任何分类器一样。</strong></p>
+
+      <p>这不是比喻。你的评判者与少量人工标注样本之间的一致率是一个数字。你可以计算它。你可以随时间监控它。当它低于阈值时你可以快速失败。如果你不计算它，评判者就会悄然出错，你的计分板也会悄然说谎。这正是大多数团队跳过的规范，也是为什么大多数团队的评估数字比他们以为的更加虚软。</p>
+
+      <p>本章接下来讲述：</p>
+
+      <ul>
+        <li>每个未经处理的评判者流水线中都会出现的四种偏差（Step 2）。</li>
+        <li>如何设计评判者提示词（prompt）——逐点式 vs 成对式，评分标准中应写什么——以及如何与人工对比进行验证（Step 3）。</li>
+        <li>让评判者在生产环境中长期稳健运行的生产模式：跨系列集成、双向顺序规范、评判者版本管理、何时回退到人工（Step 4）。</li>
+      </ul>
+
+      <div class="callout warn">
+        <p>如果你在十二个月前接入了一个 LLM 评判者，却从未将其与人工重新核对过，那么你的评估分数不是质量信号——而是在衡量你的提示词已在多大程度上学会了操控自己的评判者。评判者有偏差；你对提示词的迭代就是在对评判者实际奖励的东西做梯度下降。两者最终收敛向评判者喜欢的东西，而不是用户喜欢的东西。这就是本章要防止的失效模式。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我难道不能直接用一个强大的模型（Opus、GPT-5）作为评判者，并假定它是可靠的吗？</div>
+        <div class="answer">
+          <p>你可以用一个强大的模型作为评判者——对最高风险的评估确实应该这么做——但"可靠"是错误的框架。即使是 2026 年的前沿（frontier）模型，在调换顺序后重新比较相同的成对输出时，也会显示高达 40% 的不一致率（位置偏差），还有约 15% 的偏高膨胀（倾向于更长的答案），以及自我偏好（当评判者与被评分模型来自同一系列时，会额外给出 5–7% 的加分）。这些偏差不会因为模型更强而消失；只是量级会变化。围绕它们进行工程设计是必须的。</p>
+          <p>更强大的模型能给你带来的：对评分标准的更好理解（从而检测出细微的质量差异），更好的指令遵循（从而让结构化输出更可靠），以及对所有偏差略微更低的程度。它不能给你带来"偏差消失了"。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我的评判者只是一个字符串匹配检查（"响应是否包含预期的关键词？"）。这些偏差适用于我吗？</div>
+        <div class="answer">
+          <p>不适用。关键词匹配或字符串匹配不是 LLM 评判者——它是确定性评分工具，在你能用的时候这正是正确的工具。这些偏差仅在你要求模型做出质量判断时才适用（"这个答案好吗？"、"A 比 B 好吗？"、"这个声明是否源自这份来源？"）。对于可以用代码表达的二元检验，代码比任何 LLM 都更可靠、更便宜。不要让"我们使用 LLM-as-judge"变成一种身份象征；它是在确定性方式不可行时的回退选项。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>每个未经处理的评判者流水线中的四种偏差。</h3>
+
+      <p>在修复偏差之前，你必须先看见它们。以下四种偏差均在 2024–2026 年的文献中有充分记录，可在你自己的流水线中在十五分钟内复现，并在你防御之前悄悄扭曲你的分数。让我逐一通过具体演示来讲解。</p>
+
+      <h4>偏差 1：位置偏差（最严重的那个）</h4>
+
+      <p>在成对比较中——"这两个答案哪个更好，A 还是B？"——<em>第一个</em>出现的选项赢得比较的频率超过概率。即使是 2026 年的前沿模型，当你调换顺序重新提问时，不一致率也高达 30–40%。同样两个回答，同样的评分标准，不同的顺序，得出不同的判决。</p>
+
+      <p>十五分钟演示：</p>
+
+<pre class="standalone"><span class="c-cm"># scripts/measure_position_bias.py</span>
+<span class="c-kw">import</span> random
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+client = Anthropic()
+
+JUDGE_PROMPT = <span class="c-st">"""Compare these two answers to the question. Reply with
+A, B, or TIE — single token, no explanation.
+
+Question: {q}
+
+Answer A: {a}
+
+Answer B: {b}"""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">judge</span>(q, a, b):
+    response = client.messages.create(
+        model=<span class="c-st">"claude-sonnet-4-5"</span>,
+        max_tokens=<span class="c-st">5</span>,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+                   <span class="c-st">"content"</span>: JUDGE_PROMPT.format(q=q, a=a, b=b)}],
+    )
+    <span class="c-kw">return</span> response.content[<span class="c-st">0</span>].text.strip().upper()
+
+<span class="c-cm"># Pull 50 pairs from your eval set (or any set of paired outputs).</span>
+<span class="c-cm"># For each pair, run BOTH orderings.</span>
+inconsistent = <span class="c-st">0</span>
+<span class="c-kw">for</span> q, x, y <span class="c-kw">in</span> pairs:
+    forward  = judge(q, x, y)   <span class="c-cm"># x is A, y is B</span>
+    reversed = judge(q, y, x)   <span class="c-cm"># y is A, x is B (so flipped verdict expected)</span>
+
+    <span class="c-cm"># If they agree, forward says "A wins" iff reversed says "B wins".</span>
+    consistent = (forward, reversed) <span class="c-kw">in</span> {(<span class="c-st">"A"</span>, <span class="c-st">"B"</span>), (<span class="c-st">"B"</span>, <span class="c-st">"A"</span>),
+                                       (<span class="c-st">"TIE"</span>, <span class="c-st">"TIE"</span>)}
+    <span class="c-kw">if not</span> consistent:
+        inconsistent += <span class="c-st">1</span>
+
+<span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"position inconsistency: {inconsistent}/{len(pairs)} = {inconsistent/len(pairs):.0%}"</span>)</pre>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/measure_position_bias.py
+position inconsistency: 17/50 = 34%</span></pre>
+
+      <p>你的 34% 的"获胜"判决取决于哪个选项先出现。这意味着大约每三次成对判断中就有一次，你的评判者评的不是内容，而是位置。如果你在没有验证反向顺序的情况下基于单向成对判断发布了一个变更，那么这个"改进"有 17% 的概率只是位置偏差在单向触发的结果。</p>
+
+      <p><strong>修复方法</strong>是对评判者流水线影响最大的单一改变：<em>对每次成对比较都以两种顺序运行，只有当两次都同意时才算有获胜者</em>。分歧判决变为"平局"或"位置决定的"。这一规范能完全消除位置偏差——代价是 2 倍的评判者成本。</p>
+
+<pre class="standalone"><span class="c-kw">def</span> <span class="c-fn">judge_both</span>(q, x, y):
+    fwd = judge(q, x, y)        <span class="c-cm"># x=A, y=B</span>
+    rev = judge(q, y, x)        <span class="c-cm"># y=A, x=B</span>
+    <span class="c-cm"># x wins iff "A" forward AND "B" reverse</span>
+    <span class="c-kw">if</span> fwd == <span class="c-st">"A"</span> <span class="c-kw">and</span> rev == <span class="c-st">"B"</span>: <span class="c-kw">return</span> <span class="c-st">"x_wins"</span>
+    <span class="c-kw">if</span> fwd == <span class="c-st">"B"</span> <span class="c-kw">and</span> rev == <span class="c-st">"A"</span>: <span class="c-kw">return</span> <span class="c-st">"y_wins"</span>
+    <span class="c-kw">return</span> <span class="c-st">"tie"</span>  <span class="c-cm"># includes "position-determined" disagreements</span></pre>
+
+      <h4>偏差 2：冗长偏差（最隐蔽的那个）</h4>
+
+      <p>更长的答案得分更高。不是因为它们更好——而是因为它们更长。研究表明平均膨胀幅度约为 15%；在某些评分标准下（"全面"、"详尽"）会更高。</p>
+
+      <p>其机制是：评判者将冗长解释为努力或完整度的代理指标。当被问及"哪个答案更全面"时，评判者几乎无论内容如何都会选更长的那个。即使只是问"哪个更好"，这种偏差也会渗透进来。</p>
+
+      <p>演示：取任意一个简短、正确的答案。用重述相同内容的两句话来填充它。运行评判者。看填充后的版本获胜。</p>
+
+<pre class="trace standalone"><span class="c-out">Question: What is the capital of France?
+
+Answer A: Paris.
+
+Answer B: The capital of France is Paris, a city located in
+the northern part of the country along the Seine river. Paris
+has been the capital since the 12th century and serves as the
+political and cultural center of the nation.
+
+[judge with default rubric]: B wins on "comprehensiveness"
+[judge with rubric tuned for correctness only]: tie
+
+Both answers are correct.  B's "win" is verbosity bias.</span></pre>
+
+      <p><strong>修复方法</strong>有两点：（1）在你的评判者提示词中明确说明这种偏差——"不要奖励更长的答案；简洁正确的答案应与更长的正确答案得分相当"；（2）使用小的数值量表（1–4 而非 1–10），不给"越长 = 往上加分"留下空间。两者结合能大幅压缩冗长偏差，但不会完全消除它。</p>
+
+      <h4>偏差 3：自我偏好（系列效应）</h4>
+
+      <p>当你使用 Claude 作为评判者来比较两个答案，而其中一个答案是由 Claude 生成时，Claude 生成的答案获胜的频率超过概率。GPT 评判 GPT 输出时也一样。效果虽小——5–7% 的加分——但它与其他偏差叠加，且如果你不主动寻找就看不见。</p>
+
+      <p>原因在于文体熟悉度。每个模型系列都有标志性的模式——句式结构、措辞方式、组织信息的习惯。同系列的评判者识别这些模式为"写得好"，因为这与评判者训练所奖励的内容相符。这不是道德意义上的偏袒；而是模式匹配。</p>
+
+      <p>含义：<strong>绝不要使用同一系列作为智能体模型和评判者</strong>。如果你的智能体运行在 Claude 上，就用 GPT 或 Gemini 来评判。如果运行在 GPT 上，就用 Claude 或 Llama 来评判。跨系列检验能化解自我偏好，因为没有任何两家供应商共享训练分布。</p>
+
+      <p>另一个含义：当你做比较分析时（"我们基于 Claude 的智能体是否优于同一智能体基于 GPT 的版本？"），你不能用 Claude 或 GPT 中的任何一个作为评判者——两个评判者都会系统性地偏向自己的系列。使用第三方（Gemini、Llama）或集成方式（下方 Step 4）。</p>
+
+      <h4>偏差 4：权威感 / 置信度偏差</h4>
+
+      <p>听起来更自信的答案会胜过有所保留的答案，即使有所保留的答案更准确。"答案是 47"会胜过"答案很可能是 47，但如果你使用的是另一种定义，也可能是 42"——即使另一种定义很重要。</p>
+
+      <p>这种偏差是四种中最常与用户利益相悖的一种。幻觉往往是自信的；真实的答案有时是有所保留的。一个偏好置信度的评判者会系统性地把幻觉排在有依据的不确定性之上。经过足够多的迭代，你的智能体学会了听起来更自信，即使它本不应该如此。</p>
+
+      <p><strong>修复方法</strong>：明确在评分标准中奖励有校准的不确定性。不是"答案是否自信？"，而是"置信水平是否与证据强度相符？"这种措辞迫使评判者评估匹配程度，而不是置信度的表面信号。偏差不会消失——但会大幅缩减。</p>
+
+      <h4>观察所有四种偏差的叠加效应</h4>
+
+      <p>每种单独的偏差最多只有 5–15%。危险在于当条件对齐时，它们会以乘法方式叠加。一个更长、更自信的回答，来自与评判者同一模型系列，且在成对比较中先出现，可以以 80% 以上的概率胜过一个来自不同系列的更短、有所保留的回答——即使更短的回答更准确。</p>
+
+      <p>这就是那种失效模式：团队在数月内收敛于一些能产出又长又自信、评判者系列风格输出的提示词，而这些输出在真实用户查询上静静地表现不佳。计分板在爬升；用户满意度却没有。评估已经变成了智能体在优化的指标，而不是质量的衡量工具。</p>
+
+      <div class="callout danger">
+        <p>如果你从本步骤只带走一个防御措施，请带走双向顺序规范。它的成本是 2 倍的评判者支出，能完全消除最大的单一偏差，而且实现极其简单（10 行代码），没有任何可辩护的理由跳过它。其他所有防御措施都很重要；那一条是不可妥协的。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">这些偏差中有一些听起来会在大量样本上相互抵消。求平均不就能修正它们吗？</div>
+        <div class="answer">
+          <p>位置偏差是唯一一个可以说是平均后会抵消的——如果你的候选答案有 50% 的时间被分配到 A 位置，50% 到 B 位置，偏差会增加噪声但不会产生方向性偏差。（双向顺序修复依然要好得多，因为你能同时获得信噪比提升和噪声消除。）</p>
+          <p>其他三种是<em>有方向性的</em>。冗长偏差始终偏向更长；自我偏好始终偏向同系列；权威感偏差始终偏向听起来自信的。平均对这些毫无帮助。它们会在你的分数中产生系统性偏移，让它们看起来像真实的改进，实则不然。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">逐点评分（每个输出 1–10 分）能免疫位置偏差吗？</div>
+        <div class="answer">
+          <p>基本上是的，因为没有"第一个"和"第二个"可以对调。逐点评分有其自身问题：分数在不同运行之间会漂移（同一个回答今天得 7，明天得 8），量表的锚定不够清晰（"7 分和 8 分有什么区别？"），并且对评判者最近看到的内容很敏感。成对比较在两种顺序都同意时更可靠，在不同意时则较不可靠。</p>
+          <p>实用选择：<strong>逐点评分用于低成本持续监控（使用 1–4 这样的小量表），带双向顺序的成对比较用于把控发布的高风险评估</strong>。两种方法都有其位置。它们不能互相替代；它们回答的是不同的问题。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>校准：将评判者与人工对比验证。</h3>
+
+      <p>Step 2 让你的评判者对已知偏差具有抗性。这一步让它对真实标签（ground truth）——人工——可审计。没有这一步，你是在相信评判者与用户对"好"的定义一致。有时它确实如此；很多时候它并不是；没有衡量你就无法判断是哪种情况。</p>
+
+      <p>协议很简单。建立一个人工标注样本的校准集。在上面运行你的评判者。计算一致率。决定一致率是否足以单独使用评判者。每当你更改评判者（模型、提示词、评分标准），或当你怀疑智能体的输出分布发生了足够的偏移可能影响评判者准确率时，重新运行这个校准。</p>
+
+      <h4>构建校准集</h4>
+
+      <p>50 个样本是能给出可靠一致率测量的最小集合。每个样本是一个三元组：一个输入、一个输出（或成对比较时的一对输出），以及一个人工判决。成本：约 2–4 小时的专注评分时间，供一名评分者完成 50 个样本。收益：一个永久性的参考，让你在未来数年内都能对评判者持信或存疑。</p>
+
+      <p>应包含的内容：</p>
+
+      <ul>
+        <li><strong>明确胜出。</strong> 15 个正确答案显而易见的样本。评判者应全部答对；如果没有，评分标准就是坏的。</li>
+        <li><strong>难以抉择。</strong> 25 个两名合理的评分者可能真的会产生分歧的样本。这是评判者最常失败的地方，也是它们需要贴近人类而不是随机失败的地方。</li>
+        <li><strong>对抗性样本。</strong> 10 个专门为触发 Step 2 偏差而设计的样本。一个冗长但错误的答案与一个简洁正确的答案配对；一个自信的幻觉与一个有所保留的真实答案配对；等等。评判者对这些样本的判决能告诉你偏差缓解措施的效果如何。</li>
+      </ul>
+
+      <p>两名人工独立对每个样本评分，你来调解分歧，调解后的标签就是校准真相。两名评分者是必要的——单个评分者的个人偏好会被烙印进你的参考数据。不必很贵；通常两名评分者进行 30 分钟的讨论来解决分歧就足够了。</p>
+
+<pre class="standalone"><span class="c-cm"># evals/calibration_set.jsonl — 50 lines, one per example</span>
+{<span class="c-st">"id"</span>: <span class="c-st">"cal_001"</span>,
+ <span class="c-st">"category"</span>: <span class="c-st">"clear_win"</span>,
+ <span class="c-st">"question"</span>: <span class="c-st">"What does VACUUM FULL do in Postgres?"</span>,
+ <span class="c-st">"answer_a"</span>: <span class="c-st">"VACUUM FULL rewrites the entire table, reclaiming all dead tuple space and returning it to the OS. It takes an exclusive lock."</span>,
+ <span class="c-st">"answer_b"</span>: <span class="c-st">"It vacuums."</span>,
+ <span class="c-st">"human_verdict"</span>: <span class="c-st">"a_wins"</span>,
+ <span class="c-st">"notes"</span>: <span class="c-st">"clear: a is correct and specific; b is uselessly terse"</span>}
+
+{<span class="c-st">"id"</span>: <span class="c-st">"cal_017"</span>,
+ <span class="c-st">"category"</span>: <span class="c-st">"close_call"</span>,
+ <span class="c-st">"question"</span>: <span class="c-st">"How do I configure autovacuum for a write-heavy table?"</span>,
+ <span class="c-st">"answer_a"</span>: <span class="c-st">"Lower autovacuum_vacuum_scale_factor on that table to 0.05 and autovacuum_vacuum_cost_limit to a higher value to allow more aggressive vacuuming."</span>,
+ <span class="c-st">"answer_b"</span>: <span class="c-st">"Use ALTER TABLE foo SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_vacuum_threshold = 1000) for per-table tuning."</span>,
+ <span class="c-st">"human_verdict"</span>: <span class="c-st">"tie"</span>,
+ <span class="c-st">"notes"</span>: <span class="c-st">"both are valid approaches; b shows the actual SQL but misses cost_limit"</span>}
+
+{<span class="c-st">"id"</span>: <span class="c-st">"cal_042"</span>,
+ <span class="c-st">"category"</span>: <span class="c-st">"adversarial_verbosity"</span>,
+ <span class="c-st">"question"</span>: <span class="c-st">"What's the default value of shared_buffers?"</span>,
+ <span class="c-st">"answer_a"</span>: <span class="c-st">"128MB."</span>,
+ <span class="c-st">"answer_b"</span>: <span class="c-st">"The default value of shared_buffers in PostgreSQL is 128 megabytes, though this is widely considered too small for production workloads. Most production deployments increase this to 25% of available RAM, though the optimal value depends on..."</span>,
+ <span class="c-st">"human_verdict"</span>: <span class="c-st">"tie"</span>,
+ <span class="c-st">"notes"</span>: <span class="c-st">"both correct on the literal question; b's extra context isn't asked for. testing verbosity bias."</span>}</pre>
+
+      <h4>对校准集运行评判者</h4>
+
+<pre class="standalone"><span class="c-cm"># scripts/calibrate_judge.py</span>
+<span class="c-kw">import</span> json, collections
+<span class="c-kw">from</span> agent.judge <span class="c-kw">import</span> judge_both  <span class="c-cm"># from Step 2, with both orderings</span>
+
+cases = [json.loads(line) <span class="c-kw">for</span> line <span class="c-kw">in</span> <span class="c-kw">open</span>(<span class="c-st">"evals/calibration_set.jsonl"</span>)]
+results = collections.Counter()
+
+<span class="c-kw">for</span> c <span class="c-kw">in</span> cases:
+    judge_verdict = judge_both(c[<span class="c-st">"question"</span>], c[<span class="c-st">"answer_a"</span>], c[<span class="c-st">"answer_b"</span>])
+    <span class="c-cm"># judge returns: x_wins / y_wins / tie</span>
+    <span class="c-cm"># map to the same vocabulary as human verdicts</span>
+    judge_label = {<span class="c-st">"x_wins"</span>: <span class="c-st">"a_wins"</span>, <span class="c-st">"y_wins"</span>: <span class="c-st">"b_wins"</span>, <span class="c-st">"tie"</span>: <span class="c-st">"tie"</span>}[judge_verdict]
+
+    agreed = (judge_label == c[<span class="c-st">"human_verdict"</span>])
+    results[(c[<span class="c-st">"category"</span>], agreed)] += <span class="c-st">1</span>
+
+    <span class="c-kw">if not</span> agreed:
+        <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"DISAGREE {c['id']}: human={c['human_verdict']} judge={judge_label}"</span>)
+        <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"  notes: {c['notes']}"</span>)
+
+<span class="c-cm"># Compute per-category agreement</span>
+<span class="c-kw">for</span> cat <span class="c-kw">in</span> [<span class="c-st">"clear_win"</span>, <span class="c-st">"close_call"</span>, <span class="c-st">"adversarial_verbosity"</span>, ...]:
+    total = results[(cat, <span class="c-kw">True</span>)] + results[(cat, <span class="c-kw">False</span>)]
+    rate = results[(cat, <span class="c-kw">True</span>)] / total <span class="c-kw">if</span> total <span class="c-kw">else</span> <span class="c-st">0</span>
+    <span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"{cat:30s}  {results[(cat, True)]}/{total} = {rate:.0%}"</span>)</pre>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/calibrate_judge.py
+
+DISAGREE cal_017: human=tie judge=a_wins
+  notes: both are valid approaches; b shows the actual SQL but misses cost_limit
+
+DISAGREE cal_023: human=b_wins judge=tie
+  notes: b is significantly more specific; judge couldn't tell
+
+DISAGREE cal_042: human=tie judge=b_wins
+  notes: both correct; b's extra context isn't asked for. testing verbosity bias.
+
+DISAGREE cal_045: human=a_wins judge=b_wins
+  notes: a is correct concise; b is longer + WRONG. testing verbosity+confidence.
+
+clear_win                       15/15 = 100%
+close_call                      19/25 = 76%
+adversarial_verbosity            6/10 = 60%
+
+overall: 40/50 = 80%</span></pre>
+
+      <h4>解读结果</h4>
+
+      <p>80% 的整体一致率是一个真实的数字。它告诉你：</p>
+
+      <ul>
+        <li><strong>明确胜出：100%。</strong> 评判者能答对简单的情况。理智检查通过。</li>
+        <li><strong>难以抉择：76%。</strong> 对于真正模糊的情况，评判者大约 4 次中有 3 次与人工一致。这大致与两名<em>人工</em>评分者在难以抉择案例上彼此一致的比率相当——所以评判者在该类别上已达到人工评分者的质量。</li>
+        <li><strong>对抗性：60%。</strong> 偏差缓解措施还不够强。cal_042（冗长偏差）和 cal_045（冗长 + 置信度）都失败了——评判者仍在奖励更长的答案。待办事项：在评分标准上收紧简洁性要求，可能需要增加一句明确的"越长并不更好"。</li>
+      </ul>
+
+      <p>总体数字不如分类细分重要。80% 的总体一致率可能是明确胜出 100%、难以抉择 100%、对抗性 0%——这与 100/76/60 是截然不同的故事——但两者都产生相同的 80%。始终查看细分数据。</p>
+
+      <h4>70% 的阈值</h4>
+
+      <p>什么样的一致率才足以单独信任评判者？</p>
+
+      <p>从实战团队中总结出的实用规则：<strong>总体一致率低于 70% 时，不要将评判者作为唯一信号</strong>。把它当作筛选器，然后让人工对争议最大的案例评分。总体一致率高于 80% 时，对于非关键指标来说，单独使用评判者通常没问题。70 到 80 之间是灰色地带——廉价持续监控时单独使用评判者，把控发布的评估时使用人工。</p>
+
+      <p>另外：<strong>无论总体一致率是多少，都要求"明确胜出"类别的一致率 &gt;90%</strong>。如果评判者连显而易见的案例都无法答对，评分标准或提示词就是坏的，其余数字都无关紧要。先修好这个。</p>
+
+      <h4>校准失败时的评分标准调优</h4>
+
+      <p>第一次运行校准时，你几乎肯定低于 80%。按以下顺序修复：</p>
+
+      <ol>
+        <li><strong>阅读每一个分歧。</strong> 评判者的推理（如果你要求了）和人工的注释通常会揭示评分标准中的歧义。最常见的发现：评分标准表达的意思不是你以为的那个意思。</li>
+        <li><strong>收紧评分标准。</strong> 如果冗长偏差在对抗性案例上触发，添加一句话：<em>"简洁是一种美德。不要奖励更长的答案——简洁正确的答案应与更长的正确答案得分相当。"</em></li>
+        <li><strong>添加锚定样本。</strong> 提升难以抉择准确率的最佳手段：在评判者提示词中加入 2–3 个实际工作的示例，展示你想要的那种判断。"示例 1：输入 X，答案 A，答案 B，正确判决：平局，推理：……"成本：约 300 个提示词令牌（token）。收益：通常能在难以抉择上提升 5–10 个百分点。</li>
+        <li><strong>重新运行校准。</strong> 相同的集合，相同的协议。数字应该往上移。如果没有，你的评分标准修改没有改变行为——在继续之前搞清楚原因。</li>
+      </ol>
+
+      <p>重复直到超过你的阈值。然后冻结评判者（评分标准、模型、提示词）并为其做版本管理。</p>
+
+      <h4>锚定样本——杠杆率最高的评分标准改进</h4>
+
+      <p>这一单项改变值得单独成段，因为它对校准有不成比例的提升效果。一个有评分标准但没有示例的评判者提示词是在要求评判者从抽象规则中进行外推。一个有 2–3 个实际工作示例的评判者提示词是在向评判者展示它的工作究竟是什么样的。</p>
+
+<pre class="standalone"><span class="c-cm"># Judge prompt with anchored examples (the right shape)</span>
+JUDGE_PROMPT = <span class="c-st">"""You are an evaluator. Compare two answers to a technical
+question and decide which is better, or if they're tied.
+
+Rubric:
+1. Correctness: factually right matters more than anything.
+2. Specificity: prefers concrete details (commands, numbers) over vague
+   generalities.
+3. Conciseness: do not reward longer answers. A concise correct answer
+   scores equally with a longer correct answer.
+4. Calibrated confidence: confident wrong &lt; hedged right.
+
+Worked example:
+Question: How do I see Postgres connection count?
+Answer A: SELECT count(*) FROM pg_stat_activity;
+Answer B: You can check the number of connections by querying the
+          pg_stat_activity view, which contains one row per connection.
+Verdict: tie
+Reasoning: Both correct; A is more concise but B is more explanatory.
+Neither materially better.
+
+Now evaluate:
+Question: {q}
+Answer A: {a}
+Answer B: {b}
+
+Respond with one of: a_wins / b_wins / tie
+Reasoning (one sentence):"""</span></pre>
+
+      <p>实际工作示例向评判者展示了有校准的判断是什么样的，化解了冗长偏差（示例明确将更长但只是更有说明性的答案判为平局），并减少了运行间的漂移。涵盖不同场景（明确胜出、难以抉择、对抗性）的三个示例，通常能将一致率提升 5–10 个百分点。</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">50 个样本感觉太多了。我用 20 个能行吗？</div>
+        <div class="answer">
+          <p>数学上可以——但分类细分数据会变得不可靠。20 个样本可能是 6 个明确胜出、10 个难以抉择、4 个对抗性；如果评判者对抗性案例答对 3/4，你在每侧只有一个数据点，对偏差缓解措施是否有效几乎没有任何信号。50 个样本的结构（15/25/10）是每个类别都有足够案例来得出结论的最小规模。</p>
+          <p>如果你只能花 2 小时：30 个样本（10/15/5）是一个合理的起点。随着时间的推移，随着你遇到新的失败模式不断扩充；校准集与评估集一起成长。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我应该多久重新运行一次校准？</div>
+        <div class="answer">
+          <p>三个触发条件，按紧迫程度排序：（1）<strong>任何评判者变更</strong>——模型替换、评分标准修改、提示词重写——立即重新校准，变更在校准确认之前不算完成；（2）<strong>月度漂移检查</strong>——供应商会悄悄更新模型快照；使用新快照的相同评判者代码就是一个不同的评判者；（3）<strong>当智能体的输出分布明显发生偏移时</strong>——新工具、新领域、新的提示词模式。智能体分布的漂移可能会导致评判者在其上的准确率发生变化。</p>
+          <p>月度检查是最容易跳过的那个，也是"我们不知道分数为什么移动了"最常见的原因。把它设为日历事项。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>生产模式：集成、版本管理、回退规则。</h3>
+
+      <p>你现在有了一个具有双向顺序规范的经过校准的评判者。这是基础；本步骤涵盖在生产中数月内保持其正常运行的操作模式。四种实践，每种都廉价，每种都能防止一类特定的静默失败。</p>
+
+      <h4>用于发布把关的跨系列集成</h4>
+
+      <p>对于最高风险的评估——那些把控发布或具有合同约束力的质量声明的评估——从三个不同的模型系列运行三个评判者，采用多数投票（或要求 2/3 同意）。成本是 3 倍的评判者支出；好处是没有任何单一系列的偏差能驱动你的决策。</p>
+
+<pre class="standalone"><span class="c-cm"># evals/ensemble_judge.py</span>
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+<span class="c-kw">import</span> google.generativeai <span class="c-kw">as</span> genai
+
+claude = Anthropic()
+gpt = OpenAI()
+gemini = genai.GenerativeModel(<span class="c-st">"gemini-2.5-pro"</span>)
+
+<span class="c-kw">async def</span> <span class="c-fn">ensemble_judge</span>(q, a, b):
+    <span class="c-cm"># Run three judges in parallel. Each does both-orderings internally.</span>
+    verdicts = <span class="c-kw">await</span> asyncio.gather(
+        judge_with_claude_both_orderings(q, a, b),
+        judge_with_gpt_both_orderings(q, a, b),
+        judge_with_gemini_both_orderings(q, a, b),
+    )
+    counts = collections.Counter(verdicts)
+    most_common, n = counts.most_common(<span class="c-st">1</span>)[<span class="c-st">0</span>]
+
+    <span class="c-kw">if</span> n >= <span class="c-st">2</span>:           <span class="c-cm"># 2-of-3 or 3-of-3 agreement</span>
+        <span class="c-kw">return</span> most_common
+    <span class="c-kw">return</span> <span class="c-st">"contested"</span>    <span class="c-cm"># 1/1/1 split — escalate to human review</span></pre>
+
+      <p>"有争议"的输出是金矿——它识别出评判者真正产生分歧的案例，而这正好是你希望人工查看的集合。随着时间推移，这些案例会充实你的校准集并使你的评分标准更加精准。</p>
+
+      <p>何时使用集成：<strong>仅用于把控发布的评估</strong>。对于持续的 PR 级评估（第 3.1 章的 CI 工作流），单个经过校准的评判者就足够了；对每个 PR 支付 3 倍的评判者成本是浪费。把集成用于决定版本是否上线到生产环境的评估套件（eval suite）。</p>
+
+      <h4>评判者版本管理</h4>
+
+      <p>评判者是代码。像任何代码一样，对它的修改需要被追踪、审查，并与分数增量（delta）关联，这样你才能判断分数变化是来自智能体还是来自评判者。</p>
+
+      <p>需要一起做版本管理的三件事：</p>
+
+      <ul>
+        <li><strong>评判者模型和快照。</strong> 用 <code class="inline">claude-sonnet-4-5-20250929</code> 而非 <code class="inline">claude-sonnet-4-5</code>。供应商别名可能随时间指向不同的快照。</li>
+        <li><strong>评判者提示词。</strong> 提示词模板的 SHA-256 哈希值，与每次分数一起记录。任何提示词修改都会产生新的哈希值。</li>
+        <li><strong>评分标准。</strong> 如果评分标准是一个单独的文件（它应该是），也对它做版本管理。</li>
+      </ul>
+
+<pre class="standalone"><span class="c-cm"># scoreboard.csv extended with judge metadata</span>
+commit, ts, branch,
+  judge_model,                       <span class="c-cm"># claude-sonnet-4-5-20250929</span>
+  judge_prompt_hash,                 <span class="c-cm"># short SHA</span>
+  judge_calibration_agreement,       <span class="c-cm"># last measured: 0.84</span>
+  overall, retrieval_recall, ...</pre>
+
+      <p>这项规范的意义：当你更改评判者时，计分板行会记录新的哈希值。第 3.1 章的增量工具在比较两行具有不同 judge_prompt_hash 值的数据时会发出警告——这是个信号，说明你在比较苹果和橙子。</p>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/eval_delta.py --commit d1f5b88
+
+⚠ baseline and candidate differ on judge config:
+  - judge_prompt_hash: 7b2a1c → c1e8a3  (changed in this PR)
+
+  This score delta mixes agent changes AND a judge change.
+  The judge change alone may produce a 2-5 point shift.
+  Re-run the baseline with the new judge before drawing conclusions.
+
+  overall  0.768 → 0.781  +0.013  [REAL?]
+  ...</span></pre>
+
+      <p>这个警告防止了最险恶的混淆：发布了一个实际上只是评判者提示词修改让评判者变得更宽松的智能体"改进"。</p>
+
+      <h4>何时回退到确定性评分工具</h4>
+
+      <p>某些指标很容易让人想用 LLM 来评分，但实际上不应该这么做。规则是：如果问题有确定性答案，就使用确定性评分工具。LLM 评判者是你在没有确定性检验可用时的回退选项，而不是你的默认选择。</p>
+
+      <p>团队常常诉诸 LLM 评判者但其实不该这么做的具体案例：</p>
+
+      <ul>
+        <li><strong>代码正确性。</strong> 运行测试。通过的测试是正确的；失败的是错误的。无需评判者。（如果你在用 LLM-as-judge 评估代码，你的评估设计就是错的；基于测试执行重新构建它。）</li>
+        <li><strong>引文验证。</strong> 检查被引用的片段是否确实包含该声明。字符串匹配或句子嵌入相似度会比让模型"这个声明是否源自这个来源？"更快、更可靠。</li>
+        <li><strong>模式（schema）符合性。</strong> 智能体的输出是否符合 JSON 模式？用 <code class="inline">jsonschema.validate()</code>。完成。</li>
+        <li><strong>禁止行为。</strong> 智能体是否调用了黑名单中的任何工具？遍历追踪（trace）即可。无需评判者。</li>
+      </ul>
+
+      <p>模式：一个混合评估器，先运行确定性检验，只对确定性无法处理的维度才回退到 LLM 评判者。</p>
+
+<pre class="standalone"><span class="c-kw">async def</span> <span class="c-fn">evaluate_trajectory</span>(traj):
+    score = {}
+
+    <span class="c-cm"># Deterministic checks first — cheap and exact</span>
+    score[<span class="c-st">"completed"</span>] = traj.stop_reason == <span class="c-st">"end_turn"</span>
+    score[<span class="c-st">"used_forbidden_tool"</span>] = <span class="c-kw">any</span>(
+        t.name <span class="c-kw">in</span> FORBIDDEN <span class="c-kw">for</span> t <span class="c-kw">in</span> traj.tool_calls)
+    score[<span class="c-st">"step_count_in_budget"</span>] = <span class="c-kw">len</span>(traj.tool_calls) <= <span class="c-st">20</span>
+    score[<span class="c-st">"cited_sources_exist"</span>] = all_citations_resolve(traj)
+
+    <span class="c-cm"># Judge for what determinism can't capture</span>
+    score[<span class="c-st">"answer_quality"</span>] = <span class="c-kw">await</span> judge_quality(traj)
+    score[<span class="c-st">"faithfulness"</span>] = <span class="c-kw">await</span> judge_faithfulness(traj)
+
+    <span class="c-kw">return</span> score</pre>
+
+      <h4>评判者失败升级路径</h4>
+
+      <p>当评判者出错而你知道时该怎么办？两条路径：</p>
+
+      <p><strong>单次输出分歧（一位工程师阅读了一条追踪，分数与直觉不符）：</strong>将其作为新的分歧案例加入校准集。重新运行校准。如果总体一致率下降了，收紧评分标准并重新测量。如果没有下降，那个案例可能是工程师的解读，而不是评判者的问题；与第二位人工评分者调解。</p>
+
+      <p><strong>系统性偏斜（你注意到过去一周的每个 PR 都以可疑的模式被评判为有利或不利）：</strong>立即在下一周的 PR 中切换到集成评判者，同时进行调查。检查校准一致率——它下降了吗？如果是，评判者已经发生漂移（通常是模型快照变化），你需要重新校准或回滚。如果没有，智能体的输出分布可能已经偏移到评判者处理较差的领域；用来自新分布的样本扩充校准集。</p>
+
+      <p>原则：你永远不应该处于怀疑评判者出错却没有确认或修复它的协议的境地。校准集是规范的解决机制。</p>
+
+      <div class="callout tip">
+        <p>将评判者视为你训练的模型，即使你实际上并没有训练它。模型有验证集，会随时间漂移，需要监控，并且需要关于何时退役和替换的明确决策。你的评判者也不例外。那些长期成功使用 LLM-as-judge 的团队，都是将评判者维护视为真正的工程活动而不是一次性设置的团队。</p>
+      </div>
+    </div>
+
+    <!-- ============ WORKED EXAMPLE ============ -->
+    <div class="step">
+      <div class="step-num">WORKED EXAMPLE</div>
+      <h3>调试一个结果竟是评判者问题的回归（regression）。</h3>
+
+      <p>一个真实形态的故事，让 Step 4 变得具体。一个团队的 <code class="inline">trajectory_pass_rate</code> 在两周内从 0.764 降至 0.712，期间智能体代码没有任何 PR。他们花了五天调查"什么发生了回归"之后，才意识到智能体并没有回归。</p>
+
+      <h4>症状</h4>
+
+      <p>上次智能体合并后两周，某个周一早上的计分板扫描：</p>
+
+<pre class="trace standalone"><span class="c-out">commit         date         branch  trajectory_pass_rate
+e7b3c20        Wed Mar 4    main    0.764  ← last agent merge
+e7b3c20        Mon Mar 9    main    0.751  (nightly re-run)
+e7b3c20        Mon Mar 16   main    0.738  (nightly re-run)
+e7b3c20        Mon Mar 23   main    0.712  (nightly re-run)
+
+NO PRS TO main IN THIS PERIOD.</span></pre>
+
+      <p>同一个提交，分数在下降。团队的第一反应：语料库漂移。也许知识库中的新社区文章正在降低检索效果。他们检查；语料库哈希值没有变化。第二个反应：API 端回归。也许 Anthropic 悄悄发布了一个更安静的 Sonnet 快照。他们检查 response.model 字段——同一个快照。</p>
+
+      <p>调查两天后，有人注意到：失败行的 judge_prompt_hash 与通过行的不同。</p>
+
+<pre class="trace standalone"><span class="c-out">commit    date     judge_prompt_hash  trajectory_pass_rate
+e7b3c20   Mar 4    7b2a1c             0.764  ← original
+e7b3c20   Mar 9    7b2a1c             0.751  ← same hash, ~noise
+e7b3c20   Mar 16   c1e8a3             0.738  ← HASH CHANGED
+e7b3c20   Mar 23   c1e8a3             0.712  ← still c1e8a3</span></pre>
+
+      <h4>发生了什么</h4>
+
+      <p>三周前，一位工程师编辑了评判者评分标准，添加了一个"忠实度"标准。该 PR 经过审查并合并。计分板记录了新的哈希值。<em>没有人在评分标准修改后对校准集重新校准评判者。</em></p>
+
+      <p>团队现在用新的评判者提示词运行校准检查：</p>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/calibrate_judge.py
+
+clear_win                       15/15 = 100%
+close_call                      17/25 = 68%   ← was 76%
+adversarial_verbosity            5/10 = 50%   ← was 60%
+
+overall: 37/50 = 74%   ← was 80%</span></pre>
+
+      <p>新的评分标准在忠实度上更严格——这本身没问题——但它也在难以抉择的案例上意外地收紧了，而这种收紧方式与人工判断并不一致。评判者现在系统性地将更多难以抉择的案例判为"错误"，多于人工的程度。智能体并没有回归；是评判者变得更严苛了。</p>
+
+      <h4>修复</h4>
+
+      <p>三个步骤：</p>
+
+      <ol>
+        <li><strong>记录发现。</strong> 在团队的工程日志中写一篇简短记录："轨迹通过率从 3 月 4 日到 3 月 23 日从 0.764 降至 0.712。根本原因：3 月 10 日的评判者评分标准修改未重新校准。校准一致率从 0.80 降至 0.74。智能体未变更。"</li>
+        <li><strong>决定如何处理评判者。</strong> 两个选项：回滚评分标准修改（保持历史分数的可比性）或接受更严格的评分标准并重新设定基线（分数更低，但区分度更强）。团队选择保留更严格的评分标准——忠实度标准确实有价值——但增加了三个锚定样本来修复难以抉择的回归。此后，校准提升到 0.81，而轨迹通过率在未变更的智能体上稳定在 0.736。</li>
+        <li><strong>更新 CI。</strong> 在评判者提示词变更工作流中添加校准检查：任何修改 <code class="inline">evals/judge/</code> 下文件的 PR 都必须将校准脚本作为状态检查来运行，且 PR 评论中会显示一致率增量。使校准一致率下降 &gt;3 个百分点的变更是硬性阻塞；-3 到 0 之间的任何情况是软性警告。</li>
+      </ol>
+
+      <div class="observe">
+        <div class="label">为什么这比调试所花的时间更重要</div>
+        <p>这个团队的调查花了 5 天。隐性成本是他们在这 5 天内因忙于调查一个不真实的回归而没有发布的所有内容。更深层的成本是信任损耗：每次此后的分数变动都会触发"这是真实的吗？"的条件反射，团队无法再以同样的自信迭代。</p>
+        <p>下次的解决方案不是更好的侦探工作。而是在 PR 时就捕获问题的 CI 规则。任何没有校准增量的评判者变更现在都是失败的状态检查；评分标准修改本会在合并前被标记，团队会在当时就处理它，而不是三周后。</p>
+        <p>这就是让 LLM-as-judge 在规模上可持续的规范。偏差是真实的，漂移是真实的，评判者变更在积累——唯一的防御是以与其他任何生产代码相同的严谨性对待评判者。</p>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 3.3</div>
+      <h3>交付物</h3>
+      <p>一个经过校准、版本管理、可审计的 LLM-as-judge 流水线，附有与人工评分者的一致性记录。双向顺序规范消除位置偏差。评分标准经过调优以化解冗长偏差和权威感偏差。跨系列集成用于把控发布的评估。CI 规则确保每次评判者变更时校准必须保持。一个知道何时信任评判者、何时回退到人工的团队，有明确的策略而非凭感觉。这就是让第三部分其余评估方法论真正可信的基础。</p>
+      <ul class="checklist">
+        <li>校准集：50 个样本，跨明确胜出 / 难以抉择 / 对抗性类别，由人工双重标注</li>
+        <li>具有双向顺序成对比较的评判者流水线（位置偏差已被消除）</li>
+        <li>评分标准附有明确的简洁性和校准置信度指导</li>
+        <li>评判者提示词内含 2–3 个锚定实际工作示例</li>
+        <li>与人工对比的一致率已测量；总体 &gt;80%，明确胜出 &gt;90%</li>
+        <li>跨系列 / 跨供应商评判者用于把控发布的评估（3/3 并附有有争议升级机制）</li>
+        <li>评判者版本管理：模型快照 + 提示词哈希与每次分数一同记录</li>
+        <li>增量工具在比较具有不同 judge_prompt_hash 的行时发出警告</li>
+        <li>CI 规则：评判者配置变更 → 须进行校准检查，超过 3 个百分点的下降会阻塞合并</li>
+        <li>月度漂移检查已设为日历事项；对同一校准集重新测量一致率</li>
+        <li>已记录的回退策略：尽可能使用确定性评分工具，其余使用评判者</li>
+      </ul>
+    </div>
+
+
+  </section>

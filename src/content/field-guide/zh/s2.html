@@ -1,0 +1,733 @@
+<section class="phase">
+    <div class="phase-num">2.2</div>
+    <div class="week">第二部分 / 上线 · 生产环境中 AI 智能体的经济学</div>
+    <h2>成本（cost）与延迟（latency）：钱和时间究竟花在哪里。</h2>
+    <p class="goal">生产环境中的智能体（agent）问题，最终几乎都会归结为"太贵了"或"太慢了"。两者的根本原因相同——对成本和延迟在代理循环（agent loop）中究竟发生在哪里存在误解——解决路径也相同：先建立准确的心智模型，再针对性地应用技术。本章将向你展示真实智能体一次转轮（turn）的成本拆解（答案与大多数人的猜测不同），然后讲解三种最高杠杆优化手段——提示词缓存（prompt caching）、模型级联（model cascade）和并行/流式（parallel/streaming）模式——并教你如何衡量每种手段的效果。读完之后，你将清楚地知道面对具体问题该拨动哪根杠杆，以及能期待多大的收益。</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>钱和时间究竟花在哪里。</h3>
+
+      <p>优化之前，你必须知道账单从哪里来。大多数工程师的直觉是——输出令牌（token）主导成本，工具执行主导延迟——这是错的。带着这个错误认知去优化，只会把精力花在错误的地方。</p>
+
+      <h4>真实智能体一次转轮的构成</h4>
+
+      <p>举一个具体的例子：一个回答问题的研究智能体。四次模型调用，三次工具调用，最终给出答案。钱是这样花出去的：</p>
+
+<pre class="trace standalone"><span class="c-out">Turn 1: User asks "How do I tune Postgres autovacuum for write-heavy workloads?"
+
+──────────────────────────────────────────────────────────────────────
+Step  Type        Input tokens  Output tokens  Cost (Sonnet 4.5)   Latency
+──────────────────────────────────────────────────────────────────────
+ 1    model call    3,200          120          $0.011             1.8s
+                                                                   (decides to search)
+ 2    tool          —              —            $0.00              0.4s
+                                                                   (search_docs)
+ 3    model call    4,800          80           $0.015             2.1s
+                                                                   (decides to fetch one)
+ 4    tool          —              —            $0.00              0.6s
+                                                                   (fetch_doc)
+ 5    model call    7,200          90           $0.022             2.6s
+                                                                   (decides to search again)
+ 6    tool          —              —            $0.00              0.5s
+                                                                   (search_docs)
+ 7    model call    9,400          640          $0.038             4.1s
+                                                                   (synthesis: final answer)
+──────────────────────────────────────────────────────────────────────
+TOTAL              24,600        930          $0.086             12.1s
+──────────────────────────────────────────────────────────────────────</span></pre>
+
+      <p>仔细看这张表，有三点很突出：</p>
+
+      <p><strong>输入令牌占主导。</strong> 输入 24,600 vs 输出 930，比例高达 26:1。以 Sonnet 定价 $3 / $15（每百万令牌，输入/输出比 5:1）来算，输入令牌仍占账单的 84%（$0.074 / $0.086）。大多数成本优化应该瞄准输入，而不是输出。"输出令牌贵 5 倍"的说法在单令牌层面是对的，但在智能体循环中，输出令牌的数量是输入的 1/20，所以输入才是总账单的决定因素。</p>
+
+      <p><strong>输入令牌随每次转轮递增。</strong> 第一次模型调用用了 3,200 个输入令牌；到综合步骤时已涨到 9,400——将近 3 倍。为什么？因为每次转轮都会携带完整的对话历史，包括所有此前的工具结果。每条工具结果一旦加入上下文窗口（context window），就会在此后每次模型调用时产生输入费用。<em>上下文（context）在它存在的每次转轮都要付费，而不是只付一次</em>。</p>
+
+      <p><strong>工具执行很快；模型调用很慢。</strong> 模型调用占 12.1s 总时长中的 10.6s（88%）；工具占 1.5s。如果想让智能体更快，优化模型调用（或并行执行模型调用）才是杠杆；优化工具是四舍五入的误差。</p>
+
+      <h4>成本公式，一行搞定</h4>
+
+      <p>对任意一次智能体转轮，成本（cost）近似为：</p>
+
+      <pre class="standalone">cost  ≈  Σ (input_tokens_at_step_i  ×  input_price)
+       +  Σ (output_tokens_at_step_i ×  output_price)
+
+The dominant term is almost always the first sum — and the steps
+near the end of the loop dominate it because they carry the most
+context forward.</pre>
+
+      <p>能移动这个公式的四根杠杆，按对典型智能体的效果排序：</p>
+
+      <ol>
+        <li><strong>提示词缓存（prompt caching）</strong>，作用于稳定的前缀（系统提示词、工具定义、持久检索的文档）。缓存命中的输入令牌享 90% 折扣。见 STEP 2。</li>
+        <li><strong>模型级联（model cascade）</strong>：对 Sonnet 大材小用的路由步骤改用 Haiku。见 STEP 3。</li>
+        <li><strong>上下文预算管控（context budget discipline）</strong>：防止跨转轮积累的上下文膨胀（总结历史、丢弃过时的工具结果）。</li>
+        <li><strong>输出预算管控（output budget discipline）</strong>：合理设置 <code class="inline">max_tokens</code> 上限；结构化输出通常比自由文本更短。</li>
+      </ol>
+
+      <p>对于延迟，杠杆有所不同：</p>
+
+      <ol>
+        <li><strong>流式输出（streaming）</strong>：在模型完成之前就开始展示输出。不减少总延迟，但能大幅改善感知延迟（perceived latency）。见 STEP 4。</li>
+        <li><strong>并行工具调用（parallel tool calls）</strong>：当模型在一次转轮中触发多个独立工具时，并发执行它们。见 STEP 4。</li>
+        <li><strong>模型级联</strong>：与成本杠杆相同——更小的模型也更快。见 STEP 3。</li>
+        <li><strong>提示词缓存</strong>：缓存命中时也能降低延迟（模型无需重新处理已缓存的令牌）。见 STEP 2。</li>
+      </ol>
+
+      <p>注意，提示词缓存和模型级联同时出现在两份列表中。它们是两种最高杠杆的技术——任意一种都能可靠地同时改善成本和延迟。本章其余部分将深入讲解这两种技术。</p>
+
+      <h4>优化前应该度量什么</h4>
+
+      <p>在应用任何技术之前，先为每次模型调用埋好以下四个数字。没有它们，你就无法判断优化是有效还是适得其反：</p>
+
+<pre class="standalone"><span class="c-cm"># For every model call, log:</span>
+{
+    <span class="c-st">"step"</span>: <span class="c-st">"synthesis"</span>,
+    <span class="c-st">"model"</span>: <span class="c-st">"claude-sonnet-4-5"</span>,
+    <span class="c-st">"input_tokens"</span>: <span class="c-st">9400</span>,
+    <span class="c-st">"cache_creation_input_tokens"</span>: <span class="c-st">0</span>,    <span class="c-cm"># charged at 1.25x</span>
+    <span class="c-st">"cache_read_input_tokens"</span>: <span class="c-st">3200</span>,      <span class="c-cm"># charged at 0.1x</span>
+    <span class="c-st">"output_tokens"</span>: <span class="c-st">640</span>,
+    <span class="c-st">"latency_ms"</span>: <span class="c-st">4100</span>,
+    <span class="c-st">"latency_to_first_token_ms"</span>: <span class="c-st">820</span>,    <span class="c-cm"># if streaming</span>
+    <span class="c-st">"cost_usd"</span>: <span class="c-st">0.0285</span>,                     <span class="c-cm"># computed from above</span>
+}</pre>
+
+      <p>四个指标，作为跨度（span）属性记录（参考第 2.1 章的可观测性（observability）基础设施）。两个与缓存相关的指标是大多数团队最容易忽略的；没有它们，你就无法计算有效输入价格或缓存命中率。一旦拿到这些数字，每项优化主张都变得可验证。</p>
+
+      <div class="callout warn">
+        <p>最常见的成本优化错误：花时间调整 <code class="inline">max_tokens</code> 来降低输出成本，而输入账单比它大 20 倍却原封未动。"输出每令牌更贵"的直觉把人引到了这里，但输出只占总花费的一小部分。始终先度量，再在真正花钱的地方优化。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我的智能体成本 90% 来自输出令牌，而不是输入。上面那张表对我来说是错的吗？</div>
+        <div class="answer">
+          <p>不是，但你的智能体形态不同。如果输出占你成本的 90%，要么你在生成非常长的内容（写作、代码生成、长篇综合），要么你的智能体循环很短（1-2 次转轮），积累的上下文很少。两种形态都合理；只是成本拆解看起来不一样。</p>
+          <p>通用原则依然适用：度量你的成本在哪里，然后在那里优化。20:1 的输入:输出比例是多轮研究/助手智能体的典型值。单轮生成智能体会偏向另一个方向。在选择技术之前，先算出你的实际比例。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">这些延迟数字（1.8s、2.1s、4.1s）合理吗，还是有什么地方太慢了？</div>
+        <div class="answer">
+          <p>这对于非缓存、非流式、输入几千令牌的 Sonnet 调用来说是典型值。延迟大致随输入长度线性增长（令牌越多 = 处理时间越长），加上生成输出令牌的时间（Sonnet 约 30-80 令牌/秒，取决于负载）。一次 4 秒的综合调用，生成 640 个输出令牌，以约 150 令牌/秒的速度生成加上约 1 秒的输入处理，处于预期范围之内。</p>
+          <p>有两件事会显著改变这些数字：缓存命中能将输入处理时间缩短约 70%；流式输出让用户从第一个令牌出现时（通常 0.5-1s）就感知到延迟，而不是等到最后一个令牌输出。两者在本章后面都会介绍。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>提示词缓存（prompt caching）：最大的单一成本杠杆。</h3>
+
+      <p>提示词缓存是大多数团队投入不足的优化手段，尽管它是现有最大的单一成本杠杆。做对了，可以将智能体工作负载的输入令牌成本降低 60–90%。做错了，什么效果也没有，而且你不会察觉——因为 API 不会报错，账单只是比本可以更高。</p>
+
+      <h4>机制原理</h4>
+
+      <p>机制很简单，但值得精确理解：当你将提示词的某个部分标记为可缓存时，Anthropic 会存储该前缀的中间计算结果（键值注意力缓存，即"KV cache"）。下一个携带相同前缀的请求无需重新处理——模型从缓存状态继续运行。</p>
+
+      <p>截至 2026 年的定价：</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>令牌类别</div>
+          <div>价格倍数</div>
+          <div>实际费率（Sonnet）</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">标准输入</div>
+          <div class="vector">1.0×</div>
+          <div class="defense">$3.00 / 1M tokens</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">缓存写入（5 分钟 TTL）</div>
+          <div class="vector">1.25×</div>
+          <div class="defense">$3.75 / 1M tokens（一次性收费）</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">缓存写入（1 小时 TTL）</div>
+          <div class="vector">2.0×</div>
+          <div class="defense">$6.00 / 1M tokens（一次性收费）</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">缓存读取</div>
+          <div class="vector">0.1×</div>
+          <div class="defense">$0.30 / 1M tokens（每次命中）</div>
+        </div>
+      </div>
+
+      <p>保本计算：5 分钟缓存只需一次读取即可回本。1 小时缓存只需两次读取。对于任何会被复用的前缀，两者几乎总是值得的。</p>
+
+      <p>重要约束：</p>
+
+      <ul>
+        <li><strong>最小前缀长度。</strong> Sonnet/Haiku：1,024 令牌。Opus：4,096 令牌。低于最小值时，你的 <code class="inline">cache_control</code> 指令会被静默忽略。（大多数生产系统提示词超过这个长度；非常短的提示词本来也不需要缓存。）</li>
+        <li><strong>精确前缀匹配。</strong> 只有当缓存前缀与已存储条目逐字节一致时，缓存才会命中。多一个空格、一个不同的时间戳、一次模型快照轮换——都会导致缓存未命中。</li>
+        <li><strong>每个请求最多 4 个缓存断点。</strong> 如果你的提示词有多个稳定层，可以分别独立缓存多个片段。</li>
+      </ul>
+
+      <h4>最小正确的 API 调用</h4>
+
+      <p>有两种用法，都是对标准调用的小量补充：</p>
+
+<pre class="standalone"><span class="c-cm"># Automatic caching: simplest, recommended starting point</span>
+response = client.messages.create(
+    model=<span class="c-st">"claude-sonnet-4-5"</span>,
+    max_tokens=<span class="c-st">1024</span>,
+    cache_control={<span class="c-st">"type"</span>: <span class="c-st">"ephemeral"</span>},   <span class="c-cm"># default 5-min TTL</span>
+    system=LARGE_SYSTEM_PROMPT,
+    tools=TOOLS,
+    messages=messages,
+)
+<span class="c-cm"># Anthropic decides where to put the breakpoint (typically end of system+tools).</span>
+
+<span class="c-cm"># Explicit breakpoints: fine-grained control</span>
+response = client.messages.create(
+    model=<span class="c-st">"claude-sonnet-4-5"</span>,
+    max_tokens=<span class="c-st">1024</span>,
+    system=[
+        {<span class="c-st">"type"</span>: <span class="c-st">"text"</span>, <span class="c-st">"text"</span>: LARGE_SYSTEM_PROMPT,
+         <span class="c-st">"cache_control"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"ephemeral"</span>}}
+    ],
+    tools=TOOLS_WITH_CACHE,   <span class="c-cm"># cache_control on the last tool</span>
+    messages=messages,
+)</pre>
+
+      <p>响应中包含 <code class="inline">usage.cache_creation_input_tokens</code> 和 <code class="inline">usage.cache_read_input_tokens</code>——这两个数字告诉你缓存是否真的在生效。请务必记录它们。</p>
+
+      <h4>让缓存真正发挥效益的架构</h4>
+
+      <p>大多数团队犯的错误是：在代码各处散放 <code class="inline">cache_control</code>，然后假设缓存已经在运行。也许是的。也有可能什么都没缓存，因为"稳定"的内容在每次请求时都在变。关键在于：<strong>将提示词结构设计为一个按稳定性分层的堆叠层次</strong>：</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  PROMPT STRUCTURE FOR MAXIMUM CACHE HIT RATE                │
+│                                                             │
+│  [most stable] ─── cached, 1-hour TTL                       │
+│  System prompt (rules, persona, output format)              │
+│  Tool definitions                                           │
+│  Skills / reference material                                │
+│                                                             │
+│  [less stable] ─── cached, 5-minute TTL                     │
+│  Retrieved documents for this conversation                  │
+│  Conversation history (older turns)                         │
+│                                                             │
+│  [volatile] ─── NOT cached                                  │
+│  Current user message                                       │
+│  Current turn timestamp (if needed at all)                  │
+│  Per-request data                                           │
+└─────────────────────────────────────────────────────────────┘
+
+  Cache breakpoints go AT THE BOUNDARY between stability layers.
+  Everything BEFORE a breakpoint is cached together. Everything
+  AFTER it is fresh on every request.</div>
+
+      <p>具体做法：把系统提示词和工具定义放在最前面，紧接其后设一个缓存断点。对话历史放在其后，在倒数第二轮之后再设一个断点（这样最新一轮是新鲜的，之前所有内容都被缓存）。当前用户消息排在最后，永远不放在缓存区域内。</p>
+
+      <p>这种结构通常能在生产智能体工作负载上达到 60–80% 的缓存命中率，折算下来，在扣除缓存写入开销后，输入令牌总成本大约降低 50–70%。</p>
+
+      <h4>悄然破坏缓存的五种反模式</h4>
+
+      <p>大多数"缓存已启用"的实现无法兑现 90% 节省承诺的原因：以下五种反模式之一在每次请求时静默地使缓存失效。</p>
+
+      <p><strong>反模式 1：前缀中含有时间戳。</strong> 系统提示词开头有一行 <code class="inline">"Current time: 2026-04-17T14:32:15Z"</code>，每次请求都会变。缓存键变了 → 每次调用都缓存未命中。修复方案：要么去掉时间戳（模型真的需要秒级精度吗？），要么截断到天（<code class="inline">"Date: 2026-04-17"</code> 只每天变一次），要么把时间戳从缓存区域移到用户消息中。</p>
+
+      <p><strong>反模式 2：缓存前缀中含有用户特定内容。</strong> 系统提示词中写了 <code class="inline">"You are helping {user.name} who works at {user.company}"</code>，导致每个用户都拥有自己的缓存条目。如果每个用户每天发送数百个请求，这没问题；如果有数千个用户、每人请求量很少，则代价高昂。修复方案：把用户特定内容移到用户消息中；让缓存前缀与用户无关。</p>
+
+      <p><strong>反模式 3：不一致的空白字符。</strong> 你的提示词构建器对末尾空白字符的处理不一致——有时结尾有换行，有时没有。缓存哈希不在乎这个差异是不可见的；它只看到了不同的前缀。修复方案：强力归一化。始终去除空白，始终用统一风格的分隔符拼接。一个 30 行的提示词规范化函数，一天之内就能回本。</p>
+
+      <p><strong>反模式 4：模型快照轮换。</strong> 当 Anthropic 发布新的 Sonnet 小版本快照时，旧快照上的缓存条目就失效了。缓存写入会产生额外成本；快照轮换期间缓存重新预热会带来临时的成本峰值。修复方案：在生产环境中锁定模型快照版本（用 <code class="inline">claude-sonnet-4-5-20250929</code> 而不是 <code class="inline">claude-sonnet-4-5</code>），让轮换成为明确的决策，并将缓存预热纳入任何模型升级的计划中。</p>
+
+      <p><strong>反模式 5：前缀短于最小长度。</strong> 你在一个 600 令牌的系统提示词上加了 <code class="inline">cache_control</code>，以为会有缓存。最小长度是 1,024 令牌；什么都没缓存。API 不会报错——只是按全价处理。始终通过响应的 <code class="inline">cache_creation_input_tokens</code> 字段来验证，只有当缓存真正发生时它才非零。</p>
+
+      <h4>度量缓存是否生效</h4>
+
+      <p>在可观测性（observability）仪表板中需要追踪的指标：</p>
+
+      <pre class="standalone">cache_hit_ratio  =  cache_read_input_tokens
+                     ────────────────────────────────────────────
+                     cache_read_input_tokens + standard_input_tokens
+
+Healthy production workloads: 50–80%
+Below 20%: prefix design is broken; audit for anti-patterns
+Above 90%: probably leaving even more on the table; investigate
+           if user-message tokens could be reduced too</pre>
+
+      <p>光有数字还不够——要追踪其随时间的变化，留意是否下跌。缓存命中率突然下跌，通常意味着某个反模式刚刚悄悄混入（有人加了时间戳、模型快照发生了轮换、一次部署改变了提示词格式）。</p>
+
+      <h4>5 分钟 vs 1 小时 TTL 的选择</h4>
+
+      <p>Anthropic 默认的缓存 TTL 是 5 分钟。另有 1 小时 TTL，写入成本为 2 倍。怎么选：</p>
+
+      <p><strong>5 分钟 TTL</strong> 适合交互式工作负载，这类负载预期用户会快速发起后续请求。聊天智能体在几分钟内会收到大量请求；5 分钟窗口能覆盖其中大多数。如果用户离开 20 分钟后回来，你会再次付一次缓存写入费——但这种情况很少见，而且 5 分钟写入很便宜（1.25 倍）。</p>
+
+      <p><strong>1 小时 TTL</strong> 适合批处理工作负载，这类负载会在间隔数分钟的多个请求中重复使用相同上下文。一个处理 10,000 份文档、耗时 45 分钟的文档处理流水线，能从 1 小时 TTL 中获益，因为系统提示词在整个运行期间都保持预热。2 倍写入成本是值得的，因为你能以 0.1 倍的价格读取 10,000 次。</p>
+
+      <p>不要默认选 1 小时 TTL。如果你的工作负载实际上并不持久，2 倍写入惩罚会让你很难受；如果判断失误，5 分钟本来会更便宜。</p>
+
+      <h4>来自真实工作负载的实际数字</h4>
+
+      <p>以具体数字校准期望：一个每天处理 1,000 次对话的客服智能体，每次对话平均 4 轮，系统提示词 2,000 令牌，跨轮次积累的上下文从 2K 增长到 8K。按 Sonnet 定价计算：</p>
+
+      <pre class="standalone">Without caching:
+  System prompt (2K) sent on every call: 2K × 4 turns × 1000 conv = 8M tokens
+  Other input (~5K avg per call):                                 = 20M tokens
+  Total input: 28M tokens × $3/M = $84/day
+  Output (~500 tokens × 4 calls × 1000): 2M × $15/M               = $30/day
+  ────────
+  Total: $114/day, $42K/year
+
+With 5-minute caching (assuming 70% cache hit ratio):
+  Cached input: 0.70 × 28M = 19.6M tokens × $0.30/M              = $5.88/day
+  Standard input: 0.30 × 28M = 8.4M × $3/M                       = $25.20/day
+  Cache writes: ~2.8M tokens × $3.75/M                           = $10.50/day
+  Output: same                                                    = $30/day
+  ────────
+  Total: $71.58/day, $26K/year
+  Savings: $42 - $26 = $16K/year, ~38% reduction
+
+With model cascade on top (next step):
+  ... ~$45/day, ~$16K/year   (further 37% reduction)</pre>
+
+      <p>单靠缓存节省的成本是真实且可观的。与模型级联叠加使用（STEP 3），生产智能体的成本通常能降到未优化时的 20–30%。</p>
+
+      <div class="callout tip">
+        <p>如果这周你只从本章实现一件事，就实现提示词缓存，作用于你最大的稳定提示词前缀。这只是一个 API 参数，折扣真实存在（输入节省 60–80%），唯一挡在你和折扣之间的，是没有针对五种反模式审计你的前缀。拨出一小时，做审计，部署上线。大多数团队在 24 小时内就能看到账单的明显降低。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">提示词缓存在 OpenAI / GPT 上的工作方式一样吗？</div>
+        <div class="answer">
+          <p>OpenAI 在 2024 年底推出了提示词缓存，机制类似——对缓存输入令牌给予折扣（截至 2026 年初为 50%，不是 90%），并自动检测重复前缀。架构决策是相同的（稳定前缀，易变后缀）；折扣幅度更小。同样的反模式审计也适用。</p>
+          <p>在各家提供商中，这个原则正在标准化：将提示词结构化以最大化前缀稳定性，就能获得折扣。具体倍数各有不同；方法论是通用的。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">缓存什么时候会帮倒忙？</div>
+        <div class="answer">
+          <p>两种场景。第一，如果你的工作负载真的没有任何重复前缀——每个请求从头到尾都是唯一的——你就要为那些从未被读取的缓存写入支付 1.25 倍的写入费。输入侧成本上升 25%。这在真实智能体工作负载中不太可能（系统提示词和工具定义几乎总会重复），但如果你的架构设计比较特殊，就有可能。</p>
+          <p>第二，如果你有数百个不同的缓存前缀，每个只写一次、读一两次。写入开销占主导，数学上勉强算得过来。修复方案：合并前缀（减少唯一系统提示词的数量），或者接受这个特定工作负载不适合缓存。</p>
+          <p>如果你想保持防御性：埋好指标，如果缓存命中率在两周内一直低于 20%，就关掉缓存，直到你修复了前缀设计。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我能缓存工具结果，避免在下一轮再为它们付费吗？</div>
+        <div class="answer">
+          <p>在某种程度上可以，但是间接的。工具结果会成为消息历史的一部分，而消息历史在下一轮就变成了输入。如果你的消息历史落在缓存区域内（在其之后设有断点），那么是的——较早的工具结果会保持缓存状态，享受 90% 的折扣。如果你的消息历史是在易变用户消息之前的最后一个内容，那么工具结果<em>就处于</em>缓存区域中。</p>
+          <p>模式：缓存断点放在消息历史<em>之后</em>、新用户消息<em>之前</em>。这样每次新转轮只对新用户消息和本轮工具调用支付全价，而之前的一切都享有缓存折扣。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>模型级联（model cascade）：用更小的模型处理简单步骤。</h3>
+
+      <p>大多数智能体对所有步骤使用同一个模型。它们对规划步骤、工具决策步骤、综合步骤和格式化步骤都调用 <code class="inline">claude-sonnet-4-5</code>。这是构建智能体最省事的方式，对于低流量智能体也没问题。但对于生产智能体，这会留下可观的资金浪费。</p>
+
+      <p>洞察很简单：<strong>智能体循环的不同步骤有不同的难度</strong>。决定是否搜索文档很容易；从检索到的文本块综合出最终答案很难。对两者都用同一个模型，意味着你在为 Haiku 能同样胜任的任务支付 Sonnet 的价格。</p>
+
+      <h4>模型阵容：价格与速度</h4>
+
+      <p>当前 Anthropic 和 OpenAI 的模型阵容及大致定位：</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>模型</div>
+          <div>输入 / 输出</div>
+          <div>最适合</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Claude Haiku 4.5</div>
+          <div class="vector">$1 / $5 per 1M</div>
+          <div class="defense">路由、分类、抽取、简单工具调用、结构化输出。速度快（生成约 100 令牌/秒）。</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Claude Sonnet 4.5/4.6</div>
+          <div class="vector">$3 / $15 per 1M</div>
+          <div class="defense">大多数智能体工作的默认选择。推理能力强、工具调用可靠、综合效果好。速度与质量均衡。</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">Claude Opus 4.7</div>
+          <div class="vector">$5 / $25 per 1M</div>
+          <div class="defense">最难的问题：复杂多步推理、代码审查、深度分析。速度较慢。</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">GPT-5-mini</div>
+          <div class="vector">~$0.30 / $1.20 per 1M</div>
+          <div class="defense">路由/分类的最廉价档位。与 Haiku 相比上下文溢价较高，能力差距较小。</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">GPT-5 / 5.5</div>
+          <div class="vector">~$2.50 / $10 per 1M</div>
+          <div class="defense">OpenAI 的中间档。每令牌成本低于 Sonnet 的直接竞争对手；质量因任务而异。</div>
+        </div>
+      </div>
+
+      <p>Haiku 与 Sonnet 之间 3-5 倍的价格差就是那根杠杆。如果智能体循环中有一半模型调用能转移到 Haiku 且不损失质量，你无需做其他任何改变就能节省大量资金。</p>
+
+      <h4>哪些步骤可以转到更小的模型？</h4>
+
+      <p>实践中有效的框架：<strong>让模型与步骤真正需要做的事相匹配</strong>。分三类：</p>
+
+      <p><strong>路由 / 分发 / 分类步骤 → 能用的最小模型。</strong>"该搜索文档、搜索网页，还是直接回答？""这个问题关于账单、技术支持，还是一般问题？""这个查询需要多个来源吗？"这些步骤的输出基数很低（3-5 个选项），不需要深度推理。Haiku 在这类任务上的质量与 Sonnet 无法区分，而且便宜 3 倍。</p>
+
+      <p><strong>工具决策步骤 → 中间档模型（或能用的最小模型）。</strong>"根据这条用户消息和这些工具，应该调用哪个工具，参数是什么？"比纯分类稍难，因为参数构造需要理解问题。Haiku 通常能胜任；在你的评估（eval）集上验证。如果 Haiku 的错误路由超过 5-10%，就升到 Sonnet。</p>
+
+      <p><strong>综合 / 最终回答步骤 → 预算允许范围内的最佳模型。</strong>撰写用户最终看到的答案。这是质量最显眼的地方，糟糕的输出最能损害用户满意度，更好模型的边际成本最有理由。默认用 Sonnet。当综合任务确实很难（多文档推理、代码审查）时才用 Opus。</p>
+
+      <h4>代码中的具体模式</h4>
+
+<pre class="standalone"><span class="c-cm"># agent/loop.py — model cascade</span>
+
+ROUTING_MODEL   = <span class="c-st">"claude-haiku-4-5-20251001"</span>   <span class="c-cm"># cheap, fast</span>
+SYNTHESIS_MODEL = <span class="c-st">"claude-sonnet-4-5"</span>             <span class="c-cm"># quality</span>
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_message: <span class="c-kw">str</span>):
+    <span class="c-cm"># Step 1: route — which path does this question need?</span>
+    <span class="c-cm"># Haiku is enough: this is a classification.</span>
+    route = <span class="c-kw">await</span> client.messages.create(
+        model=ROUTING_MODEL,
+        max_tokens=<span class="c-st">50</span>,
+        system=ROUTING_PROMPT,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_message}],
+    )
+    path = parse_route(route)   <span class="c-cm"># "search" | "calculate" | "direct"</span>
+
+    <span class="c-cm"># Step 2: tool-using loop. Use Haiku — it can call simple tools fine.</span>
+    tool_results = []
+    <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(<span class="c-st">5</span>):
+        response = <span class="c-kw">await</span> client.messages.create(
+            model=ROUTING_MODEL,   <span class="c-cm"># still Haiku for tool decisions</span>
+            max_tokens=<span class="c-st">1024</span>,
+            tools=TOOLS,
+            system=TOOL_PROMPT,
+            messages=build_messages(user_message, tool_results),
+        )
+        <span class="c-kw">if</span> response.stop_reason != <span class="c-st">"tool_use"</span>:
+            <span class="c-kw">break</span>
+        <span class="c-cm"># dispatch tools, collect results</span>
+        tool_results.extend(<span class="c-kw">await</span> dispatch_tools(response))
+
+    <span class="c-cm"># Step 3: synthesis — write the final answer. Use Sonnet.</span>
+    <span class="c-cm"># This is where quality matters most.</span>
+    final = <span class="c-kw">await</span> client.messages.create(
+        model=SYNTHESIS_MODEL,
+        max_tokens=<span class="c-st">2048</span>,
+        system=SYNTHESIS_PROMPT,
+        messages=build_synthesis_messages(user_message, tool_results),
+    )
+    <span class="c-kw">return</span> final.content[<span class="c-st">0</span>].text</pre>
+
+      <p>三次模型调用，三种不同选择。路由和工具调用步骤运行在 Haiku 上；只有用户可见的综合步骤运行在 Sonnet 上。对于此前所有步骤都用 Sonnet 的智能体，这在设计良好的评估（eval）套件上通常能实现 50–60% 的成本降低且无质量回退。</p>
+
+      <h4>如何在评估集上验证级联</h4>
+
+      <p>正确的模型级联推广方式：保留 Sonnet 作为基准，每次只将一个步骤换成 Haiku，运行评估（evaluation）套件（第 3.1 章），度量增量（delta）。如果你关心的指标（通常是 <code class="inline">trajectory_pass_rate</code> 或等效指标）没有变化，这次换换是安全的。如果下降了，该步骤需要更大的模型。</p>
+
+      <p>按风险从低到高的尝试顺序：</p>
+
+      <ol>
+        <li><strong>路由/分类步骤</strong>（风险最低）。Haiku 处理这些步骤几乎没有质量损失。</li>
+        <li><strong>带结构化输出的简单工具调用</strong>（search_docs、get_user 等）。Haiku 通常可以胜任。</li>
+        <li><strong>需要推理先前工具结果的多步工具序列。</strong> Haiku 有时会退化；需要度量。</li>
+        <li><strong>输入简单的综合步骤。</strong> 也许 Haiku 能处理简短的事实性回答。</li>
+        <li><strong>输入复杂的综合步骤。</strong> 可能需要 Sonnet。评估集会告诉你答案。</li>
+      </ol>
+
+      <p>关键在于：<strong>每个级联决策都是评估问题，而不是直觉问题</strong>。"Haiku 能处理这个步骤吗？"的答案，是通过在该步骤上用 Haiku 运行评估套件并与 Sonnet 基准对比得到的。如果答案是"是的，分数没有变化"，就上线更便宜的版本。如果是"不，分数下降了 2 分"，就保留 Sonnet。</p>
+
+      <h4>推理模型的例外</h4>
+
+      <p>还有一个维度：启用了推理功能的模型（带扩展思考（extended thinking）的 Opus 4.7、GPT-5 推理模式）。这些模型比其非推理版本更慢、更贵，因为它们在响应之前会生成隐藏的"思考"令牌。只有在额外推理确实能改变答案的步骤上才值得使用——通常是复杂规划或多步逻辑推断。</p>
+
+      <p>第 0.1 章中的心智模型适用于此：扩展思考对困难的推理问题有帮助，对简单任务则会拖累。在级联中，这意味着：</p>
+
+      <ul>
+        <li>路由/分类：永远不用推理模式。Haiku 或非推理的 Sonnet。</li>
+        <li>工具决策：极少用推理模式。仅当你的智能体做复杂多步规划时。</li>
+        <li>综合：取决于复杂度。代码审查、数学、多文档分析用推理模式；其他情况用非推理模式。</li>
+      </ul>
+
+      <h4>新项目的务实默认值</h4>
+
+      <p>如果你正在启动一个新智能体，尚不清楚哪些步骤需要哪种模型，这里有一个合理的起点供你随时间调整：</p>
+
+      <pre class="standalone">Routing / classification:  Haiku 4.5
+Tool decisions:            Haiku 4.5  (start here; upgrade if eval fails)
+Synthesis:                 Sonnet 4.5
+
+If you have an Opus budget, use Opus only for:
+- Synthesis on the highest-stakes paths
+- Multi-document analysis or code-review style tasks
+
+Never default to Opus across the board. The cost compounds badly
+in agent loops, and the quality gap vs Sonnet rarely justifies it
+on non-frontier tasks.</pre>
+
+      <h4>与缓存的复合效应</h4>
+
+      <p>级联与缓存的效果是相乘的。一个未优化时成本 $100/天的工作负载，仅靠缓存降到 $60/天，仅靠级联降到 $40/天，两者都用则降到约 $25/天——因为级联降低了模型档位乘数，而缓存同时降低了输入令牌乘数。每种方法各自带来约 40% 的降低；组合起来带来约 75%。</p>
+
+      <p>具体金额取决于你的工作负载，但相乘结构是普遍的。如果你只实施了其中一种而忽视了另一种，那些通过实施第二种可以回收的资金就是白白浪费了。</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">不重新运行整个评估套件，我怎么知道把 Haiku 换进来是否真的安全？</div>
+        <div class="answer">
+          <p>你无法可靠地知道。抽查 5 个样例不能告诉你第 5 百分位的情况是否退化了。第 3.1 章中的方法论适用于此：每次模型换换都是一个有预测（"将路由换成 Haiku 应该不会使 trajectory_pass_rate 变化超过 1 分"）和判决（"运行了评估；通过率变化了 0.3 分，在噪声基线（noise floor）0.044 之内 → 上线"）的假设。</p>
+          <p>如果你的评估套件太慢，无法在每次级联决策时都运行，那你有一个不同的问题需要先解决（第 3.1 章）。评估的快速子集（10–15 个样例，2–3 分钟内完成）对大多数级联决策的上线与否判断已经足够。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我应该在一个智能体内混用不同的模型家族（Claude + GPT）吗？</div>
+        <div class="answer">
+          <p>通常不应该，但有一个具体的例外。不应该的原因：不同家族在工具调用（tool use）、结构化输出和指令跟随方面有细微的行为差异。在循环内混用意味着要调试两种失败模式而不是一种，而且你的工具调用模式可能需要针对特定提供商进行调整。</p>
+          <p>例外情况：当你有充分理由认为某个家族在特定子任务上明显更好时（例如，GPT-5-mini 在极廉价分类上，Claude Haiku 在特定输出格式的指令跟随上）。对大多数团队来说，这不值得引入这种复杂性。选择一家提供商，在其模型阵容内进行级联。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">在单次 API 调用内路由怎么样——模型能决定使用哪个档位吗？</div>
+        <div class="answer">
+          <p>一些提供商正在探索这个方向（Anthropic 的混合推理模式，让模型自行决定投入多少思考）。目前，"哪个模型处理这个步骤"的决定是你在代码中做出的，基于你的评估结果。模型无法在每个步骤级别上自我路由——你的分发代码来做这件事。</p>
+          <p>未来方向很有意思：一个单一的 API 端点，按请求决定投入多少算力。截至 2026 年中，这已部分可用（带自动预算的扩展思考），但还没有达到"在这次转轮中自动在 Haiku 和 Sonnet 之间选择"的程度。请持续关注。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>延迟：流式输出、并行化，以及感知延迟与实际延迟的分离。</h3>
+
+      <p>成本与延迟的优化杠杆有重叠，但并不完全相同。延迟方面有两种模式尤为重要：流式输出（不减少总时长，但能大幅改善感知时长）和并行工具执行（确实能减少总时长，有时幅度很大）。两者都值得单独讲解。</p>
+
+      <h4>感知延迟与实际延迟的分离</h4>
+
+      <p>第一个概念转变：<strong>用户关心的是感知延迟（perceived latency），而不是实际延迟（actual latency）</strong>。感知延迟是用户感觉自己在等待的时长，它主要由用户看到<em>任何内容</em>之前的等待时间决定。实际延迟是智能体从开始到完成所花的时间。这两个数字可以相差很大。</p>
+
+      <p>一个需要 12 秒才能产出完整答案、前 11 秒屏幕上什么都没有的智能体，感觉很慢。同样的智能体需要 12 秒产出完整答案，但在 0.8 秒时就开始显示令牌，感觉很快——尽管实际延迟完全相同。用户在智能体生成的同时阅读内容；他们的等待时间是直到<em>有内容可读</em>的时间，而不是生成完成的时间。</p>
+
+      <p>这是流式输出（streaming）的根本理由，也是为什么流式输出在任何面向用户的智能体中都是不可或缺的。</p>
+
+      <h4>流式输出，从协议层讲起</h4>
+
+      <p>Anthropic 和 OpenAI 都通过服务器发送事件（Server-Sent Events）支持流式输出。模型每次生成一个令牌，并在产出时立即发送。客户端（浏览器、移动应用、终端）消费这个流，令牌到达时立即显示。</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># Streaming with the Anthropic SDK</span>
+<span class="c-kw">async with</span> client.messages.stream(
+    model=<span class="c-st">"claude-sonnet-4-5"</span>,
+    max_tokens=<span class="c-st">2048</span>,
+    messages=messages,
+) <span class="c-kw">as</span> stream:
+    <span class="c-kw">async for</span> text <span class="c-kw">in</span> stream.text_stream:
+        <span class="c-cm"># Yield each token to the client as it arrives.</span>
+        <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"token"</span>, <span class="c-st">"text"</span>: text}
+
+    final = <span class="c-kw">await</span> stream.get_final_message()
+    <span class="c-cm"># final.usage has the token counts; useful for cost tracking</span></pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># Streaming with the OpenAI SDK (Responses API)</span>
+stream = client.responses.stream(
+    model=<span class="c-st">"gpt-5.5"</span>,
+    input=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: message}],
+)
+<span class="c-kw">with</span> stream <span class="c-kw">as</span> s:
+    <span class="c-kw">for</span> event <span class="c-kw">in</span> s:
+        <span class="c-kw">if</span> event.<span class="c-kw">type</span> == <span class="c-st">"response.output_text.delta"</span>:
+            <span class="c-kw">yield</span> {<span class="c-st">"type"</span>: <span class="c-st">"token"</span>, <span class="c-st">"text"</span>: event.delta}
+
+    <span class="c-cm"># final response, with full output and usage</span>
+    final = s.get_final_response()</pre>
+      </div>
+
+      <p>流式端点需要追踪的两个指标：</p>
+
+      <ul>
+        <li><strong>首令牌时间（time to first token，TTFT）</strong>：第一段输出出现之前的等待时长。这个数字定义了感知延迟。健康值：1 秒以内。值得关注：超过 2 秒。反映输入处理速度。</li>
+        <li><strong>每秒令牌数（tokens per second，TPS）</strong>：令牌开始流出后的生成速度。Sonnet 通常为 30-80 TPS；Haiku 更快。这影响用户在等待其余内容时的阅读体验。重要性低于 TTFT，但值得监控。</li>
+      </ul>
+
+      <p>TTFT 是需要优化的指标。如果你的 TTFT 是 3 秒，即使 TPS 很快也没用——用户盯着空白屏幕等了三秒，已经得出结论说你的产品很慢。先降低 TTFT。</p>
+
+      <h4>哪些因素能压低 TTFT</h4>
+
+      <p>对 TTFT 影响最大的因素是<strong>输入令牌数量</strong>。模型必须处理完每一个输入令牌，才能产出第一个输出令牌。对于 10K 输入的提示词，即使在生成开始之前，Sonnet 通常也需要 500-1500ms 来处理。将输入通过更好的上下文管控削减到 3K，TTFT 就能降到 200-500ms。</p>
+
+      <p>其他因素：</p>
+
+      <ul>
+        <li><strong>缓存命中</strong>能大幅降低 TTFT，因为缓存令牌跳过了处理步骤。命中缓存的请求，TTFT 通常比同一请求冷缓存写入时低 30–50%。</li>
+        <li><strong>模型大小</strong>：在相同输入规模下，Haiku 的 TTFT 通常是 Sonnet 的 30-50%。</li>
+        <li><strong>服务端负载</strong>：提供商侧的延迟随其基础设施繁忙程度而变化。这不太在你的控制之内，但响应头中的 <code class="inline">x-request-id</code> 可以让你在某些情况看起来异常时与他们的仪表板关联查询。</li>
+      </ul>
+
+      <h4>并行工具调用</h4>
+
+      <p>第二个延迟杠杆是并发执行。从第 0.3 章你已经知道，智能体可以在一次转轮中触发多个工具调用。本章的问题是：拿到这些调用后<em>怎么</em>处理——串行还是并行？</p>
+
+      <p>朴素的分发器按顺序迭代工具调用：</p>
+
+<pre class="standalone"><span class="c-cm"># Naive: sequential — wastes latency</span>
+<span class="c-kw">for</span> block <span class="c-kw">in</span> tool_use_blocks:
+    result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+    results.append(result)
+<span class="c-cm"># 3 tools × 400ms each = 1.2s</span></pre>
+
+      <p>生产级分发器并发运行它们：</p>
+
+<pre class="standalone"><span class="c-cm"># Production: parallel — bounded latency = max(individual)</span>
+<span class="c-kw">async def</span> <span class="c-fn">run_one</span>(block):
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+        <span class="c-kw">return</span> tool_result_block(block.id, result)
+    <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+        <span class="c-kw">return</span> tool_result_block(block.id, <span class="c-kw">f</span><span class="c-st">"Error: {e}"</span>, is_error=<span class="c-kw">True</span>)
+
+results = <span class="c-kw">await</span> asyncio.gather(*[run_one(b) <span class="c-kw">for</span> b <span class="c-kw">in</span> tool_use_blocks])
+<span class="c-cm"># 3 tools × 400ms each ≈ 450ms (longest + overhead)</span></pre>
+
+      <p>对于一个在单次转轮中触发 5 次检索调用的研究智能体，这是 2 秒与 400 毫秒的差距。免费的延迟改善——无需质量权衡。</p>
+
+      <p>注意事项：改变状态的工具（写入、发送、删除）不应盲目并行化。两个并发的 <code class="inline">delete_record</code> 调用可能产生竞争。安全的模式：将工具分为只读和改变状态两类；并行化前者，串行化后者。</p>
+
+      <h4>延迟预算</h4>
+
+      <p>设定每次转轮的延迟预算并强制执行。对于交互式智能体，3 秒是感知延迟的合理上限（TTFT 低于 1s，短回答的总响应时间低于 3s；只要智能体一路展示进度，更长的时间也可以接受）。</p>
+
+      <p>预算框架：</p>
+
+      <pre class="standalone">For a multi-turn agent, the budget at each step:
+  ─ Pre-flight (auth, validation, cache lookup):   &lt; 50ms
+  ─ Initial model call (routing/tool decision):    &lt; 1500ms
+  ─ Tool execution (in parallel):                  &lt; 1000ms (max of any individual)
+  ─ Synthesis call:                                &lt; 2500ms (with TTFT &lt; 800ms)
+  ─ Network/streaming overhead:                    &lt; 200ms
+
+Total budget: ~5s, with TTFT under 1s.
+
+For agents that legitimately need more time (deep research, long
+synthesis), use Pattern B from chapter 2.4 — submit/poll with
+streaming events.  The latency budget then applies per-event,
+not per-end-to-end-response.</pre>
+
+      <p>关键在于：对预算的每个组成部分都进行埋点。当智能体感觉很慢时，查看跨度树（第 2.1 章），找到超出预算的组件。通常是模型调用（输入太大、没有缓存命中）或串行工具执行。两者都可以修复。</p>
+
+      <h4>推测性执行：当延迟真的至关重要时</h4>
+
+      <p>对于高要求的延迟场景，有一种进阶技术：<strong>在上一步完成之前，就基于对下一步需要什么的猜测，提前开始下一步的工作</strong>。</p>
+
+      <p>例子：研究智能体的路由步骤决定是搜索文档、搜索网页，还是直接回答。三个选项，概率大致相等。与其等待路由决策出来再开始任何工作，你可以并行触发全部三次搜索——提前预热——然后只使用路由步骤实际选择的那条路径的结果。</p>
+
+      <p>这会花 3 倍的工具执行费用，但能将感知延迟缩短为（路由调用时间，工具调用时间）的最大值，而不是二者之和。只有当延迟确实至关重要、且推测成本较小时才值得这样做（工具调用远比模型调用便宜，所以这个权衡往往划算）。</p>
+
+      <p>对大多数智能体来说这是过度工程化。但对于在响应速度上竞争的聊天机器人、或每 100ms 都很关键的交易/实时智能体，这是正确的选择。不要提前采用；当感知延迟成为用户满意度的瓶颈、且你已经穷尽了更简单的杠杆之后，再考虑它。</p>
+
+      <h4>正确形态是什么样的</h4>
+
+      <p>把所有这些综合起来，一个优化良好的生产智能体是这样的：</p>
+
+      <div class="diagram">┌─────────────────────────────────────────────────────────────┐
+│  WHAT A WELL-OPTIMIZED AGENT LOOK LIKE                      │
+│                                                             │
+│  Cost shape:                                                │
+│   ─ Cache hit ratio: 60-80%                                 │
+│   ─ Routing/dispatch on Haiku-tier model                    │
+│   ─ Synthesis on Sonnet-tier (Opus only for hard cases)     │
+│   ─ Context budget per turn: monitored, &lt; 10K typical       │
+│   ─ Total cost per turn: $0.01-0.05 typical                 │
+│                                                             │
+│  Latency shape:                                             │
+│   ─ TTFT under 1 second on cached prefix                    │
+│   ─ Multi-tool turns run in parallel via asyncio.gather     │
+│   ─ Streaming SSE to client (perceived latency &lt;&lt; actual)   │
+│   ─ Total interactive turn: 3-5 seconds end-to-end          │
+│                                                             │
+│  Observability:                                             │
+│   ─ Span tree per turn with model, tokens, cache, latency   │
+│   ─ Per-day dashboard: cost, latency P50/P95, cache ratio   │
+│   ─ Alerts on cache ratio drop, latency spike, cost spike   │
+└─────────────────────────────────────────────────────────────┘</div>
+
+      <p>这是让你能够可持续地服务真实用户的形态。这些数字没有一个是第一天就能达到的——你需要用本章的杠杆迭代地趋近它们，用第 2.1 章可观测性工作提供的度量数据，判断自己是否在移动正确的指标。</p>
+
+      <div class="callout tip">
+        <p>对一个新智能体应用本章技术的正确顺序：(1) 对四个成本/延迟指标进行埋点；(2) 在最大的稳定前缀上实施提示词缓存；(3) 每次换一个步骤推出模型级联，通过评估套件验证；(4) 审查工具分发器，找出本该并行却串行的地方；(5) 如果还没有，启用流式输出；(6) 为每个步骤设定延迟预算，并对超标发出告警。每个步骤都是一天的投入，在一周的生产流量之内即可回本。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我的智能体 TTFT 是 4 秒。我该从哪里排查？</div>
+        <div class="answer">
+          <p>4 秒的 TTFT 偏高；缓存命中时预期值低于 1s，典型输入规模的冷缓存预期值低于 2s。诊断顺序：</p>
+          <ul>
+            <li><strong>检查输入令牌数量。</strong> 如果你每次请求向 Sonnet 发送 50K 令牌，2-4s 的 TTFT 是预期的代价。通过上下文裁剪或缓存命中减少输入。</li>
+            <li><strong>检查缓存命中率。</strong> 如果接近零，你每次调用都在支付完整的处理成本。参见 STEP 2 中的反模式。</li>
+            <li><strong>检查模型档位。</strong> Opus 的 TTFT 明显高于 Sonnet，Sonnet 高于 Haiku。如果你在用 Opus，在能降级的地方降级。</li>
+            <li><strong>检查提供商侧状况。</strong> 推理集群有时处于高负载状态。查看提供商状态页面，以及响应头中的 request-id。</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">同时支持流式和非流式会增加代码库的复杂性吗？</div>
+        <div class="answer">
+          <p>可能会——如果你有"生成文本"和"流式文本"两条代码路径，它们往往会发散。最简洁的模式：<strong>内部始终使用流式</strong>，让非流式代码路径成为一个将流消费成单一字符串的薄包装层。这样智能体循环是单一形态（异步生成器），"非流式"只是消费输出的另一种方式。</p>
+          <p>对于不需要流式输出的工具调用，流式开销可以忽略不计（几毫秒）。统一形态带来的好处远超过这点开销。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">Batch API 在哪里适用？</div>
+        <div class="answer">
+          <p>Batch API 对输入和输出令牌均提供 50% 折扣，处理窗口为 24 小时。它可以与提示词缓存叠加（所以批处理中的缓存读取为 0.5× × 0.1× = 基础输入价格的 0.05×）。缺点：它是异步的且很慢。你提交一个批次，稍后再来查看结果。</p>
+          <p>对于交互式智能体，批处理是无关的——你的延迟预算是秒级，不是小时级。对于离线工作负载（评估套件运行、批量文档处理、训练数据生成、定期报告），批处理可以是正确答案。不要试图将批处理硬塞进实时路径；那不是它的用途。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 2.2</div>
+      <h3>交付物</h3>
+      <p>一个在成本和延迟上有纪律的智能体：每次模型调用都有埋点指标，提示词缓存在稳定前缀上激活且命中率 60-80%，模型级联将档位与任务难度匹配，独立的工具并行分发，交互路径启用流式输出。清晰理解账单从哪里来（输入令牌，跨转轮积累）以及时间从哪里去（模型调用，大多串行）。这个心智模型能将"优化成本"和"优化延迟"从模糊愿望变成你知道如何拨动的具体杠杆。这是让智能体以真实成本基础服务真实用户的经济底座。</p>
+      <ul class="checklist">
+        <li>令牌级埋点：每次模型调用的 input、output、cache_creation、cache_read、latency</li>
+        <li>提示词缓存在最大稳定前缀上启用；最小 1,024（Sonnet）/ 4,096（Opus）令牌</li>
+        <li>缓存命中率仪表板，并对低于阈值发出告警</li>
+        <li>反模式审计：缓存区域中无时间戳、无用户特定数据、空白字符已归一化</li>
+        <li>模型级联：Haiku 用于路由，Sonnet 用于综合，Opus 仅在可测量地需要时使用</li>
+        <li>每个级联决策均通过评估套件验证，有预测值和实测增量（delta）</li>
+        <li>通过 asyncio.gather 并行分发工具调用；改变状态的工具串行执行</li>
+        <li>交互式端点启用 SSE 流式输出；非流式作为薄包装层</li>
+        <li>TTFT 已度量并追踪；目标为缓存命中时低于 1s</li>
+        <li>每步延迟预算已定义并强制执行；对超标发出告警</li>
+        <li>Batch API 用于离线工作负载（评估、文档处理）；标准模式用于交互式</li>
+      </ul>
+    </div>
+
+
+  </section>

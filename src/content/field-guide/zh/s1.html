@@ -1,0 +1,767 @@
+<section class="phase">
+    <div class="phase-num">2.1</div>
+    <div class="week">第二部分 / 上线 · 让后续三章成为可能的章节</div>
+    <h2>可观测性（Observability）：每次运行都留下可读的追踪。</h2>
+    <p class="goal">一个在生产环境中因不明原因失败的智能体（agent），就是一个无法上线的智能体。本章将每次模型调用、工具调用（tool calling）和检索（retrieval）接入一棵跨度树（span tree），遵循 OpenTelemetry GenAI 规范；搭建能在 <code class="inline">asyncio.gather</code> 中正常工作的结构化日志；并提供一个回放 CLI，接受追踪（trace）ID，用完全相同的工具结果在本地重现智能体运行过程。第一次在五分钟而不是五小时内定位一个生产故障时，你就会明白这一章的价值。</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>为什么 <code class="inline">print()</code> 会失效。</h3>
+
+      <p>你一直在用散落于循环各处的 <code class="inline">print()</code> 语句调试智能体。在你是唯一用户、一次只跑一个请求、盯着终端滚屏的时候，这没问题。但一旦上述任何条件改变，它就会立刻失效。</p>
+
+      <p>让我带你过一个具体的故障模式，因为动机是实实在在的。你的智能体已部署。某用户提交了一个工单："我问的是 Q3 发票，它却给了我 Q1 的内容。"你去查日志，看到的是：</p>
+
+<pre class="trace standalone"><span class="c-out">[2026-03-14 10:42:13] INFO  request received: "show me Q3 invoices"
+[2026-03-14 10:42:13] INFO  calling search_docs
+[2026-03-14 10:42:14] INFO  search_docs returned 5 results
+[2026-03-14 10:42:14] INFO  calling search_docs
+[2026-03-14 10:42:15] INFO  search_docs returned 3 results
+[2026-03-14 10:42:16] INFO  calling answer
+[2026-03-14 10:42:18] INFO  request complete (5.2s)
+[2026-03-14 10:42:13] INFO  request received: "where do I update billing"
+[2026-03-14 10:42:14] INFO  calling fetch_doc
+[2026-03-14 10:42:14] INFO  fetch_doc returned
+[2026-03-14 10:42:15] INFO  calling answer
+[2026-03-14 10:42:16] INFO  request complete (3.1s)</span></pre>
+
+      <p>仔细读这些行。至少有两个并发请求交织在一起。你无法分辨哪次 <code class="inline">search_docs</code> 调用属于哪个用户，看不到工具实际收到了什么查询、返回了什么结果、模型接下来做出了什么决策，也看不到用户最终收到了什么回答。有的只是时间戳和工具名称。仅此而已。</p>
+
+      <p>这就是生产调试的悬崖。单用户、顺序执行、REPL 驱动的开发方式让你靠看滚屏就能得到所需的一切信息。一旦面对并发请求、异步工具层，以及一个指向具体故障的愤怒用户，你就需要 <code class="inline">print()</code> 给不了你的三样东西：</p>
+
+      <ul>
+        <li><strong>关联性。</strong> 每条日志都必须标明它属于哪个请求。</li>
+        <li><strong>结构性。</strong> "Calling search_docs" 毫无价值；"search_docs(query='Q3 invoices', filter='date>=2025-07-01')" 才有价值。</li>
+        <li><strong>层次性。</strong> 调用发生在调用之内。智能体循环包含模型调用，模型调用决定发起工具调用，工具调用又触发数据库查询。这种嵌套关系是不可或缺的上下文。</li>
+      </ul>
+
+      <h4>跨度树作为正确的数据模型</h4>
+
+      <p>能同时给你这三样东西的数据结构是<strong>跨度树（span tree）</strong>。一个跨度（span）代表一次操作——一次模型调用、一次工具调用、一次检索、一次智能体运行。它有开始时间、结束时间、唯一 ID、父跨度 ID（若为根节点则为空）、名称，以及一袋描述发生了什么的属性。跨度可以嵌套：子跨度在父跨度之后开始，在父跨度之前结束。</p>
+
+      <p>对于一次智能体运行，这棵树看起来是这样的：</p>
+
+      <div class="diagram">invoke_agent  "user asks about Q3 invoices"   ┐
+├─ chat       claude-sonnet-4-5  3 turns       │  parent span
+│             input: 2,341 tok   out: 412 tok  │
+│  ├─ execute_tool  search_docs                │
+│  │              args: {query: "Q3 invoices"} │
+│  │              result: 5 chunks             │
+│  ├─ execute_tool  search_docs                │
+│  │              args: {query: "Q3 2025"}     │
+│  │              result: 3 chunks             │
+│  └─ chat       claude-sonnet-4-5  synthesis  │
+│                output: "Your Q3 invoices..." │
+└─ duration: 5.2s    tokens: 2,753   cost: $0.034 ┘</div>
+
+      <p>有了这样一棵跨度树，你可以回答：智能体用了哪些工具？传入了什么参数？按什么顺序执行？有没有失败？每次各花了多长时间？每次模型调用消耗了多少令牌（token）？最终回答是什么？这些问题你都能在几秒内回答，只需按追踪 ID 查询任何历史请求。</p>
+
+      <h4>OpenTelemetry GenAI 规范</h4>
+
+      <p>这不是什么新发明。OpenTelemetry——已经作为大多数生产追踪基础的可观测性标准——设有专门针对 LLM 和智能体语义的工作组，并发布了一套词汇表。截至 2026 年，这些规范仍标记为实验性，但字段名称已趋于稳定，各大厂商（Datadog、Grafana、Langfuse、Braintrust）均已支持。使用这些名称而不是自造一套，意味着你的追踪数据能直接接入现成工具。</p>
+
+      <p>本章其余部分将用到的核心跨度名称和属性：</p>
+
+      <div class="threat-grid">
+        <div class="threat-row header">
+          <div>跨度名称</div>
+          <div>何时发出</div>
+          <div>关键属性</div>
+        </div>
+        <div class="threat-row">
+          <div class="name">invoke_agent</div>
+          <div class="vector">每次智能体运行一次（顶层）</div>
+          <div class="defense"><code class="inline">gen_ai.agent.name</code>、<code class="inline">gen_ai.conversation.id</code>、<code class="inline">user.id</code></div>
+        </div>
+        <div class="threat-row">
+          <div class="name">chat</div>
+          <div class="vector">每次模型调用</div>
+          <div class="defense"><code class="inline">gen_ai.request.model</code>、<code class="inline">gen_ai.usage.input_tokens</code>、<code class="inline">gen_ai.usage.output_tokens</code>、<code class="inline">gen_ai.response.finish_reasons</code></div>
+        </div>
+        <div class="threat-row">
+          <div class="name">execute_tool</div>
+          <div class="vector">每次工具分发</div>
+          <div class="defense"><code class="inline">gen_ai.tool.name</code>、<code class="inline">gen_ai.tool.call.id</code>，以及你自己的 args/result</div>
+        </div>
+      </div>
+
+      <p>当你选择启用时，跨度还会携带对话内容：<code class="inline">gen_ai.system_instructions</code>、<code class="inline">gen_ai.input.messages</code> 和 <code class="inline">gen_ai.output.messages</code>。这些字段体量较大且包含用户数据，因此按条件记录——详见下文。</p>
+
+      <div class="callout tip">
+        <p>你不需要 OpenTelemetry 收集器或厂商账号才能上手。数据模型才是关键所在——一旦你的智能体能产出带有这些名称和属性的跨度，之后可以随时将其发送到任何地方：JSONL 文件、Langfuse、Datadog、你自己的 Postgres。先定数据模型，再定目的地。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我的智能体是同步运行的。单用户，本地 CLI。真的需要跨度吗？</div>
+        <div class="answer">
+          <p>如果你永远不会并发运行、永远不会部署、也永远不需要调试十分钟前发生的故障——那不需要，print 就够了。但这是一个很短的清单。一旦你在智能体前面加了一个 FastAPI 处理器（第 2.4 章），或者跑一个同时触发 50 条轨迹的评估套件（第 1.4 章），交织的日志就会变得不可读。现在加跨度没有任何成本；等到你有了一堆没有考虑关联性的代码路径再加，代价就很高了。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">为什么是"跨度"，而不是普通的结构化 JSON 日志？</div>
+        <div class="answer">
+          <p>跨度<em>就是</em>结构化 JSON 日志，只是多了普通日志没有的两个结构：时长（开始/结束时间对）和父指针。正是这两个字段让你能渲染出上面的树状视图。没有它们，你只有一条扁平的事件流；有了它们，你就有了一个可以导航的层次结构。现代可观测性工具（Langfuse、Braintrust、Datadog 等）需要这种结构，因为它们的 UI 本质上就是树状视图。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>为循环插桩。</h3>
+
+      <p>现在进入工程实现。我们将直接使用 OpenTelemetry SDK，为第 1.1 章的智能体循环添加追踪。无论跨度最终去向何处，模式都是一样的——本步骤结束时，我们先把它们指向一个本地开发用的 JSONL 文件；章节末尾，你可以将导出器（exporter）换成 Langfuse、Braintrust 或任何兼容 OTLP 的后端，代码零改动。</p>
+
+      <h4>最小化配置</h4>
+
+      <p>三个组件：追踪器（给你跨度）、导出器（将跨度发送到某处）、处理器（高效批处理）。在应用启动时一次性配置：</p>
+
+<pre class="standalone"><span class="c-cm"># obs/tracing.py</span>
+<span class="c-kw">from</span> opentelemetry <span class="c-kw">import</span> trace
+<span class="c-kw">from</span> opentelemetry.sdk.trace <span class="c-kw">import</span> TracerProvider
+<span class="c-kw">from</span> opentelemetry.sdk.trace.export <span class="c-kw">import</span> BatchSpanProcessor
+<span class="c-kw">from</span> opentelemetry.sdk.trace.export <span class="c-kw">import</span> ConsoleSpanExporter
+<span class="c-kw">from</span> opentelemetry.sdk.resources <span class="c-kw">import</span> Resource
+
+<span class="c-kw">def</span> <span class="c-fn">init_tracing</span>(service_name: <span class="c-kw">str</span> = <span class="c-st">"my-agent"</span>):
+    resource = Resource.create({<span class="c-st">"service.name"</span>: service_name})
+    provider = TracerProvider(resource=resource)
+
+    <span class="c-cm"># For now: dump spans to stdout as JSON. Swap for OTLPSpanExporter</span>
+    <span class="c-cm"># pointed at Langfuse / Braintrust / Datadog later — zero other changes.</span>
+    provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    trace.set_tracer_provider(provider)
+
+tracer = trace.get_tracer(<span class="c-st">"agent"</span>)</pre>
+
+      <h4>包裹智能体循环</h4>
+
+      <p>现在我们包裹三个关键点：顶层运行、每次模型调用、每次工具分发。与第 1.1 章的裸循环相比，唯一的区别是 <code class="inline">with tracer.start_as_current_span(...)</code> 包裹器和属性设置。</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># agent/loop.py — instrumented version</span>
+<span class="c-kw">from</span> opentelemetry <span class="c-kw">import</span> trace
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+<span class="c-kw">from</span> uuid <span class="c-kw">import</span> uuid4
+
+tracer = trace.get_tracer(<span class="c-st">"agent"</span>)
+client = Anthropic()
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_msg: <span class="c-kw">str</span>, user_id: <span class="c-kw">str</span>):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"invoke_agent"</span>) <span class="c-kw">as</span> root:
+        root.set_attribute(<span class="c-st">"gen_ai.agent.name"</span>, <span class="c-st">"research-assistant"</span>)
+        root.set_attribute(<span class="c-st">"gen_ai.conversation.id"</span>, <span class="c-kw">str</span>(uuid4()))
+        root.set_attribute(<span class="c-st">"user.id"</span>, user_id)
+
+        messages = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_msg}]
+        <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(<span class="c-st">20</span>):  <span class="c-cm"># budget</span>
+            response = <span class="c-kw">await</span> _chat(messages)
+            messages.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>,
+                             <span class="c-st">"content"</span>: response.content})
+
+            <span class="c-kw">if</span> response.stop_reason == <span class="c-st">"end_turn"</span>:
+                root.set_attribute(<span class="c-st">"gen_ai.response.finish_reasons"</span>,
+                                   [<span class="c-st">"end_turn"</span>])
+                <span class="c-kw">return</span> response.content[<span class="c-st">0</span>].text
+
+            tool_results = []
+            <span class="c-kw">for</span> block <span class="c-kw">in</span> response.content:
+                <span class="c-kw">if</span> block.<span class="c-kw">type</span> == <span class="c-st">"tool_use"</span>:
+                    result = <span class="c-kw">await</span> _dispatch_tool(block)
+                    tool_results.append({
+                        <span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                        <span class="c-st">"tool_use_id"</span>: block.id,
+                        <span class="c-st">"content"</span>: result,
+                    })
+            messages.append({<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: tool_results})
+
+<span class="c-kw">async def</span> <span class="c-fn">_chat</span>(messages):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"chat"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.request.model"</span>, <span class="c-st">"claude-sonnet-4-5"</span>)
+        span.set_attribute(<span class="c-st">"gen_ai.provider.name"</span>, <span class="c-st">"anthropic"</span>)
+        response = client.messages.create(
+            model=<span class="c-st">"claude-sonnet-4-5"</span>,
+            max_tokens=<span class="c-st">4096</span>,
+            tools=TOOLS,
+            messages=messages,
+        )
+        span.set_attribute(<span class="c-st">"gen_ai.usage.input_tokens"</span>,
+                           response.usage.input_tokens)
+        span.set_attribute(<span class="c-st">"gen_ai.usage.output_tokens"</span>,
+                           response.usage.output_tokens)
+        span.set_attribute(<span class="c-st">"gen_ai.response.finish_reasons"</span>,
+                           [response.stop_reason])
+        <span class="c-kw">return</span> response
+
+<span class="c-kw">async def</span> <span class="c-fn">_dispatch_tool</span>(block):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"execute_tool"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.tool.name"</span>, block.name)
+        span.set_attribute(<span class="c-st">"gen_ai.tool.call.id"</span>, block.id)
+        span.set_attribute(<span class="c-st">"tool.args"</span>, json.dumps(block.<span class="c-kw">input</span>))
+        <span class="c-kw">try</span>:
+            result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+            span.set_attribute(<span class="c-st">"tool.result_size"</span>, <span class="c-kw">len</span>(<span class="c-kw">str</span>(result)))
+            <span class="c-kw">return</span> result
+        <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+            span.set_attribute(<span class="c-st">"error.type"</span>, <span class="c-kw">type</span>(e).__name__)
+            span.record_exception(e)
+            <span class="c-kw">raise</span></pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># agent/loop.py — instrumented version</span>
+<span class="c-kw">from</span> opentelemetry <span class="c-kw">import</span> trace
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+<span class="c-kw">from</span> uuid <span class="c-kw">import</span> uuid4
+
+tracer = trace.get_tracer(<span class="c-st">"agent"</span>)
+client = OpenAI()
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_msg: <span class="c-kw">str</span>, user_id: <span class="c-kw">str</span>):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"invoke_agent"</span>) <span class="c-kw">as</span> root:
+        root.set_attribute(<span class="c-st">"gen_ai.agent.name"</span>, <span class="c-st">"research-assistant"</span>)
+        root.set_attribute(<span class="c-st">"gen_ai.conversation.id"</span>, <span class="c-kw">str</span>(uuid4()))
+        root.set_attribute(<span class="c-st">"user.id"</span>, user_id)
+
+        <span class="c-cm"># Responses API maintains state via previous_response_id</span>
+        prev_id = <span class="c-kw">None</span>
+        current_input = user_msg
+        <span class="c-kw">for</span> step <span class="c-kw">in</span> <span class="c-kw">range</span>(<span class="c-st">20</span>):
+            response = <span class="c-kw">await</span> _chat(current_input, prev_id)
+            prev_id = response.id
+
+            tool_calls = [item <span class="c-kw">for</span> item <span class="c-kw">in</span> response.output
+                          <span class="c-kw">if</span> item.<span class="c-kw">type</span> == <span class="c-st">"function_call"</span>]
+            <span class="c-kw">if</span> <span class="c-kw">not</span> tool_calls:
+                root.set_attribute(<span class="c-st">"gen_ai.response.finish_reasons"</span>,
+                                   [<span class="c-st">"stop"</span>])
+                <span class="c-kw">return</span> response.output_text
+
+            results = []
+            <span class="c-kw">for</span> call <span class="c-kw">in</span> tool_calls:
+                result = <span class="c-kw">await</span> _dispatch_tool(call)
+                results.append({
+                    <span class="c-st">"type"</span>: <span class="c-st">"function_call_output"</span>,
+                    <span class="c-st">"call_id"</span>: call.call_id,
+                    <span class="c-st">"output"</span>: <span class="c-kw">str</span>(result),
+                })
+            current_input = results
+
+<span class="c-kw">async def</span> <span class="c-fn">_chat</span>(input_data, previous_response_id):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"chat"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.request.model"</span>, <span class="c-st">"gpt-5.5"</span>)
+        span.set_attribute(<span class="c-st">"gen_ai.provider.name"</span>, <span class="c-st">"openai"</span>)
+        response = client.responses.create(
+            model=<span class="c-st">"gpt-5.5"</span>,
+            tools=TOOLS,
+            <span class="c-kw">input</span>=input_data,
+            previous_response_id=previous_response_id,
+        )
+        span.set_attribute(<span class="c-st">"gen_ai.usage.input_tokens"</span>,
+                           response.usage.input_tokens)
+        span.set_attribute(<span class="c-st">"gen_ai.usage.output_tokens"</span>,
+                           response.usage.output_tokens)
+        <span class="c-kw">return</span> response
+
+<span class="c-kw">async def</span> <span class="c-fn">_dispatch_tool</span>(call):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"execute_tool"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.tool.name"</span>, call.name)
+        span.set_attribute(<span class="c-st">"gen_ai.tool.call.id"</span>, call.call_id)
+        args = json.loads(call.arguments)
+        span.set_attribute(<span class="c-st">"tool.args"</span>, call.arguments)
+        <span class="c-kw">try</span>:
+            result = <span class="c-kw">await</span> HANDLERS[call.name](**args)
+            span.set_attribute(<span class="c-st">"tool.result_size"</span>, <span class="c-kw">len</span>(<span class="c-kw">str</span>(result)))
+            <span class="c-kw">return</span> result
+        <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+            span.set_attribute(<span class="c-st">"error.type"</span>, <span class="c-kw">type</span>(e).__name__)
+            span.record_exception(e)
+            <span class="c-kw">raise</span></pre>
+      </div>
+
+      <h4>你得到了什么</h4>
+
+      <p>跑一个查询，你会在 stdout 得到一串 JSON 跨度流。按树状顺序整理并美化输出：</p>
+
+<pre class="trace standalone"><span class="c-out">{
+  "name": "invoke_agent",
+  "trace_id": "8f3c2e1a9b4d5067...",
+  "span_id": "a0b1c2d3...",
+  "parent_span_id": null,
+  "start_time": "2026-03-14T10:42:13.412Z",
+  "end_time":   "2026-03-14T10:42:18.673Z",
+  "attributes": {
+    "gen_ai.agent.name": "research-assistant",
+    "gen_ai.conversation.id": "4e7a-9c2f-...",
+    "user.id": "u_8821",
+    "gen_ai.response.finish_reasons": ["end_turn"]
+  }
+}
+  {
+    "name": "chat",
+    "parent_span_id": "a0b1c2d3...",
+    "start_time": "10:42:13.420Z",
+    "end_time":   "10:42:14.108Z",
+    "attributes": {
+      "gen_ai.request.model": "claude-sonnet-4-5",
+      "gen_ai.provider.name": "anthropic",
+      "gen_ai.usage.input_tokens": 2341,
+      "gen_ai.usage.output_tokens": 89,
+      "gen_ai.response.finish_reasons": ["tool_use"]
+    }
+  }
+    {
+      "name": "execute_tool",
+      "parent_span_id": "a0b1c2d3..." (sibling of chat),
+      "attributes": {
+        "gen_ai.tool.name": "search_docs",
+        "gen_ai.tool.call.id": "toolu_01ABC...",
+        "tool.args": "{\"query\": \"Q3 invoices\"}",
+        "tool.result_size": 1842
+      }
+    }
+    ...</span></pre>
+
+      <div class="observe">
+        <div class="label">相比 print 方式的改变</div>
+        <p>原来是 print 的每一行，现在都变成了跨度上的一个属性。跨度的父指针编码了调用层次。追踪 ID 将每个跨度都关联到其发起请求——并发请求不会相互混淆，因为每个请求在顶层都有自己的追踪 ID。</p>
+        <p>树状结构是关键所在。一旦拥有它，市面上所有可观测性工具——Langfuse、Braintrust、Datadog、Honeycomb、Grafana——都能接入并给你一个 UI。你也可以把它导出为 JSONL，用 <code class="inline">jq</code> 查询。数据是可移植的。</p>
+      </div>
+
+      <h4>指向厂商</h4>
+
+      <p>一旦你的代码能发出跨度，将其发送到厂商只需改一行：换掉导出器。使用 Langfuse（免费套餐，专为 LLM 应用设计）：</p>
+
+<pre class="standalone"><span class="c-cm"># obs/tracing.py — Langfuse variant</span>
+<span class="c-kw">from</span> opentelemetry.exporter.otlp.proto.http.trace_exporter <span class="c-kw">import</span> (
+    OTLPSpanExporter
+)
+
+<span class="c-kw">def</span> <span class="c-fn">init_tracing</span>(service_name: <span class="c-kw">str</span> = <span class="c-st">"my-agent"</span>):
+    resource = Resource.create({<span class="c-st">"service.name"</span>: service_name})
+    provider = TracerProvider(resource=resource)
+
+    <span class="c-cm"># Replace ConsoleSpanExporter with OTLP pointed at Langfuse</span>
+    exporter = OTLPSpanExporter(
+        endpoint=<span class="c-st">"https://us.cloud.langfuse.com/api/public/otel/v1/traces"</span>,
+        headers={<span class="c-st">"Authorization"</span>: <span class="c-kw">f</span><span class="c-st">"Bearer {os.environ['LANGFUSE_KEY']}"</span>},
+    )
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)</pre>
+
+      <p>Braintrust、Datadog、Honeycomb 以及任何其他兼容 OTLP 的后端，区别仅在于 URL 和认证头。智能体代码无需改动。</p>
+
+      <h4>内容怎么办？</h4>
+
+      <p>你会注意到我没有把提示词（prompt）或补全内容放到跨度上。这是刻意为之——它们体量大，往往包含用户数据，而且你通常不希望把每一段检索出的文档文本都回写进可观测性存储。规范提供了 <code class="inline">gen_ai.input.messages</code> 和 <code class="inline">gen_ai.output.messages</code>，但建议按条件启用：</p>
+
+<pre class="standalone"><span class="c-cm"># Only record full content for sampled traces (1%) or for traces</span>
+<span class="c-cm"># flagged for inspection. Cheap to add per-call.</span>
+
+CAPTURE_CONTENT = os.environ.get(<span class="c-st">"CAPTURE_CONTENT"</span>) == <span class="c-st">"1"</span>
+
+<span class="c-kw">def</span> <span class="c-fn">should_capture</span>(trace_id: <span class="c-kw">str</span>) -> <span class="c-kw">bool</span>:
+    <span class="c-kw">if</span> CAPTURE_CONTENT: <span class="c-kw">return</span> <span class="c-kw">True</span>
+    <span class="c-cm"># Sample 1% by trace_id hash for ambient observability</span>
+    <span class="c-kw">return</span> <span class="c-kw">int</span>(trace_id[:<span class="c-st">8</span>], <span class="c-st">16</span>) % <span class="c-st">100</span> == <span class="c-st">0</span>
+
+<span class="c-kw">if</span> should_capture(span.context.trace_id):
+    span.set_attribute(<span class="c-st">"gen_ai.input.messages"</span>,
+                       json.dumps(messages)[:<span class="c-st">10000</span>])
+    span.set_attribute(<span class="c-st">"gen_ai.output.messages"</span>,
+                       json.dumps([b.model_dump() <span class="c-kw">for</span> b <span class="c-kw">in</span> response.content]))</pre>
+
+      <div class="callout warn">
+        <p>如果你处理的是受监管数据——医疗、金融、欧盟个人数据——请<em>先</em>咨询你的隐私团队，再开启全内容捕获。追踪就是日志；日志就是存储；存储有合规影响。上述 1% 采样模式之所以是生产环境默认值，原因正在于此。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">这些追踪不会拖慢我的智能体吗？</div>
+        <div class="answer">
+          <p>实际上不会。OpenTelemetry SDK 使用异步批处理器——跨度在内存中排队，在后台批量刷入导出器。热路径的开销约为每个跨度几微秒；即使一个智能体每次运行发出 20 个跨度，也只需付出个位数毫秒的代价。与单次 LLM 调用 800ms+ 的延迟相比，追踪成本几乎不可见。</p>
+          <p>真正可能造成损耗的地方是：在每个跨度上序列化巨大的提示词/补全内容作为属性。这就是为什么内容捕获要按条件启用。结构性属性（模型名称、令牌数、工具名称）体量很小，可以始终开启。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">该选哪个厂商——Langfuse、Braintrust、Datadog，还是别的？</div>
+        <div class="answer">
+          <p>实话实说：没有你感觉的那么重要，因为 OpenTelemetry 数据模型让它们可以互换。我的粗略启发式原则：</p>
+          <ul>
+            <li><strong>Langfuse</strong>——免费套餐最好，LLM 原生 UI，上手最简单。如果你是小团队，技术栈就是"纯 LLM"，选这个。</li>
+            <li><strong>Braintrust</strong>——评估（eval）集成最佳，对提示词工程工作流有自己的主张。如果第 1.4 章的评估是你团队的日常工作，选这个。</li>
+            <li><strong>Datadog / Honeycomb / Grafana</strong>——选公司已经在用的那个。针对 LLM 的专属功能正在快速追赶 LLM 原生工具；统一视图的价值很高。</li>
+            <li><strong>自建（仅 JSONL → SQLite）</strong>——个人项目完全可行，也是理解这些工具原理的正确答案。一旦有团队成员需要查看追踪，就不再可行了。</li>
+          </ul>
+          <p>锁定风险很低，因为数据模型是共享的。从一个迁移到另一个只需改配置，不需要重写代码。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>能在 <code class="inline">asyncio.gather</code> 中存活的日志。</h3>
+
+      <p>跨度负责结构化的故事：哪些操作发生了，按什么顺序，带什么属性。你还需要普通日志来讲述非结构化的故事——错误信息、调试上下文、你认为不值得单独建属性的中间值。问题是，一旦你在 <code class="inline">asyncio.gather</code> 内部越过 <code class="inline">await</code> 边界，普通的 Python <code class="inline">logging</code> 就会丢失与追踪树的连接。</p>
+
+      <p>具体来说，有一个难以察觉的失效方式：</p>
+
+<pre class="attack standalone"><span class="c-cm"># Naive logging — what NOT to do</span>
+<span class="c-kw">import</span> logging
+log = logging.getLogger(<span class="c-st">"agent"</span>)
+
+<span class="c-kw">async def</span> <span class="c-fn">fan_out_retrieval</span>(queries):
+    <span class="c-cm"># Logs from these concurrent calls interleave with no way</span>
+    <span class="c-cm"># to tell which log belongs to which query.</span>
+    <span class="c-kw">return</span> <span class="c-kw">await</span> asyncio.gather(*[search(q) <span class="c-kw">for</span> q <span class="c-kw">in</span> queries])
+
+<span class="c-kw">async def</span> <span class="c-fn">search</span>(query):
+    log.info(<span class="c-kw">f</span><span class="c-st">"searching for {query}"</span>)
+    results = <span class="c-kw">await</span> bm25.search(query)
+    log.info(<span class="c-kw">f</span><span class="c-st">"found {len(results)} results"</span>)
+    <span class="c-kw">return</span> results</pre>
+
+<pre class="trace standalone"><span class="c-out"># Log output during a concurrent run:
+INFO:agent:searching for Q3 invoices
+INFO:agent:searching for billing settings
+INFO:agent:found 12 results
+INFO:agent:searching for refund policy
+INFO:agent:found 3 results
+INFO:agent:found 8 results</span></pre>
+
+      <p>哪个结果数属于哪个查询？从日志里看不出来。这是 Step 1 提到的同一个关联性问题，只是出现在单个追踪内部。解决方法是通过 <code class="inline">contextvars</code> 传播上下文——Python 中让变量跟随异步任务而非线程的机制——并将该上下文绑定到每条日志记录上。</p>
+
+      <h4>模式</h4>
+
+      <p><code class="inline">structlog</code> + <code class="inline">contextvars</code> 给出最简洁的方案。大约十五行配置，之后每条日志行都自动携带追踪上下文：</p>
+
+<pre class="standalone"><span class="c-cm"># obs/logging.py</span>
+<span class="c-kw">import</span> structlog, logging, sys
+<span class="c-kw">from</span> opentelemetry <span class="c-kw">import</span> trace
+
+<span class="c-kw">def</span> <span class="c-fn">_add_trace_context</span>(logger, method_name, event_dict):
+    <span class="c-st">"""Pull current trace IDs from OpenTelemetry into log record."""</span>
+    span = trace.get_current_span()
+    ctx = span.get_span_context()
+    <span class="c-kw">if</span> ctx.is_valid:
+        event_dict[<span class="c-st">"trace_id"</span>] = <span class="c-kw">format</span>(ctx.trace_id, <span class="c-st">"032x"</span>)
+        event_dict[<span class="c-st">"span_id"</span>] = <span class="c-kw">format</span>(ctx.span_id, <span class="c-st">"016x"</span>)
+    <span class="c-kw">return</span> event_dict
+
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,  <span class="c-cm"># pull bound vars</span>
+        _add_trace_context,                       <span class="c-cm"># pull OTel IDs</span>
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt=<span class="c-st">"iso"</span>),
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+)
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, <span class="c-kw">format</span>=<span class="c-st">"%(message)s"</span>)
+
+log = structlog.get_logger(<span class="c-st">"agent"</span>)</pre>
+
+      <p>让这一切生效的两个关键：</p>
+
+      <ul>
+        <li><strong><code class="inline">merge_contextvars</code></strong>——拉入通过 <code class="inline">structlog.contextvars.bind_contextvars(...)</code> 绑定的所有变量。绑定的作用域是当前异步任务：<code class="inline">asyncio.gather</code> 为每个协程创建独立的上下文，因此绑定不会在并发调用之间泄漏。</li>
+        <li><strong><code class="inline">_add_trace_context</code></strong>——在日志发出时读取当前 OpenTelemetry 跨度 ID。每条日志行自动获得日志触发时活跃跨度的追踪 ID 和跨度 ID。</li>
+      </ul>
+
+      <h4>使用方式</h4>
+
+      <p>原来你写的是：</p>
+
+<pre class="attack standalone">log.info(<span class="c-kw">f</span><span class="c-st">"searching for {query}"</span>)  <span class="c-cm"># f-string concatenation</span></pre>
+
+      <p>现在你写：</p>
+
+<pre class="standalone">log.info(<span class="c-st">"searching"</span>, query=query, top_k=<span class="c-st">5</span>)</pre>
+
+      <p>在并发运行时，输出变成了：</p>
+
+<pre class="trace standalone"><span class="c-out">{"timestamp":"2026-03-14T10:42:13.421Z","level":"info","event":"searching",
+ "query":"Q3 invoices","top_k":5,
+ "trace_id":"8f3c2e1a9b4d50670c8...","span_id":"a0b1c2d3e4f50678"}
+{"timestamp":"2026-03-14T10:42:13.422Z","level":"info","event":"searching",
+ "query":"billing settings","top_k":5,
+ "trace_id":"8f3c2e1a9b4d50670c8...","span_id":"b1c2d3e4f5067890"}
+{"timestamp":"2026-03-14T10:42:13.890Z","level":"info","event":"found",
+ "query":"Q3 invoices","count":12,
+ "trace_id":"8f3c2e1a9b4d50670c8...","span_id":"a0b1c2d3e4f50678"}
+{"timestamp":"2026-03-14T10:42:13.894Z","level":"info","event":"found",
+ "query":"billing settings","count":8,
+ "trace_id":"8f3c2e1a9b4d50670c8...","span_id":"b1c2d3e4f5067890"}</span></pre>
+
+      <p>现在你可以用两种方式回答"哪个结果数属于哪个查询"：通过显式的 <code class="inline">query</code> 字段，或通过匹配 <code class="inline">span_id</code>。两种都有效。后者适用于碰巧没有重复查询字符串的日志。</p>
+
+      <h4>绑定更高层次的上下文</h4>
+
+      <p>在智能体运行的顶部，绑定 <code class="inline">user_id</code> 和任何你希望出现在后续每条日志行上的其他标识符：</p>
+
+<pre class="standalone"><span class="c-kw">from</span> structlog.contextvars <span class="c-kw">import</span> bind_contextvars, clear_contextvars
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_msg: <span class="c-kw">str</span>, user_id: <span class="c-kw">str</span>):
+    clear_contextvars()
+    bind_contextvars(user_id=user_id, agent=<span class="c-st">"research-assistant"</span>)
+
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"invoke_agent"</span>):
+        log.info(<span class="c-st">"agent_start"</span>, user_msg_len=<span class="c-kw">len</span>(user_msg))
+        <span class="c-cm"># ... agent loop ...</span>
+        log.info(<span class="c-st">"agent_done"</span>, duration_s=elapsed)</pre>
+
+      <p><code class="inline">run_agent</code> 内部任何地方发出的每条日志——包括来自工具处理器、检索代码、任何你调用的东西——都自动获得绑定的 <code class="inline">user_id</code>，这要归功于 <code class="inline">contextvars</code>。而且由于 <code class="inline">contextvars</code> 是异步任务作用域的，两个并发的 <code class="inline">run_agent</code> 调用不会互相踩踏各自的绑定。</p>
+
+      <h4>搜索与聚合</h4>
+
+      <p>一旦日志是带有追踪 ID 的结构化 JSON，两件事就变得轻而易举：</p>
+
+      <ul>
+        <li><strong>深入单个请求。</strong> <code class="inline">jq 'select(.trace_id=="8f3c...")' app.log</code> 输出该请求的每一条日志行。结合上一步的跨度树，你就拥有了完整的重建信息。</li>
+        <li><strong>跨请求聚合。</strong> <code class="inline">jq -s 'group_by(.event) | map({event:.[0].event, count:length})' app.log</code> 告诉你哪些事件触发频率最高。对于发现高频错误事件非常有用。</li>
+      </ul>
+
+      <p>大多数可观测性厂商也支持接入结构化日志，并在追踪和日志共享同一追踪 ID 时自动关联——Langfuse、Datadog、Honeycomb 都可以做到。你不必在追踪和日志之间二选一；两者都用，它们会相互引用。</p>
+
+      <div class="callout tip">
+        <p>如果本步骤只做一件事：把所有 <code class="inline">f"..."</code> 风格的日志消息换成 <code class="inline">log.info("event_name", field=value, ...)</code>。"每条日志都是带有具名字段的有类型事件"这一纪律，会让你受益多年。异步关联只是额外的收获。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我到处都在用标准 <code class="inline">logging</code> 模块。可以继续用吗？</div>
+        <div class="answer">
+          <p>可以。<code class="inline">structlog</code> 是对 <code class="inline">logging</code> 的包裹而非替换；它坐在标准处理器前面进行重新格式化。现有的 <code class="inline">logging.getLogger("foo").info("bar")</code> 调用继续有效——只是输出纯字符串而非结构化记录。你可以逐文件迁移。</p>
+          <p>最小有效步骤：不要迁移整个代码库。只迁移智能体循环和工具处理器——关联性最重要的地方——其余的留着不动。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">为什么用 <code class="inline">contextvars</code> 而不是线程本地存储？</div>
+        <div class="answer">
+          <p>线程本地存储是按操作系统线程隔离的；<code class="inline">asyncio</code> 在单个线程上运行多个任务。如果任务 A 中设置的绑定对共享同一线程的任务 B 可见，就会产生我们试图避免的关联性 bug。<code class="inline">contextvars</code> 是按异步任务隔离的，因此每个 <code class="inline">asyncio.gather</code> 的子任务都有自己独立的上下文。这正是 PEP 567 的设计初衷。</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>回放：在你的笔记本电脑上重现故障。</h3>
+
+      <p>你现在有了每次生产运行的跨度树，以及与之关联的结构化日志。这已经能帮你搞定大多数调试工作的 80%：读追踪，看到问题工具调用，定位问题结果。但对于另外 20%——你需要逐步走过智能体行为、改动一个提示词（prompt）、看看会有什么不同结果的 bug——你需要<strong>回放（replay）</strong>。</p>
+
+      <p>回放的含义是：取生产环境中的一个追踪 ID，用相同的输入重新运行智能体，但不真正调用工具，而是返回原始运行中记录的确切工具结果。模型看到的是与之前相同的上下文窗口（context window），以相同的方式走完循环，你可以在任何步骤暂停、变更或重新提示。这是智能体 AI 的调试器等价物。</p>
+
+      <h4>两件套架构</h4>
+
+      <p>要让回放生效，你需要在原始运行期间持久化工具 I/O，然后教会工具分发器在回放模式下查找已记录的结果。大约四十行代码。</p>
+
+<pre class="standalone"><span class="c-cm"># obs/replay.py</span>
+<span class="c-kw">import</span> json, contextvars
+<span class="c-kw">from</span> pathlib <span class="c-kw">import</span> Path
+
+REPLAY_DIR = Path(<span class="c-st">"runs/replay"</span>)
+REPLAY_DIR.mkdir(parents=<span class="c-kw">True</span>, exist_ok=<span class="c-kw">True</span>)
+
+<span class="c-cm"># When non-None, _dispatch_tool returns recorded results instead of</span>
+<span class="c-cm"># calling handlers. Set by the replay CLI.</span>
+replay_mode: contextvars.ContextVar = contextvars.ContextVar(
+    <span class="c-st">"replay_mode"</span>, default=<span class="c-kw">None</span>
+)
+
+<span class="c-kw">def</span> <span class="c-fn">recorder_path</span>(trace_id: <span class="c-kw">str</span>) -> Path:
+    <span class="c-kw">return</span> REPLAY_DIR / <span class="c-kw">f</span><span class="c-st">"{trace_id}.jsonl"</span>
+
+<span class="c-kw">def</span> <span class="c-fn">record</span>(trace_id: <span class="c-kw">str</span>, event: <span class="c-kw">dict</span>):
+    <span class="c-st">"""Append a tool I/O event to this trace's recording."""</span>
+    <span class="c-kw">with</span> recorder_path(trace_id).<span class="c-kw">open</span>(<span class="c-st">"a"</span>) <span class="c-kw">as</span> f:
+        f.write(json.dumps(event) + <span class="c-st">"\n"</span>)
+
+<span class="c-kw">def</span> <span class="c-fn">load_recording</span>(trace_id: <span class="c-kw">str</span>) -> <span class="c-kw">list</span>[<span class="c-kw">dict</span>]:
+    path = recorder_path(trace_id)
+    <span class="c-kw">if</span> <span class="c-kw">not</span> path.exists():
+        <span class="c-kw">raise</span> FileNotFoundError(<span class="c-kw">f</span><span class="c-st">"no recording for trace {trace_id}"</span>)
+    <span class="c-kw">return</span> [json.loads(line) <span class="c-kw">for</span> line <span class="c-kw">in</span> path.<span class="c-kw">open</span>()]</pre>
+
+      <h4>在正常运行时记录</h4>
+
+      <p>修改 <code class="inline">_dispatch_tool</code>，记录每个输入/输出对。我们用工具调用 ID（已在跨度上）作为查找键。记录以追踪 ID 为索引，因此每个请求的工具调用都在自己的文件里。</p>
+
+<pre class="standalone"><span class="c-cm"># Updated _dispatch_tool, replaces the version from Step 2</span>
+<span class="c-kw">async def</span> <span class="c-fn">_dispatch_tool</span>(block):
+    <span class="c-kw">with</span> tracer.start_as_current_span(<span class="c-st">"execute_tool"</span>) <span class="c-kw">as</span> span:
+        span.set_attribute(<span class="c-st">"gen_ai.tool.name"</span>, block.name)
+        span.set_attribute(<span class="c-st">"gen_ai.tool.call.id"</span>, block.id)
+
+        trace_id = <span class="c-kw">format</span>(span.get_span_context().trace_id, <span class="c-st">"032x"</span>)
+
+        <span class="c-cm"># REPLAY MODE: return recorded result, skip the real call</span>
+        recording = replay_mode.get()
+        <span class="c-kw">if</span> recording <span class="c-kw">is not</span> <span class="c-kw">None</span>:
+            recorded = next(
+                (e <span class="c-kw">for</span> e <span class="c-kw">in</span> recording <span class="c-kw">if</span> e[<span class="c-st">"call_id"</span>] == block.id),
+                <span class="c-kw">None</span>,
+            )
+            <span class="c-kw">if</span> recorded:
+                span.set_attribute(<span class="c-st">"replay.matched"</span>, <span class="c-kw">True</span>)
+                <span class="c-kw">return</span> recorded[<span class="c-st">"result"</span>]
+            <span class="c-cm"># Tool call wasn't in recording — model deviated from</span>
+            <span class="c-cm"># original trajectory. Flag it but continue with a real call.</span>
+            span.set_attribute(<span class="c-st">"replay.matched"</span>, <span class="c-kw">False</span>)
+
+        <span class="c-cm"># NORMAL MODE: call handler and record</span>
+        <span class="c-kw">try</span>:
+            result = <span class="c-kw">await</span> HANDLERS[block.name](**block.<span class="c-kw">input</span>)
+            record(trace_id, {
+                <span class="c-st">"call_id"</span>: block.id,
+                <span class="c-st">"tool"</span>: block.name,
+                <span class="c-st">"args"</span>: block.<span class="c-kw">input</span>,
+                <span class="c-st">"result"</span>: result,
+            })
+            <span class="c-kw">return</span> result
+        <span class="c-kw">except</span> Exception <span class="c-kw">as</span> e:
+            record(trace_id, {
+                <span class="c-st">"call_id"</span>: block.id,
+                <span class="c-st">"tool"</span>: block.name,
+                <span class="c-st">"args"</span>: block.<span class="c-kw">input</span>,
+                <span class="c-st">"error"</span>: <span class="c-kw">str</span>(e),
+            })
+            <span class="c-kw">raise</span></pre>
+
+      <h4>回放 CLI</h4>
+
+      <p>一条命令。接受追踪 ID，加载记录，在回放模式下针对原始用户消息运行智能体。</p>
+
+<pre class="standalone"><span class="c-cm"># scripts/replay.py</span>
+<span class="c-kw">import</span> argparse, asyncio
+<span class="c-kw">from</span> agent.loop <span class="c-kw">import</span> run_agent
+<span class="c-kw">from</span> obs.replay <span class="c-kw">import</span> load_recording, replay_mode
+
+parser = argparse.ArgumentParser()
+parser.add_argument(<span class="c-st">"trace_id"</span>)
+parser.add_argument(<span class="c-st">"--user-msg"</span>, required=<span class="c-kw">True</span>,
+                    help=<span class="c-st">"the original user message"</span>)
+args = parser.parse_args()
+
+recording = load_recording(args.trace_id)
+<span class="c-kw">print</span>(<span class="c-kw">f</span><span class="c-st">"loaded {len(recording)} tool events from trace {args.trace_id}"</span>)
+
+<span class="c-kw">async def</span> <span class="c-fn">main</span>():
+    token = replay_mode.set(recording)
+    <span class="c-kw">try</span>:
+        result = <span class="c-kw">await</span> run_agent(args.user_msg, user_id=<span class="c-st">"replay"</span>)
+        <span class="c-kw">print</span>(<span class="c-st">"---"</span>)
+        <span class="c-kw">print</span>(result)
+    <span class="c-kw">finally</span>:
+        replay_mode.reset(token)
+
+asyncio.run(main())</pre>
+
+      <h4>看起来是什么样子</h4>
+
+<pre class="trace standalone"><span class="c-out">$ python scripts/replay.py 8f3c2e1a9b4d... \
+    --user-msg "show me my Q3 invoices"
+
+loaded 3 tool events from trace 8f3c2e1a9b4d...
+
+[span: invoke_agent  agent=research-assistant  user=replay]
+  [span: chat  model=claude-sonnet-4-5  in=2341 out=89  finish=tool_use]
+  [span: execute_tool  tool=search_docs  replay.matched=True]
+  [span: execute_tool  tool=search_docs  replay.matched=True]
+  [span: chat  model=claude-sonnet-4-5  in=3104 out=271  finish=tool_use]
+  [span: execute_tool  tool=fetch_doc  replay.matched=True]
+  [span: chat  model=claude-sonnet-4-5  in=4892 out=412  finish=end_turn]
+---
+"Your Q3 2025 invoices are: INV-4421 ($2,300, paid),
+ INV-4438 ($1,150, outstanding), INV-4502 ($875, paid)..."</span></pre>
+
+      <p>你刚刚在笔记本电脑上重现了一次生产运行。从这里你可以：</p>
+
+      <ul>
+        <li>修改系统提示词并重新运行，看看新提示词是否会产生更好的回答（记录的工具结果仍然匹配，因为模型的工具调用不会改变形态）。</li>
+        <li>在 <code class="inline">_dispatch_tool</code> 内部加入 print 语句或断点，检查每一次记录的交互。</li>
+        <li>用不同的模型回放（Sonnet → Opus），在真实生产案例上进行 A/B 测试。</li>
+        <li>将追踪保存到评估（eval）集——它刚刚成为一个回归（regression）测试。</li>
+      </ul>
+
+      <h4>当回放偏离时</h4>
+
+      <p>如果你的改动导致模型发起了原始运行中没有的工具调用，你的记录就没有匹配项。上面的代码会在跨度上打印 <code class="inline">replay.matched=False</code>，然后回退到调用真实的处理器。这通常是正确的行为——你想看看会发生什么——但可能产生副作用（向用户收费、发送邮件）。为了回放安全，在回放激活时用一个标志门控状态变更工具并将其打桩：</p>
+
+<pre class="standalone"><span class="c-kw">if</span> replay_mode.get() <span class="c-kw">is not</span> <span class="c-kw">None</span> <span class="c-kw">and</span> POLICIES[block.name].scope != Scope.READ_ONLY:
+    <span class="c-kw">return</span> {<span class="c-st">"error"</span>: <span class="c-st">"state-changing tool stubbed during replay"</span>}</pre>
+
+      <p>（<code class="inline">Scope</code> 和 <code class="inline">POLICIES</code> 来自第 2.3 章安全。）只读工具始终可以安全回放；状态变更工具要么从记录中回放，要么返回一个打桩错误。</p>
+
+      <div class="observe">
+        <div class="label">为什么这值得投入</div>
+        <p>第一次上线智能体，某用户提了一个"我问了 X，它说了 Y"的 bug，你原来的工作流是：试图在本地重现，失败，因为语料库已经变了或者检索随机性不同，最后只能靠猜。你的新工作流是：从审计日志复制追踪 ID，运行 <code class="inline">replay.py</code>，看着确切的故障在你的笔记本上发生，修复它，再次回放以确认。差距是每个 bug 节省几小时，有时是几天。</p>
+        <p>这也是让回归评估成为可能的基础。每一个可重现的生产故障都成为永久评估案例。每一个你修复的问题都会一直保持修复状态，因为下次有任何改动，你都会回放所有案例，立刻发现任何回归。跨度 + 记录 + 回放是第 1.4 章评估的工程底座，也是第三部分所构建扩展的底座。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">记录每个工具结果数据量会很大。保留策略怎么定？</div>
+        <div class="answer">
+          <p>不必全部保留。两个实用模式：</p>
+          <ul>
+            <li><strong>默认按比例采样。</strong> 记录 100% 的失败运行（成本低，价值高）和 1% 的成功运行（成本低，对常规调试有用）。两者都以根跨度上可见的完成原因/错误状态为依据。</li>
+            <li><strong>按时间分层。</strong> 保留完整记录 7 天为热数据；归档到冷存储保留 90 天；之后删除。对于高流量智能体，这对应热数据几百 MB、冷数据几 GB。</li>
+          </ul>
+          <p>例外情况：被人工标记为待检查的运行（关联了支持工单、关联了评估失败、关联了客户投诉）永久全量保留。它们是未来的评估案例。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我可以同时回放模型调用，而不只是工具调用吗？</div>
+        <div class="answer">
+          <p>可以，有些配置确实这样做。Anthropic 和 OpenAI 都提供提示词缓存和基于 ID 的响应检索，让你能重新获取给定输入的确切响应。但更有用的模式是<em>不</em>回放模型调用——这样你就可以改变提示词或模型，看看新模型在相同工具结果上会有什么行为。</p>
+          <p>"全部回放"更接近视频录制；"只回放工具 I/O"更接近调试器。调试器版本在日常工作中更有用。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我的智能体使用并行工具调用。回放还能用吗？</div>
+        <div class="answer">
+          <p>可以，因为我们按 <code class="inline">call_id</code> 匹配，而不是按调用顺序。如果模型在第 2 轮并发触发三次 <code class="inline">search_docs</code> 调用，这三次调用都会用各自不同的 ID 记录下来，回放分发器会为每次调用返回正确的结果。唯一的注意事项是时序敏感的行为无法精确重现——但工具 I/O 是精确重现的，这对几乎所有 bug 来说才是关键。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of chapter 2.1</div>
+      <h3>交付物</h3>
+      <p>一个智能体，每次运行都会产出遵循 OpenTelemetry GenAI 规范的跨度树、能在并发执行中正常工作的结构化日志，以及一个 <code class="inline">replay &lt;trace_id&gt;</code> CLI，能在几秒内在你的笔记本电脑上重现生产故障。这是让第二部分其余章节——成本（2.2）、安全（2.3）、部署（2.4）——真正可调试的底座，也是让第三部分的评估驱动开发在规模上可行的底座。</p>
+      <ul class="checklist">
+        <li>OpenTelemetry SDK 已接入，本地开发使用 ConsoleSpanExporter</li>
+        <li>invoke_agent、chat 和 execute_tool 跨度带有 gen_ai.* 属性</li>
+        <li>一行切换厂商：OTLP 导出器 → Langfuse / Braintrust / Datadog</li>
+        <li>structlog 配合 contextvars + OTel 追踪 ID 注入</li>
+        <li>按条件捕获内容（1% 采样或标志门控）</li>
+        <li>按追踪记录工具 I/O，写入 runs/replay/&lt;trace_id&gt;.jsonl</li>
+        <li>replay.py CLI：加载记录，设置 replay_mode contextvar，运行智能体</li>
+        <li>回放期间打桩状态变更工具（与 2.3 安全作用域集成）</li>
+      </ul>
+    </div>
+
+
+  </section>

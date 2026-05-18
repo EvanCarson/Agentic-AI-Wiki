@@ -1,0 +1,672 @@
+<section class="phase">
+    <div class="phase-num">1.2</div>
+    <div class="week">Part I / Build · Week 2</div>
+    <h2>用真实的检索栈替换玩具搜索。</h2>
+    <p class="goal">三层架构，按顺序构建：词法基线、稠密语义、重排序。最后加上一个落地验证器。到最后，每一条结论都可追溯、可验证。</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>对语料库切块。不要过度设计。</h3>
+
+      <p>在做任何比子串匹配更聪明的事之前，我们需要把文档拆分成可检索的单元。这就是"切块"（chunking）。很容易想得太复杂——语义切块、延迟切块、递归 AST 拆分——但现在，先做最简单的事。只有当评估（eval）结果表明有必要时，我们才去改进。</p>
+
+      <h4>经验法则</h4>
+
+      <ul>
+        <li><strong>目标大小：</strong>每块约 500 个令牌（token）（大约 2000 个英文字符）。</li>
+        <li><strong>重叠：</strong>相邻块之间约 50 个令牌（token）的重叠。用于捕获答案跨越块边界的情况。</li>
+        <li><strong>按自然边界切分：</strong>优先在段落处断开，其次是句子。不要在句子中间截断。</li>
+        <li><strong>保留元数据：</strong>每块都知道自己的 <code class="inline">doc_id</code> 和文档内的 <code class="inline">chunk_idx</code>。我们需要这些来反向引用。</li>
+      </ul>
+
+      <p>注意：以下代码与提供商无关，切块只是 Python。</p>
+
+<pre class="standalone"><span class="c-cm"># retrieval/chunk.py</span>
+<span class="c-kw">import</span> tiktoken  <span class="c-cm"># works for both providers as a counter</span>
+<span class="c-kw">from</span> dataclasses <span class="c-kw">import</span> dataclass
+
+enc = tiktoken.get_encoding(<span class="c-st">"cl100k_base"</span>)
+
+<span class="c-kw">def</span> <span class="c-fn">n_tokens</span>(s: <span class="c-kw">str</span>) -> <span class="c-kw">int</span>:
+    <span class="c-kw">return</span> <span class="c-kw">len</span>(enc.encode(s))
+
+<span class="c-fn">@dataclass</span>
+<span class="c-kw">class</span> <span class="c-fn">Chunk</span>:
+    chunk_id: <span class="c-kw">str</span>   <span class="c-cm"># f"{doc_id}::{idx}"</span>
+    doc_id: <span class="c-kw">str</span>
+    idx: <span class="c-kw">int</span>
+    text: <span class="c-kw">str</span>
+    n_tok: <span class="c-kw">int</span>
+
+<span class="c-kw">def</span> <span class="c-fn">chunk_doc</span>(doc_id: <span class="c-kw">str</span>, text: <span class="c-kw">str</span>,
+              target: <span class="c-kw">int</span> = <span class="c-st">500</span>,
+              overlap: <span class="c-kw">int</span> = <span class="c-st">50</span>) -> <span class="c-kw">list</span>[Chunk]:
+    paragraphs = [p.strip() <span class="c-kw">for</span> p <span class="c-kw">in</span> text.split(<span class="c-st">"\n\n"</span>) <span class="c-kw">if</span> p.strip()]
+    chunks, buf, buf_tok = [], [], <span class="c-st">0</span>
+
+    <span class="c-kw">def</span> <span class="c-fn">flush</span>():
+        <span class="c-kw">nonlocal</span> buf, buf_tok
+        <span class="c-kw">if</span> <span class="c-kw">not</span> buf: <span class="c-kw">return</span>
+        joined = <span class="c-st">"\n\n"</span>.join(buf)
+        chunks.append(Chunk(
+            chunk_id=<span class="c-kw">f</span><span class="c-st">"{doc_id}::{len(chunks)}"</span>,
+            doc_id=doc_id,
+            idx=<span class="c-kw">len</span>(chunks),
+            text=joined,
+            n_tok=n_tokens(joined),
+        ))
+        <span class="c-cm"># Keep last paragraph for overlap</span>
+        buf = [buf[-<span class="c-st">1</span>]] <span class="c-kw">if</span> overlap <span class="c-kw">and</span> n_tokens(buf[-<span class="c-st">1</span>]) <= overlap <span class="c-kw">else</span> []
+        buf_tok = n_tokens(buf[<span class="c-st">0</span>]) <span class="c-kw">if</span> buf <span class="c-kw">else</span> <span class="c-st">0</span>
+
+    <span class="c-kw">for</span> p <span class="c-kw">in</span> paragraphs:
+        t = n_tokens(p)
+        <span class="c-kw">if</span> buf_tok + t > target <span class="c-kw">and</span> buf:
+            flush()
+        buf.append(p)
+        buf_tok += t
+    flush()
+    <span class="c-kw">return</span> chunks</pre>
+
+      <h4>运行并检查结果</h4>
+
+<pre class="standalone">>>> <span class="c-kw">from</span> retrieval.chunk <span class="c-kw">import</span> chunk_doc
+>>> <span class="c-kw">from</span> pathlib <span class="c-kw">import</span> Path
+>>> text = Path(<span class="c-st">"corpus/pgbouncer-modes.md"</span>).read_text()
+>>> chunks = chunk_doc(<span class="c-st">"pgbouncer-modes"</span>, text)
+>>> <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks[:<span class="c-st">3</span>]:
+...     <span class="c-kw">print</span>(c.chunk_id, c.n_tok, c.text[:<span class="c-st">50</span>])</pre>
+
+<pre class="trace"><span class="c-out">pgbouncer-modes::0 487 # PgBouncer Pool Modes\n\nPgBouncer supports
+pgbouncer-modes::1 503 ## Session Pooling\n\nIn session pooling mode,
+pgbouncer-modes::2 491 ## Transaction Pooling\n\nThis is the most c</span></pre>
+
+      <p>三个块，令牌数都接近 500，每块保留了章节标题。形状不错。</p>
+
+      <h4>上下文切块技巧</h4>
+
+      <p>在嵌入切块之前，在每块前面添加一句摘要，描述该块在其父文档中的内容。这能显著提升检索效果——Anthropic 的检索增强（retrieval-augmented）上下文检索研究报告称可提升约 35%。</p>
+
+      <p>成本很小：在索引阶段每块调用一次廉价模型，只需一次。用 Haiku 或 GPT-4o-mini，并批量处理。</p>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># retrieval/contextualize.py</span>
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+client = Anthropic()
+
+CTX_PROMPT = <span class="c-st">"""Document title: {doc_id}
+Full document:
+&lt;document&gt;{full_text}&lt;/document&gt;
+
+Here is a chunk from the document:
+&lt;chunk&gt;{chunk_text}&lt;/chunk&gt;
+
+In one sentence, situate this chunk in the document
+(what section, what topic, what role). No preamble.
+Output just the sentence."""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">contextualize</span>(chunk_text, doc_id, full_text):
+    response = client.messages.create(
+        model=<span class="c-st">"claude-haiku-4-5"</span>,
+        max_tokens=<span class="c-st">100</span>,
+        messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+                   <span class="c-st">"content"</span>: CTX_PROMPT.format(
+                       doc_id=doc_id,
+                       full_text=full_text,
+                       chunk_text=chunk_text)}],
+    )
+    <span class="c-kw">return</span> response.content[<span class="c-st">0</span>].text.strip()</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># retrieval/contextualize.py</span>
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+client = OpenAI()
+
+CTX_PROMPT = <span class="c-st">"""Document title: {doc_id}
+Full document:
+&lt;document&gt;{full_text}&lt;/document&gt;
+
+Here is a chunk from the document:
+&lt;chunk&gt;{chunk_text}&lt;/chunk&gt;
+
+In one sentence, situate this chunk in the document
+(what section, what topic, what role). No preamble.
+Output just the sentence."""</span>
+
+<span class="c-kw">def</span> <span class="c-fn">contextualize</span>(chunk_text, doc_id, full_text):
+    response = client.responses.create(
+        model=<span class="c-st">"gpt-5-mini"</span>,
+        input=CTX_PROMPT.format(
+            doc_id=doc_id,
+            full_text=full_text,
+            chunk_text=chunk_text),
+    )
+    <span class="c-kw">return</span> response.output_text.strip()</pre>
+      </div>
+
+      <p>输出长什么样？以 PgBouncer 事务池化章节的某个块为例：</p>
+
+<pre class="trace"><span class="c-out">"This chunk explains transaction pooling in PgBouncer,
+describing how server connections are released after
+each transaction commits — a constraint that breaks
+features requiring session state."</span></pre>
+
+      <p>这一句话现在会随每个块在检索（retrieval）全程中携带。当用户问"为什么我的预备语句在 PgBouncer 中会失败？"时，嵌入中包含了"约束会破坏需要会话状态的特性"——即使该块里没有"预备"这个确切词，语义上也与问题接近。</p>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">为什么是约 500 个令牌（token）？为什么不是 1000 或 2000？</div>
+        <div class="answer">
+          <p>两种压力互相拉扯。<strong>更大的块</strong>保留了更多上下文——当模型实际阅读时很有用。<strong>更小的块</strong>检索更精准——一个 2000 令牌的块可能因为某段恰好相似就成为最佳匹配，而其余 90% 完全无关。</p>
+          <p>500 令牌是技术文档的甜蜜点。对代码库，可以更小（250），因为信号密度更高。对文学或叙事类文本，可以更大（800–1200），以保持叙述流畅。</p>
+          <p>别凭感觉猜——在第 4 阶段通过评估来量化。试试 300、500、1000，选在评估集上 recall@5 最高的那个。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">上下文切块实际上要花多少钱？</div>
+        <div class="answer">
+          <p>索引阶段每块调用一次小模型。对一个产生约 3000 块的 200 篇文档的语料库：总 API 费用大约 1–3 美元，并行化后约 10 分钟完成。这是索引阶段的成本。查询时的检索速度与没有上下文切块时相同。</p>
+          <p>投资回报率相当可观。如果你的评估显示 recall@5 从 0.62 提升到 0.84（这是技术文档上下文检索的典型提升幅度），那你用 2 美元的索引成本，换来了一个在查询时明显减少追加搜索的智能体——永久节省模型令牌。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>构建混合搜索：BM25 + 稠密 + RRF。</h3>
+
+      <p>现在我们用真正理解查询意图的东西替换玩具版的 <code class="inline">search_docs</code>。三个组件，分别构建，然后融合。</p>
+
+      <h4>BM25 — 词法基线</h4>
+
+      <p>BM25 是一种 1990 年代的统计关键词匹配算法，在技术文档上，它往往单独击败花哨的基于嵌入的搜索。请重读这句话。人们习惯性地直接用嵌入而跳过 BM25——这是个错误。BM25 是你的底线：对于用户使用了文档里相同词汇的查询，它绝不应该输。</p>
+
+<pre class="shell standalone">pip install bm25s</pre>
+
+<pre class="standalone"><span class="c-cm"># retrieval/bm25_index.py</span>
+<span class="c-kw">import</span> bm25s
+
+<span class="c-kw">class</span> <span class="c-fn">BM25Index</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, chunks):
+        self.chunks = chunks
+        corpus = [c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks]
+        self.retriever = bm25s.BM25()
+        self.retriever.index(bm25s.tokenize(corpus, stopwords=<span class="c-st">"en"</span>))
+
+    <span class="c-kw">def</span> <span class="c-fn">search</span>(self, query: <span class="c-kw">str</span>, top_k: <span class="c-kw">int</span> = <span class="c-st">50</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>]:
+        q_tok = bm25s.tokenize(query, stopwords=<span class="c-st">"en"</span>)
+        results, scores = self.retriever.retrieve(q_tok, k=top_k)
+        <span class="c-kw">return</span> [self.chunks[i].chunk_id <span class="c-kw">for</span> i <span class="c-kw">in</span> results[<span class="c-st">0</span>]]</pre>
+
+      <h4>稠密嵌入 — 语义层</h4>
+
+      <p>稠密检索将块和查询都嵌入同一个向量空间，然后找出最接近查询的块。能捕获 BM25 漏掉的同义转述（"how to vacuum a table" 匹配 "running VACUUM on a relation"）。</p>
+
+      <p>对于嵌入模型，两家提供商都有不错的选择。我们将使用 Voyage AI（Anthropic 推荐的嵌入合作伙伴）和 OpenAI 的 text-embedding-3-large。向量数据库两者相同——我们在本地使用 ChromaDB。</p>
+
+<pre class="shell standalone">pip install chromadb voyageai</pre>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># retrieval/dense_index.py — Voyage embeddings</span>
+<span class="c-kw">import</span> chromadb, voyageai
+voyage = voyageai.Client()
+chroma = chromadb.PersistentClient(path=<span class="c-st">".chroma"</span>)
+
+<span class="c-kw">def</span> <span class="c-fn">embed</span>(texts, input_type=<span class="c-st">"document"</span>):
+    r = voyage.embed(texts, model=<span class="c-st">"voyage-3"</span>,
+                     input_type=input_type)
+    <span class="c-kw">return</span> r.embeddings
+
+<span class="c-kw">class</span> <span class="c-fn">DenseIndex</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, chunks, name=<span class="c-st">"corpus"</span>):
+        self.col = chroma.get_or_create_collection(name)
+        <span class="c-kw">if</span> self.col.count() == <span class="c-st">0</span>:
+            embeddings = embed([c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks])
+            self.col.add(
+                ids=[c.chunk_id <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+                embeddings=embeddings,
+                documents=[c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+            )
+
+    <span class="c-kw">def</span> <span class="c-fn">search</span>(self, query, top_k=<span class="c-st">50</span>):
+        q_emb = embed([query], input_type=<span class="c-st">"query"</span>)[<span class="c-st">0</span>]
+        r = self.col.query(query_embeddings=[q_emb],
+                           n_results=top_k)
+        <span class="c-kw">return</span> r[<span class="c-st">"ids"</span>][<span class="c-st">0</span>]</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># retrieval/dense_index.py — OpenAI embeddings</span>
+<span class="c-kw">import</span> chromadb
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+oai = OpenAI()
+chroma = chromadb.PersistentClient(path=<span class="c-st">".chroma"</span>)
+
+<span class="c-kw">def</span> <span class="c-fn">embed</span>(texts):
+    r = oai.embeddings.create(
+        model=<span class="c-st">"text-embedding-3-large"</span>,
+        input=texts,
+    )
+    <span class="c-kw">return</span> [e.embedding <span class="c-kw">for</span> e <span class="c-kw">in</span> r.data]
+
+<span class="c-kw">class</span> <span class="c-fn">DenseIndex</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, chunks, name=<span class="c-st">"corpus"</span>):
+        self.col = chroma.get_or_create_collection(name)
+        <span class="c-kw">if</span> self.col.count() == <span class="c-st">0</span>:
+            embeddings = embed([c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks])
+            self.col.add(
+                ids=[c.chunk_id <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+                embeddings=embeddings,
+                documents=[c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+            )
+
+    <span class="c-kw">def</span> <span class="c-fn">search</span>(self, query, top_k=<span class="c-st">50</span>):
+        q_emb = embed([query])[<span class="c-st">0</span>]
+        r = self.col.query(query_embeddings=[q_emb],
+                           n_results=top_k)
+        <span class="c-kw">return</span> r[<span class="c-st">"ids"</span>][<span class="c-st">0</span>]</pre>
+      </div>
+
+      <h4>互惠排名融合 — 合并两路结果</h4>
+
+      <p>BM25 和稠密检索都返回按排名排列的块 ID 列表。RRF 用一个简单公式将它们合并为单一排名：对每个结果，在所有排名中按 <code class="inline">1 / (k + rank)</code> 计分，累加得分，降序排列。<code class="inline">k=60</code> 是标准默认值。</p>
+
+<pre class="standalone"><span class="c-cm"># retrieval/hybrid.py</span>
+<span class="c-kw">def</span> <span class="c-fn">rrf</span>(rankings: <span class="c-kw">list</span>[<span class="c-kw">list</span>[<span class="c-kw">str</span>]], k: <span class="c-kw">int</span> = <span class="c-st">60</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>]:
+    scores: <span class="c-kw">dict</span>[<span class="c-kw">str</span>, <span class="c-kw">float</span>] = {}
+    <span class="c-kw">for</span> ranking <span class="c-kw">in</span> rankings:
+        <span class="c-kw">for</span> rank, cid <span class="c-kw">in</span> <span class="c-kw">enumerate</span>(ranking):
+            scores[cid] = scores.get(cid, <span class="c-st">0.0</span>) + <span class="c-st">1.0</span> / (k + rank + <span class="c-st">1</span>)
+    <span class="c-kw">return</span> <span class="c-kw">sorted</span>(scores, key=scores.get, reverse=<span class="c-kw">True</span>)
+
+<span class="c-kw">class</span> <span class="c-fn">HybridSearch</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, bm25: BM25Index, dense: DenseIndex):
+        self.bm25 = bm25
+        self.dense = dense
+
+    <span class="c-kw">def</span> <span class="c-fn">search</span>(self, query: <span class="c-kw">str</span>, top_k: <span class="c-kw">int</span> = <span class="c-st">20</span>) -> <span class="c-kw">list</span>[<span class="c-kw">str</span>]:
+        bm = self.bm25.search(query, top_k=<span class="c-st">50</span>)
+        ds = self.dense.search(query, top_k=<span class="c-st">50</span>)
+        <span class="c-kw">return</span> rrf([bm, ds])[:top_k]</pre>
+
+      <h4>快速对比：改进了什么？</h4>
+
+      <p>用同一个查询——"when to use VACUUM versus VACUUM FULL"——分别跑各种检索方法：</p>
+
+<pre class="trace"><span class="c-out">SUBSTRING (Phase 1):  found 0 docs ─ phrase doesn't appear literally
+
+BM25 alone:
+  1. routine-vacuuming::3     0.71   (contains "VACUUM FULL")
+  2. sql-vacuum::0            0.65
+  3. runtime-config-vacuum::1 0.41
+
+DENSE alone:
+  1. routine-vacuuming::3     0.89   (matches semantically)
+  2. routine-vacuuming::4     0.86
+  3. sql-vacuum::2            0.81
+
+HYBRID (RRF):
+  1. routine-vacuuming::3     0.0328
+  2. routine-vacuuming::4     0.0163
+  3. sql-vacuum::0            0.0162
+  4. sql-vacuum::2            0.0161</span></pre>
+
+      <div class="observe">
+        <div class="label">值得关注的现象</div>
+        <p>BM25 将 <code class="inline">routine-vacuuming::3</code> 排在第 1，因为"VACUUM FULL"在文本中字面出现。稠密检索也将其排第一，但原因不同——语义上与问题相似。</p>
+        <p>两者都答对并不能说明这是测试混合价值的好用例。但换一个转述查询，比如"how do I reclaim disk space after deleting rows"——稠密检索会找到 VACUUM FULL 的文档（正确答案），而 BM25 可能完全漏掉，因为"reclaim"和"disk space"并不出现在那些文档里。</p>
+        <p>混合搜索两种情况都能覆盖。代价是两次索引查询而不是一次——可忽略不计。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我真的需要同时用 BM25 和稠密检索吗？稠密嵌入不能搞定一切吗？</div>
+        <div class="answer">
+          <p>不行。稠密嵌入有一个特定的失效模式：<strong>精确词项敏感度</strong>。如果用户输入"PostgreSQL"而你的文档写的是"Postgres"，BM25 会漏掉（不同词项），稠密检索通常能捕获（嵌入相近）。不错。但如果用户输入"voyage-3"——特定的嵌入模型名称——稠密检索可能会返回泛泛讨论"嵌入模型"的块，而 BM25 能精准命中这个确切的提及。</p>
+          <p>生产级检索几乎总是同时需要两者。经验法则：用户知道正确词汇时用 BM25；用户用自己的话描述时用稠密检索；不确定哪种时用混合。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">RRF 中为什么用 <code class="inline">k=60</code>？</div>
+        <div class="answer">
+          <p>这是原始 RRF 论文（Cormack et al., 2009）中的值。直觉上：<code class="inline">k</code> 控制排名位置的影响程度。<code class="inline">k</code> 小，头部结果主导；<code class="inline">k</code> 大，权重更均匀。60 作为默认值已经用了十五年，因为它在很多数据集上表现良好——而不是因为它对某个具体数据集是最优的。</p>
+          <p>可以调，但别在评估结果告诉你有必要之前动它。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>在前 20 个结果上加重排序器。</h3>
+
+      <p>混合搜索让你获得不错的召回率——正确的块通常在前 20 内。但它可能在第 8 位，而你只有时间给智能体看 5 个。重排序器通过使用更贵但更精准的模型对前 20 重新打分来解决这个问题。</p>
+
+      <p>架构分两阶段：混合搜索快速宽泛地运行（从整个语料库取前 20 个候选），然后重排序器慢速精准地运行（对这 20 个重新排序，得出最优的前 5 个）。这是一种标准模式，叫做"先检索再重排"。</p>
+
+      <h4>重排序器与嵌入的区别</h4>
+
+      <p>嵌入模型<em>分别</em>将查询和块编码为向量，再比较——速度快但失去了两者之间的交叉注意力。重排序器（"交叉编码器"）<em>同时</em>编码两者并给出一个分数——每对比较更慢，但精度高得多，因为它能看到每个块如何匹配查询的每个部分。</p>
+
+      <p>重排序器有三种选项——选一个：</p>
+
+      <ul>
+        <li><strong>Cohere Rerank</strong> — 托管 API，20 个块约 50ms。生产环境最流行的选择。</li>
+        <li><strong>Voyage rerank-2</strong> — 托管 API，质量和价格类似。</li>
+        <li><strong>BGE-reranker-v2</strong> — 开放权重模型，本地运行。配置慢一些；推理时免费。</li>
+      </ul>
+
+<pre class="shell standalone">pip install cohere</pre>
+
+<pre class="standalone"><span class="c-cm"># retrieval/rerank.py — Cohere</span>
+<span class="c-kw">import</span> cohere
+co = cohere.Client()
+
+<span class="c-kw">def</span> <span class="c-fn">rerank</span>(query: <span class="c-kw">str</span>, chunks: <span class="c-kw">list</span>[Chunk],
+           top_k: <span class="c-kw">int</span> = <span class="c-st">5</span>) -> <span class="c-kw">list</span>[Chunk]:
+    <span class="c-kw">if</span> <span class="c-kw">not</span> chunks: <span class="c-kw">return</span> []
+    response = co.rerank(
+        model=<span class="c-st">"rerank-english-v3.0"</span>,
+        query=query,
+        documents=[c.text <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks],
+        top_n=top_k,
+    )
+    <span class="c-kw">return</span> [chunks[r.index] <span class="c-kw">for</span> r <span class="c-kw">in</span> response.results]</pre>
+
+      <h4>整合在一起</h4>
+
+      <p>完整的检索（retrieval）管道，封装在智能体调用的单一函数后面：</p>
+
+<pre class="standalone"><span class="c-cm"># retrieval/__init__.py</span>
+<span class="c-kw">from</span> retrieval.bm25_index <span class="c-kw">import</span> BM25Index
+<span class="c-kw">from</span> retrieval.dense_index <span class="c-kw">import</span> DenseIndex
+<span class="c-kw">from</span> retrieval.hybrid <span class="c-kw">import</span> HybridSearch
+<span class="c-kw">from</span> retrieval.rerank <span class="c-kw">import</span> rerank
+<span class="c-kw">from</span> retrieval.chunk <span class="c-kw">import</span> chunk_doc
+
+<span class="c-cm"># Built once at import time</span>
+ALL_CHUNKS = load_or_build_chunks()
+BY_ID = {c.chunk_id: c <span class="c-kw">for</span> c <span class="c-kw">in</span> ALL_CHUNKS}
+hybrid = HybridSearch(BM25Index(ALL_CHUNKS), DenseIndex(ALL_CHUNKS))
+
+<span class="c-kw">def</span> <span class="c-fn">retrieve</span>(query: <span class="c-kw">str</span>, top_k: <span class="c-kw">int</span> = <span class="c-st">5</span>) -> <span class="c-kw">list</span>[Chunk]:
+    candidate_ids = hybrid.search(query, top_k=<span class="c-st">20</span>)
+    candidates = [BY_ID[cid] <span class="c-kw">for</span> cid <span class="c-kw">in</span> candidate_ids]
+    <span class="c-kw">return</span> rerank(query, candidates, top_k=top_k)</pre>
+
+      <h4>将其重新接入智能体</h4>
+
+      <p>替换 <code class="inline">agent/tools.py</code> 中的玩具版 <code class="inline">search_docs</code>：</p>
+
+<pre class="standalone"><span class="c-kw">from</span> retrieval <span class="c-kw">import</span> retrieve
+
+<span class="c-kw">def</span> <span class="c-fn">search_docs</span>(query: <span class="c-kw">str</span>) -> <span class="c-kw">list</span>[<span class="c-kw">dict</span>]:
+    chunks = retrieve(query, top_k=<span class="c-st">5</span>)
+    <span class="c-kw">return</span> [
+        {
+            <span class="c-st">"chunk_id"</span>: c.chunk_id,
+            <span class="c-st">"doc_id"</span>: c.doc_id,
+            <span class="c-st">"snippet"</span>: c.text[:<span class="c-st">300</span>],
+        }
+        <span class="c-kw">for</span> c <span class="c-kw">in</span> chunks
+    ]
+
+<span class="c-kw">def</span> <span class="c-fn">fetch_doc</span>(chunk_id: <span class="c-kw">str</span>) -> <span class="c-kw">dict</span>:
+    <span class="c-cm"># Now we fetch a CHUNK, not a whole document.</span>
+    <span class="c-cm"># Chunks are bounded ~500 tokens — safe for context.</span>
+    c = BY_ID.get(chunk_id)
+    <span class="c-kw">if</span> <span class="c-kw">not</span> c: <span class="c-kw">return</span> {<span class="c-st">"error"</span>: <span class="c-st">"not found"</span>}
+    <span class="c-kw">return</span> {<span class="c-st">"chunk_id"</span>: chunk_id,
+            <span class="c-st">"doc_id"</span>: c.doc_id,
+            <span class="c-st">"text"</span>: c.text}</pre>
+
+      <p>注意变化：<code class="inline">fetch_doc</code> 现在返回单个块而不是整篇文档。我们选择 500 令牌的块是有原因的——它们足够小，可以舒适地放入上下文而不会占主导地位。智能体可以在多步骤调查中获取跨文档的多个块。</p>
+
+      <h4>现在用第 1 阶段同样的 VACUUM 查询运行一遍</h4>
+
+<pre class="shell standalone">$ python scripts/run.py <span class="c-st">"When should I VACUUM versus VACUUM FULL?"</span></pre>
+
+<pre class="trace"><span class="c-out">──────────────────── Step 0 ────────────────────
+→ search_docs({'query': 'VACUUM versus VACUUM FULL'})
+   returned: [
+     {chunk_id: 'routine-vacuuming::3', snippet: 'VACUUM
+       FULL rewrites the entire table and indexes,
+       reclaiming disk space but requiring an ACCESS
+       EXCLUSIVE lock. Regular VACUUM cannot...' },
+     {chunk_id: 'routine-vacuuming::4', snippet: '...'},
+     {chunk_id: 'sql-vacuum::0', snippet: '...'},
+     ...
+   ]
+
+──────────────────── Step 1 ────────────────────
+┌─ thinking ─────────────────────────────────────┐
+│ The first snippet has the core distinction.    │
+│ I'll fetch the full chunk for detail.          │
+└────────────────────────────────────────────────┘
+→ fetch_doc({'chunk_id': 'routine-vacuuming::3'})
+
+──────────────────── Step 2 ────────────────────
+→ submit_answer({...})
+
+status: answered (3 steps)</span></pre>
+
+      <div class="observe">
+        <div class="label">同样的问题，截然不同的行为</div>
+        <p>第 1 阶段：5 步，3 次冗余搜索，侥幸恢复。第 2 阶段：3 步，一次搜索就把正确的块排在第 1 位返回。</p>
+        <p>智能体并没有变聪明。是检索变聪明了，所以智能体要做的工作少了。这才是正确的结论：<strong>大多数"智能体质量"的提升，实际上是检索的提升。</strong></p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">我真的需要重排序器吗？混合搜索已经很不错了。</div>
+        <div class="answer">
+          <p>对于答案明显的干净查询，混合搜索单独使用通常已经够用。重排序器在以下三种情况下物有所值：</p>
+          <ul>
+            <li><strong>长尾查询</strong>：正确的块在混合输出中排在第 8–15 位。重排序器将其提升到前 3。</li>
+            <li><strong>模糊查询</strong>：多个块表面上都相关。重排序器更擅长选出真正回答问题的那个，而不是仅仅共享关键词的那些。</li>
+            <li><strong>多方面查询</strong>，比如"X 在条件 Z 下对 Y 的性能影响"——嵌入按整体相似度打分，重排序器能平衡多个方面。</li>
+          </ul>
+          <p>用评估来量化。如果加了重排序器之后 recall@5 没有变化，说明你的查询不需要它——跳过，节省延迟（latency）。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>添加落地验证器。</h3>
+
+      <p>检索给了智能体正确的材料。但智能体仍然可能产生幻觉（hallucination）——声称某件事与引用<em>似乎相关</em>，但实际上并不被引用支持。落地验证器可以捕获这种情况。</p>
+
+      <p>验证器是一次额外的模型调用，在 <code class="inline">submit_answer</code> 最终确定之<em>前</em>运行。它接受答案中的结论和引用的块，返回一个裁决：支持、部分支持或不支持。不受支持的结论要么被重写，要么得到引用纠正，要么触发重试。</p>
+
+      <h4>验证器提示词（prompt）</h4>
+
+      <p>两家提供商使用相同的提示词（prompt）；只有 API 调用不同。</p>
+
+<pre class="standalone">VERIFIER_PROMPT = <span class="c-st">"""You are a strict fact-checker.
+
+Given an answer and the sources it cited, decide for each
+factual claim in the answer whether the sources SUPPORT,
+PARTIALLY support, or DO NOT SUPPORT the claim.
+
+Output JSON only:
+{
+  "claims": [
+    {
+      "claim": "the exact claim from the answer",
+      "verdict": "SUPPORT" | "PARTIAL" | "NOT_SUPPORTED",
+      "evidence": "quote from a source, or empty",
+      "reasoning": "one sentence"
+    }
+  ]
+}
+
+Be strict. If a claim is more specific than what
+sources actually say, mark it PARTIAL. If a claim
+isn't mentioned in sources, mark it NOT_SUPPORTED."""</span></pre>
+
+      <div class="code-tabs">
+        <button class="code-tab active" data-api="anthropic" onclick="switchTab(this)">Anthropic</button>
+        <button class="code-tab" data-api="openai" onclick="switchTab(this)">OpenAI</button>
+      </div>
+      <div class="code-content active" data-api="anthropic">
+<pre><span class="c-cm"># grounding/verify.py</span>
+<span class="c-kw">import</span> json
+<span class="c-kw">from</span> anthropic <span class="c-kw">import</span> Anthropic
+client = Anthropic()
+
+<span class="c-kw">def</span> <span class="c-fn">verify</span>(answer: <span class="c-kw">str</span>, sources: <span class="c-kw">list</span>[<span class="c-kw">dict</span>]) -> <span class="c-kw">dict</span>:
+    sources_block = <span class="c-st">"\n\n"</span>.join(
+        <span class="c-kw">f</span><span class="c-st">"[{s['chunk_id']}]\n{s['text']}"</span>
+        <span class="c-kw">for</span> s <span class="c-kw">in</span> sources
+    )
+    response = client.messages.create(
+        model=<span class="c-st">"claude-haiku-4-5"</span>,
+        max_tokens=<span class="c-st">1024</span>,
+        system=VERIFIER_PROMPT,
+        messages=[{
+            <span class="c-st">"role"</span>: <span class="c-st">"user"</span>,
+            <span class="c-st">"content"</span>: <span class="c-kw">f</span><span class="c-st">"ANSWER:\n{answer}\n\n"</span>
+                       <span class="c-kw">f</span><span class="c-st">"SOURCES:\n{sources_block}"</span>,
+        }],
+    )
+    <span class="c-kw">return</span> json.loads(response.content[<span class="c-st">0</span>].text)</pre>
+      </div>
+      <div class="code-content" data-api="openai">
+<pre><span class="c-cm"># grounding/verify.py</span>
+<span class="c-kw">import</span> json
+<span class="c-kw">from</span> openai <span class="c-kw">import</span> OpenAI
+client = OpenAI()
+
+<span class="c-kw">def</span> <span class="c-fn">verify</span>(answer: <span class="c-kw">str</span>, sources: <span class="c-kw">list</span>[<span class="c-kw">dict</span>]) -> <span class="c-kw">dict</span>:
+    sources_block = <span class="c-st">"\n\n"</span>.join(
+        <span class="c-kw">f</span><span class="c-st">"[{s['chunk_id']}]\n{s['text']}"</span>
+        <span class="c-kw">for</span> s <span class="c-kw">in</span> sources
+    )
+    response = client.responses.create(
+        model=<span class="c-st">"gpt-5-mini"</span>,
+        instructions=VERIFIER_PROMPT,
+        input=<span class="c-kw">f</span><span class="c-st">"ANSWER:\n{answer}\n\n"</span>
+              <span class="c-kw">f</span><span class="c-st">"SOURCES:\n{sources_block}"</span>,
+        text={<span class="c-st">"format"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"json_object"</span>}},
+    )
+    <span class="c-kw">return</span> json.loads(response.output_text)</pre>
+      </div>
+
+      <h4>验证器返回什么</h4>
+
+<pre class="trace"><span class="c-out">{
+  "claims": [
+    {
+      "claim": "Transaction pooling rotates server
+                connections between transactions",
+      "verdict": "SUPPORT",
+      "evidence": "transaction pooling releases server
+                   connections back to the pool after
+                   each transaction commits",
+      "reasoning": "Source directly states this."
+    },
+    {
+      "claim": "Prepared statements are scoped to a
+                session",
+      "verdict": "SUPPORT",
+      "evidence": "PREPARE creates a prepared statement
+                   for the current session only",
+      "reasoning": "Source explicitly states session scope."
+    },
+    {
+      "claim": "This conflict is the most common cause
+                of PgBouncer migration failures",
+      "verdict": "NOT_SUPPORTED",
+      "evidence": "",
+      "reasoning": "Sources discuss the conflict but
+                    make no claim about migration
+                    failures or their frequency."
+    }
+  ]
+}</span></pre>
+
+      <div class="observe">
+        <div class="label">刚刚发生了什么</div>
+        <p>智能体的答案有三条结论。其中两条被引用的块直接支持。还有一条——"迁移失败最常见的原因"——是模型自己添加的润色，实际上并不存在于来源中。</p>
+        <p>没有验证器，那个幻觉就会原样输出。有了验证器，我们可以选择删除不受支持的结论、标记为推测性内容，或者让智能体重新去找来源。</p>
+      </div>
+
+      <h4>接入代理循环（agent loop）</h4>
+
+      <p>修改循环，在返回成功答案之前进行验证：</p>
+
+<pre class="standalone"><span class="c-cm"># in agent/loop.py, when submit_answer is called:</span>
+<span class="c-kw">if</span> tool_name == <span class="c-st">"submit_answer"</span>:
+    sources = [BY_ID[cid] <span class="c-kw">for</span> cid <span class="c-kw">in</span> citations
+               <span class="c-kw">if</span> cid <span class="c-kw">in</span> BY_ID]
+    verdict = verify(answer, [{
+        <span class="c-st">"chunk_id"</span>: s.chunk_id,
+        <span class="c-st">"text"</span>: s.text,
+    } <span class="c-kw">for</span> s <span class="c-kw">in</span> sources])
+
+    unsupported = [c <span class="c-kw">for</span> c <span class="c-kw">in</span> verdict[<span class="c-st">"claims"</span>]
+                   <span class="c-kw">if</span> c[<span class="c-st">"verdict"</span>] == <span class="c-st">"NOT_SUPPORTED"</span>]
+
+    <span class="c-kw">return</span> {
+        <span class="c-st">"status"</span>: <span class="c-st">"answered"</span>,
+        <span class="c-st">"answer"</span>: answer,
+        <span class="c-st">"citations"</span>: citations,
+        <span class="c-st">"verification"</span>: verdict,
+        <span class="c-st">"unsupported_claims"</span>: <span class="c-kw">len</span>(unsupported),
+    }</pre>
+
+      <p>目前我们只是把裁决附加到结果上——至于怎么处理（重试、警告、剔除），等第 4 阶段的评估结果出来再决定。</p>
+
+      <div class="callout">
+        <p>验证器是你的第一个<em>基础原语</em>，而不是一个功能。你将在第 3 阶段（验证子智能体输出）和第 4 阶段（它本质上是逐条结论的评估）复用它。把它做好。</p>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">对每个答案都运行验证器，不会让我的 API 成本（cost）翻倍吗？</div>
+        <div class="answer">
+          <p>粗略估算：每次成功回答额外增加一次调用，输入量以（答案 + 引用的块）≈ 2–3k 令牌为上限。使用 Haiku 或 gpt-5-mini，每次查询的费用不到一分钱。</p>
+          <p>对比<em>不</em>验证的代价：用户信任了一个幻觉答案，做了错误的决策，从此不再信任这个智能体。验证器是廉价的保险。</p>
+        </div>
+      </div>
+
+      <div class="qa">
+        <div class="q">Question</div>
+        <div class="question">如果验证器本身产生幻觉怎么办？</div>
+        <div class="answer">
+          <p>确实可能发生。验证器也是一个大语言模型（LLM）。但它的任务范围窄得多——这条结论在这些来源里有没有？——而这正是模型出奇可靠的任务，尤其是在提示词中要求引用证据的情况下。</p>
+          <p>你将在第 4 阶段通过人工标注 30 个（结论、来源、裁决）三元组并检查一致性来评估验证器本身。与人类的一致率低于约 80% 时，验证器就在帮倒忙，你需要调整提示词直到它改善。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="deliverable">
+      <div class="tag">End of week 2</div>
+      <h3>交付物</h3>
+      <p>一个答案引用具体块的智能体，配有验证器，能确认每条引用确实支持其对应的结论。横向对比：来自第 1 阶段的同样 10 个问题，行为截然不同。</p>
+      <ul class="checklist">
+        <li>带上下文单行摘要的切块器</li>
+        <li>BM25 + 稠密 + RRF 混合搜索</li>
+        <li>在前 20 上运行交叉编码器重排序器 → 取前 5</li>
+        <li>带逐条结论裁决的落地验证器</li>
+        <li>A/B 追踪（trace）对比：第 1 阶段 vs 第 2 阶段</li>
+      </ul>
+    </div>
+
+
+  </section>
