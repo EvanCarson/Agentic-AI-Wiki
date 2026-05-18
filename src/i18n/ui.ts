@@ -3,7 +3,7 @@ import type { Locale } from './index';
 export interface UIStrings {
   brand: string;
   tagline: string;
-  nav: { fieldGuide: string; concepts: string; deepDives: string; posts: string; about: string };
+  nav: { fieldGuide: string; concepts: string; deepDives: string; changelog: string; about: string };
   switcher: { en: string; zh: string; aria: string };
   sidebarAria: string;
   breadcrumbRoot: string;
@@ -18,8 +18,12 @@ export interface UIStrings {
   fg: { metaTitle: string; metaDesc: string };
   concepts: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
   deepDives: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
-  about: { kicker: string; h1: string; bodyHtml: string };
-  posts: { metaTitle: string; metaDesc: string; h1: string; emptyHtml: string };
+  about: { kicker: string; h1: string; metaDesc: string;
+           missionH: string; missionHtml: string;
+           coveredH: string; coveredHtml: string;
+           maintainerH: string; maintainerHtml: string;
+           contactH: string; contactHtml: string };
+  changelog: { kicker: string; metaTitle: string; metaDesc: string; h1: string; intro: string };
   seriesTitle: string;
 }
 
@@ -27,7 +31,7 @@ export const ui: Record<Locale, UIStrings> = {
   en: {
     brand: 'Agentic AI Wiki',
     tagline: 'Agentic AI Wiki — knowledge, written to last.',
-    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', posts: 'Posts', about: 'About' },
+    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', changelog: 'Changelog', about: 'About' },
     switcher: { en: 'EN', zh: '中文', aria: 'Language' },
     sidebarAria: 'Field Guide chapters',
     breadcrumbRoot: 'Field Guide',
@@ -61,16 +65,25 @@ export const ui: Record<Locale, UIStrings> = {
       emptyHtml: 'Deep-dive essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
     },
     about: { kicker: 'About', h1: 'Agentic AI Wiki',
-      bodyHtml: 'A living knowledge base on building agentic AI. The flagship <a href="%FG%" style="color:var(--accent);">Agentic AI Field Guide</a> walks from first principles to the frontier; standalone posts go deeper as the field moves.' },
-    posts: { metaTitle: 'Posts — Agentic AI Wiki', metaDesc: 'Standalone notes and essays on agentic AI.',
-      h1: 'Posts',
-      emptyHtml: 'No standalone posts yet — start with the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.' },
+      metaDesc: 'What the Agentic AI Wiki is, what it covers, and who maintains it.',
+      missionH: 'Mission',
+      missionHtml: 'The Agentic AI Wiki is a living, open knowledge base for building agentic AI well. It favors durable understanding over hype — clear explanations, working mental models, and practitioner depth that stays useful as the field moves.',
+      coveredH: "What's covered",
+      coveredHtml: 'The <a href="%FG%" style="color:var(--accent);">Field Guide</a> is a hands-on, end-to-end engineering course for building and shipping agents. <a href="%CONCEPTS%" style="color:var(--accent);">Concepts</a> is a plain-language encyclopedia for newcomers and intermediates. <a href="%DEEP%" style="color:var(--accent);">Deep-Dives</a> are advanced essays on architectures, protocols, memory, and agentic security. Everything is bilingual (English / 中文).',
+      maintainerH: 'Who maintains it',
+      maintainerHtml: 'Built and maintained by <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">Chen Qian</a> as an independent, open project.',
+      contactH: 'Contributing & contact',
+      contactHtml: 'Corrections, suggestions, and new entries are welcome — open an issue or pull request on <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a>, or reach out via <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a>.' },
+    changelog: { kicker: 'Changelog', metaTitle: 'Changelog — Agentic AI Wiki',
+      metaDesc: 'What changed on the Agentic AI Wiki, newest first.',
+      h1: 'Changelog',
+      intro: 'Notable changes to this site — new sections, content, and improvements.' },
     seriesTitle: 'The Agentic AI Field Guide',
   },
   zh: {
     brand: 'Agentic AI 维基',
     tagline: 'Agentic AI 维基 — 沉淀长期有效的知识。',
-    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', posts: '文章', about: '关于' },
+    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', changelog: '更新日志', about: '关于' },
     switcher: { en: 'EN', zh: '中文', aria: '语言' },
     sidebarAria: '实战指南章节',
     breadcrumbRoot: '实战指南',
@@ -104,10 +117,19 @@ export const ui: Record<Locale, UIStrings> = {
       emptyHtml: '深度剖析文章即将上线 — 在此之前，先深入阅读 <a href="%FG%" style="color:var(--accent);">实战指南</a>。',
     },
     about: { kicker: '关于', h1: 'Agentic AI 维基',
-      bodyHtml: '一个持续更新、关于构建 Agentic AI 的知识库。旗舰系列 <a href="%FG%" style="color:var(--accent);">Agentic AI 实战指南</a> 带你从第一性原理走到前沿；随着领域演进，独立文章会进一步深入。' },
-    posts: { metaTitle: '文章 — Agentic AI 维基', metaDesc: '关于 Agentic AI 的独立笔记与文章。',
-      h1: '文章',
-      emptyHtml: '暂无独立文章 — 先从 <a href="%FG%" style="color:var(--accent);">实战指南</a> 开始。' },
+      metaDesc: '关于 Agentic AI 维基：它是什么、涵盖什么，以及由谁维护。',
+      missionH: '使命',
+      missionHtml: 'Agentic AI 维基是一个持续更新、开放的知识库，专注于把 Agentic AI 构建好。它重视可沉淀的理解而非炒作 — 清晰的讲解、可用的心智模型，以及在领域演进中依然有效的实践深度。',
+      coveredH: '涵盖内容',
+      coveredHtml: '<a href="%FG%" style="color:var(--accent);">实战指南</a> 是端到端、动手构建并交付智能体的工程课程。<a href="%CONCEPTS%" style="color:var(--accent);">概念</a> 是面向新手与进阶者的白话百科。<a href="%DEEP%" style="color:var(--accent);">深度剖析</a> 是关于架构、协议、记忆与智能体安全的进阶文章。全部内容均为双语（English / 中文）。',
+      maintainerH: '维护者',
+      maintainerHtml: '由 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">Chen Qian</a> 独立构建与维护的开放项目。',
+      contactH: '贡献与联系',
+      contactHtml: '欢迎纠错、建议与新增词条 — 在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a> 提交 issue 或 pull request，或通过 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a> 联系。' },
+    changelog: { kicker: '更新日志', metaTitle: '更新日志 — Agentic AI 维基',
+      metaDesc: '本站的变更记录，按时间倒序。',
+      h1: '更新日志',
+      intro: '本站的重要变更 — 新板块、新内容与改进。' },
     seriesTitle: 'Agentic AI 实战指南',
   },
 };
