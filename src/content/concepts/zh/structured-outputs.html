@@ -1,0 +1,96 @@
+<section class="phase">
+  <div class="phase-num">08</div>
+  <div class="week">概念 · 核心构件</div>
+  <h2>结构化输出。</h2>
+  <p class="goal">一段闲聊式的散文对调用模型的代码毫无用处。结构化输出是让模型产出机器可解析数据——通常是符合某 schema 的 JSON——可靠到能直接喂进程序的做法。本文讲解为何"直接要 JSON"不够、从提示到 schema 约束解码的谱系，以及结构化输出如何支撑工具调用和智能体流水线。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>问题：散文不可组合。</h3>
+
+    <p>模型被训练成产出流畅的自然语言。当消费方是软件时，这恰恰是错的。如果你给工单分类、模型回"这看起来像计费问题，鉴于他们提到支付失败，可能是高优先级"，你的代码现在得从散文里解析意图——脆弱，而且模型某天换种措辞它就崩。要把模型组合进流水线，你需要形状固定、可预测的输出：</p>
+
+<pre class="trace standalone"><span class="c-err">UNUSABLE
+"This looks like a billing issue, probably high priority."</span>
+
+<span class="c-out">USABLE
+{ "category": "billing", "priority": "high" }</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>为何"直接要 JSON"不够。</h3>
+
+    <p>在提示词里好好请求（"只用 JSON 回复，像 {...} 这样"）多数时候奏效，而"多数时候"正是问题所在。模型仍逐令牌采样，所以它偶尔会：</p>
+    <ul>
+      <li>把 JSON 包进 <code class="inline">```json</code> 围栏或加一句"这是 JSON："开场白；</li>
+      <li>加一条尾注、输出尾逗号，或用单引号；</li>
+      <li>编造一个键、漏掉一个必需键，或把数字作为字符串返回；</li>
+      <li>在触及 <code class="inline">max_tokens</code> 时对象中途截断，产出无法解析的碎片。</li>
+    </ul>
+    <p>每天 10 万次调用里 1% 失败，就是每天 1,000 条坏记录。为结构而提示能提升可靠性；它不保证可靠性。你需要强制约束或防御性解析——最好两者都有。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>可靠性谱系。</h3>
+
+<pre class="trace standalone"><span class="c-out">WEAKEST  ->  STRONGEST
+
+1. Prompt + few-shot
+   "Reply only with JSON: {...}" plus example outputs.
+   Easy; ~95-99% valid; needs a parse-and-retry safety net.
+
+2. JSON mode
+   Provider flag forcing syntactically valid JSON.
+   Valid JSON guaranteed -- correct SCHEMA is not.
+
+3. Schema-constrained / structured outputs
+   Pass a JSON Schema; decoding is constrained so only
+   tokens that keep output schema-valid can be sampled.
+   Output is valid JSON AND matches your schema.
+
+4. Tool / function calling
+   Define a function with a typed parameter schema; the
+   model's "arguments" object is structured output by
+   another name -- same machinery, different doorway.</span></pre>
+
+    <p>第 3–4 级背后的关键思想：约束解码。在每个生成步，采样器被限制为那些能让输出保持为 schema 所允许之物的有效前缀的令牌。模型字面上无法输出缺失的大括号或拼错的键——无效性在令牌层面被排除，而非事后清理。这直接呼应工具调用篇：一次工具调用的 <code class="inline">input</code> 对象，就是对准函数而非你应用的结构化输出。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>设计模型能满足的 schema。</h3>
+
+    <p>约束解码保证<em>形状</em>，绝不保证<em>真实</em>。模型可以为一个琐碎工单返回 <code class="inline">{"priority": "high"}</code>——完全合法、语义错误。schema 设计影响内容多大概率是对的：</p>
+    <ul>
+      <li><strong>枚举优于自由字符串。</strong><code class="inline">"priority": "low"|"med"|"high"</code> 胜过自由文本优先级。模型无法漂移到"有点急"，你也不必在下游做归一化。</li>
+      <li><strong>让模型先展示推理。</strong>在 <code class="inline">answer</code> 字段前放一个 <code class="inline">reasoning</code> 字符串字段，让模型在定论前先思考——顺序要紧，因为它从左到右生成，把结论放在其理由之前等于是猜。</li>
+      <li><strong>显式允许"未知"。</strong>若没有可空或"未知"选项，被强制的 schema 会逼模型编造一个值。给它一个合法的逃生口，胡编就会减少。</li>
+      <li><strong>schema 保持浅且命名清晰。</strong>深度嵌套、含糊的 schema 即便语法被强制也会降低内容质量。清晰的字段名相当于内联指令。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>被强制的 JSON 有效性不是校验。schema 无法检查邮箱是否真实、ID 是否存在、总和是否对得上。解析后务必在代码里校验语义——符合 schema 是必要条件，绝非充分条件。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>即便有强制也要防御。</h3>
+
+    <p>即便有强力强制，也要把解析当作一个会失败的地方：</p>
+    <ul>
+      <li><strong>预留输出令牌。</strong>截断是结构化输出损坏的头号原因。按最大的合法对象设定 <code class="inline">max_tokens</code>，并核实它装得进上下文预算。</li>
+      <li><strong>解析并重试。</strong>解析或校验失败时，把错误发回并请模型修正。一次重试能挽回大多数失败。</li>
+      <li><strong>无论如何在代码里对照 schema 校验。</strong>双保险：绝不轻信上游约束在每个边界情况都成立。</li>
+      <li><strong>降低温度。</strong>结构化任务很少受益于创造性；温度 0–0.3 减少格式漂移。</li>
+    </ul>
+  </div>
+
+  <div class="deliverable">
+    <div class="tag">要点</div>
+    <h3>交付物</h3>
+    <p>你知道散文无法组合进软件，且为 JSON 而提示能提升但不保证可靠性。你能把一项技术放到谱系上——提示、JSON 模式、schema 约束解码、工具调用——并理解约束解码在生成时排除无效令牌、而非事后清理。你设计能改善内容的 schema（枚举、先推理后答案、显式未知、浅且命名的字段），并无论如何保持防御：预留输出空间、在代码里校验语义、解析并重试。这与工具调用是同一套机制，只是对准你的应用而非一个函数。</p>
+  </div>
+</section>
