@@ -25,6 +25,10 @@ optional. New section/entries, content edits worth noting, nav/IA changes,
 notable accessibility/SEO/design changes — all get a changelog line.
 
 - Newest first. Each entry: `{ date: 'YYYY-MM-DD', title: Localized, items: Localized[] }`.
+- `date` is the day the change **actually merges to `main`** (the deploy
+  date) — not the day you started drafting. Verify it right before merge:
+  if the task spanned midnight or sat in review, bump the date to the real
+  merge day. A stale changelog date is a defect, fix it like any other.
 - Every `title` and every `items[]` bullet must be **bilingual** (`L(en, zh)`),
   with a faithful, fluent Chinese translation — never machine-literal.
 - Group related work into one entry; keep bullets concrete and user-facing.
