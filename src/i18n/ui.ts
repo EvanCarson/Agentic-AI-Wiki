@@ -5,6 +5,22 @@ export interface UIStrings {
   tagline: string;
   nav: { fieldGuide: string; concepts: string; deepDives: string; changelog: string; about: string };
   switcher: { en: string; zh: string; aria: string };
+  search: {
+    open: string;        // accessible label / tooltip for the trigger button
+    label: string;       // visible short label next to the icon
+    placeholder: string;
+    clear: string;
+    loadMore: string;
+    searchLabel: string;
+    filtersLabel: string;
+    zeroResults: string; // uses [SEARCH_TERM]
+    manyResults: string; // uses [COUNT] [SEARCH_TERM]
+    oneResult: string;   // uses [COUNT] [SEARCH_TERM]
+    altSearch: string;   // uses [SEARCH_TERM] [DIFFERENT_TERM]
+    searchSuggestion: string; // uses [SEARCH_TERM]
+    searching: string;   // uses [SEARCH_TERM]
+    close: string;
+  };
   sidebarAria: string;
   breadcrumbRoot: string;
   prev: string;
@@ -33,6 +49,22 @@ export const ui: Record<Locale, UIStrings> = {
     tagline: 'Agentic AI Wiki — knowledge, written to last.',
     nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', changelog: 'Changelog', about: 'About' },
     switcher: { en: 'EN', zh: '中文', aria: 'Language' },
+    search: {
+      open: 'Search the wiki',
+      label: 'Search',
+      placeholder: 'Search the wiki…',
+      clear: 'Clear',
+      loadMore: 'Load more results',
+      searchLabel: 'Search',
+      filtersLabel: 'Filters',
+      zeroResults: 'No results for [SEARCH_TERM]',
+      manyResults: '[COUNT] results for [SEARCH_TERM]',
+      oneResult: '[COUNT] result for [SEARCH_TERM]',
+      altSearch: 'No results for [SEARCH_TERM]. Showing results for [DIFFERENT_TERM] instead',
+      searchSuggestion: 'No results for [SEARCH_TERM]. Try one of the following searches:',
+      searching: 'Searching for [SEARCH_TERM]…',
+      close: 'Close search',
+    },
     sidebarAria: 'Field Guide chapters',
     breadcrumbRoot: 'Field Guide',
     prev: '← prev',
@@ -85,6 +117,22 @@ export const ui: Record<Locale, UIStrings> = {
     tagline: 'Agentic AI 维基 — 沉淀长期有效的知识。',
     nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', changelog: '更新日志', about: '关于' },
     switcher: { en: 'EN', zh: '中文', aria: '语言' },
+    search: {
+      open: '搜索本维基',
+      label: '搜索',
+      placeholder: '搜索本维基…',
+      clear: '清除',
+      loadMore: '加载更多结果',
+      searchLabel: '搜索',
+      filtersLabel: '筛选',
+      zeroResults: '没有找到与 [SEARCH_TERM] 相关的结果',
+      manyResults: '找到 [COUNT] 条与 [SEARCH_TERM] 相关的结果',
+      oneResult: '找到 [COUNT] 条与 [SEARCH_TERM] 相关的结果',
+      altSearch: '没有找到与 [SEARCH_TERM] 相关的结果，改为显示 [DIFFERENT_TERM] 的结果',
+      searchSuggestion: '没有找到与 [SEARCH_TERM] 相关的结果。可以试试以下搜索：',
+      searching: '正在搜索 [SEARCH_TERM]…',
+      close: '关闭搜索',
+    },
     sidebarAria: '实战指南章节',
     breadcrumbRoot: '实战指南',
     prev: '← 上一章',
