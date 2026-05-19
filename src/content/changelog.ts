@@ -23,6 +23,8 @@ export const CHANGELOG: ChangelogEntry[] = [
         '可通过页眉新增的搜索入口打开，或按「/」键（Cmd/Ctrl-K 同样可用），按 Esc 关闭。搜索框与相关资源仅在首次使用时加载，保持页面轻量。'),
       L('Search is locale-aware: English pages search English content and Chinese pages search Chinese content, and the search UI is fully bilingual.',
         '搜索按语言区分：英文页面检索英文内容，中文页面检索中文内容，搜索界面也完全双语。'),
+      L('Mobile polish: the close control is now a comfortable thumb-sized target, and tapping outside the panel dismisses search just like on desktop.',
+        '移动端优化：关闭按钮现已是适合拇指点按的尺寸，点击面板以外区域即可关闭搜索，与桌面端体验一致。'),
     ],
   },
   {
