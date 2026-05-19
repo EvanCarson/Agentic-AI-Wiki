@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">O4</div>
+  <div class="week">深入解析 · 智能体运维：部署与运营</div>
+  <h2>在循环层面控制成本：按任务的成本上限就是熔断器。</h2>
+  <p class="goal">传统服务每个请求的成本大致固定。智能体不是：同一个输入可能花 0.02 美元，也可能花 40 美元，取决于它派生了多少次循环迭代、多少子智能体、多少次重试。成本不是你每月对账的计费问题——它是一个你在循环内部强制的<em>运行时安全属性</em>，因为一个无界的循环同时是一桩财务事故和一次失控。本文把按任务的成本上限当作一等熔断器来对待。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>循环默认就是一个无界的成本放大器。</h3>
+
+    <p>三条结构性性质使智能体成本在你不约束它时无界：循环迭代次数不定、上下文每轮增长（所以每一轮都比上一轮贵——成本对步数是<em>超线性</em>的）、扇出把以上一切再相乘。一个卡在"反思 → 重规划 → 反思"循环里的规划器不会崩溃；它会安静地每次迭代都计你的费，直到有人注意到那张图。<strong>一个没有预算的智能体，其默认行为就是无上限地花钱。</strong></p>
+
+    <p>所以预算不是事后再做的优化。它与任何其他系统里的超时是同一种控制：对资源消耗的硬性界限，宁可让操作 fail-closed，也不放任它无限消耗。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>用 token、步数和美元给任务做预算——并让熔断器跳闸。</h3>
+
+    <p>一个按任务的预算对象随运行一起流动，被每次模型与工具调用扣减。任一维度耗尽时，循环不会"再来一步就好"——它跳闸：停止、返回部分成果、上报。</p>
+
+<pre class="standalone"><span class="c-cm"># cost/budget.py — one budget per task, checked every step</span>
+<span class="c-kw">class</span> <span class="c-fn">Budget</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, usd, steps, tokens):
+        self.usd, self.steps, self.tokens = usd, steps, tokens
+
+    <span class="c-kw">def</span> <span class="c-fn">charge</span>(self, call):
+        self.usd    -= call.cost_usd
+        self.tokens -= call.total_tokens
+        self.steps  -= <span class="c-st">1</span>
+        <span class="c-kw">if</span> self.usd &lt;= <span class="c-st">0</span> <span class="c-kw">or</span> self.steps &lt;= <span class="c-st">0</span> <span class="c-kw">or</span> self.tokens &lt;= <span class="c-st">0</span>:
+            <span class="c-kw">raise</span> <span class="c-err">BudgetExceeded</span>(self.snapshot())  <span class="c-cm"># trip</span>
+
+<span class="c-cm"># children share the PARENT budget — fan-out can't escape it</span>
+<span class="c-kw">def</span> <span class="c-fn">spawn_child</span>(parent_budget):
+    <span class="c-kw">return</span> parent_budget        <span class="c-cm"># same object, not a fresh one</span></pre>
+
+    <div class="callout warn"><p>最常见的成本事故是：每个子智能体拿到一份<em>新</em>预算。于是一棵 8 宽 3 深的树把你设定的上限放大了约 24 倍，那个"上限"什么也没限。子节点必须扣减父节点的预算——上限是按<em>任务</em>，不是按智能体。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>模型分层与级联：别为简单步骤付前沿模型的价。</h3>
+
+    <p>大多数循环迭代是机械的：路由这个、抽取那个、判断要不要继续。每一步都花顶级模型的价，是最大的、本可避免的成本项。级联会把每次调用路由到能胜任的最便宜模型，仅在低置信或难子任务时升级：</p>
+
+    <ul>
+      <li><strong>给工作分层，而不是给智能体分层。</strong>路由、分类、抽取交给小模型；规划与综合交给前沿模型。决策是按调用的，由步骤类型驱动。</li>
+      <li><strong>带置信闸门的级联。</strong>先试便宜模型；若它的自评置信或一个便宜校验器低于阈值，就升级。你只为需要的那一部分付前沿价。</li>
+      <li><strong>度量实际的混合成本</strong>，而非那条标称的每 token 价。一个 80% 都升级的级联，就是一个多了延迟的前沿模型——把升级率插上探针。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>缓存是 ROI 最高的杠杆——提示与工具结果都是。</h3>
+
+    <p>智能体异常地可缓存，因为它每一轮都重发一个庞大、稳定的前缀（系统提示、工具 schema、检索语料），并且跨重试与子智能体重复发出完全相同的只读工具调用。</p>
+
+    <ul>
+      <li><strong>提示前缀缓存。</strong>把上下文按"稳定在前"排序（系统 → 工具 → 持久上下文 → 易变轮次），使可缓存前缀最大化。在 30 轮的循环上，这通常以接近零的成本带来输入 token 成本 5–10× 的下降——本文最大的单项收益。</li>
+      <li><strong>工具结果缓存。</strong>确定性只读工具（一次文档抓取、一次价格查询）按规范化参数做键，TTL 与数据易变性匹配。同时砍成本与延迟，并为重试降噪。</li>
+      <li><strong>整子任务的语义/结果缓存。</strong>若两个运行问了相同子问题，第二个可重放第一个的答案。节省最高，但要校验陈旧——一个错误的缓存答案比你省下的那次调用更贵。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>提前退出：最便宜的 token 是你不生成的那个。</h3>
+
+    <p>循环会跑过头。模型不停"改进"一个三轮前就完成的答案，或重复校验已校验过的东西。提前退出条件让循环在任务真正完成时立即结束，而不是等步数预算耗尽：</p>
+
+    <ul>
+      <li><strong>目标已满足检查</strong>——一个便宜、显式的"原任务现在被回答了吗？"测试。是则退出；别让模型给它镀金。</li>
+      <li><strong>无进展检测</strong>——若最近 K 步没改变状态、也没减少未闭合回路，智能体在空转；停下并上报，别把剩余预算花在确认它卡住了上。</li>
+      <li><strong>收益递减闸门</strong>——若连续迭代对一个可度量的质量信号的提升小于 ε，那些边际 token 不值得。</li>
+    </ul>
+
+    <div class="callout tip"><p>无进展检测同时是失控检测器。"没在改进"的循环和"在某个环里烧钱"的循环，是同一个循环在成本与安全两副镜片下的样子——一套机制，挡掉两类事故（见 <code class="inline">incident-response-for-agents</code>）。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>什么时候激进的成本控制会悄悄拉低产品。</h3>
+
+    <p>这里每个杠杆都在用质量换钱，调过头它们会无声地坑用户：一个升级不足的级联会发出微妙变差的答案；一个过于急切的提前退出会返回看似完成的半成品；一个过长的缓存 TTL 会自信地端上陈旧事实。没有质量评估在循环里的成本控制，只是通往一个没人发现的更差产品的更慢路径。<strong>把按任务的上限设为硬性 fail-closed 熔断器——不可妥协——但级联、缓存与提前退出要对着一个质量指标调，绝不要只对着账单调。</strong></p>
+  </div>
+</section>

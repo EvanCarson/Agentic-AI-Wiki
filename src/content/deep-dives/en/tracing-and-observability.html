@@ -1,0 +1,103 @@
+<section class="phase">
+  <div class="phase-num">E5</div>
+  <div class="week">Deep Dive · Evaluation &amp; Observability</div>
+  <h2>Tracing &amp; observability for agents &mdash; the trace is the data structure.</h2>
+  <p class="goal">You cannot evaluate, debug, or improve what you cannot see, and an agent is the least observable kind of software: a non-deterministic loop of model calls and tool effects with the decisive state living inside a context window you did not log. This essay argues for one idea &mdash; the execution trace is not telemetry bolted on afterward, it is the central data structure of an agent system &mdash; and shows what to record per step, how to model it as spans, the OpenTelemetry GenAI conventions, and why trajectory replay is what turns observability into eval.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The trace is the data structure, not a log.</h3>
+
+    <p>The instinct is to add logging to an agent the way you'd add it to a web service: a line here, a counter there. That is backwards. For an agent, the full structured trace of a run &mdash; every input, decision, tool call, observation, and token &mdash; <em>is</em> the object the rest of the system operates on. Your eval harness scores traces. Your debugger reads traces. Your regression gate diffs traces. Your fine-tuning set is filtered traces. Your judge grades traces. If the trace is lossy, every one of those is operating on corrupted input.</p>
+
+    <div class="callout">
+      <p>Design rule: a run must be fully reconstructable from its trace alone. If you have to re-run the agent to understand what it did, your trace is incomplete &mdash; and re-running a non-deterministic agent gives you a <em>different</em> run, so the information is gone for good.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>What to record per step &mdash; all of it.</h3>
+
+    <p>Each agent step is one unit of work and must capture enough to replay and to assert against. Logging only the final answer is the single most common observability failure and it makes every downstream essay impossible.</p>
+
+    <ul>
+      <li><strong>Inputs</strong> &mdash; the <em>exact</em> rendered prompt/messages sent to the model (post-templating, post-retrieval), system prompt version, model id, decoding params. Not the template &mdash; the bytes that went over the wire.</li>
+      <li><strong>Decision</strong> &mdash; raw model output including reasoning/thinking content, the parsed tool selection, and arguments.</li>
+      <li><strong>Tool call</strong> &mdash; tool name, full arguments, latency, success/error, and the <em>full</em> observation returned (truncating the observation is discarding the agent's actual input to the next step).</li>
+      <li><strong>Accounting</strong> &mdash; prompt/completion tokens, cost, wall-clock, retry count, cache hit/miss.</li>
+      <li><strong>Linkage</strong> &mdash; ids tying the step to its run, parent step, session, and (for multi-agent) the agent that emitted it.</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># the minimum step record; anything less is not replayable</span>
+step = {
+  <span class="c-st">"run_id"</span>: rid, <span class="c-st">"step"</span>: i, <span class="c-st">"parent"</span>: i - <span class="c-st">1</span>,
+  <span class="c-st">"model"</span>: <span class="c-st">"&lt;id&gt;"</span>, <span class="c-st">"prompt_version"</span>: <span class="c-st">"sys@7"</span>,
+  <span class="c-st">"input_messages"</span>: msgs,           <span class="c-cm"># exact bytes sent</span>
+  <span class="c-st">"output"</span>: raw, <span class="c-st">"tool"</span>: name, <span class="c-st">"args"</span>: args,
+  <span class="c-st">"observation"</span>: obs_full,           <span class="c-cm"># NOT truncated</span>
+  <span class="c-st">"tokens_in"</span>: ti, <span class="c-st">"tokens_out"</span>: to,
+  <span class="c-st">"latency_ms"</span>: dt, <span class="c-st">"error"</span>: err,
+}</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Model it as spans: a run is a trace tree.</h3>
+
+    <p>The right shape is the distributed-tracing model. A run is a <strong>trace</strong>; each step, model call, and tool call is a <strong>span</strong> with start/end, parent, attributes, and status. Spans nest: a step span contains a model-call span and a tool-call span; a sub-agent is a child trace linked by context propagation. This is not a metaphor &mdash; it is the same primitive APM uses, which means agent traces drop into existing tracing backends instead of a bespoke pile of JSON.</p>
+
+    <ul>
+      <li><strong>Spans give you the timeline for free</strong> &mdash; where latency went, what ran in parallel, which tool blocked.</li>
+      <li><strong>The parent/child tree is the trajectory</strong> &mdash; trajectory eval (E2) is literally assertions over this tree.</li>
+      <li><strong>Context propagation across agents</strong> means a multi-agent run is one connected trace, not N orphaned logs you cannot stitch.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Use the OpenTelemetry GenAI conventions, not a bespoke schema.</h3>
+
+    <p>OpenTelemetry has semantic conventions for GenAI/agent spans: standardized attributes like <code class="inline">gen_ai.operation.name</code>, <code class="inline">gen_ai.request.model</code>, <code class="inline">gen_ai.usage.input_tokens</code>/<code class="inline">output_tokens</code>, tool-call span structure, and conventions for capturing prompt/response content. Adopting them is a high-leverage, low-cost decision.</p>
+
+<pre class="standalone"><span class="c-cm"># OTel GenAI semantic conventions on an agent span</span>
+<span class="c-kw">with</span> tracer.<span class="c-fn">start_as_current_span</span>(<span class="c-st">"invoke_agent"</span>) <span class="c-kw">as</span> s:
+    s.<span class="c-fn">set_attribute</span>(<span class="c-st">"gen_ai.operation.name"</span>, <span class="c-st">"invoke_agent"</span>)
+    s.<span class="c-fn">set_attribute</span>(<span class="c-st">"gen_ai.request.model"</span>, model_id)
+    s.<span class="c-fn">set_attribute</span>(<span class="c-st">"gen_ai.usage.input_tokens"</span>, ti)
+    s.<span class="c-fn">set_attribute</span>(<span class="c-st">"gen_ai.usage.output_tokens"</span>, to)
+    <span class="c-cm"># tool calls become child spans: gen_ai.operation.name=execute_tool</span></pre>
+
+    <div class="callout tip">
+      <p>Standard conventions are not bureaucracy &mdash; they are why your traces work in any OTel backend, why two teams' agents are comparable, and why a vendor-neutral exporter means you are never locked into one observability tool. A bespoke trace schema is a migration you will pay for later with interest.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Trajectory replay: where observability becomes eval.</h3>
+
+    <p>A complete trace is replayable: feed the recorded inputs and observations back through a candidate prompt/policy and see if it makes the same or better decisions &mdash; <em>without</em> re-hitting live tools. This is the bridge between this essay and all the others.</p>
+
+    <ul>
+      <li><strong>Counterfactual debugging</strong> &mdash; "would prompt v8 have avoided the bad call at step 12?" Replay step 12 with the recorded context; you get an answer in seconds, not a re-run.</li>
+      <li><strong>Regression eval from real traffic</strong> &mdash; replay a sampled set of production traces against the new build; a decision that flipped from good to bad is a regression, caught before deploy (this is E6's gate).</li>
+      <li><strong>Eval-set construction</strong> &mdash; the most informative eval tasks are real failed traces, frozen with their environment, turned into replayable cases.</li>
+    </ul>
+
+    <pre class="trace"><span class="c-out">replay: prod trace #4471 vs build candidate-92
+  step  3  tool=search        same        ok
+  step  7  tool=db.write      args DIFFER  &larr; candidate adds dry_run
+  step 12  tool=delete_user   BLOCKED      &larr; candidate refuses, prod did it
+  verdict: candidate FIXES the step-12 incident; ship behind flag</span></pre>
+
+    <p>That replay turned a production incident into a regression test and a fix verification in one pass &mdash; impossible if the trace had been a few log lines and a final answer.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The honest tradeoff.</h3>
+
+    <p>Full-fidelity tracing is not free: storage grows fast, prompt/observation content can contain PII and secrets (redact at the boundary, never log raw credentials), and naive synchronous export adds latency to the hot path (export async, sample by policy, keep 100% of errors). But the alternative &mdash; thin logs and a final answer &mdash; makes evaluation, debugging, and improvement structurally impossible, not merely harder. <strong>Pay the tracing cost deliberately and treat the trace as the system's primary data structure; an agent you cannot fully replay is an agent you cannot actually evaluate.</strong></p>
+  </div>
+</section>
