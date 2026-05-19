@@ -14,7 +14,7 @@ const L = (en: string, zh: string): Localized => ({ en, zh });
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
-    date: '2026-05-18',
+    date: '2026-05-19',
     title: L('Operations, evaluation & training coverage', '扩充运维、评估与训练内容'),
     items: [
       L('New Deep-Dive group "Evaluation & Observability" — 6 essays: why agent eval is hard, outcome vs trajectory eval, LLM-as-judge for agents, reading agent benchmarks critically, tracing & observability, and eval-driven development.',
