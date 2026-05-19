@@ -30,6 +30,16 @@ notable accessibility/SEO/design changes — all get a changelog line.
 - Group related work into one entry; keep bullets concrete and user-facing.
 - If you forget and only notice later, add it as a follow-up before merge.
 
+## Accepted security trade-off
+
+`main` auto-deploys to production on every push, and content fragments are
+rendered with `set:html` (unsanitized by design — content is build-time
+author-controlled). Consequence: **a content PR is effectively a code PR** —
+review content changes with the same scrutiny as code, including any inline
+`<script>`/`on*=` handlers. CSP is intentionally not set (AdSense would
+require weakening it to little value); the other security headers in
+`vercel.json` carry the defense-in-depth.
+
 ## Conventions
 
 - Every content entry exists in **both** `en/` and `zh/` with the same
