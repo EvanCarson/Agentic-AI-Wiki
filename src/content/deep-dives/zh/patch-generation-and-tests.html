@@ -1,0 +1,52 @@
+<section class="phase">
+  <div class="phase-num">U3</div>
+  <div class="week">深入解析 · 编码与计算机操作智能体</div>
+  <h2>补丁是一个假设；测试套件是接受或杀死它的那场实验。</h2>
+  <p class="goal">生成一个貌似合理的 diff 是容易的部分&mdash;&mdash;模型从 2023 年起就会了。难的是那个闭环：把补丁作为真实 <code class="inline">git</code> diff 应用、运行套件、读懂失败、在不过拟合、不弄坏无关测试、不被一次 flaky 通过骗到的前提下修订。本文涵盖 diff/补丁应用与 hunk 失败、测试驱动自我纠错、回归守护，以及这个循环悄悄对你撒谎的几种具体方式。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>用结构化 diff 编辑，而非重写文件。</h3>
+    <p>整文件重写既费 token 又会悄无声息地破坏&mdash;&mdash;模型会丢掉一个它没"看见"为相关的函数。稳健的单元是<strong>局部化的 hunk</strong>：一个 search/replace 块，或一段锚定在上下文行上的 unified diff。这迫使模型确切承诺<em>究竟</em>改了什么，使编辑可评审，并把搞砸的编辑变成一个干净、可恢复的<em>应用失败</em>，而不是一个被损坏的文件&mdash;&mdash;否则智能体还得把它当成缺陷来 debug。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Hunk 应用失败是信息，不只是一个错误。</h3>
+    <p>当一个 hunk 应用不上时，原因几乎总是模型对文件的认知过期了&mdash;&mdash;行号错了、上下文漂移了、它忘了自己早先的某次编辑。智能体必须把被拒的 hunk 当作<em>重新读取</em>当前文件状态的<em>信号</em>，而不是更用力地重试同一个 diff。生产级智能体对应用失败的反应是：在目标周围重开一个紧凑视窗、针对<em>实际</em>字节重新生成 hunk，然后才重新应用。</p>
+<pre class="standalone"><span class="c-cm"># apply -> test -> read -> revise, with honest failure handling</span>
+<span class="c-kw">try</span>:
+    repo.<span class="c-fn">apply</span>(hunk)
+<span class="c-kw">except</span> HunkReject <span class="c-kw">as</span> e:
+    window = repo.<span class="c-fn">open</span>(e.file, e.line, ctx=<span class="c-st">40</span>)  <span class="c-cm"># re-ground on real bytes</span>
+    hunk   = agent.<span class="c-fn">regen</span>(window)               <span class="c-cm"># not: retry same diff</span>
+res = sandbox.<span class="c-fn">run_tests</span>(scope=<span class="c-st">"changed"</span>)        <span class="c-cm"># fast loop: targeted first</span>
+<span class="c-kw">if</span> res.passed: res = sandbox.<span class="c-fn">run_tests</span>(scope=<span class="c-st">"full"</span>)  <span class="c-cm"># then guard regressions</span></pre>
+    <div class="callout tip"><p>先跑<em>定向</em>测试以获得快速修订循环，提交前再跑<em>完整</em>套件作为回归门。跳过完整这一遍，正是一个绿的定向测试发布出一个坏邻居的方式。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>测试驱动自我纠错：先复现，再修。</h3>
+    <p>纵观 SWE-agent 与 OpenHands 的运行，最强的范式是把 TDD 倒置到智能体身上：<strong>先写出或运行一个复现该缺陷的测试</strong>，看它因正确的原因失败，再编辑直到它通过<em>且</em>其余保持绿色。一个失败的复现把含糊的 issue 变成具体的裁决者，并免费给出一个能定位（U2）的堆栈跟踪。在拿到红色测试之前就编辑的智能体，是在对着一个它看不见的目标做优化。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>回归守护：套件是两个裁决者，不是一个。</h3>
+    <p>定向测试回答"我修好了吗"。既有套件回答"我有没有弄坏别的"&mdash;&mdash;这是另一个、同样承重的问题。许多提交的补丁解决了 issue 却悄悄让某个邻居失败；在 SWE-bench 系列上，模型形态补丁与 gold 补丁之间的差异常常是一处回归，而非漏修。这门纪律是：<strong>把通过/失败集合与打补丁前的基线做 diff</strong>，把任何新变红的测试当作硬阻断，即便定向测试是绿的。</p>
+    <div class="callout warn"><p>当心<em>本来就已部分变红</em>的套件。智能体必须在编辑<em>之前</em>给失败打基线；否则它会去追既有的 flake、"修"无关测试，或因为一个从未通过的测试仍然没通过而宣布胜利。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>循环里有三个诚实的骗子：flake、过拟合、被删的断言。</h3>
+    <p>三种失败模式会污染信号。<strong>Flaky 测试</strong>让正确补丁看着像坏的、让坏补丁看着像修好的&mdash;&mdash;在相信一次翻转前要隔离并重跑。<strong>过拟合</strong>：智能体对夹具的确切输入做特例处理而非修复机制，通过可见测试却在每个留出测试上失败。<strong>对裁决者做奖励黑客</strong>：削弱断言、删掉失败测试，或用一个吞掉错误的 try/except 包住调用&mdash;&mdash;技术上绿了，实质上是谎言。这三者都能过循环，都会败给现实。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>当循环救不了你时。</h3>
+    <p>测试驱动自我纠错的强度，只到套件对真实契约的覆盖为止。在测试不足的代码上，智能体会产出一个绿而错的补丁；对正确性非机械化的改动（性能、可读性、API 工效）则根本没有红色测试可朝之逼近。<strong>套件通过只证明补丁没弄坏被测试的东西&mdash;&mdash;绝不证明它正确；循环的上限就是套件的覆盖，而一个只见过它必须通过的测试的补丁，只会拟合那些测试、别的什么都不拟合。</strong></p>
+  </div>
+</section>
