@@ -1,0 +1,80 @@
+<section class="phase">
+  <div class="phase-num">O5</div>
+  <div class="week">深入解析 · 智能体运维：部署与运营</div>
+  <h2>灰度发布、版本化与固定：模型在你脚下变了，却没人发布过。</h2>
+  <p class="goal">智能体在生产中的头号意外，不是你写的某个 bug——而是你什么都没改、行为却变了，因为模型提供商在一个浮动别名背后轮换了检查点。智能体的行为是三个耦合工件的函数——模型、提示、工具——发布其中任何一个都是一次部署，无论你的 CI 是否知道。本文讲的是把这个三元组当作一个版本化、固定、灰度、可回滚的发布来对待。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>"模型在我们脚下变了"是默认，不是例外。</h3>
+
+    <p>用浮动别名调用 <code class="inline">gpt-4o</code> 或 <code class="inline">claude-sonnet</code>，意味着提供商可以——而且确实会——按他们的时间表，把那个指针移到一个行为不同的新检查点，你的仓库里没有任何 diff，变更日志里也没有任何条目。你上周通过的评估，是针对一个在那个名字下已不再存在的模型跑的。<strong>一个未固定的模型，是对你最关乎行为的依赖的一次持续、无声、未经评审的部署。</strong></p>
+
+    <p>能修好这件事的思维重构是：智能体的行为契约是元组 <code class="inline">(model_version, prompt_version, tool_schema_version)</code>。其中两个住在你仓库里，你已经反射性地给它们做版本化。第三个会在你不知情时移动——所以它必须以与库版本相同的纪律来固定，而不是用一个会移动的标签去引用。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>固定整个三元组，并在每次运行上打戳。</h3>
+
+    <p>固定到不可变、带日期的模型快照——绝不用裸的家族别名。把提示与工具 schema 版本化为内容寻址的工件。然后把解析出的三元组记进运行的日志，使每条轨迹都可归因到一个确切的行为契约。</p>
+
+<pre class="standalone"><span class="c-cm"># release/pin.py — one immutable behavioral contract</span>
+RELEASE = {
+    <span class="c-st">"model"</span>:  <span class="c-st">"claude-sonnet-2025-09-01"</span>,  <span class="c-cm"># dated snapshot, NOT a float</span>
+    <span class="c-st">"prompt"</span>: <span class="c-st">"sha256:9af3...e1"</span>,           <span class="c-cm"># content-addressed</span>
+    <span class="c-st">"tools"</span>:  <span class="c-st">"toolset@v7"</span>,                <span class="c-cm"># pinned schema set</span>
+}
+
+<span class="c-kw">def</span> <span class="c-fn">start_run</span>(req):
+    rel = active_release(req.tenant)        <span class="c-cm"># may be canary or stable</span>
+    journal.record(req.run_id, <span class="c-st">0</span>, <span class="c-st">"PLAN"</span>,
+                   {<span class="c-st">"req"</span>: req, <span class="c-st">"release"</span>: rel})  <span class="c-cm"># stamp it</span>
+    <span class="c-kw">return</span> rel                              <span class="c-cm"># run is bound to THIS triple</span></pre>
+
+    <div class="callout tip"><p>把发布打戳到运行上，也修掉了 <code class="inline">durable-state-and-resumability</code> 里的可恢复性隐患：在发布 <code class="inline">R</code> 下崩溃的运行必须在 <code class="inline">R</code> 下恢复，而不是当前那个。前半段由一个模型产生、后半段由另一个产生的运行，是一条无法调试的轨迹。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>灰度与影子：在新三元组触及所有人之前先证明它。</h3>
+
+    <p>一个新的模型快照或提示改动是一次没有编译器替你捕获回归的行为变更。把它作为一次受控实验来铺开，而非一次切换：</p>
+
+    <ul>
+      <li><strong>影子（shadow）</strong>——让候选三元组与线上三元组在真实流量上并行运行，只对外提供线上结果，离线对比输出。零用户风险；在任何客户看到之前就暴露行为漂移。这是模型快照升级的最佳第一道闸门。</li>
+      <li><strong>灰度（canary）</strong>——把一小片精选流量（比如 1–5%，最好先内部/低风险租户）路由到新三元组，并自动把质量与安全指标与对照片比较。</li>
+      <li><strong>渐进提升</strong>——只在闸门保持绿色时扩大；一旦某个护栏指标回归，冻结铺开——不要"观察看看"。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>评估闸门就是提升标准——评估不绿，不提升。</h3>
+
+    <p>灰度告诉你生产怎么想；评估套件告诉你这个问题该不该问。从灰度提升到全量铺开，必须以一次针对<em>候选三元组</em>、版本化的离线评估为闸门，在要紧的指标上与在位者比较——任务成功率、回归集，以及对抗/安全套件。这不是可选的打磨；它是横亘在"提供商的新检查点写代码强 3%、拒绝提示注入弱 20%"与"它无声上线"之间的唯一东西。</p>
+
+    <div class="callout warn"><p>提供商的模型升级不是单调的。一个更新的快照可能在标称基准上更好，却在<em>你的</em>任务或你的安全面上更差。把每一次提供商快照变更当作一个候选，必须通过与你自己提示改动相同的评估闸门——厂商的发布说明不是你的评估。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>回滚纪律：一个不能在几分钟内回退的发布不算发布。</h3>
+
+    <p>由于行为回归往往很微妙、只在聚合上可见，恢复原语必须是即时且乏味的：</p>
+
+    <ul>
+      <li><strong>回滚是配置切换，不是重新部署。</strong>当前发布是数据（每租户/每分段一个指针），所以回退是改一个值，而不是在事故压力下重新构建并发布。</li>
+      <li><strong>把前 N 个发布保持热备。</strong>上一个三元组——含模型快照——必须仍可调用；别让一个固定指向一个会被提供商在你回滚路径下退役掉的快照。</li>
+      <li><strong>在途运行在它打戳的发布上跑完。</strong>回滚改变的是<em>新</em>运行拿到什么；它绝不能追溯改写已在循环中途的运行的行为契约。</li>
+      <li><strong>一个回滚理由就够了。</strong>护栏指标回归就是回退，不是辩论。回到安全状态再去调查。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>什么时候严格固定比这个用例所需更讲究。</h3>
+
+    <p>固定、影子与评估闸门是实打实的发布机制，带着实打实的升级延迟：一个低风险的内部摘要器，任何过得去的模型都行、答错也没代价，并不需要一条灰度流水线——一个浮动别名加一次抽查就成比例了。不固定的代价以<em>每美元影响下的行为意外</em>来支付：对一个一次性小助手它可忽略，对一个搬动资金或做不可逆变更的智能体它是灾难性的。<strong>按"一次无声行为漂移会让你付出多少"来成比例地固定与设闸——但永远不要让一个有真实世界副作用的智能体骑在一个浮动模型别名上。</strong></p>
+  </div>
+</section>

@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">O2</div>
+  <div class="week">Deep Dive · AgentOps: Deploy &amp; Operate</div>
+  <h2>Concurrency, queues and scaling: agents are jobs, not requests.</h2>
+  <p class="goal">An HTTP handler that holds a connection open for a 40-minute agent loop is a design error you will discover under load. Agents are long-running, bursty, stateful, and expensive per unit of work — that profile is a <em>batch job</em>, and the operational shape that survives production is a queue with workers, per-tenant limits, and fan-out you can afford. This essay is about that shape.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The request/response framing breaks at the first concurrency spike.</h3>
+
+    <p>Synchronous "POST /agent, await result" couples three things that have wildly different time constants: the client's patience (seconds), the agent's runtime (minutes), and your capacity (fixed). Under a burst, every slow agent pins a worker thread and a socket; the pool exhausts; healthy short requests queue behind 30-minute ones; load balancers time out and clients <em>retry</em>, multiplying the very load that is failing you. <strong>The fix is not a bigger thread pool; it is decoupling acceptance from execution.</strong></p>
+
+    <p>The durable submission pattern: the API call <em>enqueues</em> a run and returns a <code class="inline">run_id</code> immediately. Workers pull from the queue and execute against the durable journal (see <code class="inline">durable-state-and-resumability</code>). The client polls or subscribes for completion. Acceptance is O(milliseconds) and never blocked by execution depth.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Queue + workers is the reference architecture.</h3>
+
+<pre class="standalone"><span class="c-cm"># api: accept fast, never block on the loop</span>
+<span class="c-kw">def</span> <span class="c-fn">submit</span>(req):
+    run_id = new_id()
+    journal.record(run_id, <span class="c-st">0</span>, <span class="c-st">"PLAN"</span>, req)
+    queue.enqueue(<span class="c-st">"agent-runs"</span>, run_id,
+                  tenant=req.tenant, priority=req.tier)
+    <span class="c-kw">return</span> {<span class="c-st">"run_id"</span>: run_id, <span class="c-st">"status"</span>: <span class="c-st">"queued"</span>}
+
+<span class="c-cm"># worker: bounded concurrency, lease + heartbeat</span>
+<span class="c-kw">async</span> <span class="c-kw">def</span> <span class="c-fn">worker</span>(slot):
+    <span class="c-kw">while</span> <span class="c-kw">True</span>:
+        job = <span class="c-kw">await</span> queue.lease(<span class="c-st">"agent-runs"</span>, ttl=<span class="c-st">120</span>)
+        <span class="c-kw">async</span> <span class="c-kw">with</span> heartbeat(job):       <span class="c-cm"># renew lease while alive</span>
+            <span class="c-kw">await</span> run_loop(job.run_id)   <span class="c-cm"># resumable; safe to redeliver</span>
+        queue.ack(job)</pre>
+
+    <p>The non-negotiable properties: <strong>leases with heartbeats</strong> (a dead worker's job becomes redeliverable, not lost — and because the run is resumable, redelivery is correct, not a duplicate), <strong>bounded worker concurrency</strong> (a fixed number of in-flight loops per worker, sized to provider rate limits and memory, not "as many as arrive"), and <strong>visibility</strong> (queue depth and oldest-message-age are your true load signal — not CPU).</p>
+
+    <div class="callout tip"><p>Scale workers off <em>queue depth and age</em>, not CPU. An agent worker is mostly blocked on model and tool latency; CPU stays low while latency explodes. Autoscaling on CPU will under-provision exactly when you are drowning. Alert on oldest-message-age crossing your SLA.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Per-tenant concurrency limits, or one customer is everyone's outage.</h3>
+
+    <p>A single global queue is a noisy-neighbor incident waiting to happen: one tenant submitting 5,000 runs starves every other tenant and burns the shared provider rate limit, turning their isolated burst into your platform-wide latency spike. You need <em>fairness</em>, enforced as a per-tenant in-flight cap, not just a global one.</p>
+
+<pre class="standalone"><span class="c-cm"># fair dispatch: cap concurrent runs per tenant</span>
+<span class="c-kw">def</span> <span class="c-fn">dispatchable</span>(job):
+    inflight = counter.get(<span class="c-st">"inflight"</span>, job.tenant)
+    cap = plan_limit(job.tenant)        <span class="c-cm"># e.g. free=2, pro=20</span>
+    <span class="c-kw">if</span> inflight &gt;= cap:
+        queue.requeue(job, delay=<span class="c-st">backoff</span>)  <span class="c-cm"># yield, don't drop</span>
+        <span class="c-kw">return</span> <span class="c-kw">False</span>
+    counter.incr(<span class="c-st">"inflight"</span>, job.tenant)
+    <span class="c-kw">return</span> <span class="c-kw">True</span></pre>
+
+    <p>Implement this as work-stealing across per-tenant sub-queues, or a global queue with an admission gate as above. The cap is a product decision (plan tiers) <em>and</em> a safety device: it bounds the blast radius of one tenant's runaway loop (see <code class="inline">incident-response-for-agents</code>).</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Statefulness is the real scaling tax — pay it with the journal.</h3>
+
+    <p>Horizontal scaling is trivial for stateless services and hard for agents because an agent loop <em>has state</em>: plan, history, scratchpad. The trap is keeping that state in worker memory, which sticks a run to a pod and makes every restart a data loss. The discipline that buys horizontal scale: <strong>workers are stateless; the journal is the state.</strong> Any worker can pick up any run by replaying its journal. That single decision converts agents from sticky, un-rebalanceable workloads into fungible jobs you can autoscale, drain, and bin-pack like anything else.</p>
+
+    <div class="callout warn"><p>In-memory caches for "the conversation so far" are the most common scaling regression. They work in dev (one process), pass review, and then sticky-route every run, defeat autoscaling, and lose state on deploy. If it must survive a process, it lives in the journal — not a process-local dict.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Fan-out is a cost multiplier with no natural backpressure.</h3>
+
+    <p>Multi-agent and parallel-subtask patterns spawn N children per parent. The arithmetic is unforgiving: a top-level agent that fans out to 8 researchers, each making 15 model calls, is 120 calls for one user request — and a recursive planner that fans out at each level is exponential. Fan-out has <em>no built-in backpressure</em>: nothing stops a planner from deciding it needs 200 sub-agents.</p>
+
+    <ul>
+      <li><strong>Bound the fan-out factor</strong> structurally (max children per node) and the <strong>recursion depth</strong> — both as hard runtime limits, not prompt requests the model can ignore.</li>
+      <li><strong>Charge children against the parent's budget</strong>, not a fresh budget each, so fan-out depletes a shared per-task ceiling (see <code class="inline">cost-control-in-the-loop</code>).</li>
+      <li><strong>Enqueue children as jobs</strong> through the same fair dispatcher — so 200 sub-agents queue behind the per-tenant cap instead of all hitting the provider at once.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When a queue is the wrong tool.</h3>
+
+    <p>Queues add latency (enqueue, lease, poll) and operational surface (dead-letter handling, redelivery semantics, the polling API). A genuinely interactive agent where the human is staring at the screen waiting for a 4-second reply should stream synchronously — a queue there just adds a second of dead air for no durability the user cares about. The architecture in this essay earns its complexity when runs are <em>long</em>, <em>bursty</em>, or <em>fanned-out</em>. <strong>Use a queue when work outlives the requester's attention span; stream when it does not — and never block a request thread on a loop that can outlive the load balancer's timeout.</strong></p>
+  </div>
+</section>
