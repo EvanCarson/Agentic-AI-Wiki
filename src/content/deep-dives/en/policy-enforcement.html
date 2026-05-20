@@ -1,0 +1,67 @@
+<section class="phase">
+  <div class="phase-num">C2</div>
+  <div class="week">Deep Dive · Governance &amp; Compliance</div>
+  <h2>Policy enforcement &mdash; a policy a model can talk its way around is not a control.</h2>
+  <p class="goal">Every team writes an agent policy: don't touch production data, get approval over a threshold, never email external parties. Almost every team then "enforces" it by putting it in the system prompt &mdash; which makes it a strong suggestion to a non-deterministic optimizer that an adversary is actively trying to redirect. A control is something a model cannot decline. This essay is about turning policy into code, choosing where in the agent loop to enforce it, and the structural patterns &mdash; allowlists, separation of duties &mdash; that hold when the model is wrong or compromised.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Policy-as-code: the rule is evaluated, not interpreted.</h3>
+    <p>The first move is to take the policy out of natural language and into an executable artifact that runs <em>outside</em> the model: a function, a rules engine, a policy language like the kind used for cloud authorization. The agent proposes an action; a deterministic evaluator returns allow or deny before anything happens. This buys three things prompt-based "policy" can never have: it is <strong>auditable</strong> (the rule is a versioned, reviewable object, not buried in a prompt), <strong>testable</strong> (you can assert deny on the dangerous cases in CI), and <strong>non-bypassable by persuasion</strong> (no wording of a malicious instruction changes the output of a function).</p>
+<pre class="standalone"><span class="c-cm"># the model proposes; a deterministic evaluator decides</span>
+decision = policy.<span class="c-fn">evaluate</span>(
+  action=proposed_tool_call,
+  principal=ctx.principal,
+  context=ctx,
+)
+<span class="c-kw">if</span> decision.effect != <span class="c-st">"allow"</span>:
+    <span class="c-kw">return</span> <span class="c-fn">Denied</span>(decision.reason)  <span class="c-cm"># fail closed</span></pre>
+    <div class="callout tip">
+      <p>Keep the policy engine separate from the agent code and version it independently. "Which policy was in force when this ran" must be answerable from the audit record (C1) by id, not by reading old prompts.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Enforce in three places: before, inside, and after the loop.</h3>
+    <p>There is no single chokepoint, because different risks live at different stages. <strong>Pre-loop</strong>: admission &mdash; is this principal allowed to run this agent at all, with what data scope and budget. <strong>In-loop</strong>: the high-leverage layer &mdash; every tool call is checked against policy before execution, with arguments inspected, not just the tool name (the difference between "may call the DB tool" and "may run <code class="inline">DELETE</code>"). <strong>Post-loop</strong>: egress &mdash; inspect the agent's output and any outbound payload before it leaves the trust boundary, because a correct sequence of allowed calls can still assemble a disallowed result, like exfiltrating data into a "summary".</p>
+    <ul>
+      <li><strong>Pre</strong> bounds the blast radius before the model runs &mdash; scope, budget, data domain.</li>
+      <li><strong>In-loop</strong> is where autonomy actually does damage &mdash; argument-level checks on every effectful call.</li>
+      <li><strong>Post</strong> catches emergent violations no single step tripped &mdash; the assembled outcome, not the steps.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Allowlist, never blocklist.</h3>
+    <p>A blocklist enumerates forbidden actions and permits everything else; for an open-ended generator that invents action sequences, the set of harmful things you didn't think of is unbounded, so a blocklist fails open. An <strong>allowlist</strong> enumerates permitted tools, permitted argument shapes, permitted destinations, and denies by default &mdash; the unanticipated action is refused because it was never granted, not because someone predicted it. This is the single highest-leverage structural decision in agent policy and it must be the default posture at every enforcement point: deny unless explicitly allowed.</p>
+    <div class="callout warn">
+      <p>A blocklist of "bad" tool calls is security theater against a model an attacker can prompt-inject. The unsafe default &mdash; allow-then-block &mdash; means your safety depends on having predicted the attack.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Separation of duties: no single agent closes the loop on a sensitive action.</h3>
+    <p>For high-consequence operations, borrow the oldest control in finance: the entity that proposes an action cannot be the entity that approves and commits it. An agent may <em>draft</em> a payment, a deletion, a production change; a separate authority &mdash; a different service with different credentials, a second agent with a narrow verifier role, or a human (the operator role developed in C4) &mdash; must approve before the effect lands. This means a single compromised or hallucinating agent cannot unilaterally cause the worst outcome; the attacker now has to defeat two independently-scoped controls.</p>
+<pre class="standalone"><span class="c-cm"># proposer and approver are different principals</span>
+draft = agent.<span class="c-fn">propose</span>(<span class="c-st">"refund"</span>, amount=<span class="c-st">9000</span>)
+<span class="c-kw">if</span> draft.amount &gt; <span class="c-st">5000</span>:
+    approval = approver.<span class="c-fn">review</span>(draft)   <span class="c-cm"># separate authority + creds</span>
+    <span class="c-kw">assert</span> approval.granted_by != draft.proposed_by
+commit.<span class="c-fn">apply</span>(draft, approval)</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Tie enforcement to the audit trail, both ways.</h3>
+    <p>Enforcement and audit are one system. Every policy decision &mdash; allow <em>and</em> deny &mdash; must be written to the C1 trail with the rule id, the inputs evaluated, and the outcome, so "why was this blocked" and "why was this permitted" are both answerable later. Denials are the more valuable signal: a rising deny rate on a path is an early indicator of a misbehaving agent, a prompt-injection campaign, or a policy that is wrong for the real workload. Enforcement without audit cannot be reviewed; audit without enforcement only records the damage.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The honest tradeoff.</h3>
+    <p>Hard enforcement has a real cost: every gate is latency and engineering, an overtight allowlist generates false denials that push users toward shadow workarounds, and a separate policy engine is another system to keep correct and in sync. But the alternative &mdash; policy that lives only in a prompt &mdash; is not a weaker control, it is the <em>absence</em> of a control wearing the costume of one. <strong>Enforce the rules that protect against irreversible or regulated harm in code outside the model; let prompt guidance handle only what a violation would merely make slightly worse.</strong></p>
+  </div>
+</section>
