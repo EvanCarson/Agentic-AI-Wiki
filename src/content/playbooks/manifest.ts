@@ -21,7 +21,7 @@ interface GroupModule { default: Group }
 const modules = import.meta.glob<GroupModule>('./groups/*.ts', { eager: true });
 
 /** Groups sorted by `.order` asc, with `.key` as a deterministic tiebreaker. */
-const GROUPS: Group[] = Object.values(modules)
+export const GROUPS: Group[] = Object.values(modules)
   .map(m => m.default)
   .sort((a, b) => a.order - b.order || a.key.localeCompare(b.key));
 
