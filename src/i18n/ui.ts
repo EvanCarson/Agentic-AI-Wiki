@@ -42,6 +42,7 @@ export interface UIStrings {
            maintainerH: string; maintainerHtml: string;
            contactH: string; contactHtml: string };
   changelog: { kicker: string; metaTitle: string; metaDesc: string; h1: string; intro: string };
+  og: { tagline: string };
   seriesTitle: string;
 }
 
@@ -126,6 +127,7 @@ export const ui: Record<Locale, UIStrings> = {
       metaDesc: 'What changed on the Agentic AI Wiki, newest first.',
       h1: 'Changelog',
       intro: 'Notable changes to this site — new sections, content, and improvements.' },
+    og: { tagline: 'A living knowledge base on building agentic AI.' },
     seriesTitle: 'The Agentic AI Field Guide',
   },
   zh: {
@@ -208,6 +210,7 @@ export const ui: Record<Locale, UIStrings> = {
       metaDesc: '本站的变更记录，按时间倒序。',
       h1: '更新日志',
       intro: '本站的重要变更 — 新板块、新内容与改进。' },
+    og: { tagline: '持续更新的智能体 AI 知识库。' },
     seriesTitle: 'Agentic AI 实战指南',
   },
 };
