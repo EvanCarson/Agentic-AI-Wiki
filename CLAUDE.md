@@ -12,27 +12,37 @@ production by **Vercel on every push to `main`**. Content sections:
 - **Concepts** & **Deep-Dives** — `src/content/{concepts,deep-dives}/{en,zh}/<slug>.html`
   fragments, registered in each section's `manifest.ts` (`Entry` with
   `page, slug, title, summary, group` — all `Localized {en, zh}`).
-- **Changelog** — curated data module `src/content/changelog.ts` (single page,
-  no per-entry routes).
+- **Changelog** — one file per entry under
+  `src/content/changelog/entries/<YYYY-MM-DD>-<slug>.ts` (each `export default`s
+  a `ChangelogEntry`). `src/content/changelog.ts` is a thin aggregator that
+  globs the directory at build time. Single page, no per-entry routes.
 - About/Home/nav copy lives in `src/i18n/ui.ts` (typed `UIStrings`, full `en`
   and `zh`); routes are thin `src/pages/<r>.astro` + `src/pages/zh/<r>.astro`.
 
 ## ALWAYS update the changelog
 
-**Whenever you change site content or structure, add an entry to
-`src/content/changelog.ts` in the same change (PR).** This is required, not
+**Whenever you change site content or structure, add ONE new entry file in
+the same PR** at `src/content/changelog/entries/<YYYY-MM-DD>-<short-slug>.ts`,
+exporting a `ChangelogEntry` as the default export. Concurrent PRs each add
+their own file, so changelog edits **never collide**. This is required, not
 optional. New section/entries, content edits worth noting, nav/IA changes,
-notable accessibility/SEO/design changes — all get a changelog line.
+notable accessibility/SEO/design changes — all get an entry file.
 
-- Newest first. Each entry: `{ date: 'YYYY-MM-DD', title: Localized, items: Localized[] }`.
+- Each file `export default`s `{ date: 'YYYY-MM-DD', title: Localized, items: Localized[] }`.
+  Import the shape + the `L(en, zh)` helper from `../types.ts`. Copy any
+  existing file under `entries/` as a template.
+- The filename **date prefix MUST equal** the entry's `date` field — the
+  `changelog.test.mjs` test enforces this; the aggregator sorts by filename
+  descending (newest date first, alphabetical slug tiebreaker within a day).
 - `date` is the day the change **actually merges to `main`** (the deploy
   date) — not the day you started drafting. Verify it right before merge:
-  if the task spanned midnight or sat in review, bump the date to the real
-  merge day. A stale changelog date is a defect, fix it like any other.
+  if the task spanned midnight or sat in review, rename the file and bump
+  the `date` field to the real merge day. A stale changelog date is a
+  defect, fix it like any other.
 - Every `title` and every `items[]` bullet must be **bilingual** (`L(en, zh)`),
   with a faithful, fluent Chinese translation — never machine-literal.
-- Group related work into one entry; keep bullets concrete and user-facing.
-- If you forget and only notice later, add it as a follow-up before merge.
+- Group related work into one entry file; keep bullets concrete and user-facing.
+- If you forget and only notice later, add the file as a follow-up before merge.
 
 ## Accepted security trade-off
 
