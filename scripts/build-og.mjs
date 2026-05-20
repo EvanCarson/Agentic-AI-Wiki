@@ -3,7 +3,7 @@
 // Run via `npm run og:build`. Idempotent: writes only when bytes change.
 //
 // Layout: Direction A — dark editorial card (see the spec).
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import satori from 'satori';
@@ -33,6 +33,8 @@ const INK = '#0a0a0a';
 const PAPER = '#f4f1ea';
 const PAPER_2 = '#ebe7dc';
 const ACCENT = '#d4421e';
+
+const SITE_HOST = 'menuagentic.com'; // keep in sync with astro.config.mjs `site:`
 
 function loadFonts() {
   return FONTS.map((f) => ({
@@ -141,7 +143,7 @@ function renderCard({ name, tagline }) {
                     letterSpacing: '0.12em', textTransform: 'uppercase',
                     color: PAPER_2, opacity: 0.85,
                   },
-                  children: 'menuagentic.com',
+                  children: SITE_HOST,
                 },
               },
             ],
@@ -163,8 +165,11 @@ function writeIfChanged(path, bytes) {
 
 function nameFor(section, locale) {
   if (section.key === 'default') return section.name[locale];
-  // ui.<locale>.nav.<key>
-  return ui[locale].nav[section.key];
+  const name = ui[locale].nav[section.key];
+  if (!name) {
+    throw new Error(`[og] No nav label for section key "${section.key}" / locale "${locale}"`);
+  }
+  return name;
 }
 
 async function main() {
@@ -206,12 +211,13 @@ async function main() {
     }
   }
 
-  // Prune orphan PNGs that no longer have a section mapping.
+  // Prune orphan PNGs this script owns (og-*.png) that no longer map to a section.
+  // The pattern guard prevents accidentally deleting unrelated files anyone might
+  // place under public/og/ in the future.
   for (const f of readdirSync(OUT_DIR)) {
-    if (f === '.DS_Store') continue;
+    if (!/^og-.*\.png$/.test(f)) continue;
     if (!expected.has(f)) {
-      const stale = resolve(OUT_DIR, f);
-      unlinkSync(stale);
+      unlinkSync(resolve(OUT_DIR, f));
       console.log(`[og] removed orphan ${f}`);
     }
   }
