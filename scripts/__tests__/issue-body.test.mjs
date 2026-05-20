@@ -70,3 +70,20 @@ test('composeUmbrellaBody groups ideas by tier with cross-refs', () => {
   assert.ok(body.includes('#102'), 'missing P1 issue ref');
   assert.ok(body.includes('#103'), 'missing P2 issue ref');
 });
+
+test('composeIssueBody handles missing lenses gracefully', () => {
+  const idea = { ...sampleIdea, lenses: undefined };
+  const body = composeIssueBody(idea, BRANCH, REPO);
+  assert.ok(body.includes('_unclassified_'), 'missing fallback for empty lenses');
+});
+
+test('composeUmbrellaBody throws on unknown tier', () => {
+  const ideas = [{ ...sampleIdea, tier: 'P3', issueNumber: 999, slug: 'x', title: 'X' }];
+  assert.throws(() => composeUmbrellaBody(ideas, BRANCH, REPO), /unknown tier/);
+});
+
+test('composeUmbrellaBody does not double-period the pitch', () => {
+  const ideas = [{ ...sampleIdea, rank: 1, tier: 'P0', issueNumber: 101, problem: 'Short sentence.' }];
+  const body = composeUmbrellaBody(ideas, BRANCH, REPO);
+  assert.ok(!body.includes('..'), 'body contains "..": ' + body.match(/.{0,30}\.\..{0,30}/));
+});

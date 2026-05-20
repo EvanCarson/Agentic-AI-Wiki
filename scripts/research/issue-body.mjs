@@ -28,7 +28,10 @@ export function composeTitle(idea) {
 
 export function composeIssueBody(idea, branch, repo) {
   const paths = mockupPaths(idea);
-  const lenses = idea.lenses.map(l => `\`lens/${l}\``).join(', ');
+  const lensArr = idea.lenses ?? [];
+  const lenses = lensArr.length
+    ? lensArr.map(l => `\`lens/${l}\``).join(', ')
+    : '_unclassified_';
   const competitors = (idea.competitor_examples ?? []).length
     ? idea.competitor_examples.map(c => `- ${c.startsWith('http') ? `<${c}>` : c}`).join('\n')
     : '_None cited._';
@@ -89,9 +92,17 @@ _Filed by the 2026-05-19 multi-lens research pass. See umbrella issue for the fu
 
 export function composeUmbrellaBody(ideas, branch, repo) {
   const byTier = { P0: [], P1: [], P2: [] };
-  for (const i of ideas) byTier[i.tier].push(i);
+  for (const i of ideas) {
+    if (!byTier[i.tier]) {
+      throw new Error(`composeUmbrellaBody: unknown tier ${JSON.stringify(i.tier)} on idea ${JSON.stringify(i.slug ?? i.title)}`);
+    }
+    byTier[i.tier].push(i);
+  }
 
-  const line = (i) => `- #${i.issueNumber} — **${i.title}** — ${i.problem.split('. ')[0].slice(0, 120)}.`;
+  const line = (i) => {
+    const pitch = i.problem.split('. ')[0].slice(0, 120).replace(/\.+$/, '');
+    return `- #${i.issueNumber} — **${i.title}** — ${pitch}.`;
+  };
   const block = (tier, label) => {
     if (byTier[tier].length === 0) return `## ${tier} — ${label}\n\n_None._\n`;
     return `## ${tier} — ${label}\n\n${byTier[tier].map(line).join('\n')}\n`;
