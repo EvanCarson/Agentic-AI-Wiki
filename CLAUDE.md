@@ -9,9 +9,18 @@ production by **Vercel on every push to `main`**. Content sections:
 
 - **Field Guide** — `src/content/field-guide/{en,zh}/<page>.html` raw HTML
   fragments, ordered by `src/content/field-guide/manifest.ts`.
-- **Concepts** & **Deep-Dives** — `src/content/{concepts,deep-dives}/{en,zh}/<slug>.html`
-  fragments, registered in each section's `manifest.ts` (`Entry` with
-  `page, slug, title, summary, group` — all `Localized {en, zh}`).
+- **Concepts** — `src/content/concepts/{en,zh}/<slug>.html` fragments,
+  registered as a single ordered array in `src/content/concepts/manifest.ts`
+  (`Entry` with `page, slug, title, summary, group` — all `Localized {en, zh}`).
+- **Deep-Dives** — `src/content/deep-dives/{en,zh}/<slug>.html` fragments;
+  registered **one file per group** under `src/content/deep-dives/groups/<key>.ts`
+  (each `export default`s a `Group` of entries). `src/content/deep-dives/manifest.ts`
+  is a thin aggregator that globs the directory at build time, sorts groups by
+  `order`, and exports the same flat `ENTRIES` API as before. To add a group:
+  create a new file under `groups/`. To add an essay to an existing group:
+  append to that group file's `entries` array. The
+  `deep-dives-manifest.test.mjs` test enforces shape, uniqueness, and that
+  every registered slug has bilingual `<slug>.html` fragments.
 - **Changelog** — one file per entry under
   `src/content/changelog/entries/<YYYY-MM-DD>-<slug>.ts` (each `export default`s
   a `ChangelogEntry`). `src/content/changelog.ts` is a thin aggregator that

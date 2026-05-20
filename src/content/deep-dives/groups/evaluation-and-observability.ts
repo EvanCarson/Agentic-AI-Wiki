@@ -1,0 +1,16 @@
+import { L, type Group } from '../types.ts';
+
+const group: Group = {
+  key: 'evaluation-and-observability',
+  order: 60,
+  name: L('Evaluation & Observability', '评估与可观测性'),
+  entries: [
+    { page: 'why-agent-eval-is-hard', slug: 'why-agent-eval-is-hard', title: L('Why Evaluating Agents Is Hard','为什么评估智能体很难'), summary: L('Non-determinism, compounding multi-step error, no single gold answer, path-dependence, eval cost, and dataset rot — the six reasons one clean number is a lie.','非确定性、多步复合误差、没有唯一标准答案、路径依赖、评估成本与数据集腐烂——单个干净数字是谎言的六个原因。') },
+    { page: 'outcome-vs-trajectory-eval', slug: 'outcome-vs-trajectory-eval', title: L('Outcome vs Trajectory Evaluation','结果评估 vs 轨迹评估'), summary: L('End-state predicates vs grading the decision sequence: when each is right, partial credit, and tool-call assertions as the highest-leverage safety check.','终态谓词与给决策序列打分：各自何时为正解、部分给分，以及作为最高杠杆安全检查的工具调用断言。') },
+    { page: 'llm-as-judge-for-agents', slug: 'llm-as-judge-for-agents', title: L('LLM-as-Judge for Agents','用 LLM 作为智能体评判者'), summary: L('Rubric design, pairwise vs pointwise, the biases that invert verdicts, calibrating against human labels, and the cases where you must not use a judge.','评分量表设计、成对 vs 单点、能颠倒裁决的偏差、针对人类标注校准，以及那些绝不该用评判者的情形。') },
+    { page: 'reading-agent-benchmarks', slug: 'reading-agent-benchmarks', title: L('Reading Agent Benchmarks Critically','批判地阅读智能体基准'), summary: L('What SWE-bench, GAIA, τ-bench and WebArena actually measure, why contamination and harness sensitivity make rank a weak signal, and the small custom set that really decides.','SWE-bench、GAIA、τ-bench、WebArena 实际测量什么，污染与框架敏感性为何让名次成为弱信号，以及真正做决定的小型自定义集。') },
+    { page: 'tracing-and-observability', slug: 'tracing-and-observability', title: L('Tracing & Observability for Agents','智能体的追踪与可观测性'), summary: L('The trace is the data structure, not a log: what to record per step, spans and OpenTelemetry GenAI conventions, and trajectory replay as the bridge to eval.','轨迹是数据结构而非日志：每步记录什么、span 与 OpenTelemetry GenAI 约定，以及作为通往评估之桥的轨迹回放。') },
+    { page: 'eval-driven-agent-development', slug: 'eval-driven-agent-development', title: L('Eval-Driven Agent Development','评估驱动的智能体开发'), summary: L('The eval is the only spec an agent has: tiered CI gates, golden trajectories, offline vs online, the production-to-eval flywheel, and the no-regression ratchet.','评估是智能体唯一的规格：分层 CI 关卡、黄金轨迹、离线 vs 在线、生产到评估的飞轮，以及无回归棘轮。') },
+  ],
+};
+export default group;

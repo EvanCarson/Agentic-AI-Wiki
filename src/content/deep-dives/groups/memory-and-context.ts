@@ -1,0 +1,17 @@
+import { L, type Group } from '../types.ts';
+
+const group: Group = {
+  key: 'memory-and-context',
+  order: 30,
+  name: L('Memory & Context', '记忆与上下文'),
+  entries: [
+    { page: 'context-budgeting', slug: 'context-budgeting', title: L('Engineering the Context Window','设计上下文窗口'), summary: L('Treat the finite window as a budgeted resource: per-category token budgets, position-aware ordering, and utilization metrics.','把有限窗口当作有预算的资源：分类令牌预算、位置感知排序与利用率度量。') },
+    { page: 'short-vs-long-term-memory', slug: 'short-vs-long-term-memory', title: L('Short-Term vs Long-Term Memory','短期与长期记忆'), summary: L('The in-prompt working set vs the external store: what earns a slot, when to write, when to recall, and the promotion/demotion cycle.','提示内工作集与外部存储：什么配占位、何时写、何时回忆，以及提升／降级循环。') },
+    { page: 'memory-types', slug: 'memory-types', title: L('Memory Types: Episodic, Semantic, Procedural','记忆类型：情景、语义、程序性'), summary: L('Three durable memory kinds plus the scratchpad, each written and retrieved differently; reflection promotes episodes to semantics.','三种持久记忆加草稿区，各自写入与检索方式不同；反思把情景提升为语义。') },
+    { page: 'retrieval-augmented-memory', slug: 'retrieval-augmented-memory', title: L('Retrieval-Augmented Memory','检索增强记忆'), summary: L('Recall as retrieval: state-derived cues, relevance+recency+salience scoring, threshold-before-truncate, and provenance-tagged rendering.','回忆即检索：状态派生线索，相关性＋时近性＋显著性评分，先阈值再截断，以及带来源标注的渲染。') },
+    { page: 'context-compaction', slug: 'context-compaction', title: L('Context Compaction & Hierarchical Memory','上下文压缩与分层记忆'), summary: L('The compaction ladder, task-structured summarization, MemGPT-style tiering, pressure-triggered hysteresis, and verifying lossy compaction.','压缩阶梯、任务结构化摘要、MemGPT 式分级、压力触发迟滞，以及验证有损压缩。') },
+    { page: 'memory-stores', slug: 'memory-stores', title: L('Memory Stores: Vector, KV, Graph & Eviction','记忆存储：向量、键值、图与驱逐'), summary: L('Match backend to memory kind, a unified interface, why unbounded stores rot retrieval, and decay/eviction policies.','把后端匹配到记忆类型、统一接口、无界存储为何腐蚀检索，以及衰减／驱逐策略。') },
+    { page: 'evaluating-memory', slug: 'evaluating-memory', title: L('Evaluating Memory Quality','评估记忆质量'), summary: L('Memory-specific metrics (recall@k, staleness, constraint survival, write precision) and the pitfalls they catch: poisoning, staleness, drift, compaction amnesia.','记忆特有指标（recall@k、过期率、约束存活、写入精度）及其捕获的陷阱：毒化、过期、漂移、压缩失忆。') },
+  ],
+};
+export default group;
