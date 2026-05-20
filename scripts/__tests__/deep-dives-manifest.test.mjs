@@ -36,6 +36,7 @@ test('deep-dives: every group file is well-shaped and entries match HTML fragmen
     assert.equal(typeof g.order, 'number', `${f}: order must be a number`);
     assert.ok(Number.isFinite(g.order), `${f}: order must be finite`);
     assert.ok(g.name?.en?.trim() && g.name?.zh?.trim(), `${f}: name must be bilingual non-empty`);
+    assert.ok(g.groupSummary?.en?.trim() && g.groupSummary?.zh?.trim(), `${f}: groupSummary must be bilingual non-empty`);
     assert.ok(Array.isArray(g.entries) && g.entries.length > 0, `${f}: entries must be non-empty array`);
 
     // unique key

@@ -4,6 +4,7 @@ const group: Group = {
   key: 'coding-and-computer-use-agents',
   order: 100,
   name: L('Coding & Computer-Use Agents', '编码与计算机操作智能体'),
+  groupSummary: L('Agents that read code, write code, run tools, and drive a computer — patterns, harnesses, and pitfalls.', '能读代码、写代码、运行工具并驱动计算机的智能体——模式、外壳与陷阱。'),
   entries: [
     { page: 'coding-agent-architecture', slug: 'coding-agent-architecture', title: L('Coding Agent Architecture','编码智能体架构'), summary: L('The localize-edit-verify loop that makes a coding agent more than a code generator: the agent-computer interface, why agentic beats pipeline coding, and where the loop fails.','让编码智能体不止是代码生成器的“定位-编辑-验证”循环：智能体-计算机接口、为何智能体式优于流水线式，以及循环在哪里失效。') },
     { page: 'repo-navigation-and-context', slug: 'repo-navigation-and-context', title: L('Repo Navigation & Code Context','仓库导航与代码上下文'), summary: L('Code search vs. embeddings, symbol-level indexing, context budgeting over a large tree, and why confident wrong localization is the expensive failure of code retrieval.','代码搜索 vs 向量检索、符号级索引、在大型目录树上做上下文预算，以及为何自信的错误定位是代码检索代价最高的失败。') },

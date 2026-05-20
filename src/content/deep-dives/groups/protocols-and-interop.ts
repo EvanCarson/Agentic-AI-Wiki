@@ -4,6 +4,7 @@ const group: Group = {
   key: 'protocols-and-interop',
   order: 20,
   name: L('Protocols & Interop', '协议与互操作'),
+  groupSummary: L('The protocol layer of the agent stack — MCP, A2A, tool-calling standards, capability discovery — and how systems plug together.', '智能体栈的协议层——MCP、A2A、工具调用标准、能力发现——以及系统如何互联。'),
   entries: [
     { page: 'interop-problem', slug: 'interop-problem', title: L('Why Interop Matters: The M×N Problem','互操作为何重要：M×N 问题'), summary: L('How connecting M agents to N systems by hand explodes, and why a protocol layer is the structural fix.','手工把 M 个智能体连接到 N 个系统为何会爆炸，以及为什么协议层是结构性解法。') },
     { page: 'tool-calling-standards', slug: 'tool-calling-standards', title: L('Tool Calling Standards: JSON Schema','工具调用标准：JSON Schema'), summary: L('The universal declare/select/execute/return contract, the portable JSON Schema core, and where providers differ.','通用的声明/选择/执行/返回契约、可移植的 JSON Schema 核心，以及厂商差异所在。') },

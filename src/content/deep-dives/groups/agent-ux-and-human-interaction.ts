@@ -4,6 +4,7 @@ const group: Group = {
   key: 'agent-ux-and-human-interaction',
   order: 110,
   name: L('Agent UX & Human Interaction', '智能体体验与人机交互'),
+  groupSummary: L('How agents present themselves, ask for input, and earn trust — UX patterns for human-in-the-loop systems.', '智能体如何呈现自己、请求输入并赢得信任——人在回路系统的交互模式。'),
   entries: [
     { page: 'designing-for-trust', slug: 'designing-for-trust', title: L('Designing for Trust & Calibration','为信任与校准而设计'), summary: L('Trust is a calibration target, not a maximization goal: matching user-perceived reliability to measured reliability per task, displaying confidence only where it changes a decision, and spending friction where it actually calibrates.','信任是一个校准目标，而非追求最大化的目标：让用户感知的可靠性按任务匹配实测可靠性，只在置信度会改变决策时展示它，并把摩擦力花在真正能产生校准的地方。') },
     { page: 'approval-and-confirmation-ux', slug: 'approval-and-confirmation-ux', title: L('Approval & Confirmation UX','审批与确认体验'), summary: L('Consequence-tiered gates, payload-hash pinning so you confirm the action that actually runs, batching and defaults to fight confirmation fatigue, and stronger modalities for genuinely irreversible actions.','按后果分级的关卡、用载荷哈希钉定以确保你确认的就是实际执行的动作、用批量与默认项对抗确认疲劳，以及为真正不可逆的动作采用更强的交互形态。') },

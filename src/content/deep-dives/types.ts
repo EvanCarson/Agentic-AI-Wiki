@@ -21,6 +21,17 @@ export interface Entry {
   summary: Localized;
   /** Localized group label (set by the aggregator — do not specify in group files). */
   group?: Localized;
+  /** Optional cross-links surfaced on the group landing's "Related" block. */
+  related?: Related;
+}
+
+/** Cross-section related links surfaced on the group landing's "Related" block. */
+export interface Related {
+  concepts?: string[];
+  fieldGuide?: string[];
+  deepDives?: string[];
+  playbooks?: string[];
+  operations?: string[];
 }
 
 /** A Deep-Dive group: a curated cluster of entries with a localized display name. */
@@ -36,6 +47,8 @@ export interface Group {
   order: number;
   /** Bilingual display name (used as the section header on the index). */
   name: Localized;
+  /** One-to-two-sentence localized group thesis. Used on section + group landings. */
+  groupSummary: Localized;
   /** Entries in this group, in display order. */
   entries: Omit<Entry, 'group'>[];
 }

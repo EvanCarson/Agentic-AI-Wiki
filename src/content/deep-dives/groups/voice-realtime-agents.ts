@@ -4,6 +4,7 @@ const group: Group = {
   key: 'voice-realtime-agents',
   order: 150,
   name: L('Voice & Realtime Agents', '语音与实时智能体'),
+  groupSummary: L('Realtime voice agents — speech stack, turn-taking, barge-in, latency budgets, voice-specific tooling and state.', '实时语音智能体——语音栈、轮替、打断、延迟预算、语音特有的工具与状态。'),
   entries: [
   { page: 'realtime-architecture', slug: 'realtime-architecture', title: L('Realtime Agent Architecture','实时智能体架构'), summary: L('Cascade (STT→LLM→TTS) vs native speech-to-speech, the stateful audio transport, and the one decision everything else hangs on: where the agent loop lives.','级联（STT→LLM→TTS）vs 原生语音到语音、有状态的音频传输，以及一切所系的那个决策：智能体循环住在哪里。') },
   { page: 'latency-budget', slug: 'latency-budget', title: L('The Latency Budget','延迟预算'), summary: L('The sub-second turn accounted for line by line: where the milliseconds go, why endpointing is the biggest slice, and perceived vs actual latency.','把亚秒轮次逐行记账：毫秒去了哪里、为何端点检测是最大一块，以及被感知 vs 实际的延迟。') },

@@ -4,6 +4,7 @@ const group: Group = {
   key: 'evaluation-and-observability',
   order: 60,
   name: L('Evaluation & Observability', '评估与可观测性'),
+  groupSummary: L('Measuring agents that don\'t have a single right answer — outcome vs trajectory evals, LLM-as-judge, traces, benchmarks.', '度量没有唯一正确答案的智能体——结果与轨迹评测、LLM 作裁判、追踪与基准。'),
   entries: [
     { page: 'why-agent-eval-is-hard', slug: 'why-agent-eval-is-hard', title: L('Why Evaluating Agents Is Hard','为什么评估智能体很难'), summary: L('Non-determinism, compounding multi-step error, no single gold answer, path-dependence, eval cost, and dataset rot — the six reasons one clean number is a lie.','非确定性、多步复合误差、没有唯一标准答案、路径依赖、评估成本与数据集腐烂——单个干净数字是谎言的六个原因。') },
     { page: 'outcome-vs-trajectory-eval', slug: 'outcome-vs-trajectory-eval', title: L('Outcome vs Trajectory Evaluation','结果评估 vs 轨迹评估'), summary: L('End-state predicates vs grading the decision sequence: when each is right, partial credit, and tool-call assertions as the highest-leverage safety check.','终态谓词与给决策序列打分：各自何时为正解、部分给分，以及作为最高杠杆安全检查的工具调用断言。') },

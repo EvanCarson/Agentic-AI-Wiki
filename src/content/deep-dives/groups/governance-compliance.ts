@@ -4,6 +4,7 @@ const group: Group = {
   key: 'governance-compliance',
   order: 160,
   name: L('Governance & Compliance', '治理与合规'),
+  groupSummary: L('Accountability, audit, policy enforcement and the regulatory landscape — making agent decisions defensible.', '问责、审计、策略执行与监管版图——让智能体的决策可被解释与辩护。'),
   entries: [
   { page: 'audit-trails', slug: 'audit-trails', title: L('Audit Trails & Provenance','审计轨迹与溯源'), summary: L('What to capture to reconstruct any decision, hash-chained tamper-evidence, retention vs erasure, and the four-strand provenance of model, prompt, tools and data.','为重建任何决策该捕获什么、哈希链式防篡改可察觉、保留期与擦除权，以及模型／提示词／工具／数据的四线溯源。') },
   { page: 'policy-enforcement', slug: 'policy-enforcement', title: L('Policy Enforcement & Controls','策略执行与管控'), summary: L('Policy-as-code outside the model, enforcing pre/in/post loop, allowlist-by-default, and separation of duties so a compromised agent cannot close the loop alone.','模型之外的策略即代码、在循环前／内／后执行、默认白名单，以及职责分离使被攻陷的智能体无法独自闭环。') },

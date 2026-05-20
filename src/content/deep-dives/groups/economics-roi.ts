@@ -4,6 +4,7 @@ const group: Group = {
   key: 'economics-roi',
   order: 140,
   name: L('Economics & ROI', '经济性与投资回报'),
+  groupSummary: L('The unit economics of agents — pricing, cost attribution, ROI measurement, build-vs-buy, failure modes.', '智能体的单位经济性——定价、成本归因、ROI 度量、自建对外购、失败模式。'),
   entries: [
   { page: 'build-vs-buy', slug: 'build-vs-buy', title: L('Build vs Buy vs Orchestrate','自建 vs 采购 vs 编排'), summary: L('Not a cost comparison but a question of which layer is your durable moat: the three-branch decision tree, the hidden costs each path omits, and the lock-in you price today but pay later.','不是成本比较，而是哪一层是你持久护城河的问题：三分支决策树、每条路略去的隐性成本，以及你今天定价、以后才付的锁定。') },
   { page: 'unit-economics', slug: 'unit-economics', title: L('Agent Unit Economics','智能体单位经济学'), summary: L('Cost per token is the wrong unit; cost per successful task is the right one, with the success rate in the denominator where small reliability gains swing margin hardest.','每 token 成本是错误的单位；每个成功任务的成本才对，成功率在分母上——那里一点可靠性提升对毛利的撬动最猛。') },

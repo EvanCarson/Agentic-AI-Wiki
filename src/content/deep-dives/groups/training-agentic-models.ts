@@ -4,6 +4,7 @@ const group: Group = {
   key: 'training-agentic-models',
   order: 80,
   name: L('Training Agentic Models', '训练智能体模型'),
+  groupSummary: L('Post-training for agentic ability — SFT, rejection sampling, distillation, RLHF/RLAIF, RL for tool use, reward design.', '面向智能体能力的后训练——SFT、拒绝采样、蒸馏、RLHF/RLAIF、面向工具调用的 RL、奖励设计。'),
   entries: [
     { page: 'prompt-finetune-or-rl', slug: 'prompt-finetune-or-rl', title: L('Prompt, Fine-Tune, or RL?','提示、微调，还是强化学习？'), summary: L('The decision tree for changing agent behavior: prompting asks, SFT imitates, RL optimizes — pick the cheapest lever that closes the gap.','改变智能体行为的决策树：提示发问、SFT 模仿、RL 优化——选能闭合差距的最便宜的杠杆。') },
     { page: 'rlhf-and-rlaif', slug: 'rlhf-and-rlaif', title: L('RLHF & RLAIF','RLHF 与 RLAIF'), summary: L('Walking the RLHF pipeline stage by stage — SFT, reward model, PPO/GRPO/DPO — and what swapping human labels for an AI judge actually fixes.','逐阶段走完 RLHF 管线——SFT、奖励模型、PPO/GRPO/DPO——以及把人类标注换成 AI 评判者实际修了什么。') },

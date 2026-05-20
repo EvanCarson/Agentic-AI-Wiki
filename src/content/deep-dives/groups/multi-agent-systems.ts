@@ -4,6 +4,7 @@ const group: Group = {
   key: 'multi-agent-systems',
   order: 90,
   name: L('Multi-Agent Systems', '多智能体系统'),
+  groupSummary: L('When multiple agents pay off, when one beats many, and the topologies, failure modes and debate patterns in between.', '多个智能体何时划算、何时一个胜过一群，以及之间的拓扑、失败模式与辩论模式。'),
   entries: [
     { page: 'multi-agent-when-and-why', slug: 'multi-agent-when-and-why', title: L('When (and When Not) to Go Multi-Agent','何时（与何时不）采用多智能体'), summary: L('Price the coordination tax before you split: the three honest reasons to add an agent, and when one agent with tools wins.','拆分前先给协调税定价：增加一个智能体的三个站得住脚的理由，以及单个带工具的智能体何时取胜。') },
     { page: 'multi-agent-topologies', slug: 'multi-agent-topologies', title: L('Multi-Agent Topologies','多智能体拓扑'), summary: L('Star, pipeline, hierarchy, mesh — their O(·) message cost and failure profiles, and how to pick the sparsest wiring that still works.','星型、流水线、层级、网状——它们的 O(·) 消息成本与失败画像，以及如何选出仍能奏效的最稀疏接线。') },

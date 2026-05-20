@@ -4,6 +4,7 @@ const group: Group = {
   key: 'domain-playbooks',
   order: 170,
   name: L('Domain Playbooks', '领域实战手册'),
+  groupSummary: L('Domain-specific playbooks — customer support, research, sales, data analysis, DevOps — what to build, what to skip.', '按领域的实战手册——客服、研究、销售、数据分析、DevOps——该建什么，可以省什么。'),
   entries: [
   { page: 'customer-support-agents', slug: 'customer-support-agents', title: L('Customer-Support Agents','客户支持智能体'), summary: L('Optimize deflection subject to a near-zero confident-wrong-answer rate: grounded answers autonomous, transactions gated, tone graded in the eval, clean handoff over a confident guess.','在自信错答率近乎为零的约束下优化分流：接地答案自主、交易设关、语气进评估、干净交接胜过自信猜测。') },
   { page: 'data-analysis-agents', slug: 'data-analysis-agents', title: L('Data &amp; Analytics Agents','数据与分析智能体'), summary: L('The failure mode is a confidently wrong number: schema/semantic-layer grounding, read-only execution, verification as a separate stage, and abstention scored above confident error.','失败模式是自信的错误数字：schema/语义层接地、只读执行、核验作为独立阶段、弃答得分高于自信错答。') },

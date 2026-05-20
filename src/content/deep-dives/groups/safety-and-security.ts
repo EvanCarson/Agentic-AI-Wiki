@@ -4,6 +4,7 @@ const group: Group = {
   key: 'safety-and-security',
   order: 50,
   name: L('Safety & Security', '安全与防护'),
+  groupSummary: L('Prompt injection, sandboxing, exfiltration, red-teaming, deployment safety — the threat model an agent\'s environment creates.', '提示注入、沙箱、数据外泄、红队、部署安全——智能体环境制造的威胁模型。'),
   entries: [
     { page: 'agentic-threat-model', slug: 'agentic-threat-model', title: L('The Agentic Threat Model','智能体威胁模型'), summary: L('Why autonomy and tool use widen the attack surface, and the four channels attacker-influenced text reaches an agent.','为何自主性与工具使用扩大攻击面，以及攻击者可影响的文本进入智能体的四个通道。') },
     { page: 'prompt-injection', slug: 'prompt-injection', title: L('Prompt Injection: Direct & Indirect','提示词注入：直接与间接'), summary: L('How prompt injection works, why no clean fix exists, and the layered defense pattern for defenders.','提示词注入的机理、为何无干净修复，以及面向防御者的分层防御模式。') },

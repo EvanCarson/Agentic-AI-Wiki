@@ -4,6 +4,7 @@ const group: Group = {
   key: 'agentops',
   order: 70,
   name: L('AgentOps: Deploy & Operate', '智能体运维：部署与运营'),
+  groupSummary: L('Running agents in production: rollout, versioning, scaling, idempotent retries, cost control, incident response.', '在生产中运行智能体：灰度、版本化、扩缩、幂等重试、成本控制与事故响应。'),
   entries: [
     { page: 'durable-state-and-resumability', slug: 'durable-state-and-resumability', title: L('Durable State & Resumability','持久状态与可恢复性'), summary: L('Make the agent loop a durable computation — event-sourced history, journal-before-effect, and resume that replays rather than re-derives, so a crash or redeploy never restarts a half-done task.','把智能体循环做成一次持久计算——事件溯源式历史、先写日志再产生副作用、以重放而非重新推导来恢复，使崩溃或重新部署绝不重启一个做了一半的任务。') },
     { page: 'concurrency-and-scaling', slug: 'concurrency-and-scaling', title: L('Concurrency, Queues & Scaling','并发、队列与扩缩容'), summary: L('Agents are batch jobs, not requests: a queue with leased workers, per-tenant concurrency caps, journal-as-state for horizontal scale, and bounded fan-out are what survive production load.','智能体是批处理作业而非请求：带租约 worker 的队列、按租户并发上限、以日志为状态实现横向扩缩、以及有界扇出，才是能扛住生产负载的形态。') },
