@@ -1,0 +1,53 @@
+<section class="phase">
+  <div class="phase-num">G3</div>
+  <div class="week">Deep Dive · Multi-Agent Systems</div>
+  <h2>Supervisor / worker orchestration: the pattern that actually ships.</h2>
+  <p class="goal">The supervisor/worker (orchestrator–subagent) pattern is the topology behind nearly every multi-agent system that has reached production through 2025 — including Anthropic's research system and the default in LangGraph, CrewAI, and AutoGen. A supervisor decomposes a task, dispatches isolated workers, and aggregates their results. It works because it is a star you can reason about. This essay covers the control flow in detail, how to decompose and aggregate without losing the plot, and the failure mode it cannot escape: the supervisor is a bottleneck.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The control flow is plan → dispatch → join → aggregate, and each arrow is a design decision.</h3>
+    <p>The supervisor holds the task and the plan; workers hold only their slice. The loop: the supervisor <strong>decomposes</strong> the task into subtasks, <strong>dispatches</strong> each to a fresh worker with a scoped instruction and only the context it needs, <strong>joins</strong> on the results (waiting for the slowest), and <strong>aggregates</strong> into a single answer — possibly looping if the result is incomplete. Workers never see each other; all coordination is mediated by the supervisor. That mediation is the pattern's strength (one place for policy) and its ceiling (one place to overload).</p>
+
+<pre class="standalone"><span class="c-cm"># supervisor/worker: scoped dispatch, central aggregate</span>
+<span class="c-kw">def</span> <span class="c-fn">supervise</span>(task, budget):
+    plan = supervisor.<span class="c-fn">decompose</span>(task)
+    jobs = [dispatch(w, sub, budget / len(plan)) <span class="c-kw">for</span> sub <span class="c-kw">in</span> plan]
+    done = join(jobs)                         <span class="c-cm"># waits on the slowest</span>
+    <span class="c-kw">return</span> supervisor.<span class="c-fn">aggregate</span>(task, done)   <span class="c-cm"># may re-plan if thin</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Decomposition quality sets the ceiling on everything downstream.</h3>
+    <p>A bad split cannot be rescued by good workers. The supervisor must produce subtasks that are <strong>independent</strong> (no branch needs another's intermediate state — otherwise you have a disguised pipeline), <strong>scoped</strong> (each instruction is concrete enough that a context-isolated worker cannot drift), and <strong>budgeted</strong> (each carries a token/step ceiling so fan-out cannot run away). The single most common production defect is vague subtasks: "research the market" spawns a worker with no stopping condition that burns its budget and returns mush. Decomposition is the supervisor's real job; dispatching is mechanical.</p>
+
+    <div class="callout tip"><p>Make the supervisor emit subtasks as a structured plan object — id, instruction, success criterion, budget — not as free prose it then re-parses. The success criterion is what lets a worker know it is <em>done</em> instead of looping until the budget is gone.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Workers must be context-isolated, or you have thrown away the main benefit.</h3>
+    <p>The reliability win of this pattern is that a worker sees <em>only</em> its subtask and the minimal context for it — which makes it harder to distract, cheaper per call, and a smaller prompt-injection surface. Leaking the full task or sibling outputs into every worker re-couples them, inflates every context window, and reintroduces the groupthink you split to avoid. Treat the worker boundary as a hard interface: scoped instruction in, structured result out, nothing else crosses.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Aggregation is a synthesis step, not a concatenation.</h3>
+    <p>Joining results is where multi-agent value is realized or lost. The naive aggregator pastes worker outputs together and returns them — which surfaces every contradiction between workers and every gap unfilled, pushing the real work onto the reader. A real aggregator <em>reconciles</em>: detects conflicting worker claims, resolves or flags them, fills gaps with a re-dispatch, and produces one coherent artifact. Critically, the aggregator must not have to re-derive what the workers did — if it does, the decomposition failed and you paid fan-out cost for nothing.</p>
+
+    <div class="callout warn"><p>"Aggregate" implemented as string concatenation is the most common silent failure of this pattern. It passes demos (workers rarely conflict on toy inputs) and fails in production the first time two workers disagree — the system confidently returns both contradictory answers stitched together.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The supervisor is a bottleneck and a single point of failure — design for it.</h3>
+    <p>Every subtask passes through one agent's context to be planned and one agent's context to be aggregated. That serializes two phases around a single resource: the supervisor's context window caps how many workers it can meaningfully plan and reconcile, its latency is on the critical path twice, and if it fails the whole run fails. Mitigations: cap fan-out so the aggregator's context can hold every worker's structured result; pass compact structured artifacts up, not raw transcripts; checkpoint the plan and partial results so a supervisor crash resumes instead of restarting; and when fan-out exceeds one supervisor's reconcilable limit, go hierarchical (see <code class="inline">multi-agent-topologies</code>) — accepting the extra lossy hop deliberately.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When NOT to use supervisor/worker.</h3>
+    <p>Skip it when subtasks are not independent (you built a pipeline and called it a star), when the aggregation cannot be done without re-doing the workers' reasoning (the split bought nothing), or when fan-out is so wide that no single supervisor context can reconcile it and a hierarchy's extra summarization loss would corrupt the answer anyway. <strong>Supervisor/worker pays off exactly when decomposition is clean and aggregation is real synthesis — the moment either is faked, you are paying a star's cost for a single agent's quality.</strong></p>
+  </div>
+</section>
