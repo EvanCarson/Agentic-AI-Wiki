@@ -324,10 +324,11 @@ Reuses the `capture()` export from `scripts/screenshot.mjs`. Targets are all `.h
 // Usage: node scripts/research/screenshot-mockups.mjs
 import { readdirSync } from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { capture } from '../screenshot.mjs';
 
-const repoRoot = path.resolve(new URL('../../', import.meta.url).pathname);
+// fileURLToPath normalises Windows drive paths; new URL(...).pathname does not.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../');
 const mockupsDir = path.join(repoRoot, 'docs/research/mockups');
 const outDir = path.join(mockupsDir, 'screenshots');
 
