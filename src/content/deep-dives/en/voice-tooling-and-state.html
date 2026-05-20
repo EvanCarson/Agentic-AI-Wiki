@@ -1,0 +1,91 @@
+<section class="phase">
+  <div class="phase-num">V5</div>
+  <div class="week">Deep Dive · Voice &amp; Realtime Agents</div>
+  <h2>Tool use and state in voice: calling tools without dead air, confirming by ear.</h2>
+  <p class="goal">A text agent can think for four seconds and nobody notices. A voice agent that goes silent for four seconds has, as far as the caller is concerned, frozen or hung up. Tool calls are where voice agents most visibly break, because the backend latency that is invisible in chat becomes an audible hole in the conversation. The job is to make tool use <em>conversational</em>: never silent, confirmable by ear, and recoverable across a stateful call.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Speak before, during, and after the tool call.</h3>
+
+    <p>The single highest-leverage technique in voice tooling: emit a verbal acknowledgement <em>before</em> the tool latency lands, so the caller hears a human-shaped pause, not a dead line.</p>
+
+<pre class="trace"><span class="c-out">caller: "what's my balance?"
+  t+0.2s  agent: "Let me pull that up..."   &lt;-- cover starts
+  t+0.3s  [tool: get_balance() dispatched]
+  t+1.6s  [tool returns]
+  t+1.8s  agent: "Your balance is $2,481.10."
+silence the caller actually experienced: ~0ms</span></pre>
+
+    <p>OpenAI's Realtime API exposes this directly as <strong>preambles</strong> — the model speaks a short filler while a function call is in flight. The preamble must be generic enough to be true regardless of the result ("let me check that"), never a guess at the answer ("looks like you're all paid up" before the tool returns is how agents lie).</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Tool calls are async; the conversation does not block on them.</h3>
+
+    <p>In a text agent the loop is naturally serial: call tool, wait, continue. In voice you cannot freeze the audio channel while waiting. The tool call runs as an async task; the agent stays live on the line, able to acknowledge, answer a clarifying sub-question, or absorb a barge-in while the backend works.</p>
+
+<pre class="standalone"><span class="c-cm"># voice/tool_runtime.py — never block the audio loop</span>
+<span class="c-kw">async def</span> <span class="c-fn">on_tool_call</span>(call, session):
+    <span class="c-kw">await</span> session.say(filler_for(call))      <span class="c-cm"># cover now</span>
+    task = asyncio.create_task(run(call))     <span class="c-cm"># off the path</span>
+    <span class="c-kw">while</span> <span class="c-kw">not</span> task.done():
+        <span class="c-kw">if</span> session.user_started_talking():
+            <span class="c-kw">await</span> session.yield_floor()       <span class="c-cm"># caller wins</span>
+        <span class="c-kw">await</span> asyncio.sleep(<span class="c-st">0.05</span>)
+    <span class="c-kw">return</span> task.result()</pre>
+
+    <div class="callout warn">
+      <p>Run independent tool calls in <strong>parallel</strong>, never sequentially — three serial 400 ms calls is a 1.2 s hole; three parallel ones is 400 ms. Voice removes the slack that hides serial tool latency in text agents, so the parallelism you could be lazy about there is mandatory here.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Confirm side effects by ear, before they happen.</h3>
+
+    <p>A voice agent cannot show a confirmation dialog. The confirmation <em>is</em> the spoken turn, and for any irreversible action it is mandatory: read the consequential parameters back in the caller's terms and require an explicit yes before the tool fires.</p>
+
+<pre class="standalone"><span class="c-cm"># confirm BEFORE the mutating call, not after</span>
+agent: <span class="c-st">"So that's cancelling the 7pm reservation
+        for four at Nopa tonight — shall I?"</span>
+caller: <span class="c-st">"yes"</span>
+  &rarr; only NOW dispatch cancel_reservation(...)</pre>
+
+    <p>This is the same read-back that fixes the STT tax (see <code class="inline">speech-stack</code>): on a lossy audio channel, the confirmation turn is the error-correcting code for both mishearing <em>and</em> wrong intent. Skip it only for read-only, reversible actions.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>State must survive a stateful, interruptible call.</h3>
+
+    <p>A voice call is one long stateful session, and the caller can interrupt, change their mind, and revisit a slot ("actually, make it 8pm") at any point. The agent's state is not "the transcript so far" — it is the structured set of slots and pending actions, and it must track what was <em>confirmed</em>, what is <em>tentative</em>, and what the caller <em>actually heard</em>.</p>
+
+    <ul>
+      <li><strong>Slot state, not transcript state.</strong> Track <code class="inline">{party: 4, time: 8pm (was 7pm), date: today}</code>, not a wall of text to re-parse every turn.</li>
+      <li><strong>Confirmed vs tentative.</strong> A value the caller corrected after you read it back is confirmed; one only mentioned in passing is tentative and must be confirmed before any mutation.</li>
+      <li><strong>Spoken vs generated.</strong> If a barge-in truncated the agent mid-sentence, state must reflect what was <em>said aloud</em>, or the agent will reference a number the caller never heard.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Slow and failed tools are conversational events.</h3>
+
+    <p>A backend that takes eight seconds, or fails, is not an exception to log and swallow — the caller is on the line and will hear it. Give every tool call a conversational timeout and a spoken contingency.</p>
+
+    <ul>
+      <li><strong>Timeout with a spoken exit.</strong> If the tool exceeds its budget, say so honestly ("that's taking longer than usual — can I call you back, or hold a moment?") rather than narrating filler forever.</li>
+      <li><strong>Degrade, don't freeze.</strong> On failure, offer the next best path (a callback, a human, a retry) — never silence, never an infinite "still working on that."</li>
+      <li><strong>Idempotency under interruption.</strong> A barge-in or hang-up mid-tool must not double-charge or double-book; mutating calls need idempotency keys exactly as in text agents, but the failure here is also audible.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The honest tradeoff.</h3>
+
+    <p><strong>Every cover phrase you add to hide tool latency is conversational time the caller did not ask for; padding the call with filler is its own failure mode — the goal is fast tools, and verbal cover is a tax on slowness, not a substitute for fixing it.</strong></p>
+  </div>
+</section>

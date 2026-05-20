@@ -1,0 +1,82 @@
+<section class="phase">
+  <div class="phase-num">V2</div>
+  <div class="week">深入解析 · 语音与实时智能体</div>
+  <h2>延迟预算：那个亚秒轮次实际花在哪里。</h2>
+  <p class="goal">在文本里，慢的智能体令人烦躁。在语音里，慢的智能体是<em>坏了</em>——人类把沉默解读为掉线、误解，或一台蠢机器，于是开始抢话。语音智能体被感知到的全部智能，都被一个数字卡住：来电者说完到智能体开口之间的那段间隔。本文是一道记账题：每一毫秒，去了哪里，以及如何花掉它。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>真正要紧的那个数字是响应延迟，而且它很小。</h3>
+
+    <p>自然对话中人类轮次切换的典型间隔约为 200 ms；人们远在整整一秒之前就会察觉并感到不适。语音智能体<strong>响应延迟</strong>——来电者停止 → 首段音频输出——端到端的工作目标是亚秒级，而最好的原生栈把模型的那一份推向几百毫秒。</p>
+
+    <div class="callout">
+      <p>对你在测什么要精确。<strong>响应延迟</strong>是用户语音结束到首段音频输出。它<em>不是</em>完整回复耗时，也<em>不是</em>孤立的模型 TTFT——它包含端点检测延迟，那往往是最大的一块，也是团队忘了计入的那块。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>预算，逐行拆。</h3>
+
+    <p>这个轮次是一个总和。你无法改善一个你没拆解过的总数，所以拆解它。</p>
+
+<pre class="standalone"><span class="c-cm"># response_latency = sum of these, ms</span>
+network_in        <span class="c-cm"># mic/carrier &rarr; your edge</span>
+endpoint_detect   <span class="c-cm"># "is the user done?" — often the biggest</span>
+stt_finalize      <span class="c-cm"># cascade only; 0 for native S2S</span>
+model_ttft        <span class="c-cm"># prompt &rarr; first output token/frame</span>
+tts_first_audio   <span class="c-cm"># cascade only; first synthesized chunk</span>
+network_out       <span class="c-cm"># your edge &rarr; speaker/carrier</span>
+playout_buffer    <span class="c-cm"># jitter buffer before audio plays</span></pre>
+
+    <p>对级联，每一行都活着。对原生语音到语音，<code class="inline">stt_finalize</code> 与 <code class="inline">tts_first_audio</code> 坍缩进 <code class="inline">model_ttft</code>——原生栈更快的结构性原因不是模型更好，而是少了两个串行跳。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>端点检测是你选择花掉的延迟。</h3>
+
+    <p>智能体在它相信来电者已说完之前不能开口。朴素的静音检测会等一个固定超时（比如 700 ms 的安静）——那个超时被<em>直接加到</em>每一个轮次的延迟上，无论来电者只是想到一半停顿，还是真的说完了。</p>
+
+    <p>这正是为何语义端点检测对延迟要紧，而不仅是对正确性：一个能从词语预测"这句话完整了"的模型，可以在约 100&ndash;300 ms 触发，而不必耗完一个最坏情况的静音定时器。你是用一个固定的悲观延迟，换一个可变的、通常更短的延迟。正确性那一面见 <code class="inline">turn-taking-and-barge-in</code>；此处它纯粹是预算。</p>
+
+    <div class="callout warn">
+      <p>把端点检测调低以省延迟，会直接抬高你在句子中途打断来电者的比率。这个旋钮在响应延迟与打断率之间做权衡。它没有免费档位——两者都测，按用例挑工作点，绝不要盲调其一而不看另一。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>流式与部分结果掩盖你无法消除的延迟。</h3>
+
+    <p>有些延迟不可约减。诀窍并不总是消除它，而是<em>盖住</em>它，让来电者从不经历沉默。</p>
+
+    <ul>
+      <li><strong>流式输出。</strong>在头几个 token 上就启动 TTS／发出音频，而非等完整回复。首段音频输出是指标；总长度不是。</li>
+      <li><strong>流式输入。</strong>在部分转写文本上就跑 STT 并开始推理，这样来电者停下时模型已经"热"了。</li>
+      <li><strong>快速应答。</strong>一句 150 ms 的"嗯哼"或"我查一下"会被感知为有响应，哪怕真正的答案还在两秒之外。被感知的延迟，而非挂钟时间，才是用户的现实。</li>
+      <li><strong>推测。</strong>在部分结果上就开始起草回复；若最终转写文本相符，你已经付过模型成本了。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>工具调用的悬崖。</h3>
+
+    <p>上面的预算描述的是没有工具调用的轮次。智能体一旦必须打数据库或调 API，你就直接冲穿了亚秒预算——单是一次 400 ms 的 API 调用就是整个对话间隔。语音让工具延迟成为一等的对话问题，而非后端细节。</p>
+
+<pre class="trace"><span class="c-out">no-tool turn:   ~500-900ms   acceptable
+tool turn:      ~500ms + API + 2nd model pass
+                = often 2-4s   &rarr; DEAD AIR unless covered</span></pre>
+
+    <p>解法是对话性的，而不仅是工程性的：在工具调用<em>之前</em>和<em>期间</em>说话（"稍等，正在调出来…"）、并行跑相互独立的工具调用，且绝不让音频通道在后端干活时陷入沉默。这在 <code class="inline">voice-tooling-and-state</code> 中完整展开。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>诚实的权衡。</h3>
+
+    <p><strong>你从端点检测或模型尺寸里夺回的每一毫秒，都是你花在更高打断率或更笨答案上的一毫秒——没有免费的延迟胜利，只有一个你判定值得的延迟代价。</strong></p>
+  </div>
+</section>
