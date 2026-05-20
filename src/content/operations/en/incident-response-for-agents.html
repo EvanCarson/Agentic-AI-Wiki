@@ -1,0 +1,83 @@
+<section class="phase">
+  <div class="phase-num">O6</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Incident response and runaway containment: the loop that will not stop.</h2>
+  <p class="goal">A crashed service stops doing damage; a runaway agent keeps acting — looping, spending, and writing to the world while you scramble. Agent incidents have a property ordinary outages do not: the system is the attacker's hands, and "do nothing" is not safe because the agent keeps going. This essay is the on-call reality: how you detect a runaway, what you slam to stop it, how you bound the blast radius, and what the trace must contain so the postmortem is possible.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>An agent incident is an active adversary, not a passive failure.</h3>
+
+    <p>The reflexes from service ops mislead here. A wedged web server fails closed — it stops serving and stops harming. A wedged agent fails <em>open</em>: it keeps iterating, keeps calling tools, keeps spending, possibly keeps writing to production, for the entire time it takes you to notice and react. The cost and the damage are integrated over your <em>response latency</em>. <strong>For agents, mean-time-to-contain dominates mean-time-to-diagnose — you stop the bleeding first, understand it second.</strong></p>
+
+    <p>The runaway shapes you will actually see: a tight tool-call loop (same action, rising rate), a reflection spiral (re-planning forever, no state change), pathological fan-out (sub-agents spawning sub-agents), a budget-burn with no progress, and the dangerous one — a coherent agent doing the <em>wrong</em> thing confidently and fast (a bad prompt or a model regression at scale).</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Detect from rate and progress, not from errors.</h3>
+
+    <p>A runaway often throws zero errors — it is "succeeding" at the wrong thing. Error-rate dashboards stay green while you bleed. The signals that actually fire are derivatives and ratios:</p>
+
+    <ul>
+      <li><strong>Steps-per-run and tool-calls-per-minute</strong> crossing a hard ceiling — the loop-detection signal, and the same no-progress metric from <code class="inline">cost-control-in-the-loop</code> doing double duty as a safety alarm.</li>
+      <li><strong>Spend-rate per tenant/fleet</strong> with an absolute alert, not just a daily-total — a runaway burns the month's budget in an hour, and the daily rollup tells you tomorrow.</li>
+      <li><strong>Write-action rate and first-seen destinations</strong> — a spike in side-effecting calls, or actions hitting destinations never seen before, is a containment trigger regardless of "success."</li>
+      <li><strong>Progress-to-cost ratio</strong> collapsing — lots of activity, no closed loops — is the cleanest single runaway signature.</li>
+    </ul>
+
+    <div class="callout tip"><p>Alert on absolute rate over a short window, not cumulative daily totals. A daily spend dashboard reports a runaway after it has already cost you the most. The useful alarm is "$X in the last 5 minutes," wired to the kill switch path — not an email.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Kill switches, layered by blast radius and reversibility.</h3>
+
+    <p>One global off-switch is too blunt (it takes down every healthy tenant to stop one) and too slow to reach for. Build a graded ladder so the on-call can match the smallest sufficient hammer to the incident:</p>
+
+<pre class="standalone"><span class="c-cm"># containment/killswitch.py — checked before every tool call</span>
+<span class="c-kw">def</span> <span class="c-fn">guard</span>(run, tool, args):
+    <span class="c-kw">if</span> flag(<span class="c-st">"halt:global"</span>):           <span class="c-cm"># 4: stop the world</span>
+        <span class="c-kw">raise</span> <span class="c-err">Halted</span>(<span class="c-st">"global"</span>)
+    <span class="c-kw">if</span> flag(<span class="c-st">f"halt:tenant:{run.tenant}"</span>):  <span class="c-cm"># 3: one tenant</span>
+        <span class="c-kw">raise</span> <span class="c-err">Halted</span>(<span class="c-st">"tenant"</span>)
+    <span class="c-kw">if</span> flag(<span class="c-st">f"halt:run:{run.id}"</span>):       <span class="c-cm"># 2: one run</span>
+        <span class="c-kw">raise</span> <span class="c-err">Halted</span>(<span class="c-st">"run"</span>)
+    <span class="c-kw">if</span> tool <span class="c-kw">in</span> frozen_tools():            <span class="c-cm"># 1: disable a capability</span>
+        <span class="c-kw">raise</span> <span class="c-err">Halted</span>(<span class="c-st">f"tool:{tool}"</span>)     <span class="c-cm"># reads still flow</span>
+    <span class="c-kw">return</span> args</pre>
+
+    <p>The properties that make a kill switch trustworthy under stress: it is checked <em>in the loop before every effect</em> (not a deploy, not a process kill that loses state), it is <em>fail-closed</em> (flag store unreachable ⇒ halt, do not "fail open and keep acting"), and capability-freeze (level 1) exists so you can neutralize the dangerous write tool while read-only diagnosis continues.</p>
+
+    <div class="callout warn"><p>"Just redeploy" or "kill the pods" is not containment for a durable agent — a resumable run comes back on the next worker and continues exactly the harmful loop. Containment must be an in-loop, state-aware halt the resume path also respects, or you have built a runaway that survives its own kill.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Blast radius is bounded before the incident, not during it.</h3>
+
+    <p>The most effective incident response is the limit that was already in place when it started. The structural bounds from earlier essays <em>are</em> the containment system, pre-installed: per-task cost ceilings (<code class="inline">cost-control-in-the-loop</code>) cap one run's damage; per-tenant concurrency caps (<code class="inline">concurrency-and-scaling</code>) stop one tenant becoming a fleet event; idempotent writes (<code class="inline">idempotency-and-retries</code>) mean a looping agent re-issuing the same write does bounded damage instead of N charges; least-privilege tool scoping bounds the <em>worst</em> any single call can do. An incident with no pre-installed bounds is unbounded by definition — on-call reaction time becomes the only limit, and that is never fast enough.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The runbook is a decision tree, executed under pressure.</h3>
+
+    <p>At 3am, nobody reasons from first principles. The runbook must be a pre-decided sequence the on-call can execute without designing it live:</p>
+
+    <ul>
+      <li><strong>Contain first.</strong> Pick the smallest sufficient kill-switch level (Step 3). Stopping the bleed is not the same as understanding it; do not investigate a still-acting agent.</li>
+      <li><strong>Assess scope.</strong> How many runs/tenants, what side effects already landed (read the side-effect ledger — the source of truth, not the chat logs), is value or only tokens at risk.</li>
+      <li><strong>Decide reversibility.</strong> Identify writes that need compensating actions (refunds, retractions). The idempotent ledger tells you exactly what fired and once.</li>
+      <li><strong>Communicate.</strong> Affected tenants, status, ETA — an agent acting wrongly on customer data is a trust incident, not just an ops one.</li>
+      <li><strong>Recover deliberately.</strong> If a release caused it, roll back the pinned triple (<code class="inline">rollout-and-versioning</code>) before un-halting; resume runs only on a known-good contract.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The postmortem is only possible if the trace was captured first.</h3>
+
+    <p>You cannot reconstruct an agent incident from metrics; you need the decision-level trace — every prompt, model output, tool call with arguments, and the release stamp, joinable by <code class="inline">run_id</code> to the side-effect ledger. The single rule: <em>if it isn't in the trace, the postmortem is speculation, and every incident must produce a permanent regression test (the exact scenario, replayable, in the eval gate) so this class of runaway fails CI forever after.</em> An incident that does not become a test is an incident you have agreed to have again. <strong>You cannot bolt observability on during an incident — the trace is captured before the incident or the postmortem is fiction; build the kill switch and the trace before you need either, because the day you need them is the day you cannot add them.</strong></p>
+  </div>
+</section>

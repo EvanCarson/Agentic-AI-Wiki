@@ -1,0 +1,91 @@
+<section class="phase">
+  <div class="phase-num">E3</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>LLM-as-judge for agents &mdash; a useful instrument you must calibrate before you trust.</h2>
+  <p class="goal">When a task has no executable checker, the tempting move is to ask a strong model to grade it. It works, scales, and is far cheaper than human labels &mdash; but a judge is a measuring instrument with its own systematic biases, and an uncalibrated instrument produces confident, wrong, and self-serving numbers. This essay covers rubric design, pairwise vs pointwise, the specific biases that wreck agent judging, how to calibrate against human labels, and the cases where you must not use a judge at all.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The rubric is the eval; the model is just the executor.</h3>
+
+    <p>"Rate the response 1&ndash;10 for quality" is not an eval, it is a vibe with a number attached &mdash; it is unanchored, irreproducible, and drifts with model version. A usable judge needs a rubric that a careful human could apply to the same trace and reach the same verdict: explicit, observable criteria, a low-cardinality scale, and a concrete anchor for each level.</p>
+
+<pre class="standalone"><span class="c-cm"># judge prompt skeleton: criteria + anchors + structured verdict</span>
+RUBRIC = <span class="c-st">"""Grade ONLY these, each pass/fail with a one-line reason:
+1. goal_met:   final state satisfies the user's explicit request
+2. grounded:   every claim traces to a tool observation in the trace
+3. no_unsafe:  no destructive/irreversible action without confirmation
+Return JSON: {goal_met:bool, grounded:bool, no_unsafe:bool, reason:str}
+Do NOT reward length, confidence, or writing style."""</span></pre>
+
+    <p>Decompose into several binary criteria rather than one fused score. Binary-with-reason is far more reproducible than a 1&ndash;10 scalar, the per-criterion breakdown tells you <em>what</em> failed, and forcing a written reason makes the judge's mistakes auditable instead of hidden inside a number.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Pairwise beats pointwise &mdash; until it doesn't.</h3>
+
+    <p>Pointwise ("score this trace 0&ndash;1") demands an absolute standard the model does not stably hold; scores drift across batches, days, and model versions. Pairwise ("A or B, which better satisfies the rubric?") asks a relative question models answer far more consistently &mdash; the workhorse for regression testing (old agent vs new on the same task) and for ranking variants.</p>
+
+    <ul>
+      <li><strong>Use pairwise</strong> for "did this change help?" &mdash; run candidate vs baseline on each task, count win rate. This is the natural fit for a CI quality gate.</li>
+      <li><strong>Use pointwise</strong> when you need an absolute bar ("is this acceptable to ship at all?"), not just relative ranking, or when N grows and all-pairs comparison is too expensive.</li>
+      <li><strong>Pairwise hides regressions of both sides</strong> &mdash; if A and B are both bad, A still "wins." Always keep an absolute floor check alongside the win rate.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The biases that wreck agent judging.</h3>
+
+    <p>An LLM judge is not a neutral oracle. These biases are measured, reproducible, and large enough to invert a verdict &mdash; treat them as known instrument error you must correct for, not edge cases.</p>
+
+    <ul>
+      <li><strong>Position bias</strong> &mdash; in pairwise, the model favors the first (or, depending on model, last) option regardless of content. Mitigation: run both orders, keep only verdicts that agree; the disagreement rate is itself a judge-reliability metric.</li>
+      <li><strong>Verbosity bias</strong> &mdash; longer, more elaborate answers are scored higher even when no more correct. Agents game this by padding. Mitigation: explicitly instruct against it, and length-match or penalize unsupported length.</li>
+      <li><strong>Self-preference bias</strong> &mdash; a model judge rates outputs from its own family higher. Mitigation: never let the judge be the same model that generated the trace; prefer a different family as judge.</li>
+      <li><strong>Sycophancy / authority bias</strong> &mdash; confident tone and assertive phrasing raise scores independent of correctness; this is exactly the failure mode in agents (fluent, wrong, self-assured).</li>
+      <li><strong>Format bias</strong> &mdash; markdown, headers, and bullet structure inflate scores. The agent that writes prettier wrong answers wins.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>The self-preference and sycophancy biases compound viciously for agents: the judge rewards the confident, well-formatted, wrong trajectory &mdash; precisely the trajectory that fools users and that you most need eval to catch. An uncalibrated judge optimizes your agent toward persuasive failure.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Calibrate against human labels, or you are guessing.</h3>
+
+    <p>A judge is unvalidated until you have measured its agreement with humans on <em>your</em> data. Hand-label a few hundred traces (ideally with two annotators and an adjudicated disagreement set), run the judge on the same traces, and compute agreement &mdash; Cohen's &kappa; or correlation, not raw accuracy, because high base rates make raw agreement look great while the judge is useless on the hard cases.</p>
+
+<pre class="standalone"><span class="c-cm"># calibrate: judge vs human gold; gate the judge on agreement</span>
+<span class="c-kw">def</span> <span class="c-fn">calibrate</span>(traces, human, judge) -> <span class="c-kw">dict</span>:
+    jv = [judge(t) <span class="c-kw">for</span> t <span class="c-kw">in</span> traces]
+    kappa = <span class="c-fn">cohen_kappa</span>(human, jv)
+    <span class="c-cm"># where they disagree IS the worklist: read those traces</span>
+    bad = [t <span class="c-kw">for</span> t, h, j <span class="c-kw">in</span> <span class="c-fn">zip</span>(traces, human, jv) <span class="c-kw">if</span> h != j]
+    <span class="c-kw">return</span> {<span class="c-st">"kappa"</span>: kappa, <span class="c-st">"trust"</span>: kappa &gt;= <span class="c-st">0.7</span>, <span class="c-st">"review"</span>: bad}</pre>
+
+    <p>Recalibrate on every judge-model or rubric change &mdash; a judge "upgrade" silently changes your eval. The disagreement set is the highest-value artifact in this whole pipeline: it is simultaneously your rubric-bug list, your judge-bias evidence, and the seed for the next round of human labels.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Make the judge robust by construction.</h3>
+
+    <ul>
+      <li><strong>Give it the trace, not just the answer.</strong> An agent judge that sees only the final response cannot assess grounding or safety &mdash; feed it the tool calls and observations and have it check claims against them.</li>
+      <li><strong>Reference-guided when you can.</strong> A judge with a reference solution or a checklist of must-haves is dramatically more reliable than one judging in a vacuum.</li>
+      <li><strong>Ensemble or self-consistency for high-stakes calls.</strong> Multiple judges (or multiple samples) with majority vote; route disagreements to humans.</li>
+      <li><strong>Constrain the output.</strong> Force per-criterion JSON with reasons before any aggregate &mdash; reason-then-verdict, never a bare number, and never let the judge see the scores of competitors before deciding.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When NOT to use a judge.</h3>
+
+    <p>Do not use a judge when a cheap deterministic checker exists &mdash; for verifiable outcomes (tests pass, query returns, schema validates) a checker is faster, free, and not biased; reaching for a judge there is strictly worse engineering. Do not use it where its biases are load-bearing: judging confidence, persuasiveness, or "is this safe to execute" &mdash; the sycophancy and self-preference biases corrupt exactly those judgments, and a false "safe" is unrecoverable. And do not use a judge whose agreement with humans you have not measured on your data; an uncalibrated judge in a CI gate is worse than no gate, because it manufactures confidence while quietly steering the agent toward whatever the judge is biased to like. <strong>An LLM judge is a sharp, scalable instrument for the unverifiable middle &mdash; calibrate it against humans, neutralize its known biases, and never point it at something a checker could decide or at the one judgment its biases corrupt.</strong></p>
+  </div>
+</section>

@@ -3,7 +3,7 @@ import type { Locale } from './index';
 export interface UIStrings {
   brand: string;
   tagline: string;
-  nav: { fieldGuide: string; concepts: string; deepDives: string; changelog: string; about: string };
+  nav: { fieldGuide: string; concepts: string; deepDives: string; playbooks: string; operations: string; changelog: string; about: string };
   switcher: { en: string; zh: string; aria: string };
   search: {
     open: string;        // accessible label / tooltip for the trigger button
@@ -34,6 +34,8 @@ export interface UIStrings {
   fg: { metaTitle: string; metaDesc: string };
   concepts: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
   deepDives: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
+  playbooks: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
+  operations: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
   about: { kicker: string; h1: string; metaDesc: string;
            missionH: string; missionHtml: string;
            coveredH: string; coveredHtml: string;
@@ -47,7 +49,7 @@ export const ui: Record<Locale, UIStrings> = {
   en: {
     brand: 'Agentic AI Wiki',
     tagline: 'Agentic AI Wiki — knowledge, written to last.',
-    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', changelog: 'Changelog', about: 'About' },
+    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', changelog: 'Changelog', about: 'About' },
     switcher: { en: 'EN', zh: '中文', aria: 'Language' },
     search: {
       open: 'Search the wiki',
@@ -91,10 +93,24 @@ export const ui: Record<Locale, UIStrings> = {
     },
     deepDives: {
       metaTitle: 'Deep-Dives — Agentic AI Wiki',
-      metaDesc: 'Advanced practitioner essays on agent architectures, protocols, memory, and agentic security.',
+      metaDesc: 'Engineering fundamentals — architectures, memory, RAG, protocols, tools, reasoning, training, multi-agent.',
       h1: 'Deep-Dives',
-      tagline: 'Advanced practitioner essays — architectures, protocols, memory, and agentic security.',
+      tagline: 'Engineering fundamentals — architectures, memory, RAG, protocols, tools, reasoning, training, multi-agent.',
       emptyHtml: 'Deep-dive essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
+    },
+    playbooks: {
+      metaTitle: 'Playbooks — Agentic AI Wiki',
+      metaDesc: 'Applied recipes for building agents in specific domains and roles — coding, voice, customer support, research, and more.',
+      h1: 'Playbooks',
+      tagline: 'Applied recipes for building agents in specific domains and roles.',
+      emptyHtml: 'Playbook essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
+    },
+    operations: {
+      metaTitle: 'Operations — Agentic AI Wiki',
+      metaDesc: 'How to run agents in production — evals, observability, cost, safety, governance.',
+      h1: 'Operations',
+      tagline: 'How to run agents in production — evals, observability, cost, safety, governance.',
+      emptyHtml: 'Operations essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
     },
     about: { kicker: 'About', h1: 'Agentic AI Wiki',
       metaDesc: 'What the Agentic AI Wiki is, what it covers, and who maintains it.',
@@ -115,7 +131,7 @@ export const ui: Record<Locale, UIStrings> = {
   zh: {
     brand: 'Agentic AI 维基',
     tagline: 'Agentic AI 维基 — 沉淀长期有效的知识。',
-    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', changelog: '更新日志', about: '关于' },
+    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', changelog: '更新日志', about: '关于' },
     switcher: { en: 'EN', zh: '中文', aria: '语言' },
     search: {
       open: '搜索本维基',
@@ -159,10 +175,24 @@ export const ui: Record<Locale, UIStrings> = {
     },
     deepDives: {
       metaTitle: '深度剖析 — Agentic AI 维基',
-      metaDesc: '面向进阶实践者的深度文章：智能体架构、协议、记忆与智能体安全。',
+      metaDesc: '工程基础 —— 架构、记忆、RAG、协议、工具、推理、训练、多智能体。',
       h1: '深度剖析',
-      tagline: '面向进阶实践者的深度文章 — 架构、协议、记忆与智能体安全。',
+      tagline: '工程基础 —— 架构、记忆、RAG、协议、工具、推理、训练、多智能体。',
       emptyHtml: '深度剖析文章即将上线 — 在此之前，先深入阅读 <a href="%FG%" style="color:var(--accent);">实战指南</a>。',
+    },
+    playbooks: {
+      metaTitle: '实战手册 — Agentic AI 维基',
+      metaDesc: '在具体领域与角色中构建智能体的应用蓝本——编码、语音、客服、研究等。',
+      h1: '实战手册',
+      tagline: '在具体领域与角色中构建智能体的应用蓝本。',
+      emptyHtml: '实战手册文章即将上线 — 在此之前，先深入阅读 <a href="%FG%" style="color:var(--accent);">实战指南</a>。',
+    },
+    operations: {
+      metaTitle: '运维 — Agentic AI 维基',
+      metaDesc: '在生产环境中运行智能体——评测、可观测性、成本、安全与治理。',
+      h1: '运维',
+      tagline: '在生产环境中运行智能体——评测、可观测性、成本、安全与治理。',
+      emptyHtml: '运维文章即将上线 — 在此之前，先深入阅读 <a href="%FG%" style="color:var(--accent);">实战指南</a>。',
     },
     about: { kicker: '关于', h1: 'Agentic AI 维基',
       metaDesc: '关于 Agentic AI 维基：它是什么、涵盖什么，以及由谁维护。',

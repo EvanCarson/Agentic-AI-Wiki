@@ -1,0 +1,82 @@
+<section class="phase">
+  <div class="phase-num">E1</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>Why evaluating agents is hard &mdash; and why your test suite lies to you.</h2>
+  <p class="goal">Evaluating a single model call is a solved-enough problem: fix the prompt, sample once, score the string. Agents break every assumption that made that easy. The output is non-deterministic, the task is multi-step so errors compound, there is rarely one gold answer, success is path-dependent, every eval run costs real money and minutes, and the dataset you trusted last quarter has quietly rotted. This essay is the honest catalogue of why agent eval is hard, so the next five essays can attack each difficulty deliberately.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Non-determinism makes a single run uninformative.</h3>
+
+    <p>A model with <code class="inline">temperature &gt; 0</code> samples a different trajectory each run; even at <code class="inline">temperature = 0</code>, batching, GPU non-associativity, and provider-side routing produce run-to-run drift. For a one-shot QA prompt this is noise around a stable mean. For an agent it is <em>structural</em>: one sampled token at step 3 sends the agent down a different tool, into a different observation, onto a different branch of the task. The variance is not a small band around the answer &mdash; it is a different answer reached by a different path.</p>
+
+    <p>The consequence is brutal and frequently ignored: <strong>a single pass@1 number on a single run is not a measurement, it is one sample of a distribution you have not characterized.</strong> An agent that "passed the eval" may pass 40% of the time. You must run each task <em>k</em> times and report a distribution &mdash; <code class="inline">pass^k</code> (passes all k, the reliability number) is usually more honest than <code class="inline">pass@k</code> (passes at least once, the capability number).</p>
+
+    <div class="callout warn">
+      <p>If your CI runs each eval task once, your green checkmark has a confidence interval wide enough to drive a regression through. The flake you blame on "the model being weird today" is the measurement, not noise to suppress.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Errors compound multiplicatively across steps.</h3>
+
+    <p>The arithmetic is unforgiving. If each step of an agent is independently 95% reliable, a 10-step task succeeds at <code class="inline">0.95^10 &asymp; 0.60</code>; a 20-step task at <code class="inline">0.36</code>. Per-step accuracy that would be excellent for a classifier is a coin flip for a workflow. This is why agent demos look magical at 5 steps and collapse at 30, and why "the model got better at the subtask" can leave end-to-end success unchanged or worse.</p>
+
+<pre class="standalone"><span class="c-cm"># the tyranny of the exponent: per-step p -> task success</span>
+<span class="c-kw">for</span> p <span class="c-kw">in</span> (<span class="c-st">0.99</span>, <span class="c-st">0.95</span>, <span class="c-st">0.90</span>):
+    <span class="c-kw">for</span> n <span class="c-kw">in</span> (<span class="c-st">5</span>, <span class="c-st">10</span>, <span class="c-st">20</span>):
+        <span class="c-fn">print</span>(p, n, <span class="c-kw">round</span>(p ** n, <span class="c-st">2</span>))
+<span class="c-cm"># 0.99 20 -> 0.82   0.95 20 -> 0.36   0.90 20 -> 0.12</span></pre>
+
+    <p>Two implications for eval design. First, an aggregate task-success number tells you the system is broken but not <em>where</em> &mdash; you need per-step instrumentation (this is the through-line to the tracing essay). Second, errors are not independent: a wrong step poisons the context for every step after it, so real curves decay <em>faster</em> than the naive product. Recovery behavior &mdash; can the agent notice and correct &mdash; is a first-class thing to measure, not an afterthought.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>There is rarely a single gold answer.</h3>
+
+    <p>For "what is the capital of France" there is a string to match. For "refactor this module to remove the circular import" or "book me a reasonable flight" there is a <em>set</em> of acceptable outcomes, possibly infinite, with no clean membership test. Exact-match scoring is impossible; the task is defined by a predicate over end states ("the tests pass and no import cycle remains"), not by an answer key.</p>
+
+    <ul>
+      <li><strong>Open-ended generation</strong> &mdash; many correct phrasings; string match is hopeless, embedding similarity is a weak proxy that rewards fluent wrongness.</li>
+      <li><strong>Constraint satisfaction</strong> &mdash; the spec is "all of these properties hold," gradeable by an executable checker; the right kind of task to build evals around.</li>
+      <li><strong>Genuinely subjective</strong> &mdash; "is this summary good." No checker exists; this is where LLM-as-judge enters, with all the bias caveats of its essay.</li>
+    </ul>
+
+    <p>The design move is to push tasks toward the second category: prefer tasks with a <em>verifiable end state</em>, because a checker you can run is worth ten judges you have to calibrate.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Success is path-dependent, so the same answer can be right or wrong.</h3>
+
+    <p>Two agents return the identical final answer. One read the docs, called the API correctly, and verified the result. The other guessed, got lucky, and would fail on the next input. <strong>Outcome alone cannot distinguish competence from a fortunate coin flip</strong> &mdash; and an eval that only checks the final state will score them identically and ship the lucky one.</p>
+
+    <p>Worse, the path can be unacceptable even when the outcome is correct: the agent deleted a production table, then restored it from backup, then reported success. Final state is fine; the trajectory is a fireable offense. This is the entire motivation for the outcome-vs-trajectory essay &mdash; for agents, <em>how</em> is often part of <em>whether</em>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Eval is expensive, and the dataset rots.</h3>
+
+    <p>Every eval run is full agent execution: many model calls, real tool latency, sometimes real API spend and side effects. A 500-task suite run <em>k</em>=5 times is 2,500 multi-minute trajectories &mdash; you cannot run it on every commit by reflex. Eval cost is a budget you design against: a fast small gate on every push, the full suite nightly, the expensive judge-graded slice weekly.</p>
+
+    <ul>
+      <li><strong>Contamination.</strong> Public benchmarks leak into pretraining; a frontier model may have <em>seen</em> SWE-bench solutions. Yesterday's hard benchmark is today's memorized answer key. Held-out, private, freshly-authored tasks are the only durable signal.</li>
+      <li><strong>Eval-set rot.</strong> Your tasks reference APIs that changed, websites that redesigned, tickets that were closed. A passing eval can mean the system works <em>or</em> that the task no longer tests anything. Stale tasks decay silently into false green.</li>
+      <li><strong>Overfitting to the suite.</strong> Once an eval is a CI gate, every change is implicitly tuned to it. The suite stops measuring capability and starts measuring conformance to itself. Rotate held-out tasks the team never sees.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Treat the eval set as code with an expiry date. Pin tool/API versions, snapshot web targets, date-stamp every task, and schedule a re-validation pass &mdash; a task that hasn't been confirmed to still test what it claims is technical debt accruing as false confidence.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The honest tradeoff.</h3>
+
+    <p>You cannot make agent eval cheap, deterministic, and definitive &mdash; pick which two you will fake and be loud about it. The mature posture is not "we have an eval that says 87%"; it is "we sample a characterized distribution on a versioned, decontaminated, deliberately-rotated set, and we report variance and path, not just a headline number." <strong>An agent eval that yields one clean number you fully trust is not rigorous &mdash; it is hiding all six of these problems behind a green checkmark.</strong></p>
+  </div>
+</section>

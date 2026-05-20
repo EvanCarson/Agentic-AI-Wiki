@@ -4,6 +4,7 @@ const group: Group = {
   key: 'architectures-and-patterns',
   order: 10,
   name: L('Architectures & Patterns', '架构与模式'),
+  groupSummary: L('Reusable agent architectures — ReAct, plan-and-execute, supervisor-worker, router, reflection — and when each fits.', '可复用的智能体架构——ReAct、Plan-and-Execute、Supervisor-Worker、Router、Reflection——以及何时该用哪一种。'),
   entries: [
     { page: 'pattern-landscape', slug: 'pattern-landscape', title: L('The Agent Design-Pattern Landscape','智能体设计模式全景'), summary: L('Why architecture is a reliability lever, and the five axes that compare every pattern.','为什么架构是可靠性杠杆，以及比较每种模式的五个坐标轴。') },
     { page: 'react-pattern', slug: 'react-pattern', title: L('ReAct — Interleaving Reasoning and Acting','ReAct——交错进行推理与行动'), summary: L('The workhorse tool loop: control flow, why interleaving wins, and the failure modes at scale.','主力工具循环：控制流、交错为何取胜，以及规模化时的失败模式。') },

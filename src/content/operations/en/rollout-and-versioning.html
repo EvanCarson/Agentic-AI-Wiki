@@ -1,0 +1,80 @@
+<section class="phase">
+  <div class="phase-num">O5</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Rollout, versioning and pinning: the model changed under you and nobody deployed.</h2>
+  <p class="goal">The number-one production surprise with agents is not a bug you wrote — it is behavior shifting when you changed nothing, because the model provider rotated a checkpoint behind a floating alias. An agent's behavior is a function of three coupled artifacts — model, prompt, tools — and shipping any of them is a deploy whether your CI knows it or not. This essay is about treating that triple as a versioned, pinned, canaried, rollback-able release.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>"The model changed under us" is the default, not the exception.</h3>
+
+    <p>Calling <code class="inline">gpt-4o</code> or <code class="inline">claude-sonnet</code> by a floating alias means the provider can — and does — move that pointer to a new checkpoint with different behavior, on their schedule, with no diff in your repo and no entry in your changelog. Your evals passed last week against a model that no longer exists at that name. <strong>An unpinned model is a continuous, silent, un-reviewed deploy of your most behavior-critical dependency.</strong></p>
+
+    <p>The mental reframe that fixes this: the agent's behavioral contract is the tuple <code class="inline">(model_version, prompt_version, tool_schema_version)</code>. Two of those live in your repo and you already version them by reflex. The third is the one that moves without you — so it must be pinned with the same discipline as a library version, not referenced by a moving tag.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Pin the whole triple and stamp it on every run.</h3>
+
+    <p>Pin to immutable, dated model snapshots — never a bare family alias. Version prompts and tool schemas as content-addressed artifacts. Then record the resolved triple in the run's journal, so every trace is attributable to an exact behavioral contract.</p>
+
+<pre class="standalone"><span class="c-cm"># release/pin.py — one immutable behavioral contract</span>
+RELEASE = {
+    <span class="c-st">"model"</span>:  <span class="c-st">"claude-sonnet-2025-09-01"</span>,  <span class="c-cm"># dated snapshot, NOT a float</span>
+    <span class="c-st">"prompt"</span>: <span class="c-st">"sha256:9af3...e1"</span>,           <span class="c-cm"># content-addressed</span>
+    <span class="c-st">"tools"</span>:  <span class="c-st">"toolset@v7"</span>,                <span class="c-cm"># pinned schema set</span>
+}
+
+<span class="c-kw">def</span> <span class="c-fn">start_run</span>(req):
+    rel = active_release(req.tenant)        <span class="c-cm"># may be canary or stable</span>
+    journal.record(req.run_id, <span class="c-st">0</span>, <span class="c-st">"PLAN"</span>,
+                   {<span class="c-st">"req"</span>: req, <span class="c-st">"release"</span>: rel})  <span class="c-cm"># stamp it</span>
+    <span class="c-kw">return</span> rel                              <span class="c-cm"># run is bound to THIS triple</span></pre>
+
+    <div class="callout tip"><p>Stamping the release on the run also fixes the resumability hazard from <code class="inline">durable-state-and-resumability</code>: a run that crashes under release <code class="inline">R</code> must resume under <code class="inline">R</code>, not whatever is current. A run whose first half was produced by one model and second half by another is an un-debuggable trace.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Canary and shadow: prove the new triple before it touches everyone.</h3>
+
+    <p>A new model snapshot or prompt edit is a behavior change with no compiler to catch regressions. Roll it out as a controlled experiment, not a flip:</p>
+
+    <ul>
+      <li><strong>Shadow</strong> — run the candidate triple alongside the live one on real traffic, serve only the live result, and diff outputs offline. Zero user risk; surfaces behavioral drift before any customer sees it. The best first gate for a model snapshot bump.</li>
+      <li><strong>Canary</strong> — route a small, well-chosen slice (say 1–5%, ideally internal/low-stakes tenants first) to the new triple, with automatic comparison of quality and safety metrics against the control slice.</li>
+      <li><strong>Progressive promotion</strong> — widen only while the gate stays green; the moment a guardrail metric regresses, freeze the rollout — do not "monitor and see."</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The eval gate is the promotion criterion — no green eval, no promote.</h3>
+
+    <p>Canary tells you what production thinks; the eval suite tells you whether you should have asked. Promotion from canary to full rollout must be gated on a versioned offline eval run against the <em>candidate triple</em>, comparing to the incumbent on the metrics that matter — task success, regression set, and the adversarial/safety suite. This is not optional polish; it is the only thing standing between "the provider's new checkpoint is 3% better at coding and 20% worse at refusing prompt injection" and that shipping silently.</p>
+
+    <div class="callout warn"><p>Provider model upgrades are not monotone. A newer snapshot can be better on the headline benchmark and worse on <em>your</em> task or your safety surface. Treat every provider snapshot change as a candidate that must clear the same eval gate as your own prompt change — the vendor's release notes are not your eval.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Rollback discipline: a release you cannot revert in minutes is not a release.</h3>
+
+    <p>Because behavior regressions are often subtle and only visible in aggregate, the recovery primitive must be instant and boring:</p>
+
+    <ul>
+      <li><strong>Rollback is a config flip, not a redeploy.</strong> The active release is data (a pointer per tenant/segment), so reverting is changing one value, not rebuilding and shipping under incident pressure.</li>
+      <li><strong>Keep N previous releases warm.</strong> The prior triple — model snapshot included — must remain callable; do not let a pin point at a provider snapshot that gets retired out from under your rollback path.</li>
+      <li><strong>In-flight runs finish on their stamped release.</strong> Rollback changes what <em>new</em> runs get; it must not retroactively rewrite the behavioral contract of runs already mid-loop.</li>
+      <li><strong>One reason to roll back is enough.</strong> A guardrail-metric regression is a revert, not a debate. Investigate from the safe state.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When strict pinning is more rigor than the use case needs.</h3>
+
+    <p>Pinning, shadowing, and an eval gate are real release machinery with real latency-to-upgrade: a low-stakes internal summarizer where any reasonable model is fine, and a wrong answer costs nothing, does not need a canary pipeline — a floating alias and a spot check is proportionate. The cost of being unpinned is paid in <em>behavioral surprise per dollar of impact</em>: it is negligible for a throwaway helper and catastrophic for an agent that moves money or makes irreversible changes. <strong>Pin and gate in proportion to what a silent behavior shift would cost you — but never let an agent with real-world side effects ride a floating model alias.</strong></p>
+  </div>
+</section>

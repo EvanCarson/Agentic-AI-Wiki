@@ -1,0 +1,84 @@
+<section class="phase">
+  <div class="phase-num">O3</div>
+  <div class="week">运维 · 智能体运维：部署与运营</div>
+  <h2>幂等、重试与副作用安全：智能体一定会做两次。</h2>
+  <p class="goal">智能体循环会重试——在瞬时模型错误时、在工具超时时、在崩溃后恢复时，以及因为模型自己有时就是会再次调用同一个工具。其中每一次，都是把邮件发两遍、把卡扣两次、把工单建两条的机会。你想要的那种"恰好一次"在网络层并不存在；它是你用幂等键、重试分类与副作用账本<em>构造</em>出来的东西。本文就是这套构造。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>每个写工具在你让它幂等之前都是至少一次。</h3>
+
+    <p>分布式系统只给你至多一次（可能丢）或至少一次（可能重）。智能体让重复路径远比普通服务更可能，因为有<em>四个独立的重试源</em>层层叠加：HTTP 客户端的重试、循环的工具错误重试、持久运行时的崩溃恢复、以及模型重新发出一次它已经做过的工具调用。<strong>一个未加防护的写工具不是"通常没事"；它是一个等着第一次超时就重复的隐患。</strong></p>
+
+    <p>唯一稳健的答案是让<em>副作用</em>本身幂等：第二次相同调用是一个空操作，并返回第一次调用的结果。这需要"这次意图动作"有一个稳定身份，作为幂等键由工具层强制——而不是寄望于重试不会发生。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>幂等键派生自意图，而非在调用时现生成。</h3>
+
+    <p>在工具包装器内部现生成的键，每次重试都会变，什么也保护不了。键必须是<em>逻辑动作</em>的确定性函数，这样被重试的调用会算出<em>相同</em>的键，并与首次尝试的账本条目相撞。</p>
+
+<pre class="standalone"><span class="c-cm"># tools/idem.py — key is a function of intent, not of the attempt</span>
+<span class="c-kw">def</span> <span class="c-fn">idem_key</span>(run_id, step_seq, tool, args):
+    <span class="c-cm"># run_id + step pins it to one decision in one run;</span>
+    <span class="c-cm"># arg-hash defends against the model re-deciding identically</span>
+    h = sha256(canonical(args)).hexdigest()[:<span class="c-st">16</span>]
+    <span class="c-kw">return</span> <span class="c-st">f"{run_id}:{step_seq}:{tool}:{h}"</span>
+
+<span class="c-kw">def</span> <span class="c-fn">do_write</span>(key, fn, args):
+    hit = ledger.get(key)
+    <span class="c-kw">if</span> hit <span class="c-kw">and</span> hit.status == <span class="c-st">"DONE"</span>:
+        <span class="c-kw">return</span> hit.result            <span class="c-cm"># replay, do NOT re-execute</span>
+    ledger.put(key, status=<span class="c-st">"PENDING"</span>)  <span class="c-cm"># claim before effect</span>
+    res = fn(**args, idempotency_key=key)  <span class="c-cm"># pass downstream too</span>
+    ledger.put(key, status=<span class="c-st">"DONE"</span>, result=res)
+    <span class="c-kw">return</span> res</pre>
+
+    <p>键里有两层防御：<code class="inline">run_id:step_seq</code> 把它绑到持久日志中的某一个决策，使崩溃恢复复用它；<code class="inline">args</code> 哈希则防御模型独立地再发出一次完全相同的调用。也把键透传到下游——Stripe、支付与消息类 API 都接受幂等键；让它们的键与你的键保持一致。</p>
+
+    <div class="callout tip"><p>哈希前先把参数规范化（键排序、数字归一、剥掉像客户端时间戳这类易变字段）。一个因为模型重排了参数里的空白就翻转的键不是幂等键——它是一个多绕了几道弯的重复生成器。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>对失败分类：可重试、毒丸，或含混。</h3>
+
+    <p>"出错就重试"正是一个毒丸输入被尝试 50 次的原因，也是一个含混超时变成一次重复的原因。每次工具失败在你决定重试前都必须先分类：</p>
+
+    <ul>
+      <li><strong>可重试</strong>——瞬时且可证明无副作用：连接被拒、429、503、DNS 抖动。用带上限的指数退避加抖动重试，尝试次数有界。</li>
+      <li><strong>毒丸</strong>——确定性且永远不会成功：400 校验错误、"账户不存在"、schema 不匹配。重试是纯粹浪费且烧预算。停下，作为一个真实观测呈现给智能体，不要重试。</li>
+      <li><strong>含混</strong>——危险的那一类：在请求<em>可能</em>已被处理<em>之后</em>发生的超时或连接断开。你不知道副作用是否发生了。绝不盲目重试；先对照账本或下游系统的状态端点做<em>对账</em>。</li>
+    </ul>
+
+    <div class="callout warn"><p>含混这一类正是钱被弄丢或弄重的地方。一个你从未收到的 200，与一个从未送达的请求，看起来一模一样。唯一安全的动作是按幂等键对账——"动作 <code class="inline">K</code> 是否已经生效？"——而不是重试，也不是靠猜。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>副作用账本才是真相之源，不是模型的记忆。</h3>
+
+    <p>智能体的上下文是"它对世界做了什么"的糟糕记录——它会被压缩、摘要，有时还会幻觉。外部副作用的权威记录是一个独立、持久的<strong>副作用账本</strong>：每次尝试的写一行，按幂等键索引，带状态（<code class="inline">PENDING / DONE / FAILED</code>）、结果和时间戳。它回答上下文无法回答的三个运维关键问题：<em>这事发生了吗</em>、<em>恰好一次吗</em>、<em>第一次的结果是什么</em>。崩溃恢复时，是账本——不是 LLM——来决定执行还是重放。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>去重窗口，以及"恰好一次"诚实的边界。</h3>
+
+    <p>跨不可靠网络的真正"恰好一次投递"是不可能的；你能构造的是通过幂等操作加去重窗口实现的恰好一次<em>副作用</em>。窗口就是账本的保留期：在窗口内相撞你就重放；落在窗口外，一个迟到很久的重试就能造成重复。</p>
+
+    <ul>
+      <li>把去重窗口设得宽裕地超过你最坏情况的端到端重试时程（包括多小时故障后的崩溃恢复），而非平均值。</li>
+      <li>有下游原生幂等就优先用（支付、邮件提供商）：它们的窗口与持久性胜过你外挂的任何东西。</li>
+      <li>对没有幂等支持的副作用（一个发给合作方的即发即忘 webhook），把操作设计成<em>逻辑上</em>幂等——"把状态置为 X"，而非"自增"——或把它放到人工审批之后。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>什么时候这套机制超过了该动作应得的待遇。</h3>
+
+    <p>幂等键、分类和账本都是实打实的成本：每个副作用前的一次写、一条对账路径、为运营而保留的数据。对<em>只读</em>工具（搜索、抓取、查询）它大多没必要——重复的读浪费的是 token，不是钱，所以朴素重试就够了。整套装置恰恰在动作<em>外部可见</em>、<em>不可逆</em>或<em>搬动价值</em>时才是强制的。<strong>在"重复即事故"处花幂等的钱；在"重复只是一次浪费的 GET"处省掉它——并且永远不要让"把它做对的成本"成为一个支付工具不带键就上线的理由。</strong></p>
+  </div>
+</section>

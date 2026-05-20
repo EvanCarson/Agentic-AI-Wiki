@@ -4,6 +4,7 @@ const group: Group = {
   key: 'tool-capability-design',
   order: 130,
   name: L('Tool & Capability Design', '工具与能力设计'),
+  groupSummary: L('Designing tools an agent can actually use — granularity, schemas, error messages, recovery, antipatterns.', '设计智能体真正能用的工具——粒度、Schema、错误消息、恢复与反模式。'),
   entries: [
   { page: 'tool-design-principles', slug: 'tool-design-principles', title: L('Designing Tools Agents Can Use','设计智能体能用好的工具'), summary: L('Tools are the agent\'s entire API: design for a model that reads only the description and is confidently wrong, not for an engineer who read the source.','工具就是智能体的全部 API：为一个只读描述、且会自信犯错的模型而设计，而非为一个读过源码的工程师。') },
   { page: 'tool-granularity', slug: 'tool-granularity', title: L('Tool Granularity & Composition','工具粒度与组合'), summary: L('Coarse tools hide decisions and concentrate blast radius, fine tools multiply round-trips and bloat the list — and tool explosion is now a measured ~24-point selection-accuracy loss.','粗工具隐藏决策、集中爆炸半径，细工具放大来回、撑大列表——而工具爆炸如今是约 24 个百分点的选择准确率实测损失。') },

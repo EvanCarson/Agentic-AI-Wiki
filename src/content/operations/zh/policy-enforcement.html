@@ -1,0 +1,67 @@
+<section class="phase">
+  <div class="phase-num">C2</div>
+  <div class="week">运维 · 治理与合规</div>
+  <h2>策略执行——一条模型能用话术绕过的策略不是管控。</h2>
+  <p class="goal">每个团队都会写一份智能体策略：别碰生产数据、超过阈值要审批、绝不给外部方发邮件。然后几乎每个团队都靠把它放进系统提示词来「执行」它——而这只是对一个非确定优化器的强烈建议，何况有对手正主动试图把它带偏。管控是模型无法拒绝的东西。本文讲如何把策略变成代码、在智能体循环的哪个位置执行它，以及当模型出错或被攻陷时仍能站住的结构性模式——白名单、职责分离。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>策略即代码：规则是被求值的，不是被理解的。</h3>
+    <p>第一步是把策略从自然语言里取出，变成一个在模型<em>之外</em>运行的可执行制品：一个函数、一个规则引擎、一种像云授权所用的那类策略语言。智能体提议一个行动；一个确定性求值器在任何事发生之前返回允许或拒绝。这换来三样基于提示词的「策略」永远没有的东西：它<strong>可审计</strong>（规则是一个版本化、可评审的对象，而非埋在提示词里）、<strong>可测试</strong>（你能在 CI 里对危险情形断言拒绝），且<strong>无法被劝说绕过</strong>（恶意指令无论怎么措辞都改不了一个函数的输出）。</p>
+<pre class="standalone"><span class="c-cm"># the model proposes; a deterministic evaluator decides</span>
+decision = policy.<span class="c-fn">evaluate</span>(
+  action=proposed_tool_call,
+  principal=ctx.principal,
+  context=ctx,
+)
+<span class="c-kw">if</span> decision.effect != <span class="c-st">"allow"</span>:
+    <span class="c-kw">return</span> <span class="c-fn">Denied</span>(decision.reason)  <span class="c-cm"># fail closed</span></pre>
+    <div class="callout tip">
+      <p>让策略引擎与智能体代码分离，并独立做版本化。「这次运行时生效的是哪条策略」必须能从审计记录（C1）按 id 回答，而不是靠读旧提示词。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>在三处执行：循环之前、循环之内、循环之后。</h3>
+    <p>没有单一咽喉点，因为不同风险住在不同阶段。<strong>循环前</strong>：准入——这个主体到底允不允许跑这个智能体，用什么数据范围与预算。<strong>循环内</strong>：高杠杆层——每个工具调用在执行前对照策略检查，且检查参数而不只是工具名（这是「可调用数据库工具」与「可执行 <code class="inline">DELETE</code>」之间的差别）。<strong>循环后</strong>：出口——在智能体输出与任何外发载荷离开信任边界之前检查它，因为一串各自被允许的调用仍可能拼出一个不被允许的结果，比如把数据藏进一份「摘要」里外泄。</p>
+    <ul>
+      <li><strong>循环前</strong>在模型跑起来之前界定爆炸半径——范围、预算、数据域。</li>
+      <li><strong>循环内</strong>是自主性真正造成损害之处——对每个有副作用的调用做参数级检查。</li>
+      <li><strong>循环后</strong>抓住没有单步触发的涌现式违规——是拼出的结果，不是步骤。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>用白名单，绝不用黑名单。</h3>
+    <p>黑名单枚举被禁止的行动并放行其余一切；对一个会自创行动序列的开放式生成器而言，你没想到的有害事物是无界的，所以黑名单会 fail open。<strong>白名单</strong>枚举被许可的工具、被许可的参数形状、被许可的目的地，并默认拒绝——未预料到的行动被拒，是因为它从未被授予，而非因为有人预见了它。这是智能体策略中单项杠杆最高的结构性决定，且它必须是每个执行点的默认姿态：未明确允许即拒绝。</p>
+    <div class="callout warn">
+      <p>一份「坏」工具调用的黑名单，面对一个攻击者能提示词注入的模型，是安全表演。不安全的默认——先放行再拦截——意味着你的安全取决于你是否预见了那次攻击。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>职责分离：没有单个智能体能对敏感行动闭环。</h3>
+    <p>对高后果操作，借用财务里最古老的管控：提议某行动的实体不能是审批并提交它的实体。一个智能体可以<em>起草</em>一笔支付、一次删除、一项生产变更；一个独立权威——一个用不同凭据的不同服务、一个角色狭窄做核验的第二智能体，或一个人（C4 发展出的操作者角色）——必须在效果落地前审批。这意味着单个被攻陷或在幻觉的智能体无法单方面造成最坏结果；攻击者现在得击败两个独立限定范围的管控。</p>
+<pre class="standalone"><span class="c-cm"># proposer and approver are different principals</span>
+draft = agent.<span class="c-fn">propose</span>(<span class="c-st">"refund"</span>, amount=<span class="c-st">9000</span>)
+<span class="c-kw">if</span> draft.amount &gt; <span class="c-st">5000</span>:
+    approval = approver.<span class="c-fn">review</span>(draft)   <span class="c-cm"># separate authority + creds</span>
+    <span class="c-kw">assert</span> approval.granted_by != draft.proposed_by
+commit.<span class="c-fn">apply</span>(draft, approval)</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>把执行与审计轨迹双向绑定。</h3>
+    <p>执行与审计是一个系统。每个策略决定——允许<em>与</em>拒绝——都必须连同规则 id、所求值的输入与结果写进 C1 轨迹，使「这为什么被拦」和「这为什么被准」事后都可回答。拒绝是更有价值的信号：某路径上拒绝率上升，是行为失常的智能体、一次提示词注入战役，或一条对真实工作负载来说就是错的策略的早期指标。没有审计的执行无法被评审；没有执行的审计只记录了损害。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>诚实的取舍。</h3>
+    <p>硬执行有真实成本：每道闸门都是延迟与工程，一份过紧的白名单会产生假拒绝、把用户推向影子变通办法，而一个独立策略引擎是又一个要保持正确并同步的系统。但替代方案——只活在提示词里的策略——不是更弱的管控，它是<em>没有</em>管控却穿着管控的戏服。<strong>把防范不可逆或受监管损害的规则在模型之外用代码执行；让提示词指导只去管那些违反了顶多稍微更糟一点的事。</strong></p>
+  </div>
+</section>

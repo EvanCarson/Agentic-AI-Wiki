@@ -1,0 +1,91 @@
+<section class="phase">
+  <div class="phase-num">V5</div>
+  <div class="week">实战手册 · 语音与实时智能体</div>
+  <h2>语音中的工具调用与状态：不留空气死寂地调工具，靠耳朵确认。</h2>
+  <p class="goal">文本智能体可以想四秒，没人察觉。一个沉默四秒的语音智能体，在来电者看来，已经卡死或挂断。工具调用是语音智能体最显眼地崩坏之处，因为聊天里不可见的后端延迟，在语音里变成对话中一个能听见的窟窿。任务是让工具调用<em>对话化</em>：永不沉默、能靠耳朵确认、且能在一通有状态的通话里恢复。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>在工具调用之前、期间、之后都说话。</h3>
+
+    <p>语音工具调用里杠杆率最高的单一技术：在工具延迟落地<em>之前</em>就发出一句口头应答，让来电者听到一个有人样的停顿，而非一条死线。</p>
+
+<pre class="trace"><span class="c-out">caller: "what's my balance?"
+  t+0.2s  agent: "Let me pull that up..."   &lt;-- cover starts
+  t+0.3s  [tool: get_balance() dispatched]
+  t+1.6s  [tool returns]
+  t+1.8s  agent: "Your balance is $2,481.10."
+silence the caller actually experienced: ~0ms</span></pre>
+
+    <p>OpenAI 的 Realtime API 直接把这个暴露为<strong>前导语（preambles）</strong>——函数调用在途时模型说一句短的填充。前导语必须足够通用，无论结果如何都为真（"我查一下"），绝不能是对答案的猜测（工具返回前就说"看起来你都付清了"，正是智能体撒谎的方式）。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>工具调用是异步的；对话不在它上面阻塞。</h3>
+
+    <p>在文本智能体里循环自然是串行的：调工具、等、继续。在语音里你不能在等待时冻住音频通道。工具调用作为一个异步任务跑；智能体保持在线，能在后端干活时应答、回答一个澄清子问题，或吸收一次打断。</p>
+
+<pre class="standalone"><span class="c-cm"># voice/tool_runtime.py — never block the audio loop</span>
+<span class="c-kw">async def</span> <span class="c-fn">on_tool_call</span>(call, session):
+    <span class="c-kw">await</span> session.say(filler_for(call))      <span class="c-cm"># cover now</span>
+    task = asyncio.create_task(run(call))     <span class="c-cm"># off the path</span>
+    <span class="c-kw">while</span> <span class="c-kw">not</span> task.done():
+        <span class="c-kw">if</span> session.user_started_talking():
+            <span class="c-kw">await</span> session.yield_floor()       <span class="c-cm"># caller wins</span>
+        <span class="c-kw">await</span> asyncio.sleep(<span class="c-st">0.05</span>)
+    <span class="c-kw">return</span> task.result()</pre>
+
+    <div class="callout warn">
+      <p>把相互独立的工具调用<strong>并行</strong>跑，绝不要串行——三个串行的 400 ms 调用是一个 1.2 s 窟窿；三个并行的是 400 ms。语音去掉了文本智能体里掩盖串行工具延迟的那点余地，所以那里你可以偷懒的并行，这里是强制的。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>靠耳朵确认副作用，在它发生之前。</h3>
+
+    <p>语音智能体没法弹一个确认对话框。确认<em>就是</em>那个口头轮次，而对任何不可逆动作它是强制的：用来电者的措辞把那些有后果的参数读回去，并在工具触发前要求一个明确的"是"。</p>
+
+<pre class="standalone"><span class="c-cm"># confirm BEFORE the mutating call, not after</span>
+agent: <span class="c-st">"So that's cancelling the 7pm reservation
+        for four at Nopa tonight — shall I?"</span>
+caller: <span class="c-st">"yes"</span>
+  &rarr; only NOW dispatch cancel_reservation(...)</pre>
+
+    <p>这与修转写税的那个读回是同一个（见 <code class="inline">speech-stack</code>）：在一条有损音频信道上，确认轮次同时是听错<em>与</em>意图错的纠错码。仅对只读、可逆的动作才跳过它。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>状态必须熬过一通有状态、可打断的通话。</h3>
+
+    <p>一通语音通话是一段长的有状态会话，来电者可以在任何点打断、改主意、回头改一个槽位（"其实，改成 8 点"）。智能体的状态不是"到目前为止的转写文本"——它是结构化的槽位与待办动作集合，且必须跟踪什么被<em>确认</em>、什么是<em>暂定</em>、以及来电者<em>实际听到</em>了什么。</p>
+
+    <ul>
+      <li><strong>槽位状态，而非转写状态。</strong>跟踪 <code class="inline">{party: 4, time: 8pm (was 7pm), date: today}</code>，而非每轮重新解析的一墙文本。</li>
+      <li><strong>已确认 vs 暂定。</strong>你读回后被来电者纠正过的值是已确认；只是顺带提过的是暂定，任何变更前必须确认。</li>
+      <li><strong>说出口 vs 已生成。</strong>若一次打断在句子中途截断了智能体，状态必须反映<em>出声说过</em>的，否则智能体会引用一个来电者从未听到的数字。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>慢的与失败的工具是对话事件。</h3>
+
+    <p>一个耗八秒、或失败的后端，不是一个记下来咽掉的异常——来电者在线上，会听见它。给每个工具调用一个对话级超时与一个口头应急。</p>
+
+    <ul>
+      <li><strong>带口头出口的超时。</strong>若工具超出预算，诚实说出来（"这个比平常久——我回拨给你，还是您稍等一下？"），而非永远念填充词。</li>
+      <li><strong>降级，别冻住。</strong>失败时，给出次优路径（回拨、转人工、重试）——绝不沉默，绝不无限"还在处理那个"。</li>
+      <li><strong>打断下的幂等。</strong>工具中途的一次打断或挂断不得重复扣款或重复预订；变更类调用需要幂等键，与文本智能体里完全一样，只是这里的失败还能被听见。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>诚实的权衡。</h3>
+
+    <p><strong>你为掩盖工具延迟而加的每一句遮掩话，都是来电者没要的对话时间；用填充词把通话撑长本身就是一种失败模式——目标是快的工具，口头遮掩是对慢的征税，而非修它的替代品。</strong></p>
+  </div>
+</section>

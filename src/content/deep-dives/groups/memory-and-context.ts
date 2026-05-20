@@ -4,6 +4,7 @@ const group: Group = {
   key: 'memory-and-context',
   order: 30,
   name: L('Memory & Context', '记忆与上下文'),
+  groupSummary: L('Context windows, memory stores, compaction, retrieval-augmented memory — keeping the right things on the prompt.', '上下文窗口、记忆存储、压缩、检索增强记忆——把对的东西留在提示上。'),
   entries: [
     { page: 'context-budgeting', slug: 'context-budgeting', title: L('Engineering the Context Window','设计上下文窗口'), summary: L('Treat the finite window as a budgeted resource: per-category token budgets, position-aware ordering, and utilization metrics.','把有限窗口当作有预算的资源：分类令牌预算、位置感知排序与利用率度量。') },
     { page: 'short-vs-long-term-memory', slug: 'short-vs-long-term-memory', title: L('Short-Term vs Long-Term Memory','短期与长期记忆'), summary: L('The in-prompt working set vs the external store: what earns a slot, when to write, when to recall, and the promotion/demotion cycle.','提示内工作集与外部存储：什么配占位、何时写、何时回忆，以及提升／降级循环。') },

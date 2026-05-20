@@ -4,6 +4,7 @@ const group: Group = {
   key: 'reasoning-and-test-time-compute',
   order: 120,
   name: L('Reasoning & Test-Time Compute', '推理与测试时计算'),
+  groupSummary: L('Chain of thought, self-consistency, tree/graph of thought, and the inference-time-scaling laws that govern them.', '思维链、自我一致性、思维树/图，以及支配它们的推理期扩展规律。'),
   entries: [
     { page: 'chain-of-thought', slug: 'chain-of-thought', title: L('Chain-of-Thought, Properly','正确理解思维链'), summary: L('What CoT actually buys (serial compute, not introspection), faithfulness vs post-hoc rationalization, when it hurts, and structured vs free traces.','CoT 究竟买到了什么（串行计算，而非内省）、忠实性与事后合理化、它何时有害，以及结构化轨迹与自由轨迹之别。') },
     { page: 'self-consistency-and-sampling', slug: 'self-consistency-and-sampling', title: L('Self-Consistency & Sampling','自一致性与采样'), summary: L('Why sampling + majority vote works, the exact bias-amplification failure, the saturating returns curve, and how to spend the k budget.','采样加多数投票为何有效、偏差被放大的精确失效条件、收益饱和曲线，以及如何花好 k 这笔预算。') },

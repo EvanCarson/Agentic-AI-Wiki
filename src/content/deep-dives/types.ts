@@ -21,6 +21,22 @@ export interface Entry {
   summary: Localized;
   /** Localized group label (set by the aggregator — do not specify in group files). */
   group?: Localized;
+  /** Optional cross-section related links (see Related). */
+  related?: Related;
+}
+
+/** Cross-section related links surfaced on the group landing's "Related" block. */
+export interface Related {
+  /** Slugs from src/content/concepts/manifest.ts. */
+  concepts?: string[];
+  /** Page basenames from src/content/field-guide/manifest.ts (Field Guide chapters are keyed by `page`, not slug). */
+  fieldGuide?: string[];
+  /** Slugs from src/content/deep-dives/groups/*.ts. */
+  deepDives?: string[];
+  /** Slugs from src/content/playbooks/groups/*.ts. */
+  playbooks?: string[];
+  /** Slugs from src/content/operations/groups/*.ts. */
+  operations?: string[];
 }
 
 /** A Deep-Dive group: a curated cluster of entries with a localized display name. */
@@ -36,6 +52,8 @@ export interface Group {
   order: number;
   /** Bilingual display name (used as the section header on the index). */
   name: Localized;
+  /** One-to-two-sentence localized group thesis. Used on section + group landings. */
+  groupSummary: Localized;
   /** Entries in this group, in display order. */
   entries: Omit<Entry, 'group'>[];
 }
