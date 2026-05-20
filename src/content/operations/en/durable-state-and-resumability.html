@@ -1,0 +1,91 @@
+<section class="phase">
+  <div class="phase-num">O1</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Durable state and resumability: an agent that survives the process that ran it.</h2>
+  <p class="goal">A production agent will be killed mid-loop — by a deploy, an OOM, a spot reclaim, a 3am pod eviction. The only question is whether it resumes where it was or starts a fresh, half-completed task that now double-charges a customer. This essay is about making the agent loop a <em>durable</em> computation: state that outlives the process, replayable history, and a crisp line between what must persist and what you recompute.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The agent loop is a long-lived computation pretending to be a request.</h3>
+
+    <p>The default mental model — "call the agent, await the answer" — is a lie that holds only until the first crash. A real agent loop is minutes-to-hours of <code class="inline">think → call tool → observe → repeat</code>, with side effects landing in the world along the way. If the holding process dies at step 14 of 30, an in-memory loop loses everything: the plan, the scratchpad, the fact that it already filed the refund. <strong>Durability is not a feature you add later; it is the data model you choose on day one.</strong></p>
+
+    <p>The fork is: <em>recompute</em> or <em>persist</em>. Recomputing the whole trajectory from the original prompt is appealing (no storage) and wrong — LLM calls are non-deterministic and side-effecting, so a "replay" re-asks the model and re-fires tools. The only sound design persists the loop's <em>decisions and observations</em> as they happen, so resume reads history rather than re-deriving it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Event-sourced history is the natural representation.</h3>
+
+    <p>Model the loop as an append-only log of events, not a mutable blob you overwrite each turn. Each model decision, each tool invocation, each observation is one immutable record. State is a <em>fold</em> over the log; resume is "replay the log into memory, then continue." This is the same insight as event sourcing, and it is why durable-execution engines (Temporal, Restate, DBOS, AWS Step Functions) all converge on it.</p>
+
+<pre class="standalone"><span class="c-cm"># runtime/journal.py — append-only, fsync'd, monotonic seq</span>
+<span class="c-kw">def</span> <span class="c-fn">record</span>(run_id, seq, kind, payload):
+    row = {<span class="c-st">"run_id"</span>: run_id, <span class="c-st">"seq"</span>: seq,
+           <span class="c-st">"kind"</span>: kind,           <span class="c-cm"># PLAN | TOOL_CALL | OBS | DONE</span>
+           <span class="c-st">"payload"</span>: payload,
+           <span class="c-st">"ts"</span>: now()}
+    db.append(<span class="c-st">"journal"</span>, row)      <span class="c-cm"># durable BEFORE the effect</span>
+
+<span class="c-kw">def</span> <span class="c-fn">load_state</span>(run_id):
+    events = db.scan(<span class="c-st">"journal"</span>, run_id, order=<span class="c-st">"seq"</span>)
+    <span class="c-kw">return</span> reduce(apply_event, events, State.empty())</pre>
+
+    <div class="callout tip"><p>Write the journal entry for an intended tool call <em>before</em> you execute the tool, not after. On resume you then know "we intended call N and don't have its result" — which is exactly the state an idempotent retry needs (see <code class="inline">idempotency-and-retries</code>). Logging only completed calls loses the most dangerous in-flight ones.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What must persist vs. what you recompute.</h3>
+
+    <p>Persisting everything is slow and expensive; persisting too little loses the task. The discriminator is determinism and cost-to-rederive:</p>
+
+    <ul>
+      <li><strong>Must persist:</strong> every LLM output, every tool call's arguments and result, the resolved plan, human approvals, and the seq counter. These are non-deterministic or side-effecting — they cannot be honestly recomputed.</li>
+      <li><strong>Recompute freely:</strong> derived views, the rendered prompt string, token counts, embeddings of already-stored text. Pure functions of persisted state; storing them is just a cache.</li>
+      <li><strong>Persist a pointer, not the bytes:</strong> large tool payloads (a 40MB CSV) go to object storage; the journal holds the URI and a content hash. The log stays small and replay stays fast.</li>
+    </ul>
+
+    <p>The rule of thumb: <em>if regenerating it would call a model or touch the outside world, persist it; if it is a pure function of what you already persisted, recompute it.</em></p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Resume is replay-up-to-the-frontier, then continue.</h3>
+
+    <p>Crash recovery is not "start over" and not "guess." It is: load the journal, fold it into state, find the frontier (highest completed seq), and re-enter the loop at the next step. The subtle case is a journal that ends with an intended-but-unconfirmed tool call — the process died between "I will call <code class="inline">refund()</code>" and recording its result.</p>
+
+<pre class="standalone"><span class="c-cm"># runtime/resume.py</span>
+<span class="c-kw">def</span> <span class="c-fn">resume</span>(run_id):
+    st = load_state(run_id)
+    <span class="c-kw">if</span> st.pending_call:                 <span class="c-cm"># intent logged, result not</span>
+        <span class="c-cm"># DO NOT blindly re-run: reconcile via idempotency key</span>
+        res = tool_status(st.pending_call.idem_key)
+        <span class="c-kw">if</span> res <span class="c-kw">is</span> <span class="c-kw">None</span>:                   <span class="c-cm"># provably never happened</span>
+            res = execute(st.pending_call)
+        record(run_id, st.seq + <span class="c-st">1</span>, <span class="c-st">"OBS"</span>, res)
+    <span class="c-kw">return</span> continue_loop(load_state(run_id))</pre>
+
+    <div class="callout warn"><p>The dangerous bug is a resume that re-issues a side-effecting call because its result was not journaled. Durable state without idempotency keys turns every crash into a duplicate action. The two essays are a single design: <strong>journal-before-effect</strong> plus <strong>idempotent-effect</strong> is the contract.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Redeploys are crashes you schedule — design for them.</h3>
+
+    <p>The most common "crash" in production is your own deploy. Treat in-flight runs as a first-class migration problem. Three workable strategies, in order of preference:</p>
+
+    <ul>
+      <li><strong>Drain:</strong> stop scheduling new runs, let in-flight ones reach a checkpoint boundary, then redeploy. Cleanest; needs bounded step latency and a max-drain timeout after which you fall back to resume.</li>
+      <li><strong>Checkpoint-and-resume:</strong> the journal already makes any pod fungible. New code picks up the run via <code class="inline">resume()</code>. Requires the journal schema to be forward/backward compatible across the deploy window.</li>
+      <li><strong>Version-pin the run:</strong> a run started under prompt/model version <code class="inline">v7</code> resumes under <code class="inline">v7</code>, not whatever just shipped — otherwise the agent's "memory" and its current brain disagree (see <code class="inline">rollout-and-versioning</code>).</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When durable execution is overkill.</h3>
+
+    <p>Not every agent needs an event-sourced runtime. A sub-30-second, read-only, single-tool agent (a RAG question-answerer) can be a plain stateless request: if it dies, the user retries, nothing was written, nobody is double-charged. The machinery here earns its keep precisely when loops are <em>long</em>, <em>side-effecting</em>, or <em>expensive to restart</em>. Adopting Temporal-grade durability for a 5-second classifier is cargo-culting; skipping it for a multi-hour agent that moves money is negligence. <strong>Durability cost should track the cost of losing the run, not the sophistication of the framework you admire.</strong></p>
+  </div>
+</section>

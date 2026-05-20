@@ -1,0 +1,119 @@
+<section class="phase">
+  <div class="phase-num">S4</div>
+  <div class="week">Operation · Safety, Alignment &amp; Agentic Security</div>
+  <h2>Guardrails: input/output filtering, sandboxing, and scoping.</h2>
+  <p class="goal">"Add guardrails" is the most over-promised phrase in agent security. Guardrails are real and necessary, but only when you know which kind does which job and which ones fail open. This essay separates the four guardrail families — input, output, execution sandboxing, and capability scoping — and shows how to layer them so the weak ones cover the strong ones' gaps.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>A taxonomy that prevents wishful thinking</h3>
+
+    <p>Most guardrail disappointment comes from category confusion: teams deploy a content classifier (a probabilistic detector) and expect it to behave like a sandbox (a hard boundary). They are different tools with different failure modes.</p>
+
+    <ul>
+      <li><strong>Probabilistic guardrails</strong> — input/output classifiers, LLM-based judges. They estimate "is this bad?" They fail open: an attacker who crafts around the model gets through, silently.</li>
+      <li><strong>Deterministic guardrails</strong> — schema validation, allowlists, sandboxes, capability scoping. They enforce "this is structurally not permitted." They fail closed: the disallowed action does not happen even against a novel attack.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Design rule: put your <strong>trust</strong> in deterministic guardrails and your <strong>visibility</strong> in probabilistic ones. A classifier is a smoke detector, not a fire door. Build the fire door.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Input guardrails</h3>
+
+    <p>Input guardrails inspect content <em>before</em> it reaches the model: user messages, retrieved chunks, tool results. Useful jobs they can do:</p>
+
+    <ul>
+      <li>Detect and flag known injection patterns and jailbreak shapes (raise attacker cost, gather signal).</li>
+      <li>Strip or neutralize structurally dangerous content: HTML comments, hidden Unicode, zero-width characters, embedded markup in retrieved text.</li>
+      <li>Enforce hard input limits: length, allowed languages/encodings, schema for structured inputs, source allowlists for retrieval.</li>
+      <li>Tag provenance: mark each span as trusted (operator) or untrusted (retrieved/tool) so downstream layers can treat them differently.</li>
+    </ul>
+
+    <p>The deterministic parts (stripping hidden markup, enforcing schemas, provenance tagging) are durable. The classifier part is best-effort. Do not let "we have an input filter" stand in for the structural controls below.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Output guardrails</h3>
+
+    <p>Output guardrails inspect what the model produced before anything acts on it. There are two distinct kinds, and the second matters far more for agents.</p>
+
+    <h4>Content output checks</h4>
+    <p>Scan generated text for leaked secrets, PII, disallowed content, or exfiltration markup (e.g. external image URLs encoding context). Strip or block before the response reaches a user or a renderer.</p>
+
+    <h4>Action output checks (the critical one)</h4>
+    <p>Before any tool call executes, validate it deterministically: is this tool allowed in this state? Do the arguments match a strict schema? Is the destination on the allowlist? Is the operation within rate/volume limits? This is where you stop the agent from acting on a successful injection, and it must not be implemented as another LLM the same attacker prompt can talk past.</p>
+
+    <pre class="standalone"><span class="c-cm"># Action guardrail: deterministic check before execution</span>
+<span class="c-kw">def</span> <span class="c-fn">allow_tool_call</span>(call, state):
+    <span class="c-kw">if</span> call.name <span class="c-kw">not in</span> state.allowed_tools:
+        <span class="c-kw">return</span> deny(<span class="c-st">"tool not permitted in this state"</span>)
+    <span class="c-kw">if</span> <span class="c-kw">not</span> schema_valid(call.name, call.args):
+        <span class="c-kw">return</span> deny(<span class="c-st">"argument schema violation"</span>)
+    <span class="c-kw">if</span> call.name == <span class="c-st">"send"</span> <span class="c-kw">and</span> call.args.to <span class="c-kw">not in</span> state.allowlist:
+        <span class="c-kw">return</span> deny(<span class="c-st">"destination not allowlisted"</span>)
+    <span class="c-kw">return</span> allow()</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Execution sandboxing</h3>
+
+    <p>Some agents run code or shell commands. For these, the guardrail is not a classifier on the command string — it is the environment the command runs in. Assume the command is hostile and design the box so a hostile command is contained.</p>
+
+    <ul>
+      <li><strong>Isolation:</strong> a disposable container/microVM per task, no host mounts, dropped privileges, killed after use.</li>
+      <li><strong>Network egress default-deny:</strong> the sandbox cannot reach arbitrary hosts; outbound is allowlisted or absent. This neutralizes most exfiltration even if code execution is achieved.</li>
+      <li><strong>Resource caps:</strong> CPU, memory, wall-clock, and disk limits to contain resource-abuse and runaway loops.</li>
+      <li><strong>No ambient credentials:</strong> the sandbox holds no secrets or cloud metadata access by default; capabilities are injected narrowly and per-task.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>A sandbox protects the host. It does not protect the data you deliberately handed into the sandbox, and it does not stop misuse of tools the agent legitimately calls from <em>inside</em> it. Sandboxing is necessary, not sufficient — pair it with capability scoping.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Capability scoping — the guardrail that subsumes the rest</h3>
+
+    <p>The most effective guardrail is the action you never made possible. Capability scoping means each agent (and each sub-agent) is granted exactly the tools, data scopes, and credentials its task requires, and nothing more — enforced at the boundary, not requested in the prompt.</p>
+
+    <ul>
+      <li>Per-task, time-bound, narrowly-scoped credentials instead of long-lived broad ones.</li>
+      <li>Read tools that are parameterized and result-limited rather than general query interfaces.</li>
+      <li>Trust separation: a tool-less reader for untrusted content; a privileged actor that never ingests raw untrusted text.</li>
+      <li>State machines: tools available only in states where they are valid, so an injected instruction cannot summon an out-of-phase capability.</li>
+    </ul>
+
+    <div class="diagram">┌──────────────────────────────────────────────────────────┐
+│  LAYERED GUARDRAILS (outer = visibility, inner = trust)   │
+│                                                            │
+│  [ input filter ]  probabilistic · best-effort            │
+│   [ output content ]  probabilistic · best-effort         │
+│    [ sandbox ]  deterministic · contains host             │
+│     [ action checks ]  deterministic · blocks bad calls   │
+│      [ CAPABILITY SCOPE ]  deterministic · removes power  │
+└──────────────────────────────────────────────────────────┘</div>
+
+    <div class="qa">
+      <div class="q">Question</div>
+      <div class="question">Can an LLM be the guardrail that judges another LLM's output?</div>
+      <div class="answer">
+        <p>As a probabilistic outer layer, yes — an independent judge model catches some failures and adds signal. As the control that decides whether a destructive tool runs, no: it shares the prompt-injection failure mode of the agent it is judging, and a payload that fools one can be crafted to fool both. The decision to execute a high-impact action must rest on deterministic code — schema, allowlist, state — not on a second model's opinion.</p>
+      </div>
+    </div>
+
+    <div class="qa">
+      <div class="q">Question</div>
+      <div class="question">We can't enumerate every bad input. How do we write the input guardrail?</div>
+      <div class="answer">
+        <p>You don't try to. Input guardrails should be allowlist-shaped where the input is structured (enforce a schema, a source list, an encoding) and best-effort-detection-shaped where it is free text (flag, log, raise cost). Acknowledge the free-text classifier will miss things and design so a miss is survivable — that survivability comes from the deterministic inner layers, not from a perfect filter.</p>
+      </div>
+    </div>
+  </div>
+</section>

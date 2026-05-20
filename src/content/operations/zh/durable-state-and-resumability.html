@@ -1,0 +1,91 @@
+<section class="phase">
+  <div class="phase-num">O1</div>
+  <div class="week">运维 · 智能体运维：部署与运营</div>
+  <h2>持久状态与可恢复性：让智能体活过运行它的那个进程。</h2>
+  <p class="goal">生产环境中的智能体一定会在循环中途被杀死——被一次部署、一次 OOM、一次抢占式实例回收、一次凌晨三点的 Pod 驱逐。唯一的问题是：它会从中断处恢复，还是从头开一个做了一半的新任务、把客户重复扣一次款。本文讲的是如何把智能体循环变成一次<em>持久</em>计算：能比进程活得更久的状态、可重放的历史，以及一条清晰的界线——哪些必须持久化、哪些重新计算即可。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>智能体循环是一次伪装成请求的长生命周期计算。</h3>
+
+    <p>默认的思维模型——"调用智能体，等待答案"——是一个谎言，只在第一次崩溃之前成立。真实的智能体循环是几分钟到几小时的 <code class="inline">think → call tool → observe → repeat</code>，期间副作用不断落到外部世界。如果承载进程在第 30 步中的第 14 步死掉，一个纯内存循环会丢失一切：计划、草稿本、以及"它已经发起过退款"这个事实。<strong>持久性不是事后添加的特性；它是你在第一天就要选定的数据模型。</strong></p>
+
+    <p>分叉在于：<em>重算</em>还是<em>持久化</em>。从原始提示重算整条轨迹很诱人（无需存储），但它是错的——LLM 调用是非确定且有副作用的，所以一次"重放"会重新问模型、重新触发工具。唯一可靠的设计是在循环的<em>决策与观测</em>发生时就把它们持久化，使恢复变成读历史，而非重新推导。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>事件溯源式的历史是最自然的表示。</h3>
+
+    <p>把循环建模为一条只追加的事件日志，而不是每轮覆写的可变大块。每个模型决策、每次工具调用、每次观测都是一条不可变记录。状态是对日志的一次<em>折叠（fold）</em>；恢复就是"把日志重放进内存，然后继续"。这与事件溯源是同一个洞见，也是为什么各家持久执行引擎（Temporal、Restate、DBOS、AWS Step Functions）最终都收敛到它。</p>
+
+<pre class="standalone"><span class="c-cm"># runtime/journal.py — append-only, fsync'd, monotonic seq</span>
+<span class="c-kw">def</span> <span class="c-fn">record</span>(run_id, seq, kind, payload):
+    row = {<span class="c-st">"run_id"</span>: run_id, <span class="c-st">"seq"</span>: seq,
+           <span class="c-st">"kind"</span>: kind,           <span class="c-cm"># PLAN | TOOL_CALL | OBS | DONE</span>
+           <span class="c-st">"payload"</span>: payload,
+           <span class="c-st">"ts"</span>: now()}
+    db.append(<span class="c-st">"journal"</span>, row)      <span class="c-cm"># durable BEFORE the effect</span>
+
+<span class="c-kw">def</span> <span class="c-fn">load_state</span>(run_id):
+    events = db.scan(<span class="c-st">"journal"</span>, run_id, order=<span class="c-st">"seq"</span>)
+    <span class="c-kw">return</span> reduce(apply_event, events, State.empty())</pre>
+
+    <div class="callout tip"><p>在执行工具<em>之前</em>就写下该次工具调用意图的日志条目，而不是执行之后。这样恢复时你就知道"我们打算执行第 N 次调用，但没有它的结果"——这恰恰是幂等重试所需的状态（见 <code class="inline">idempotency-and-retries</code>）。只记录已完成的调用，会丢掉最危险的那些在途调用。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>哪些必须持久化，哪些重新计算即可。</h3>
+
+    <p>全部持久化既慢又贵；持久化太少则会丢任务。判别标准是确定性与重新推导的成本：</p>
+
+    <ul>
+      <li><strong>必须持久化：</strong>每个 LLM 输出、每次工具调用的参数与结果、定稿的计划、人工审批、以及 seq 计数器。这些是非确定或有副作用的——无法诚实地重算。</li>
+      <li><strong>可随意重算：</strong>派生视图、渲染后的提示字符串、token 计数、已存储文本的嵌入。它们是持久化状态的纯函数；存它们只是缓存。</li>
+      <li><strong>持久化指针而非字节：</strong>大体积工具负载（一个 40MB 的 CSV）放进对象存储；日志只保存其 URI 与内容哈希。日志保持小巧，重放保持快速。</li>
+    </ul>
+
+    <p>经验法则：<em>若重新生成它需要调用模型或触碰外部世界，就持久化它；若它是你已持久化内容的纯函数，就重算它。</em></p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>恢复 = 重放到前沿，然后继续。</h3>
+
+    <p>崩溃恢复既不是"从头来过"，也不是"靠猜"。它是：加载日志，折叠成状态，找到前沿（最高的已完成 seq），在下一步处重新进入循环。微妙的情形是日志以一次"已意图但未确认"的工具调用结尾——进程死在了"我将调用 <code class="inline">refund()</code>"与记录其结果之间。</p>
+
+<pre class="standalone"><span class="c-cm"># runtime/resume.py</span>
+<span class="c-kw">def</span> <span class="c-fn">resume</span>(run_id):
+    st = load_state(run_id)
+    <span class="c-kw">if</span> st.pending_call:                 <span class="c-cm"># intent logged, result not</span>
+        <span class="c-cm"># DO NOT blindly re-run: reconcile via idempotency key</span>
+        res = tool_status(st.pending_call.idem_key)
+        <span class="c-kw">if</span> res <span class="c-kw">is</span> <span class="c-kw">None</span>:                   <span class="c-cm"># provably never happened</span>
+            res = execute(st.pending_call)
+        record(run_id, st.seq + <span class="c-st">1</span>, <span class="c-st">"OBS"</span>, res)
+    <span class="c-kw">return</span> continue_loop(load_state(run_id))</pre>
+
+    <div class="callout warn"><p>危险的 bug 是：恢复时因为某次有副作用的调用结果没入日志，就重新发起它。没有幂等键的持久状态，会把每次崩溃都变成一次重复操作。这两篇本是同一个设计：<strong>先写日志再产生副作用</strong>加上<strong>副作用幂等</strong>，构成契约。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>重新部署是你自己安排的崩溃——为它做设计。</h3>
+
+    <p>生产中最常见的"崩溃"就是你自己的部署。把在途运行当作一等迁移问题来对待。三种可行策略，按偏好排序：</p>
+
+    <ul>
+      <li><strong>排空（drain）：</strong>停止调度新运行，让在途运行抵达一个检查点边界，再重新部署。最干净；要求步骤延迟有界，并设一个最大排空超时，超时后回退到恢复。</li>
+      <li><strong>检查点并恢复：</strong>日志已经让任何 Pod 都可互换。新代码通过 <code class="inline">resume()</code> 接管该运行。要求日志 schema 在部署窗口内向前/向后兼容。</li>
+      <li><strong>把运行钉到版本：</strong>在提示/模型版本 <code class="inline">v7</code> 下启动的运行，应在 <code class="inline">v7</code> 下恢复，而不是刚发布的那个版本——否则智能体的"记忆"与它当前的"大脑"会彼此打架（见 <code class="inline">rollout-and-versioning</code>）。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>什么时候持久执行是杀鸡用牛刀。</h3>
+
+    <p>并非每个智能体都需要事件溯源式运行时。一个 30 秒以内、只读、单工具的智能体（一个 RAG 问答器）可以是纯无状态请求：它死了，用户重试，什么也没写，没人被重复扣款。本文这套机制恰恰在循环<em>长</em>、<em>有副作用</em>或<em>重启代价高</em>时才物有所值。为一个 5 秒分类器套上 Temporal 级别的持久化是盲目跟风；为一个搬动资金的多小时智能体省掉它则是失职。<strong>持久化的成本应当与丢失这次运行的代价挂钩，而不是与你所仰慕的框架的精巧程度挂钩。</strong></p>
+  </div>
+</section>

@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">O4</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Cost control at the loop level: the per-task ceiling is a circuit breaker.</h2>
+  <p class="goal">A traditional service has a roughly fixed cost per request. An agent does not: the same input can cost $0.02 or $40 depending on how many loop iterations, sub-agents, and retries it spawns. Cost is not a billing concern you reconcile monthly — it is a <em>runtime safety property</em> you enforce inside the loop, because an unbounded loop is simultaneously a financial incident and a runaway. This essay treats the per-task cost ceiling as a first-class circuit breaker.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The loop is an unbounded cost amplifier by default.</h3>
+
+    <p>Three structural properties make agent cost unbounded unless you bound it: the loop iterates an undetermined number of times, the context grows every turn (so each turn is more expensive than the last — cost is <em>super-linear</em> in steps), and fan-out multiplies all of that. A planner stuck in a "reflect → re-plan → reflect" cycle does not crash; it quietly bills you every iteration until someone notices the graph. <strong>The default behavior of an agent without a budget is to spend without limit.</strong></p>
+
+    <p>So budget is not an optimization to do later. It is the same control as a timeout in any other system: a hard bound on resource consumption that fails the operation closed rather than letting it consume without limit.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Budget the task in tokens, steps, and dollars — and trip the breaker.</h3>
+
+    <p>A per-task budget object travels with the run and is decremented by every model and tool call. When any dimension is exhausted the loop does not continue "just one more step" — it trips: stop, return partial work, escalate.</p>
+
+<pre class="standalone"><span class="c-cm"># cost/budget.py — one budget per task, checked every step</span>
+<span class="c-kw">class</span> <span class="c-fn">Budget</span>:
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(self, usd, steps, tokens):
+        self.usd, self.steps, self.tokens = usd, steps, tokens
+
+    <span class="c-kw">def</span> <span class="c-fn">charge</span>(self, call):
+        self.usd    -= call.cost_usd
+        self.tokens -= call.total_tokens
+        self.steps  -= <span class="c-st">1</span>
+        <span class="c-kw">if</span> self.usd &lt;= <span class="c-st">0</span> <span class="c-kw">or</span> self.steps &lt;= <span class="c-st">0</span> <span class="c-kw">or</span> self.tokens &lt;= <span class="c-st">0</span>:
+            <span class="c-kw">raise</span> <span class="c-err">BudgetExceeded</span>(self.snapshot())  <span class="c-cm"># trip</span>
+
+<span class="c-cm"># children share the PARENT budget — fan-out can't escape it</span>
+<span class="c-kw">def</span> <span class="c-fn">spawn_child</span>(parent_budget):
+    <span class="c-kw">return</span> parent_budget        <span class="c-cm"># same object, not a fresh one</span></pre>
+
+    <div class="callout warn"><p>The single most common cost incident: each sub-agent gets a <em>fresh</em> budget. Then an 8-wide, 3-deep tree multiplies your intended ceiling by ~24 and the "limit" limited nothing. Children must draw down the parent's budget — the ceiling is per <em>task</em>, not per agent.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Model tiering and cascade: do not pay frontier price for easy steps.</h3>
+
+    <p>Most loop iterations are mechanical: route this, extract that, decide whether to continue. Spending top-tier model price on every one is the largest avoidable line item. A cascade routes each call to the cheapest model that can do it, escalating only on low confidence or hard sub-tasks:</p>
+
+    <ul>
+      <li><strong>Tier the work, not the agent.</strong> Routing, classification, and extraction go to a small model; planning and synthesis go to the frontier model. The decision is per-call, driven by step type.</li>
+      <li><strong>Cascade with a confidence gate.</strong> Try the cheap model; if its self-rated confidence or a cheap validator is below threshold, escalate. You pay frontier price only on the fraction that needs it.</li>
+      <li><strong>Measure the realized blended cost</strong>, not the headline per-token price. A cascade that escalates 80% of the time is a frontier model with extra latency — instrument the escalation rate.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Caching is the highest-ROI lever — prompt and tool results both.</h3>
+
+    <p>Agents are unusually cacheable because they re-send a large, stable prefix (system prompt, tool schemas, retrieved corpus) every single turn, and they re-issue identical read tool calls across retries and sub-agents.</p>
+
+    <ul>
+      <li><strong>Prompt prefix caching.</strong> Order the context stable-first (system → tools → durable context → volatile turns) so the cacheable prefix is maximal. On a 30-turn loop this is often a 5–10× cost reduction on input tokens for near-zero effort — the single biggest win in this essay.</li>
+      <li><strong>Tool-result caching.</strong> Deterministic read tools (a doc fetch, a price lookup) keyed by canonical args, with a TTL matched to data volatility. Cuts both cost and latency, and de-noises retries.</li>
+      <li><strong>Semantic/result cache for whole sub-tasks.</strong> If two runs ask the same sub-question, the second can replay the first's answer. Highest savings, but validate staleness — a wrong cached answer is more expensive than the call you saved.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Early-exit: the cheapest token is the one you do not generate.</h3>
+
+    <p>Loops over-run. The model keeps "improving" an answer that was done three turns ago, or re-verifies something already verified. Early-exit conditions end the loop as soon as the task is actually complete, rather than when the step budget runs out:</p>
+
+    <ul>
+      <li><strong>Goal-satisfied check</strong> — a cheap, explicit "is the original task now answered?" test. If yes, exit; do not let the model gild it.</li>
+      <li><strong>No-progress detection</strong> — if the last K steps did not change state or reduce open loops, the agent is spinning; stop and escalate rather than spend the rest of the budget confirming it is stuck.</li>
+      <li><strong>Diminishing-returns gate</strong> — if successive iterations improve a measurable quality signal by less than ε, the marginal tokens are not worth it.</li>
+    </ul>
+
+    <div class="callout tip"><p>No-progress detection is also a runaway detector. The loop that "isn't improving" and the loop that "is burning money in a cycle" are the same loop viewed through cost vs. safety lenses — one mechanism, two incident classes prevented (see <code class="inline">incident-response-for-agents</code>).</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When aggressive cost control quietly degrades the product.</h3>
+
+    <p>Every lever here trades quality for money, and over-tuned they fail the user invisibly: a cascade that under-escalates ships subtly worse answers; an over-eager early-exit returns half-finished work that looks complete; an over-long cache TTL serves stale facts confidently. Cost control without a quality eval in the loop is just a slower path to a worse product nobody flagged. <strong>Set the per-task ceiling as a hard fail-closed circuit breaker — non-negotiable — but tune cascades, caches, and early-exit against a quality metric, never against the invoice alone.</strong></p>
+  </div>
+</section>
