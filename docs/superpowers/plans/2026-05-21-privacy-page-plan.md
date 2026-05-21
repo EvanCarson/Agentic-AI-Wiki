@@ -19,14 +19,14 @@
 | File | Action | Why |
 |---|---|---|
 | `src/layouts/BaseLayout.astro` | **Modify** | Add `noindex?: boolean` prop; emit `<meta name="robots" content="noindex, nofollow">` when truthy. |
-| `src/pages/privacy.astro` | **Create** | The hidden English-only privacy page; uses `BaseLayout` with `noindex={true}` and `data-pagefind-ignore` on its content wrapper. |
-| `astro.config.mjs` | **Modify** | Add `filter` to `sitemap()` integration to omit `/privacy` from `sitemap-index.xml`. |
+| `src/pages/privacy.astro` | **Create** | The hidden English privacy page; uses `BaseLayout` with `noindex={true}` and `data-pagefind-ignore` on its content wrapper. |
+| `src/pages/zh/privacy.astro` | **Create** | Chinese counterpart, added during implementation to satisfy `check-internal-links.mjs` (it caught BaseLayout's auto-emitted `hreflang="zh-Hans"` as a dangling link when only the English page existed). See spec §"Brainstorming-time non-goal that was REVERSED during implementation". |
+| `astro.config.mjs` | **Modify** | Add `filter` to `sitemap()` integration. Regex `/\/privacy\/?$/` omits both `/privacy` and `/zh/privacy` from `sitemap-index.xml`. |
 
 **Files intentionally NOT touched** (resist the urge):
 - `src/components/SiteHeader.astro` — no nav link.
 - `src/components/SiteFooter.astro` — no footer link.
-- `src/i18n/ui.ts` — page is English-only; no `privacy:` entry.
-- `src/pages/zh/privacy.astro` — no Chinese counterpart.
+- `src/i18n/ui.ts` — privacy page content is inlined per the spec, not data-driven.
 - `src/content/changelog/entries/*` — **no changelog entry** (intentional deviation from CLAUDE.md, justified in spec §Non-goals; the page is hidden from wiki readers, so it does not belong in the reader-facing changelog).
 
 ---

@@ -31,10 +31,6 @@ this repo under `src/pages/privacy.astro` resolves at both hostnames.
 
 ## Non-goals
 
-- **No `/zh/privacy` Chinese translation.** The page is for the AI Menu
-  App Store submission (English audience). The site's bilingual gate
-  (`verify-chapters.mjs`) checks Field Guide content fragments, not
-  top-level pages, so an English-only page does not break the gate.
 - **No nav link, no footer link, no changelog entry.** Per the issue
   author's follow-up comment: "this would be a privacy URL for the iOS
   app, not for the website. Don't show active link over website, we will
@@ -47,18 +43,38 @@ this repo under `src/pages/privacy.astro` resolves at both hostnames.
 - **No custom-domain configuration.** `menuagentic.com` is already wired
   to this Vercel project; no DNS or Vercel changes in this PR.
 
+### Brainstorming-time non-goal that was REVERSED during implementation
+
+The original spec said "No `/zh/privacy` Chinese translation" on the
+reasoning that `verify-chapters.mjs` only checks Field Guide content
+fragments. That reasoning was incomplete: `npm run verify` also runs
+`check-internal-links.mjs`, which scans every internal `href` in built
+HTML. `BaseLayout` auto-emits `<link rel="alternate" hreflang="zh-Hans"
+href="/zh/privacy/">` on every page, so an English-only privacy page
+left a dangling internal link and broke the verify gate.
+
+Three fixes were possible: (a) add the zh page, (b) make `BaseLayout`
+conditionally skip the zh hreflang for English-only pages, or (c) add
+a path exclusion to `check-internal-links.mjs`. We chose (a) — it
+keeps the wiki's "every URL has a working locale alternate" invariant
+intact and doesn't add complexity to `BaseLayout`. The zh page is
+hidden by the same four mechanisms as the English page; the sitemap
+filter regex `/\/privacy\/?$/` matches both `/privacy` and
+`/zh/privacy`.
+
 ## Architecture
 
 ### Files touched
 
 | File | Change |
 |---|---|
-| `src/pages/privacy.astro` | **New.** English-only, inlined HTML using site CSS vocabulary. |
+| `src/pages/privacy.astro` | **New.** English page, inlined HTML using site CSS vocabulary. |
+| `src/pages/zh/privacy.astro` | **New.** Chinese counterpart, added during implementation to satisfy `check-internal-links.mjs` (see §Non-goals deviation above). |
 | `src/layouts/BaseLayout.astro` | **Edit.** Add `noindex?: boolean` prop; when true, emit `<meta name="robots" content="noindex, nofollow">` in `<head>`. |
-| `astro.config.mjs` | **Edit.** Add `filter` to `sitemap()` integration to exclude `/privacy` from `sitemap-index.xml`. |
+| `astro.config.mjs` | **Edit.** Add `filter` to `sitemap()` integration to exclude `/privacy` (and `/zh/privacy`) from `sitemap-index.xml`. |
 
 No changes to `src/components/SiteHeader.astro`, `src/components/SiteFooter.astro`,
-`src/i18n/ui.ts`, `src/pages/zh/*`, or `src/content/changelog/entries/*`.
+`src/i18n/ui.ts`, or `src/content/changelog/entries/*`.
 The page is intentionally orphaned from the wiki's information
 architecture.
 
