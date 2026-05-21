@@ -35,6 +35,10 @@ const entry: ChangelogEntry = {
       'Search results can be filtered by section (Field Guide / Concepts / Deep-Dives / Playbooks / Operations / Changelog) via Pagefind filters added to detail pages.',
       '搜索结果现可按板块（实战指南 / 概念 / 深度剖析 / 实战手册 / 运维 / 更新日志）筛选 —— 详情页已加入 Pagefind 过滤标记。',
     ),
+    L(
+      'In-page "On this page" TOC on long-form entries — Field Guide chapters, Concepts, Deep-Dives, Playbooks, and Operations. Scroll-spies the active heading; hides automatically when fewer than 3 headings exist.',
+      '长篇正文页面新增「本页目录」侧栏 —— 涵盖实战指南章节、概念、深度剖析、实战手册与运维。滚动时高亮当前小节；标题数少于 3 个时自动隐藏。',
+    ),
   ],
 };
 export default entry;

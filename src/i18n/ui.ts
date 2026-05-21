@@ -26,6 +26,7 @@ export interface UIStrings {
   prev: string;
   next: string;
   tocHeading: string;
+  toc: { heading: string };
   chapterWord: { one: string; many: string };
   home: { kicker: string; h1Html: string; lede: string;
           featuredKicker: string; featuredTitle: string;
@@ -74,6 +75,7 @@ export const ui: Record<Locale, UIStrings> = {
     prev: '← prev',
     next: 'next →',
     tocHeading: 'The whole path',
+    toc: { heading: 'On this page' },
     chapterWord: { one: 'chapter', many: 'chapters' },
     home: {
       kicker: 'A Living Knowledge Base',
@@ -162,6 +164,7 @@ export const ui: Record<Locale, UIStrings> = {
     prev: '← 上一章',
     next: '下一章 →',
     tocHeading: '完整路径',
+    toc: { heading: '本页目录' },
     chapterWord: { one: '章', many: '章' },
     home: {
       kicker: '持续更新的知识库',
