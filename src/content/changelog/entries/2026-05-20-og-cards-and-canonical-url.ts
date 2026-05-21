@@ -23,6 +23,14 @@ const entry: ChangelogEntry = {
       'New `npm run og:build` regenerates all 14 PNGs from a single template via Satori + resvg-js. Adding a new section is a one-line change in src/content/og.ts.',
       '新增 `npm run og:build`，通过 Satori + resvg-js 从单一模板重新生成全部 14 张 PNG。新增版块只需在 src/content/og.ts 中加一行。',
     ),
+    L(
+      'Dark mode: a three-state toggle (light / dark / auto) in the header. Defaults to your OS preference; click cycles through. True-black palette (#000 background) on OLED-friendly displays.',
+      '深色模式：标题栏新增三态切换（浅色 / 深色 / 跟随系统）。默认跟随系统偏好，点击循环切换。纯黑配色（#000 背景），对 OLED 屏更友好。',
+    ),
+    L(
+      'Theme choice persists in localStorage and survives EN ↔ 中文 switches. No flash of wrong theme on reload (inline pre-paint guard).',
+      '主题选择存于 localStorage，并在中英文切换间保持不变。重新加载时不会出现错误主题闪烁（采用首屏前置内联守卫）。',
+    ),
   ],
 };
 export default entry;
