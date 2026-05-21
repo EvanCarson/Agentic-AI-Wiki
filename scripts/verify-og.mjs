@@ -89,8 +89,10 @@ function main() {
       if (!hasMeta(html, f)) errors.push(`${route}: missing ${f.replace(/<meta\s+/, '').slice(0, 60)}…`);
     }
 
-    // d) zero stale-domain references
-    if (html.includes('agentic-ai-wiki.vercel.app')) {
+    // d) zero stale-domain references — except the changelog, which legitimately
+    // documents the URL migration in its entry text.
+    const isChangelog = route === '/changelog/' || route === '/zh/changelog/';
+    if (!isChangelog && html.includes('agentic-ai-wiki.vercel.app')) {
       errors.push(`${route}: leftover "agentic-ai-wiki.vercel.app" reference`);
     }
   }
