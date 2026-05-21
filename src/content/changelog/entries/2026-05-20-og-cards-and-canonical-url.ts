@@ -31,6 +31,10 @@ const entry: ChangelogEntry = {
       'Theme choice persists in localStorage and survives EN ↔ 中文 switches. No flash of wrong theme on reload (inline pre-paint guard).',
       '主题选择存于 localStorage，并在中英文切换间保持不变。重新加载时不会出现错误主题闪烁（采用首屏前置内联守卫）。',
     ),
+    L(
+      'Search results can be filtered by section (Field Guide / Concepts / Deep-Dives / Playbooks / Operations / Changelog) via Pagefind filters added to detail pages.',
+      '搜索结果现可按板块（实战指南 / 概念 / 深度剖析 / 实战手册 / 运维 / 更新日志）筛选 —— 详情页已加入 Pagefind 过滤标记。',
+    ),
   ],
 };
 export default entry;
