@@ -12,6 +12,7 @@ const group: Group = {
   { page: 'speech-stack', slug: 'speech-stack', title: L('STT, TTS & Speech-to-Speech','STT、TTS 与语音到语音'), summary: L('Streaming STT, the transcription-error tax, TTS time-to-first-audio, native audio models, and why 8 kHz telephony changes every benchmark.','流式 STT、转写错误税、TTS 首段音频时间、原生音频模型，以及为何 8 kHz 电话改变每一个基准。') },
   { page: 'voice-tooling-and-state', slug: 'voice-tooling-and-state', title: L('Tool Use & State in Voice','语音中的工具调用与状态'), summary: L('Calling tools without dead air: preambles, async/parallel tool runs, confirm-by-ear before mutating, and slot state across an interruptible call.','不留空气死寂地调工具：前导语、异步/并行工具运行、变更前靠耳朵确认，以及贯穿可打断通话的槽位状态。') },
   { page: 'voice-failure-modes', slug: 'voice-failure-modes', title: L('Voice Agent Failure Modes','语音智能体失败模式'), summary: L('Hallucinated hearing, dead air, the infinite apology loop, the latency death spiral, and the escalation/handoff you must design for.','幻听、空气死寂、无限道歉循环、延迟死亡螺旋，以及你必须为之设计的升级/移交。') },
+  { page: 'outbound-voice-agents', slug: 'outbound-voice-agents', title: L('Outbound voice agents','外呼语音智能体'), summary: L('Agents that **make** the call instead of answering it — pacing, abandonment, identity disclosure, and the regulatory landmines that turn a clever demo into a fine.','主动拨打而非接听的智能体——节奏、放弃率、身份披露，以及把炫酷 demo 变成罚单的合规雷区。') },
   ],
 };
 export default group;
