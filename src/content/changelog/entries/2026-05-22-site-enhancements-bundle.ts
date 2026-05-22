@@ -1,10 +1,10 @@
 import { L, type ChangelogEntry } from '../types.ts';
 
 const entry: ChangelogEntry = {
-  date: '2026-05-20',
+  date: '2026-05-22',
   title: L(
-    'Social-share OG cards + canonical URL fix',
-    '社交分享 OG 卡片 + 规范网址修复',
+    'Site enhancements: OG cards, dark mode, in-page TOC, search filters',
+    '站点优化：OG 卡片、深色模式、本页目录、搜索筛选',
   ),
   items: [
     L(
