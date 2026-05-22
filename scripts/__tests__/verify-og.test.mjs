@@ -19,6 +19,10 @@ test('expectedOgFor maps every section route → its PNG', () => {
   assert.equal(expectedOgFor('/deep-dives/memory/episodic/'),    '/og/og-deep-dives.png');
   assert.equal(expectedOgFor('/playbooks/coding/'),              '/og/og-playbooks.png');
   assert.equal(expectedOgFor('/operations/observability/'),      '/og/og-operations.png');
+  assert.equal(expectedOgFor('/blogs/'),                         '/og/og-blog.png');
+  assert.equal(expectedOgFor('/blogs/some-slug/'),               '/og/og-blog.png');
+  assert.equal(expectedOgFor('/zh/blogs/'),                      '/og/og-blog-zh.png');
+  assert.equal(expectedOgFor('/zh/blogs/some-slug/'),            '/og/og-blog-zh.png');
   assert.equal(expectedOgFor('/changelog/'),                     '/og/og-changelog.png');
   assert.equal(expectedOgFor('/zh/changelog/'),                  '/og/og-changelog-zh.png');
   assert.equal(expectedOgFor('/'),                               '/og/og-default.png');

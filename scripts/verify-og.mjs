@@ -41,6 +41,7 @@ export function expectedOgFor(pathname) {
     'deep-dives': 'deep-dives',
     playbooks: 'playbooks',
     operations: 'operations',
+    blogs: 'blog',
     changelog: 'changelog',
   };
   const slug = MAP[section] ?? 'default';
