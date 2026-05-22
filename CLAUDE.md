@@ -75,6 +75,25 @@ require weakening it to little value); the other security headers in
   (translate prose only, never code/comments).
 - Deep-Dive in-page header line: en `Deep Dive · <Group>`, zh `深入解析 · <Group>`.
 
+## Document openers
+
+Every content fragment opens with a **hook lede** — one short paragraph between
+the title and the first `<h2>` that does two jobs in one breath:
+
+1. **Lead with the stakes.** Why a reader who clicks away loses something concrete.
+2. **Name the takeaway.** A skimmer who reads only the first 30 words leaves with
+   a useful idea.
+
+No header label ("TL;DR", "Summary", "Overview", "Intro" — banned). No bullet
+list, no table, no fenced block. No throat-clearing ("In this post we'll…",
+"AI agents are everywhere…" — banned).
+
+Self-test: which sentence in your lede is doing the eye-catching work? If you
+can't point to one, rewrite until you can — and put it first.
+
+Both `en` and `zh` ledes are translated faithfully, not byte-mirrored. The rule
+applies to all new content; existing fragments are not required to retrofit.
+
 ## Verification gates (must pass before any PR/merge)
 
 ```
