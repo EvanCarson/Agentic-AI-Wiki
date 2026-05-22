@@ -1,4 +1,4 @@
-import { L, type ChangelogEntry } from '../types';
+import { L, type ChangelogEntry } from '../types.ts';
 
 const entry: ChangelogEntry = {
   date: '2026-05-22',
