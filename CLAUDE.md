@@ -90,4 +90,4 @@ npm test          # extraction unit tests
 - One consolidated PR per unit of work; squash-merge to `main`.
 - Track non-trivial work with a GitHub issue and link/close it from the PR.
 - After merge: sync local `main` to `origin/main`, remove the merged worktree
-  and branch, and confirm the live site (https://agentic-ai-wiki.vercel.app).
+  and branch, and confirm the live site (https://menuagentic.com).

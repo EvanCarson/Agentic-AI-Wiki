@@ -3,7 +3,7 @@ import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 
 export default defineConfig({
-  site: 'https://agentic-ai-wiki.vercel.app',
+  site: 'https://menuagentic.com',
   output: 'static',
   i18n: {
     defaultLocale: 'en',
