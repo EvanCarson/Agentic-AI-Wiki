@@ -53,6 +53,7 @@ export interface UIStrings {
     defaultAuthor: string;
     tagMetaTitle: string;   // template with [TAG]
     tagMetaDesc: string;    // template with [TAG]
+    onThisPage: string;
   };
   about: { kicker: string; h1: string; metaDesc: string;
            missionH: string; missionHtml: string;
@@ -149,6 +150,7 @@ export const ui: Record<Locale, UIStrings> = {
       defaultAuthor: 'Agentic AI Wiki',
       tagMetaTitle: 'Posts tagged [TAG] — AI Blog · Agentic AI Wiki',
       tagMetaDesc:  'Every AI Blog post tagged [TAG] — comparisons, deep-dives, and field notes.',
+      onThisPage: 'On this page',
     },
     about: { kicker: 'About', h1: 'Agentic AI Wiki',
       metaDesc: 'What the Agentic AI Wiki is, what it covers, and who maintains it.',
@@ -255,6 +257,7 @@ export const ui: Record<Locale, UIStrings> = {
       defaultAuthor: '智能体 AI 维基',
       tagMetaTitle: '标签：[TAG] — AI 博客 · 智能体 AI 维基',
       tagMetaDesc:  '所有带 [TAG] 标签的 AI 博客文章——对比、详解与一线笔记。',
+      onThisPage: '本页目录',
     },
     about: { kicker: '关于', h1: 'Agentic AI 维基',
       metaDesc: '关于 Agentic AI 维基：它是什么、涵盖什么，以及由谁维护。',
