@@ -3,7 +3,7 @@ import type { Locale } from './index';
 export interface UIStrings {
   brand: string;
   tagline: string;
-  nav: { fieldGuide: string; concepts: string; deepDives: string; playbooks: string; operations: string; changelog: string; about: string };
+  nav: { fieldGuide: string; concepts: string; deepDives: string; playbooks: string; operations: string; blog: string; changelog: string; about: string };
   switcher: { en: string; zh: string; aria: string };
   search: {
     open: string;        // accessible label / tooltip for the trigger button
@@ -37,6 +37,23 @@ export interface UIStrings {
   deepDives: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
   playbooks: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
   operations: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
+  blog: {
+    metaTitle: string;
+    metaDesc: string;
+    h1: string;
+    tagline: string;
+    postedOn: string;
+    byline: string;
+    readingTime: string;
+    taggedWith: string;
+    latestPosts: string;
+    allPosts: string;
+    allTags: string;
+    backToBlog: string;
+    defaultAuthor: string;
+    tagMetaTitle: string;   // template with [TAG]
+    tagMetaDesc: string;    // template with [TAG]
+  };
   about: { kicker: string; h1: string; metaDesc: string;
            missionH: string; missionHtml: string;
            coveredH: string; coveredHtml: string;
@@ -52,7 +69,7 @@ export const ui: Record<Locale, UIStrings> = {
   en: {
     brand: 'Agentic AI Wiki',
     tagline: 'Agentic AI Wiki — knowledge, written to last.',
-    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', changelog: 'Changelog', about: 'About' },
+    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', blog: 'AI Blog', changelog: 'Changelog', about: 'About' },
     switcher: { en: 'EN', zh: '中文', aria: 'Language' },
     search: {
       open: 'Search the wiki',
@@ -116,6 +133,23 @@ export const ui: Record<Locale, UIStrings> = {
       tagline: 'How to run agents in production — evals, observability, cost, safety, governance.',
       emptyHtml: 'Operations essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
     },
+    blog: {
+      metaTitle: 'AI Blog — Agentic AI Wiki',
+      metaDesc:  'Long-form posts on the state of agentic AI — comparisons, architecture deep-dives, field notes.',
+      h1: 'AI Blog',
+      tagline: 'Long-form posts, comparisons, and field notes from the agentic frontier.',
+      postedOn: 'Posted',
+      byline: 'By',
+      readingTime: 'min read',
+      taggedWith: 'Tagged',
+      latestPosts: 'Latest posts',
+      allPosts: 'All posts',
+      allTags: 'All tags',
+      backToBlog: '← Back to AI Blog',
+      defaultAuthor: 'Agentic AI Wiki',
+      tagMetaTitle: 'Posts tagged [TAG] — AI Blog · Agentic AI Wiki',
+      tagMetaDesc:  'Every AI Blog post tagged [TAG] — comparisons, deep-dives, and field notes.',
+    },
     about: { kicker: 'About', h1: 'Agentic AI Wiki',
       metaDesc: 'What the Agentic AI Wiki is, what it covers, and who maintains it.',
       missionH: 'Mission',
@@ -141,7 +175,7 @@ export const ui: Record<Locale, UIStrings> = {
   zh: {
     brand: 'Agentic AI 维基',
     tagline: 'Agentic AI 维基 — 沉淀长期有效的知识。',
-    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', changelog: '更新日志', about: '关于' },
+    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', blog: 'AI 博客', changelog: '更新日志', about: '关于' },
     switcher: { en: 'EN', zh: '中文', aria: '语言' },
     search: {
       open: '搜索本维基',
@@ -204,6 +238,23 @@ export const ui: Record<Locale, UIStrings> = {
       h1: '运维',
       tagline: '在生产环境中运行智能体——评测、可观测性、成本、安全与治理。',
       emptyHtml: '运维文章即将上线 — 在此之前，先深入阅读 <a href="%FG%" style="color:var(--accent);">实战指南</a>。',
+    },
+    blog: {
+      metaTitle: 'AI 博客 — 智能体 AI 维基',
+      metaDesc:  '关于智能体 AI 的长文：横向对比、架构详解、一线笔记。',
+      h1: 'AI 博客',
+      tagline: '关于智能体前沿的长文、对比与一线笔记。',
+      postedOn: '发表于',
+      byline: '作者',
+      readingTime: '分钟读完',
+      taggedWith: '标签',
+      latestPosts: '最新文章',
+      allPosts: '全部文章',
+      allTags: '全部标签',
+      backToBlog: '← 返回 AI 博客',
+      defaultAuthor: '智能体 AI 维基',
+      tagMetaTitle: '标签：[TAG] — AI 博客 · 智能体 AI 维基',
+      tagMetaDesc:  '所有带 [TAG] 标签的 AI 博客文章——对比、详解与一线笔记。',
     },
     about: { kicker: '关于', h1: 'Agentic AI 维基',
       metaDesc: '关于 Agentic AI 维基：它是什么、涵盖什么，以及由谁维护。',
