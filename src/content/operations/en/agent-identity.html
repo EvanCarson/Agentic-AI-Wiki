@@ -1,0 +1,79 @@
+<section class="phase">
+  <div class="phase-num">S10</div>
+  <div class="week">Operation · Safety, Alignment &amp; Agentic Security</div>
+  <h2>Agent identity: when an agent calls a tool, whose identity is on the request?</h2>
+  <p class="goal">"The agent did it" is not an answer your audit log can give. Every tool call leaves your system under some principal — a service account, a delegated user token, or a hybrid record — and getting that choice wrong silently corrupts authorization decisions and breaks every downstream audit. This essay is the three patterns, the trade-offs, the audit consequences, and one anti-pattern (the shared "robot user") that quietly undoes the whole stack.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three patterns, and the question they each answer differently.</h3>
+
+    <p>When an agent calls a tool — say, "create a refund" — three identities could be on the resulting request, and the choice shapes every authorization decision the downstream system makes:</p>
+
+    <ul>
+      <li><strong>Service account (agent's own identity).</strong> The agent authenticates as itself; the downstream tool sees the request as "from the agent." Authorization is decided against the agent's permissions, not the user's. Simplest model; loses per-user scoping entirely.</li>
+      <li><strong>On-behalf-of (OBO, impersonating the user with a delegated token).</strong> The agent acts with a token derived from the user's session — typically short-lived, narrowly-scoped, audience-bound. The downstream tool sees the request as "from this user, via this agent." Per-user authorization is preserved.</li>
+      <li><strong>Hybrid (agent identity on the wire, both principals in the audit metadata).</strong> The transport-level credential is the agent's; the request carries claims for both the agent and the human user. Authorization can be configured to require both ("the agent is authorized for this tool AND the user is authorized for this data"); the audit log always records both.</li>
+    </ul>
+
+    <p>None of these is universally right. The choice is a function of who legitimately should be authorized for what, and how much blast radius you can tolerate if the agent is compromised.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The trade-offs, side by side.</h3>
+
+    <p>Each pattern protects one property and risks another. The honest version of the trade-off:</p>
+
+    <ul>
+      <li><strong>Service account</strong> — simplest to implement, easiest to operate. The risk: every user effectively gets the union of permissions the agent has; a user who is not authorized to delete records is now talking to an agent that is. Compromise of the agent's credential means full access at the agent's scope, with no per-user firewall.</li>
+      <li><strong>OBO</strong> — preserves per-user authorization, keeps the principle of least privilege at the human boundary. The risk: the agent has to be trusted with delegated tokens that are real user credentials at scope; a prompt-injected agent is now a prompt-injected actor wielding many users' authority in sequence. Token lifetime and scope are the only thing standing between an injection and a mass-impersonation event.</li>
+      <li><strong>Hybrid</strong> — best audit properties; supports policies like "the agent may only call this tool when the user is also authorized for the target resource." More moving parts to implement and operate; downstream tools have to know how to read both principals.</li>
+    </ul>
+
+    <p>The rule of thumb: low-stakes, internal-only, no per-user scoping needed → service account. Per-user authorization required, agent is trusted enough → OBO with aggressive token hygiene. Regulated or high-stakes, audit duty is heavy, multi-principal policy is realistic → hybrid.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Audit consequences: the log cannot answer "who did this?" if you got this wrong.</h3>
+
+    <p>The audit consequences are not abstract. The <a class="xref" href="/operations/governance-compliance/audit-trails">audit-trails</a> material asks the system to reconstruct any decision; identity is the part of the trail without which "who" is just unanswerable. The specific failure modes you trade for the simplification of a service-account-only model:</p>
+
+    <ul>
+      <li><strong>Attribution collapse.</strong> Every tool call in the log is "from the agent." Asked which user caused which side effect, you can only correlate via run-id back to the prompt — and only if your tracing pipeline kept that link intact across asynchronous fan-out.</li>
+      <li><strong>Authorization-decision blindness.</strong> Downstream systems made authorization decisions against the agent's permissions, not the user's. A privacy review six months later asking "was user X authorized to see Y" cannot be answered from the audit log alone.</li>
+      <li><strong>Regulatory exposure.</strong> Finance, healthcare, and legal use cases — the ones covered in their Playbooks — typically have legal duties on traceable, per-user attribution. A service-account-only design that ships into those domains is shipping with an audit gap regulators will eventually find.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Implementation patterns that work in practice.</h3>
+
+    <p>The hybrid pattern is more common in serious deployments than the textbooks suggest, partly because it composes the simplicity of service-account transport with the audit completeness of OBO. The implementation primitives that hold up:</p>
+
+    <ul>
+      <li><strong>Short-lived OBO tokens.</strong> When OBO is used, the delegated token's lifetime is measured in minutes, scope is per-action, and re-derivation happens for each tool call rather than once per session. The pattern is built on top of an authorization layer that sits between the agent and the tool, not implemented inside the agent.</li>
+      <li><strong>Action-scoped delegation.</strong> The user does not delegate "everything you can do" to the agent; the user authorizes a specific class of action ("refund up to $50 on orders you placed"), and the OBO token's scope reflects that class.</li>
+      <li><strong>Two-principal audit metadata always.</strong> Even under a pure service-account model, the audit record carries both the agent identity (who acted) and the human user (on whose behalf), as separate fields. Future-proofs the audit trail against the regulatory question even before you change the authorization model.</li>
+      <li><strong>Joinable to traces.</strong> The identity recorded on each tool call is joinable by run_id to the trace in <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing-and-observability</a>; the audit answer and the behavioral answer come from the same record.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The anti-pattern: the "robot user" with a real human account.</h3>
+
+    <p>The tempting shortcut, especially under deadline, is to provision a literal user account — call it <code class="inline">agent-bot</code> — and let the agent log into downstream systems with it like a person. It works in the demo; it explodes in production. The damage:</p>
+
+    <ul>
+      <li><strong>The audit log lies.</strong> Every downstream action is attributed to a user that is not a person; the log carries no information about which human user the agent was actually acting for.</li>
+      <li><strong>Permissions sprawl.</strong> The robot user accumulates the union of every permission anyone ever needed the agent to use; it becomes the highest-privileged account on the system, with no human accountable for it.</li>
+      <li><strong>Credentials sit in too many places.</strong> The password or token for <code class="inline">agent-bot</code> is now a secret that lives in every agent worker, every staging environment, every developer's machine. Compromise of any of those is compromise of all of it.</li>
+      <li><strong>Compliance failure.</strong> Most regulated domains forbid this explicitly: a "user account" must correspond to a natural person, and shared user accounts violate identity-management requirements baked into HIPAA, PCI-DSS, SOC 2, and most internal control frameworks.</li>
+    </ul>
+
+    <div class="callout danger"><p>Never share a real user account between humans and an agent. If your tool only supports human users, your tool is wrong for an agent integration; build a service account, OBO flow, or hybrid model that lets the audit log answer "who did this?" with a defensible answer. The companion essay on scoped credentials is the next layer this rests on.</p></div>
+  </div>
+</section>
