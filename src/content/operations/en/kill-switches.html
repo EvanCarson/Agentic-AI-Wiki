@@ -1,0 +1,81 @@
+<section class="phase">
+  <div class="phase-num">O8</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Kill switches: the button that stops a running agent fleet.</h2>
+  <p class="goal">Every team running agents in production will, eventually, want a button that stops the fleet. The hard parts are not the button — they are what the button must actually stop (in-flight calls, queued work, scheduled retries, fan-out children), how that stop propagates faster than work fans in, and the quarterly drill that proves it works before the day you need it.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What "stop" must actually halt.</h3>
+
+    <p>Pressing a kill switch sounds like one action; for an agent fleet it is four, and any one of them being skipped means the button is theater. The minimum surface a real kill switch covers:</p>
+
+    <ul>
+      <li><strong>In-flight LLM and tool calls</strong> — cancel them, do not wait for them to return. A 60-second tool call after the switch flipped is 60 seconds of bleeding you signed off on.</li>
+      <li><strong>Queued tasks</strong> — decide drain-vs-discard up front. Drain means the queue still runs to completion; discard means you accept the partial-task tax in exchange for an actual stop. Most safety-driven incidents want discard, with the journal sufficient to resume.</li>
+      <li><strong>Scheduled retries and timers</strong> — every <code class="inline">at(future_time)</code> that was set before the flip must be cancelled, not "expire harmlessly later." The retry chain from <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency-and-retries</a> is the part most likely to fire ten minutes after you thought you stopped.</li>
+      <li><strong>Webhooks and side effects already in flight</strong> — for actions the agent already dispatched to downstream systems, the kill switch cannot recall them; what it can do is record exactly what fired (so a compensating-action sweep is possible) and prevent any <em>further</em> dispatch.</li>
+    </ul>
+
+    <p>The bar: after the switch is flipped, no new effect leaves the system. The journal from <a class="xref" href="/operations/agentops/durable-state-and-resumability">durable-state-and-resumability</a> tells you exactly which effects had already left.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Four scopes, four buttons.</h3>
+
+    <p>One global off-switch is too blunt for daily use and too slow to reach for in a real incident. The graded ladder pairs with the one in <a class="xref" href="/operations/agentops/incident-response-for-agents">incident-response-for-agents</a> — each level needs its own switch, evaluated in the loop before any side effect:</p>
+
+    <ul>
+      <li><strong>Capability</strong> — freeze a single tool (the dangerous write tool, say) while reads keep flowing; diagnosis continues, damage stops.</li>
+      <li><strong>Run</strong> — halt a single <code class="inline">run_id</code> on its next loop tick; the cheapest surgical stop.</li>
+      <li><strong>Tenant or feature</strong> — halt every run for one tenant or one feature flag; the right level when one cohort is misbehaving and the rest are healthy.</li>
+      <li><strong>Global</strong> — stop the world. The button you almost never want to need, that must work the one time you do.</li>
+    </ul>
+
+    <p>Each level is its own button because the on-call's job at 3am is to pick the smallest sufficient hammer, not to debate what to escalate. The flags powering these scopes are themselves a use case for <a class="xref" href="/operations/agentops/feature-flags-for-agents">feature-flags-for-agents</a>: per-request, fail-closed evaluation, observable flip log.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Propagation: the stop must outrun the fan-in.</h3>
+
+    <p>A distributed agent fleet has workers across processes, machines, and regions, all reading the kill state from somewhere. The hazard is that the stop signal arrives at one worker while another has already started its next tool call; the longer the propagation tail, the more "post-flip" effects you eat. The two properties that keep propagation honest:</p>
+
+    <ul>
+      <li><strong>Evaluate the flag in the loop, before every effect</strong> — not at run start, not at process start. A worker that cached the kill state at process boot is a worker that ignores the switch you just flipped.</li>
+      <li><strong>Fail closed on the flag store</strong> — if the flag service is unreachable, the worker treats the switch as on, not off. The alternative is a kill switch that becomes useless during exactly the kind of outage that makes you want to reach for it.</li>
+    </ul>
+
+    <div class="callout danger"><p>"Just redeploy" or "kill the pods" is not a kill switch for a durable agent — a resumable run comes back on the next worker and continues exactly the harmful loop. The stop must be a state-aware halt that the resume path also respects, or you have built a runaway that survives its own kill.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The tabletop drill: an untested kill switch does not exist.</h3>
+
+    <p>The day you need the switch is not the day to discover that the flag store has been unreachable for a month, or that the worker pool deployed last quarter is reading from a different config namespace, or that the discard-on-stop path leaves orphaned rows in the side-effect ledger. Run the drill on the calendar, not on the incident:</p>
+
+    <ul>
+      <li><strong>Quarterly, in staging on production-shape traffic</strong>, pull the lever at each of the four scope levels.</li>
+      <li><strong>Measure</strong>: time-to-stop per worker, count of effects emitted after the flip, queue state at T+0 and T+60s, journal consistency after recovery.</li>
+      <li><strong>Capture the run as a permanent regression test</strong> — same scenario, replayable, in CI — so a refactor that breaks propagation fails the gate before it ships.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>After the switch: what state is the system in, and how do you resume.</h3>
+
+    <p>The kill switch is a halt, not a teardown. Recovery is the second half of the discipline and is far easier when you decided what "after" looks like before you pressed the button:</p>
+
+    <ul>
+      <li><strong>The journal is intact</strong> — every effect that landed is recorded with its idempotency key; every effect that did not is recoverable from the run's plan. A clean stop produces a clean diff between "intended" and "landed."</li>
+      <li><strong>Compensating actions are explicit, not heuristic</strong> — refunds, retractions, customer notifications come off a list, not from on-call intuition. The side-effect ledger is the list.</li>
+      <li><strong>Resume requires a green release</strong> — if the cause was a bad <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout-and-versioning</a> triple, roll it back before unhalting. Resuming on the same broken contract reproduces the incident on cue.</li>
+      <li><strong>One reason is enough</strong> — a guardrail-metric regression or a write-rate anomaly is a flip, not a debate. Investigate from the safe state.</li>
+    </ul>
+
+    <p>The kill switch you build before you need it, drill on the calendar, and document the recovery path for is the one that buys you a postmortem instead of a press release. Build it before the day you cannot.</p>
+  </div>
+</section>
