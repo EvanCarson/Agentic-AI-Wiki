@@ -4,10 +4,10 @@
 // one file per post — so concurrent PRs adding posts never collide. Vite's
 // `import.meta.glob` resolves all post files at build time; posts are sorted
 // by filename (which is date-prefixed) DESCENDING so the newest post is first.
-import type { BlogPost } from './types';
+import type { BlogPost } from './types.ts';
 
-export type { BlogPost, Locale, Localized } from './types';
-export { L } from './types';
+export type { BlogPost, Locale, Localized } from './types.ts';
+export { L } from './types.ts';
 
 interface PostModule { default: BlogPost }
 const modules = import.meta.glob<PostModule>('./posts/*.ts', { eager: true });
@@ -15,7 +15,7 @@ const modules = import.meta.glob<PostModule>('./posts/*.ts', { eager: true });
 /** Posts sorted newest-first by filename (date prefix), slug as tiebreaker within a day. */
 export const POSTS: BlogPost[] = Object.entries(modules)
   .map(([path, m]) => ({ post: m.default, file: path.split('/').pop()! }))
-  .sort((a, b) => b.file.localeCompare(a.file))
+  .sort((a, b) => (a.file < b.file ? 1 : a.file > b.file ? -1 : 0))
   .map(({ post }) => post);
 
 /** Lookup a post by its slug. */
