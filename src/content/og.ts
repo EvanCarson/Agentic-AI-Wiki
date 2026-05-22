@@ -7,6 +7,7 @@ export type OgSectionKey =
   | 'deepDives'
   | 'playbooks'
   | 'operations'
+  | 'blog'
   | 'changelog';
 
 export interface OgSection {
@@ -25,5 +26,6 @@ export const OG_SECTIONS: readonly OgSection[] = [
   { key: 'deepDives' },
   { key: 'playbooks' },
   { key: 'operations' },
+  { key: 'blog' },
   { key: 'changelog' },
 ] as const;
