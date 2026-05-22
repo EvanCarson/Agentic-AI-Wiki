@@ -126,9 +126,9 @@ Every section uses a `<div class="week">` kicker line inside the opening `<secti
 | Operations | `evaluation-and-observability` | `Operation · Evaluation & Observability` | `运维 · 评估与可观测性` |
 | Operations | `economics-roi` | `Operation · Economics & ROI` | `运维 · 经济性与投资回报` |
 | Operations | `governance-compliance` | `Operation · Governance & Compliance` | `运维 · 治理与合规` |
-| Operations | `safety-and-security` | `Operation · Safety, Alignment & Agentic Security` | `运维 · 安全与防护` |
+| Operations | `safety-and-security` | `Operation · Safety, Alignment & Agentic Security` | `运维 · 安全、对齐与智能体安全` |
 
-(The Playbooks/Operations ZH kicker labels are sampled from the existing entries' ZH HTML, which mirrors the EN form. The `safety-and-security` group's EN kicker uses the older descriptive label `Safety, Alignment & Agentic Security` even though the group's `name` field is the shorter `Safety & Security` — match siblings, not the field.)
+(The Playbooks/Operations ZH kicker labels are sampled from the existing entries' ZH HTML, which mirrors the EN form. The `safety-and-security` group's kicker uses the **longer** descriptive label `Safety, Alignment & Agentic Security` / `安全、对齐与智能体安全` even though the group's `name` field is the shorter `Safety & Security` / `安全与防护` — **match siblings**, not the field.)
 
 **Concepts entries also include a `<div class="phase-num">` letter+number** (e.g., `A8`, `B5`) prefix on the section element. New Concepts entries use the next free letter+number in the group's existing scheme. Sample siblings to determine the right prefix.
 
