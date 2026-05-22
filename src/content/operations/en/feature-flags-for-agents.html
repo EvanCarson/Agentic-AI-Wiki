@@ -1,0 +1,75 @@
+<section class="phase">
+  <div class="phase-num">O7</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Feature flags for agents: prompts, models, tools, and policies are all flippable surfaces.</h2>
+  <p class="goal">Classic feature flags gate code paths. An agent's surface area is bigger than that — prompts, tool registrations, model versions, policy thresholds, retrieval configs are all things you want to roll, scope, and rip back without a deploy. This essay is about what to put behind a flag, why "off by default" is non-negotiable for any flag with non-trivial blast radius, and what the audit trail must look like so a flip is reviewable after the fact.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The flippable surface is bigger than code.</h3>
+
+    <p>A classic feature flag wraps an <code class="inline">if</code> branch around a code path. For an agent that is the small case — the interesting flags wrap the parts of the behavioral contract from <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout-and-versioning</a> that you want to move independently. The list, in roughly decreasing blast radius:</p>
+
+    <ul>
+      <li><strong>Model version</strong> — which dated snapshot a tenant or cohort resolves to. The single highest-impact flag you own.</li>
+      <li><strong>Prompt revision</strong> — which content-addressed prompt the run loads. Behavior change without a redeploy.</li>
+      <li><strong>Tool registration</strong> — whether a given tool is even exposed to the model for this run; the registration list is data, not code.</li>
+      <li><strong>Policy thresholds</strong> — the confidence cutoff a guardrail uses, the cost ceiling per task, the auto-approval limit. Tuned per cohort, not hard-coded.</li>
+      <li><strong>Retrieval config</strong> — which index, which top-k, which reranker; classically a deploy, productively a flag.</li>
+      <li><strong>Sampling parameters</strong> — temperature, top-p, max steps. Small numbers that change behavior a lot; flag-gate them once you have more than one production cohort.</li>
+    </ul>
+
+    <p>The reframe: a feature flag for an agent is not "show this button" — it is a per-request override on a piece of the behavioral contract. Treat it with the seriousness that contract deserves.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Off by default, for anything with non-trivial blast radius.</h3>
+
+    <p>Standard feature-flag hygiene says "default to off, expand when proven." Agent flags need this rule harder. The reason is asymmetric cost: a flag that defaults <em>on</em> for a new prompt or a new tool exposes every tenant the moment the flag exists, and a regression discovered an hour later has already touched real customers, real tokens, and real side effects. A flag that defaults <em>off</em> requires an explicit per-cohort opt-in, which forces the discipline of a canary plus a comparison.</p>
+
+    <div class="callout tip"><p>Two rules that catch the common slip: (1) the default branch of an agent flag must be the <em>incumbent</em> behavior, never the new one, even when the new one looks safe in dev. (2) "Default on, exclude broken tenants" is the same bug as "default on" — by the time you know who is broken, the blast already landed.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Scope by request context, not just user-id.</h3>
+
+    <p>The unit of evaluation that matters for an agent flag is the request, with the full agent context attached — tenant, user, run_id, the resolved release triple, the tool about to be called, the cost so far this run. A flag platform built on user-id alone cannot answer "expose the new search tool only on runs that have already burned less than $0.50" or "ramp the new prompt only on internal tenants whose users opted into the beta cohort."</p>
+
+<pre class="standalone"><span class="c-cm"># flags/eval.py — per-request evaluation with full agent context</span>
+<span class="c-kw">def</span> <span class="c-fn">resolve_flag</span>(name, ctx):
+    <span class="c-cm"># ctx carries tenant, user, run_id, release, spend_so_far, tool</span>
+    rule = active_rule(name)
+    <span class="c-kw">if</span> rule.scope == <span class="c-st">"tenant"</span>     <span class="c-kw">and</span> ctx.tenant     <span class="c-kw">in</span> rule.allow:
+        <span class="c-kw">return</span> rule.on
+    <span class="c-kw">if</span> rule.scope == <span class="c-st">"cohort"</span>     <span class="c-kw">and</span> cohort_of(ctx.user) <span class="c-kw">in</span> rule.allow:
+        <span class="c-kw">return</span> rule.on
+    <span class="c-kw">if</span> rule.scope == <span class="c-st">"cost_cap"</span>   <span class="c-kw">and</span> ctx.spend_so_far &lt; rule.under:
+        <span class="c-kw">return</span> rule.on
+    <span class="c-kw">return</span> <span class="c-kw">False</span>                          <span class="c-cm"># off-by-default fallback</span></pre>
+
+    <p>Evaluate per-request, log the resolved value into the run's journal alongside the release triple, and the flag becomes part of the behavioral contract a trace is attributable to. Skip the log and you have a flag whose effect cannot be reproduced after the fact.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Flag lifetime: retire them, or pay the long-tail bill.</h3>
+
+    <p>Stale code-path flags are a familiar nuisance; stale agent flags are a hazard. A long-lived flag gating a policy threshold gradually becomes the policy — except nobody re-reviewed it, the cohort it serves has drifted, and the tenant who turned it on three months ago has long forgotten it. The two practices that keep this in check:</p>
+
+    <ul>
+      <li><strong>Every flag has an owner and a retirement plan from the day it lands</strong> — either it becomes the default (incumbent flips), or it is removed. "We will leave this on for one tenant forever" means turning the flag into permanent configuration; do that explicitly with a config entry, not a flag with no owner.</li>
+      <li><strong>Audit flag age and usage quarterly</strong> — a flag that has been at the same value for 90 days for every cohort is a flag that should be code; a flag that has not been evaluated in 30 days is a flag that should be deleted.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Every flip and every evaluation is observable, or the flag does not exist.</h3>
+
+    <p>The whole point of moving behavior into a flag is that you can flip it without a redeploy. That power earns its keep only if the flip itself is observable: who flipped what, to what, for which scope, at what time, and — separately — every per-request evaluation that ran under the new value, joinable by <code class="inline">run_id</code> to the journal entries in <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing-and-observability</a>. Without the flip log, you cannot answer "did this regression start when we changed the prompt or when we flipped the threshold?"; without the per-request log you cannot answer "which runs ran under the new value?".</p>
+
+    <p>One more rule: the flag platform itself must <em>fail closed</em>. If the flag service is unreachable mid-run, the evaluation returns the incumbent default, not the new behavior. Otherwise an outage at the flag tier becomes an unannounced rollout of every flag's "on" path — a class of incident you do not want to discover the hard way.</p>
+  </div>
+</section>
