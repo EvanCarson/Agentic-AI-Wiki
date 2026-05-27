@@ -1,0 +1,114 @@
+<section class="phase">
+  <div class="phase-num">R3</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>混合检索与重排序：生产级检索栈。</h2>
+  <p class="goal">单一检索器几乎从来不够。稠密嵌入擅长改写、对罕见词失灵；词法检索精准匹配字符串、对同义词失灵；要求同一个一阶段既<em>广</em>又<em>准</em>本身就是矛盾。2025&ndash;2026 年的严肃 <a class="xref" href="/zh/concepts/what-is-rag">RAG</a> 系统默认采用两阶段栈——先做一次廉价的融合检索以最大化召回，再用昂贵的交叉编码器重排序以最大化精度。本条目讲清这种形状为何取胜、如何串联，以及真正能撬动指标的调参杠杆。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>为什么单一检索器在结构上不够。</h3>
+
+    <p>稠密（基于嵌入的）检索与稀疏（词法的，BM25）检索以相反方式失败，而这些失败并非噪声——是算法本身的性质。</p>
+
+    <ul>
+      <li><strong>稠密检索</strong>——查询与每个切块各自变成向量，相似度是点积或余弦。它能把"我怎么重设密码"匹配到"账户恢复步骤"，二者无共享词。它也会自信地错配罕见字符串：像 <code class="inline">A7-552-Q</code> 这样的商品 SKU、<code class="inline">ECONNRESET</code> 这样的错误码、未在预训练中出现的人名——它们会塌缩到几乎相同的向量，正确切块浮不上来。稠密检索器还在<em>分布上</em>脆弱：与嵌入模型训练数据看起来不像的查询会朝不可预测的方向漂移。</li>
+      <li><strong>稀疏检索（BM25、SPLADE 式的学得稀疏）</strong>——带长度归一化的经典 TF&middot;IDF。对令牌精确、对罕见词稳健、可解释。它也会漏掉所有改写："cannot log in"与"authentication failure"没有共享令牌，BM25 看不到任何匹配。</li>
+    </ul>
+
+    <p>你可以靠更大的 <em>k</em> 掩盖任一种失败，但无法修复其失败模式。正确的做法是<em>组合</em>：两者都跑，融合两条结果列表，然后让一个更强的二阶段排序其并集。这与 CPU 缓存的逻辑相同——前端便宜而宽、后端昂贵而窄——被搬到检索上。</p>
+
+    <div class="callout">
+      <p>快速诊断：取十条系统答错的查询，在语料里 grep 答案字符串。如果答案字符串<em>在语料里却不在 top-50 检索集中</em>，那 bug 是检索器，不是提示词。然后问：哪种检索器本该找到它？大多是同义词 &rarr; 你需要稠密。大多是精确字符串、ID、代码 &rarr; 你需要词法。混合 &rarr; 你两者都需要。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>融合：在不调权重的情况下合并词法与稠密。</h3>
+
+    <p>合并两条已排序列表的干净做法是<strong>倒数排名融合</strong>（RRF，Cormack 等，2009）。每个文档的分数只取决于它在每条列表中的<em>排名</em>，与原始检索分无关——这意味着你不必把 BM25 分数与稠密余弦标定到同一尺度（它们在不同量纲上，不能相加）。</p>
+
+<pre class="standalone"><span class="c-cm"># reciprocal rank fusion across N ranked lists</span>
+<span class="c-kw">def</span> <span class="c-fn">rrf</span>(ranked_lists, k=<span class="c-st">60</span>):
+    scores = {}
+    <span class="c-kw">for</span> lst <span class="c-kw">in</span> ranked_lists:
+        <span class="c-kw">for</span> rank, doc_id <span class="c-kw">in</span> <span class="c-fn">enumerate</span>(lst):
+            scores[doc_id] = scores.<span class="c-fn">get</span>(doc_id, <span class="c-st">0.0</span>) + <span class="c-st">1.0</span> / (k + rank)
+    <span class="c-kw">return</span> <span class="c-fn">sorted</span>(scores.<span class="c-fn">items</span>(), key=<span class="c-kw">lambda</span> x: -x[<span class="c-st">1</span>])
+
+<span class="c-cm"># typical usage: top-100 from each retriever, fuse, take top-50 for rerank</span>
+fused = <span class="c-fn">rrf</span>([bm25_results[:<span class="c-st">100</span>], dense_results[:<span class="c-st">100</span>]])[:<span class="c-st">50</span>]</pre>
+
+    <p><code class="inline">k=60</code> 这个常数来自原论文，是惯例——它控制分数随排名衰减的速度。RRF 在实践中胜过线性加权融合，因为它跨检索器无参：语料变化导致 BM25 分布漂移时无需重新调参。要融合三个及以上来源（如 BM25 + 稠密 + 像 SPLADE 这样的学得稀疏检索器），同一个公式只要多传几条列表即可。</p>
+
+    <p>融合是一个<em>召回</em>动作。只要任一检索器单独能找到答案，融合后的 top-50 几乎都包含正确段落——但它仍是一条噪声列表，正确答案往往落在第 20&ndash;40 名附近。把这堆噪声排好，是下一阶段的活。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>重排序：交叉编码器，精度的来源。</h3>
+
+    <p>一阶段检索器独立地计算查询嵌入与每个文档嵌入——一个<strong>双编码器</strong>——这是能预计算语料索引、毫秒级搜索数百万向量的唯一方式。这种速度的代价是：模型从未同时看到查询和某个候选，因而无法做细粒度匹配（"<em>这条具体的条款</em>是否真的回答了<em>这个具体的问题</em>"）。</p>
+
+    <p>一个<strong>交叉编码器</strong>把查询与一个候选作为单条拼接输入，对两者跑完整的自注意力，并输出一个相关性分数。在同等模型规模下，它显著比双编码器更准，因为每个查询令牌都能注意到每个文档令牌。代价同样显著：它必须对每对（查询、候选）跑一次，因而无法在全语料上打分。最终胜出的形态是<em>两阶段</em>：</p>
+
+<pre class="standalone"><span class="c-cm"># two-stage retrieval: cheap recall, then expensive precision</span>
+<span class="c-kw">def</span> <span class="c-fn">retrieve_then_rerank</span>(query, k_first=<span class="c-st">50</span>, k_final=<span class="c-st">5</span>):
+    <span class="c-cm"># stage 1: fused bi-encoder + BM25, optimized for recall</span>
+    candidates = <span class="c-fn">hybrid_retrieve</span>(query, k=k_first)
+
+    <span class="c-cm"># stage 2: cross-encoder rescores every (query, candidate) pair</span>
+    pairs  = [(query, c.text) <span class="c-kw">for</span> c <span class="c-kw">in</span> candidates]
+    scores = cross_encoder.<span class="c-fn">predict</span>(pairs)        <span class="c-cm"># ~50 forward passes</span>
+
+    reranked = <span class="c-fn">sorted</span>(<span class="c-fn">zip</span>(candidates, scores), key=<span class="c-kw">lambda</span> x: -x[<span class="c-st">1</span>])
+    <span class="c-kw">return</span> [c <span class="c-kw">for</span> c, _ <span class="c-kw">in</span> reranked[:k_final]]</pre>
+
+    <p>经验上，在一个一般的一阶段之上加一个交叉编码器重排序，孤立地看通常胜过任何其它"进阶 RAG"技巧。相关基准（BEIR、MS MARCO）自 2020 年以来一直显示这一点，并在多轮嵌入模型升级周期中存活。如果一个朴素 RAG 系统表现不佳、而你只能做一个升级，这就是 ROI 最高的那一个——超过 HyDE、多查询、嵌入微调或图索引。</p>
+
+    <div class="callout warn">
+      <p>交叉编码器在运行时并不免费。在一块小 GPU 上，用一个约 100M 参数的交叉编码器对 50 个候选做重排序，每个查询大致是 50&ndash;200ms 量级；延迟随候选数线性增长。若你受延迟约束，杠杆是<em>更少候选</em>而非更小模型——交叉编码器质量在模型变小时下降很快，而把 <code class="inline">k_first</code> 从 100 缩到 30 通常只损失不到 1&ndash;2 个召回点。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>晚交互（ColBERT）：当交叉编码器太慢时。</h3>
+
+    <p>交叉编码器<em>每对</em>都跑完整注意力。<strong>晚交互</strong>检索器——ColBERT（Khattab &amp; Zaharia，2020）及其后续 ColBERTv2 和 PLAID——折中处理：它们独立地嵌入每个查询令牌与每个文档令牌（因此文档索引可预计算），在查询时计算一个 <em>MaxSim</em> 分数：对每个查询令牌，取它在文档令牌上的最大相似度，再把这些最大值求和。</p>
+
+    <p>结果比双编码器更细粒度（双编码器把每边塌缩为一条向量），又远比交叉编码器快（无需每对一次前向）。代价是索引体积：每令牌存一条向量，而非每文档一条，磁盘体积大约高一个量级。PLAID 与乘积量化变体把这条差距缩窄。</p>
+
+    <p>何时值得用晚交互？当你需要接近交叉编码器的质量、又必须维持检索级延迟时——通常出现在大语料上，连对 50 个候选跑一次交叉编码器都负担不起。对当下大多数发布团队而言，正确路径仍是 <em>BM25 + 稠密 + 交叉编码器重排序</em>，而 ColBERT 类检索器是当你撑爆这条流水线的延迟预算、或想完全砍掉重排序阶段时的认真选项。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>调参：真正能动 recall@k 的旋钮。</h3>
+
+    <p>大多数团队低估了一阶段的召回预算，并高估了重排序的挽救能力。重排序只能重排已检索的内容——若正确切块在第 200 名，对 top-50 做任何重排序都找不到它。按通常影响力排序的杠杆层级：</p>
+
+    <ul>
+      <li><strong>一阶段 <code class="inline">k</code>。</strong>把 <code class="inline">k_first=10</code> 提升到 <code class="inline">k_first=50</code>，对答案质量的提升通常超过换嵌入模型。目标是 <code class="inline">k_first</code> 取到 recall@k_first 平台化的最小值，再在此之上重排序。直接度量它——别猜。</li>
+      <li><strong>给纯稠密系统加上 BM25</strong>（或反之）。对含大量命名实体、代码、数字标识符的语料，仅此一项常常值 10&ndash;20 个 recall@10 点。代价几乎为零——现代 OpenSearch / Elastic / Postgres-pgvector 配置可在一次查询中同时服务两者。</li>
+      <li><strong>重排序模型的选择。</strong>交叉编码器质量差异很大；一个强的开源模型（如 BGE-reranker、Cohere rerank、mxbai-rerank）相对一个小型通用模型通常是实打实的升级。"有重排序"与"无重排序"的差距远大于不同重排序之间的差距。</li>
+      <li><strong>切块大小与重叠。</strong>详见<a class="xref" href="/zh/concepts/chunking-and-vector-search">分块与向量搜索</a>。更小的切块抬升词法精度但会切断答案；更大的切块改善连贯但模糊相似度。默认 300&ndash;500 令牌、约 10% 重叠是一个可辩护的起点，但这是按语料调的。</li>
+      <li><strong>分数阈值与放弃。</strong>若交叉编码器顶端分数低于一个校准阈值，应返回"证据不足"，而非把烂列表里最好的拿出来。这是对可信度杠杆最大的干预之一，却常被跳过。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>何时两阶段栈过度设计。</h3>
+
+    <p>并非每个系统都需要它。以下情形跳过重排序：</p>
+
+    <ul>
+      <li>语料足够小（数百份文档），可以把整个语料塞进长上下文提示——见<a class="xref" href="/zh/concepts/what-is-rag">什么是 RAG</a>中关于 RAG 与长上下文的讨论。检索问题消失。</li>
+      <li>查询是简单的关键字查找（文件名、工单号、词条）。仅 BM25 已够用且更快。</li>
+      <li>你受 p99 延迟约束在 ~200ms 以下，交叉编码器塞不进预算。用更强的一阶段补偿——学得稀疏（SPLADE）或在领域上微调过的稠密检索器——而非端上一个被削弱的重排序。</li>
+    </ul>
+
+    <p>诚实的小结：混合检索 + 交叉编码器重排序之所以是默认值，是因为任何单一检索器的失败模式都是结构性的、融合步骤无参、重排序阶段在唯一能真正裁决精度的位置——查询与候选同时进入同一个模型——攻击精度问题。把这条栈搭起来，分别度量 recall@k_first 与最终答案质量（见<a class="xref" href="/zh/concepts/what-is-rag">分两半调试 RAG</a>），再问：剩下的差距是否足以正当化任何更花哨的东西。</p>
+  </div>
+</section>

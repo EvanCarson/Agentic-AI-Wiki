@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">R6</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Agentic retrieval: making search a tool, not a pre-step.</h2>
+  <p class="goal">Classical <a class="xref" href="/concepts/what-is-rag">RAG</a> is a pipeline: retrieve once, augment, generate. Agentic retrieval inverts this &mdash; the retriever is exposed as a tool the model can call, multiple times, with queries it chooses, and a control loop decides when enough has been gathered. It is the natural shape of RAG inside an agent, and it is the right shape for a small but important class of questions: multi-hop, comparison, exploration, and "did I get enough evidence to answer." This entry is about when to reach for it, how to bound it, and why the failure modes are different from a fixed pipeline's.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why a fixed pipeline runs out of room.</h3>
+
+    <p>A naive retrieve-then-generate pipeline has one shot at retrieval. The query goes in, top-k chunks come back, the generator works with what it got. This is the right shape when the question maps cleanly to one passage &mdash; "what's the refund window?" &mdash; and the wrong shape for everything else:</p>
+
+    <ul>
+      <li><strong>Iterative refinement.</strong> The first retrieval reveals a term the user didn't know to ask for ("you mean the <em>extended</em> refund window, which is different"). A second retrieval keyed on the new term finds the actual answer. The pipeline cannot do this; it has already moved on to generation.</li>
+      <li><strong>Multi-hop reasoning.</strong> "Who reviewed the migration that broke the on-call alert?" requires retrieving the alert, then the migration referenced in it, then the reviewer of that migration. Each hop's query depends on the previous hop's result. Static <a class="xref" href="/deep-dives/retrieval-and-rag/query-understanding-for-rag">decomposition</a> covers the easy case where all sub-questions are known in advance; agentic retrieval covers the case where sub-questions are <em>discovered</em>.</li>
+      <li><strong>Multi-source comparison.</strong> "What does the docs say vs what the support ticket says?" needs the docs index and the support index, and the comparison is an LLM operation over the results.</li>
+      <li><strong>Sufficiency judgment.</strong> Sometimes one retrieval returns the answer; sometimes it returns three plausible chunks that contradict each other. A fixed pipeline cannot say "I need to look harder before I answer." An agentic loop can.</li>
+    </ul>
+
+    <p>For these cases, the limitation is structural &mdash; the pipeline's one-shot retrieval cannot adapt to what it learns. The fix is to give the model the retriever as a tool and let it decide when to stop.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Search as a tool: the basic shape.</h3>
+
+    <p>The minimal version of agentic retrieval is one tool, one loop:</p>
+
+<pre class="standalone"><span class="c-cm"># expose retrieval as a tool the model calls in a ReAct-style loop</span>
+TOOLS = [{
+    <span class="c-st">&quot;name&quot;</span>: <span class="c-st">&quot;search&quot;</span>,
+    <span class="c-st">&quot;description&quot;</span>: <span class="c-st">&quot;Search the company knowledge base. Returns up to 5 passages with source citations. Call multiple times with different queries to gather evidence before answering.&quot;</span>,
+    <span class="c-st">&quot;input_schema&quot;</span>: {<span class="c-st">&quot;query&quot;</span>: <span class="c-st">&quot;string&quot;</span>}
+}]
+
+<span class="c-kw">def</span> <span class="c-fn">agentic_rag</span>(question, max_steps=<span class="c-st">6</span>):
+    msgs = [{<span class="c-st">&quot;role&quot;</span>: <span class="c-st">&quot;user&quot;</span>, <span class="c-st">&quot;content&quot;</span>: question}]
+    <span class="c-kw">for</span> _ <span class="c-kw">in</span> <span class="c-fn">range</span>(max_steps):
+        resp = llm.<span class="c-fn">respond</span>(msgs, tools=TOOLS)
+        <span class="c-kw">if</span> resp.tool_calls:
+            <span class="c-kw">for</span> call <span class="c-kw">in</span> resp.tool_calls:
+                result = retriever.<span class="c-fn">search</span>(call.query, k=<span class="c-st">5</span>)
+                msgs.<span class="c-fn">append</span>(<span class="c-fn">tool_result</span>(call.id, result))
+        <span class="c-kw">else</span>:
+            <span class="c-kw">return</span> resp.text       <span class="c-cm"># model stopped calling tools = it's ready</span>
+    <span class="c-kw">return</span> <span class="c-st">&quot;exceeded retrieval budget&quot;</span></pre>
+
+    <p>That is the entire pattern: the model reads the question, decides to call <code class="inline">search</code> with a query of its choice, reads the results, decides whether to call <code class="inline">search</code> again with a refined query or answer now. This is the same loop as <a class="xref" href="/deep-dives/architectures-and-patterns/react-pattern">ReAct</a>, pointed at a knowledge base instead of generic tools. The tool description matters a lot &mdash; "call multiple times with different queries" is the part that unlocks multi-step behavior; without that hint, most models default to a single call.</p>
+
+    <p>The harness still owns: the retriever quality (see <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a>), what the corpus looks like (see <a class="xref" href="/deep-dives/retrieval-and-rag/document-parsing-for-rag">document parsing</a>), and the budget. The model owns: how many calls, with what queries, in what order, and when to stop.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Multiple tools, not just one.</h3>
+
+    <p>The real power shows up when retrieval is one of several tools, not the only one. A research agent might have:</p>
+
+    <ul>
+      <li><code class="inline">search_docs</code> &mdash; the internal documentation index.</li>
+      <li><code class="inline">search_tickets</code> &mdash; the support ticket corpus, with date-range filters.</li>
+      <li><code class="inline">run_sql</code> &mdash; structured queries against the analytics warehouse.</li>
+      <li><code class="inline">web_search</code> &mdash; external search when the question is out of corpus.</li>
+      <li><code class="inline">read_url</code> &mdash; fetch the full text of a result the model decided was important.</li>
+    </ul>
+
+    <p>The model now picks not just <em>what</em> to query but <em>where</em>. This subsumes the static query <a class="xref" href="/deep-dives/retrieval-and-rag/query-understanding-for-rag">router</a> from the previous entry &mdash; same idea, runtime decision. The trade-off is that more tools enlarge the action space, which raises latency (more decisions to make) and the risk of mis-routing (calling SQL with what should have been a doc-search query).</p>
+
+    <p>A practical heuristic: tools should be heterogeneous enough that the right choice is usually clear from the question. Two retrievers over similar content with overlapping descriptions will confuse the model and degrade both. If you have two doc indices that feel similar, fuse them behind one tool and route inside the tool, not in the model's prompt.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Stopping: the hard part.</h3>
+
+    <p>The dominant failure mode of agentic retrieval is not under-searching; it is the opposite. Models will happily keep calling search forever if you let them, polishing an already-sufficient answer, exploring tangents, or compulsively re-checking. Three stopping levers, in increasing sophistication:</p>
+
+    <ul>
+      <li><strong>Hard step budget.</strong> A <code class="inline">max_steps</code> like 4&ndash;8 prevents pathological loops. The cap is dollar-and-latency insurance, not a quality lever; if you regularly hit it on valid questions, raise it.</li>
+      <li><strong>Diminishing-returns check.</strong> If two consecutive searches return overlapping results (high Jaccard on doc IDs), the agent is repeating itself and likely will not learn more. Force a transition to answering. This catches the most common pathological pattern.</li>
+      <li><strong>Sufficiency self-check.</strong> After each retrieval, prompt the model: "given the evidence so far, can you answer the question? If yes, stop. If no, what specific gap would another search fill?" This makes stopping a deliberate decision rather than an absence of decision. It costs an extra small generation per step but is usually the highest-quality lever.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>"Just let the model decide when it's done" is the failure mode dressed as a feature. Models without explicit stopping discipline will burn budget on confirmation searches that add no new information &mdash; the same confidence-seeking pattern that drives hallucination. Always combine at least the step budget with one quality-aware criterion.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The new failure modes.</h3>
+
+    <p>Agentic retrieval inherits the failure modes of the underlying retriever (a bad index is still a bad index) and adds its own:</p>
+
+    <ul>
+      <li><strong>Looping without progress.</strong> The agent searches, gets results, doesn't like them, searches again with a near-identical query, gets the same results. Mitigation: the diminishing-returns check from Step 4, plus an explicit instruction that "if the same query returned no new evidence, try a substantially different angle or stop."</li>
+      <li><strong>Premature stop.</strong> The agent answers from the first plausible-looking retrieval without checking whether other documents disagree. Mitigation: the sufficiency self-check, and (for high-stakes questions) a forced second retrieval from a different angle before allowing the answer.</li>
+      <li><strong>Drift.</strong> The agent's query rewrites pull the search away from the original question. By step 4 it is searching for something tangentially related and answering that instead. Mitigation: include the original question in every retrieval-step prompt as an anchor, and log the queries so drift is visible in traces.</li>
+      <li><strong>Cost blow-up.</strong> One agent run can issue 10&ndash;20 retrieval calls; at scale this dominates the bill. Mitigation: tight <code class="inline">max_steps</code>, smaller models for the orchestration turns (the search-or-answer decision rarely needs a frontier model), and a per-session retrieval budget independent of step count.</li>
+      <li><strong>Untrustworthy retrieved content.</strong> Every chunk fetched from the index is untrusted data and a potential <a class="xref" href="/operations/safety-and-security/prompt-injection">prompt-injection</a> vector. This risk is worse than in fixed RAG because the agent will read the injection's instruction and then issue more tool calls on its behalf. See <a class="xref" href="/operations/safety-and-security/rag-security">RAG security</a> for the defenses.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When to reach for it, and when not.</h3>
+
+    <p>The decision is mostly question-shape, not corpus size. Use agentic retrieval when:</p>
+
+    <ul>
+      <li>Questions are multi-hop or comparison-shaped, with sub-queries that depend on previous results.</li>
+      <li>Multiple heterogeneous sources need to be combined per question (docs + SQL + web).</li>
+      <li>"Insufficient evidence" is a meaningful answer and you need the agent to recognize and admit it rather than always producing something.</li>
+      <li>The task is exploratory &mdash; research, investigation, debugging &mdash; where the user cannot pre-specify what evidence is needed.</li>
+    </ul>
+
+    <p>Stick with a fixed pipeline when:</p>
+
+    <ul>
+      <li>Questions are single-hop and well-bounded (FAQ, single-doc lookup). A good <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">two-stage retriever</a> is faster, cheaper, and more predictable.</li>
+      <li>Latency is the dominant constraint (sub-second responses). The agentic loop adds at least one extra LLM call per retrieval; budgets do not fit.</li>
+      <li>Auditability matters more than flexibility &mdash; a deterministic pipeline is easier to reason about and replay than a tool-calling loop.</li>
+      <li>You haven't yet built the eval set to detect agentic-retrieval failure modes. An agent that fails silently with extra cost is worse than a pipeline that fails predictably.</li>
+    </ul>
+
+    <p>The honest summary: agentic retrieval is not a strict upgrade over fixed RAG. It is a different tool for a different class of question. Start with the simplest pipeline that solves the bulk of your traffic, identify the queries it cannot serve, and add the loop only for those. The control loop is what makes it agentic &mdash; and that control loop is exactly the surface that needs the budgeting, stopping, and evaluation discipline this entry has spent six steps describing.</p>
+  </div>
+</section>

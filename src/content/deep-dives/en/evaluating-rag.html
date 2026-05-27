@@ -1,0 +1,121 @@
+<section class="phase">
+  <div class="phase-num">R7</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Evaluating RAG: separating retrieval, grounding, and answer quality.</h2>
+  <p class="goal">A RAG system that gets the answer right on a demo and wrong in production usually has no eval set, or worse, an eval set that scores the wrong thing. "Did the final answer look correct?" is a single signal hiding three independent failure modes &mdash; bad retrieval, ungrounded generation, and unhelpful-but-grounded answers &mdash; that each demand a different fix. This entry is about how to measure each layer separately, build a small set that actually drives decisions, and use LLM-as-judge without lying to yourself.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>One number is not enough: the three things a RAG eval must score.</h3>
+
+    <p>The "debug RAG in two halves" guidance from <a class="xref" href="/concepts/what-is-rag">what is RAG</a> generalizes into three measurable layers, each with its own dominant failure mode:</p>
+
+    <ul>
+      <li><strong>Retrieval quality.</strong> Of the chunks fetched for this question, were the right ones in the candidate set? Fails when the retriever cannot find the answer. No amount of prompt-tuning recovers this.</li>
+      <li><strong>Grounding / faithfulness.</strong> Of the claims in the generated answer, are they actually supported by the retrieved chunks? Fails when the generator ignores the chunks and writes from training memory anyway, or weaves chunks and memory into a plausible-but-unsupported answer.</li>
+      <li><strong>Answer quality.</strong> Given that the retrieval was correct and the answer is grounded, does it actually answer the question the user asked? Fails when the answer is technically supported by the chunks but evasive, off-topic, or incomplete.</li>
+    </ul>
+
+    <p>A single end-to-end "is the answer right?" score collapses all three. If retrieval recall drops 5% and faithfulness rises 5%, the end-to-end score does not move, and you ship a system that retrieves worse but hallucinates less &mdash; or vice versa, with no way to tell which knob did what. The fix is to instrument each layer independently. Any "RAG works better with X" claim that does not separate these three is unverifiable.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Retrieval metrics: recall@k, MRR, nDCG, context precision.</h3>
+
+    <p>Retrieval evaluation needs a labeled set of (query, relevant doc_ids) pairs. With it, the metrics that matter:</p>
+
+    <ul>
+      <li><strong>Recall@k.</strong> Fraction of relevant documents present in the top-k retrieved set. The single most important retrieval number for RAG &mdash; if the right chunk is not in the candidate set, no downstream stage can answer correctly. Track recall@k_first (after first-stage retrieve) and recall@k_final (after rerank) separately to see where loss happens.</li>
+      <li><strong>Mean reciprocal rank (MRR).</strong> Average of <code class="inline">1/rank</code> of the first relevant doc per query. Sensitive to where the answer sits in the ranked list; matters when the generator only sees the top few.</li>
+      <li><strong>nDCG@k.</strong> Discounted cumulative gain at k, normalized to the ideal ranking. Useful when relevance is graded (highly-relevant vs marginal) rather than binary, and when multiple relevant chunks exist per query.</li>
+      <li><strong>Context precision (RAGAS).</strong> Of the top-k chunks delivered to the generator, what fraction are actually relevant? Catches the case where recall is fine but the candidate set is mostly noise that will distract the generator.</li>
+      <li><strong>Context recall (RAGAS).</strong> Of the claims in a known-good answer, what fraction can be supported by the retrieved chunks? An answer-conditioned recall measure &mdash; useful when ground-truth answers are easier to write than gold passage lists.</li>
+    </ul>
+
+    <p>The classic retrieval metrics (recall, MRR, nDCG) come from information retrieval and need labeled passages. RAGAS-style metrics (context precision, context recall) lean on an LLM judge instead of human labels &mdash; cheaper, useful for triage, but noisier than direct labels (see Step 5).</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Grounding metrics: faithfulness, citation accuracy.</h3>
+
+    <p>Grounding asks a different question from retrieval: given the chunks the generator <em>did</em> see, did its answer stay inside them? The relevant measures:</p>
+
+    <ul>
+      <li><strong>Faithfulness.</strong> Of the claims in the answer, what fraction are entailed by the retrieved chunks? An LLM judge reads the answer, decomposes it into atomic claims, and for each claim checks whether the chunks support it. The score is <code class="inline">supported / total</code>. A faithful answer can still be wrong (if the chunks were wrong); an unfaithful answer is wrong even when the chunks were right.</li>
+      <li><strong>Citation accuracy.</strong> If the generator emits citations (chunk IDs or quotes), do the cited chunks actually contain the claim? Easier to compute than full faithfulness &mdash; string match between cited spans and chunk text &mdash; and a strong proxy.</li>
+      <li><strong>Unsupported-claim rate.</strong> Count of answers containing at least one unsupported claim, divided by total answers. Easier to act on than per-claim scores for shipping decisions ("we ship at &lt; 2% unsupported rate").</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># LLM-judge faithfulness, simplified</span>
+JUDGE_PROMPT = <span class="c-st">&quot;&quot;&quot;
+Given:
+  CONTEXT: {retrieved_chunks}
+  ANSWER:  {generated_answer}
+
+Decompose ANSWER into atomic factual claims. For each claim, decide:
+- SUPPORTED  (entailed by CONTEXT)
+- UNSUPPORTED (not entailed, even if plausible)
+- CONTRADICTED (CONTEXT says otherwise)
+
+Output JSON: {&quot;claims&quot;: [{&quot;text&quot;: ..., &quot;label&quot;: ...}, ...]}
+&quot;&quot;&quot;</span></pre>
+
+    <p>Faithfulness is the metric most worth tracking week-over-week, because it isolates the generator's grounding discipline from retrieval quality. If retrieval is steady and faithfulness drops, the regression is a prompt or model change. If retrieval recall drops and faithfulness holds, the upstream pipeline is the bug.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Answer-quality metrics: relevance, completeness, and the hard problem.</h3>
+
+    <p>An answer can be grounded and still be bad. Three additional axes:</p>
+
+    <ul>
+      <li><strong>Answer relevance.</strong> Does the answer respond to the question that was actually asked? "What's the refund window?" answered with "Our refund policy is documented in section 4.2" is grounded, retrieved, and useless. RAGAS computes this by having the LLM generate questions <em>from</em> the answer and measuring semantic similarity to the original question &mdash; a high-relevance answer should let you reconstruct the question.</li>
+      <li><strong>Completeness.</strong> Were all parts of a multi-part question addressed? Single-number end-to-end scores miss this; a partial answer scores like a wrong one.</li>
+      <li><strong>Abstention correctness.</strong> When the corpus genuinely does not contain the answer, does the system say "I don't know" instead of producing something? This is a feature, not a failure, and it needs its own eval: a slice of queries with no answer in the corpus, scored on the rate of correct abstention.</li>
+    </ul>
+
+    <p>End-to-end answer quality is the hardest to automate cleanly because correctness is task-specific. Three workable patterns:</p>
+
+    <ul>
+      <li><strong>Reference answers + LLM judge.</strong> For each query, a human writes the ideal answer; an LLM scores the generated answer against the reference on semantic equivalence. Cheap to scale, noisy in the tails.</li>
+      <li><strong>Reference-free LLM judge with a rubric.</strong> A criteria-based scorer ("correct, complete, on-topic, no fabrication") with explicit anchors. Avoids the cost of writing references; risks the judge's biases being the spec.</li>
+      <li><strong>Pairwise human review.</strong> For high-stakes systems, periodic A/B human review of the production-vs-candidate model. Slow but unbiased &mdash; the only ground truth when the question is subjective.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Building a small eval set that actually drives decisions.</h3>
+
+    <p>The eval set is what makes the metrics above useful. The right size is "the smallest set whose result you trust to make a ship decision," which is typically 100&ndash;300 queries for an initial RAG system &mdash; not the 10,000 a benchmark might use, and not the 5 a demo uses. The structure:</p>
+
+    <ul>
+      <li><strong>Stratify by question type.</strong> Single-hop factual lookups, multi-hop, comparison, summarization, "no answer in corpus" (the abstention slice), and any domain-specific shapes that matter for your traffic. Sample from production logs proportionally &mdash; the eval set is only useful if it looks like the real distribution.</li>
+      <li><strong>Label what matters per layer.</strong> Each query gets at minimum a gold answer; ideally also the gold passage IDs (for direct recall) and a list of key claims (for completeness). Skip what you cannot afford to label; do not skip the gold answer.</li>
+      <li><strong>Include adversarial queries.</strong> Prompt-injection attempts in the corpus (see <a class="xref" href="/operations/safety-and-security/rag-security">RAG security</a>), ambiguous queries that should be clarified, queries with conflicting evidence across documents. These are where systems silently regress.</li>
+      <li><strong>Keep it living.</strong> Every production failure surfaced from logging becomes a new eval query. The set should grow by ~5&ndash;10 queries per week of operation; if it doesn't, you are not learning from production. This is the production-to-eval flywheel from <a class="xref" href="/operations/evaluation-and-observability/eval-driven-agent-development">eval-driven agent development</a>.</li>
+    </ul>
+
+    <p>For the broader why-evals-are-the-only-spec argument, see <a class="xref" href="/concepts/evals-101">evals 101</a> and <a class="xref" href="/operations/evaluation-and-observability/eval-driven-agent-development">eval-driven agent development</a>. The RAG-specific addition is just the three layers in this entry &mdash; the discipline is the same.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Online vs offline, and the judges that will betray you.</h3>
+
+    <p>Two final cautions, before you wire this up.</p>
+
+    <p><strong>Offline eval catches regressions; online eval catches reality.</strong> The labeled set in Step 5 is an offline eval &mdash; it runs against a frozen snapshot and gives you regression detection on every change. It does not catch the queries you didn't anticipate. Pair it with online signals from production: user thumbs, retry rates, follow-up question rates, "this answer was unhelpful" buttons, and silent metrics like answer length variance. See <a class="xref" href="/operations/evaluation-and-observability/online-vs-offline-evals">online vs offline evals</a> for the trade-offs.</p>
+
+    <p><strong>LLM judges have failure modes.</strong> Every metric in this entry that says "have an LLM check" inherits the judge's biases &mdash; favoring longer answers, the judge's own outputs (when judge and generator share a model family), and answers that match the judge's training distribution. Mitigations: spot-check 5&ndash;10% of judge decisions against human labels; rotate judge models periodically; never use the same model family for both the generator and the judge on the same metric; treat the absolute score with skepticism and the trend with more trust. <a class="xref" href="/operations/evaluation-and-observability/why-agent-eval-is-hard">Why agent eval is hard</a> covers the general version of this problem.</p>
+
+    <div class="callout tip">
+      <p>The minimum viable RAG eval setup, in one paragraph: 100 stratified queries with gold answers and (where you can label them) gold passage IDs; recall@k_first and recall@k_final on the gold passages; an LLM-judged faithfulness score and a reference-vs-generated answer-quality score; an abstention slice of ~10 queries with no answer in the corpus; the whole thing runs on every PR. This catches 80% of what a fancier setup would catch and costs a day to build.</p>
+    </div>
+
+    <p>The unifying point across all six steps: RAG eval is plural by construction, because RAG itself is plural &mdash; retrieve, ground, generate. Score them separately, ship on the trends not the absolutes, grow the set from production failures, and verify the judges. The architecture choices in <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid retrieval</a>, <a class="xref" href="/deep-dives/retrieval-and-rag/document-parsing-for-rag">parsing</a>, <a class="xref" href="/deep-dives/retrieval-and-rag/query-understanding-for-rag">query understanding</a>, and <a class="xref" href="/deep-dives/retrieval-and-rag/agentic-retrieval">agentic loops</a> only become real engineering decisions when there is a scoreboard to settle them. This is that scoreboard.</p>
+  </div>
+</section>

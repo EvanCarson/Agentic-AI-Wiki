@@ -1,0 +1,121 @@
+<section class="phase">
+  <div class="phase-num">R7</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>评估 RAG：把检索、接地与答案质量分开打分。</h2>
+  <p class="goal">在演示中答对、在生产中答错的 RAG 系统，通常没有评测集，更糟的是有一个评测集——却在打错的分。"最终答案看起来对吗？"是一个把三种独立失败模式藏在一起的单一信号——糟糕的检索、未接地的生成、虽接地却不能帮上忙的答案——它们各自需要不同修复。本条目讲如何分别度量每一层、构建一个真能驱动决策的小评测集，以及如何在不自欺欺人的前提下用 LLM 当裁判。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>一个数字不够：RAG 评测必须打的三件事。</h3>
+
+    <p><a class="xref" href="/zh/concepts/what-is-rag">什么是 RAG</a> 中"分两半调试 RAG"的指引可以推广为三个可度量层，每一层都有自己的主导失败模式：</p>
+
+    <ul>
+      <li><strong>检索质量。</strong>为这条问题取来的切块里，正确的那些在候选集中吗？检索器找不到答案时失败。再多提示调优都救不回来。</li>
+      <li><strong>接地 / 忠实性。</strong>生成答案中的主张，是否真的被检索切块支持？当生成器忽视切块而从训练记忆里写、或把切块与记忆编织成"看似可信但无支撑"的答案时，失败。</li>
+      <li><strong>答案质量。</strong>在检索正确、答案接地的前提下，它是否真的回答了用户的问题？当答案在技术上有切块支持，却闪烁其词、跑题或不完整时，失败。</li>
+    </ul>
+
+    <p>一个端到端的"答案对不对？"单一分数会把这三件事压成一件。如果检索召回掉了 5%，忠实性升了 5%，端到端分数不会动——你上线了一个检索更差但幻觉更少的系统，或反之，且无从知道是哪一颗旋钮起了作用。修复办法是分别对每一层加埋点。任何不区分这三层的"RAG 加了 X 之后更好"都无法核验。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>检索指标：recall@k、MRR、nDCG、context precision。</h3>
+
+    <p>检索评测需要一个带标注的（查询、相关 doc_id 集合）对集合。在它之上的关键指标：</p>
+
+    <ul>
+      <li><strong>Recall@k。</strong>top-k 检索集中出现的相关文档比例。对 RAG 而言是最重要的检索数字——若正确切块不在候选集，下游任何阶段都无法正确回答。分别跟踪 recall@k_first（一阶段检索后）与 recall@k_final（重排序后），以查看损失发生在哪里。</li>
+      <li><strong>平均倒数排名（MRR）。</strong>每条查询中第一条相关文档的 <code class="inline">1/rank</code> 的平均。对答案在排名列表中位置敏感；当生成器只看到前几条时尤为重要。</li>
+      <li><strong>nDCG@k。</strong>对 k 处归一化到理想排名的折扣累积增益。在相关性是分级（高相关 vs 边缘）而非二元，且每条查询存在多个相关切块时有用。</li>
+      <li><strong>Context precision（RAGAS）。</strong>送到生成器的 top-k 切块中，实际相关的比例是多少？能抓住"召回没问题但候选集大多是噪声"会让生成器分心的情形。</li>
+      <li><strong>Context recall（RAGAS）。</strong>一份已知良答案中的主张，能被检索切块支持的比例是多少？这是一种基于答案的召回测度——当撰写黄金答案比写黄金段落清单更易时有用。</li>
+    </ul>
+
+    <p>经典检索指标（recall、MRR、nDCG）来自信息检索，需要标注段落。RAGAS 风格指标（context precision、context recall）依赖 LLM 裁判而非人工标签——更便宜、可用于初筛，但比直接标签更吵（见第 5 步）。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>接地指标：忠实性、引用准确率。</h3>
+
+    <p>接地问的是与检索不同的问题：在生成器<em>实际看到</em>的切块之上，它的答案是否停留在切块以内？相关测度：</p>
+
+    <ul>
+      <li><strong>忠实性（Faithfulness）。</strong>答案中的主张里，能被检索切块蕴含的比例是多少？一个 LLM 裁判读答案、把它分解为原子主张，对每条主张判断切块是否支持。分数是 <code class="inline">supported / total</code>。一个忠实的答案仍可能是错的（如果切块本身错），但一个不忠实的答案即便切块对也仍是错的。</li>
+      <li><strong>引用准确率。</strong>当生成器输出引用（切块 ID 或引文）时，被引用的切块是否真的包含该主张？比完整忠实性更易计算——比对引文片段与切块文本的字符串——是一个强代理。</li>
+      <li><strong>未支撑主张率。</strong>含至少一条未支撑主张的答案数除以总答案数。对发布决策比逐条主张分数更易动手（"未支撑率 &lt; 2% 才发布"）。</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># LLM-judge faithfulness, simplified</span>
+JUDGE_PROMPT = <span class="c-st">&quot;&quot;&quot;
+Given:
+  CONTEXT: {retrieved_chunks}
+  ANSWER:  {generated_answer}
+
+Decompose ANSWER into atomic factual claims. For each claim, decide:
+- SUPPORTED  (entailed by CONTEXT)
+- UNSUPPORTED (not entailed, even if plausible)
+- CONTRADICTED (CONTEXT says otherwise)
+
+Output JSON: {&quot;claims&quot;: [{&quot;text&quot;: ..., &quot;label&quot;: ...}, ...]}
+&quot;&quot;&quot;</span></pre>
+
+    <p>忠实性是最值得逐周跟踪的指标，因为它把生成器的接地纪律与检索质量分离开。若检索稳定而忠实性下降，回归来自提示词或模型变更。若检索召回下降而忠实性持平，bug 在上游流水线。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>答案质量指标：相关性、完整性，以及那个难解的问题。</h3>
+
+    <p>一个答案可以接地，仍然是个烂答案。三条额外的轴：</p>
+
+    <ul>
+      <li><strong>答案相关性。</strong>答案是否回应了实际被问的问题？"退款窗口是多久？"被答以"我们的退款政策记录在 4.2 节"——它接地、检索到了，却没用。RAGAS 计算它的方式是让 LLM<em>从答案出发</em>生成问题，并测量这些问题与原始问题的语义相似度——一个高相关性的答案应让你能反推出原问题。</li>
+      <li><strong>完整性。</strong>多部分问题的所有部分都被回应了吗？单一端到端分数会漏掉这一点；一个不完整的答案与一个错答打同样的分。</li>
+      <li><strong>放弃的正确性。</strong>当语料确实不含答案时，系统是否说"我不知道"，而不是产出某种东西？这是一个特性，不是失败，需要自己的评测：一片"语料中无答案"的查询切片，按正确放弃率打分。</li>
+    </ul>
+
+    <p>端到端的答案质量最难干净地自动化，因为正确性是任务特定的。三种可行模式：</p>
+
+    <ul>
+      <li><strong>参考答案 + LLM 裁判。</strong>给每条查询由人手写理想答案；一个 LLM 在语义等价性上对生成答案与参考打分。规模便宜、尾部噪声大。</li>
+      <li><strong>无参考、带评分细则的 LLM 裁判。</strong>基于准则的打分器（"正确、完整、切题、无臆造"）配以明确锚点。省去撰写参考的代价；风险是裁判的偏见变成了规格。</li>
+      <li><strong>成对人评。</strong>对高代价系统，定期对"生产模型 vs 候选模型"做 A/B 人评。慢但无偏——当问题主观时，这是唯一的真相。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>构建一个真能驱动决策的小评测集。</h3>
+
+    <p>让以上指标真正可用的，是评测集。正确的体量是"最小、其结果你信得过用来做发布决策的集合"，对初期 RAG 系统通常是 100&ndash;300 条查询——不是基准的 10,000，也不是演示的 5。其结构：</p>
+
+    <ul>
+      <li><strong>按问题类型分层。</strong>单跳事实查找、多跳、对比、摘要、"语料中无答案"（放弃切片），以及任何对你的流量有意义的领域特定形状。按比例从生产日志中抽样——评测集只有在看起来像真实分布时才有用。</li>
+      <li><strong>按层打标签。</strong>每条查询至少要有黄金答案；理想情况下还要有黄金段落 id（用于直接召回）与一组关键主张（用于完整性）。你标不起的就跳过；但黄金答案不能跳过。</li>
+      <li><strong>包含对抗性查询。</strong>语料中的提示注入尝试（见<a class="xref" href="/zh/operations/safety-and-security/rag-security">RAG 安全</a>）、应被澄清的歧义查询、跨文档证据相互冲突的查询。这些正是系统静默回归的地方。</li>
+      <li><strong>让它持续生长。</strong>每一次从日志中浮出来的生产失败都成为一条新评测查询。这个集合应以每周约 5&ndash;10 条的速度成长；若它不长，你没有在从生产中学习。这就是<a class="xref" href="/zh/operations/evaluation-and-observability/eval-driven-agent-development">评估驱动的智能体开发</a>中的"生产到评估飞轮"。</li>
+    </ul>
+
+    <p>关于"评估是唯一规格"的更广论证，见<a class="xref" href="/zh/concepts/evals-101">评测入门</a>与<a class="xref" href="/zh/operations/evaluation-and-observability/eval-driven-agent-development">评估驱动的智能体开发</a>。RAG 特定的增量就是本条目里的三层——纪律是一样的。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>在线 vs 离线，以及会背叛你的裁判。</h3>
+
+    <p>在你把这一切接起来之前，两条最后告诫。</p>
+
+    <p><strong>离线评测抓回归；在线评测抓现实。</strong>第 5 步里的标注集是离线评测——它对一份冻结的快照运行，给你在每次改动上提供回归检测。它抓不住你没预想过的查询。把它与生产中的在线信号配对：用户点赞/踩、重试率、追问率、"这个答案没帮助"按钮，以及答案长度方差等隐式指标。权衡见<a class="xref" href="/zh/operations/evaluation-and-observability/online-vs-offline-evals">在线 vs 离线评测</a>。</p>
+
+    <p><strong>LLM 裁判有失败模式。</strong>本条目里每一个"让一个 LLM 检查一下"的指标都继承了裁判的偏见——偏好更长答案、偏好裁判自家的输出（当裁判与生成器同属一个模型家族时），以及匹配裁判训练分布的答案。缓解：对 5&ndash;10% 的裁判决策抽查人评；定期轮换裁判模型；切勿让生成器与裁判在同一指标上属于同一模型家族；对绝对分数保持怀疑、对趋势给予更多信任。<a class="xref" href="/zh/operations/evaluation-and-observability/why-agent-eval-is-hard">为何智能体评测很难</a>覆盖了这一问题的一般版本。</p>
+
+    <div class="callout tip">
+      <p>最小可用 RAG 评测，一段话讲完：100 条分层查询、带黄金答案以及（你能标的地方）黄金段落 id；在黄金段落上度量 recall@k_first 与 recall@k_final；一个 LLM 裁判忠实性分数以及一个"参考 vs 生成"的答案质量分数；一片约 10 条"语料中无答案"的放弃切片；整套在每次 PR 上跑。它抓得到一个更花哨方案能抓到的 80%，搭建只要一天。</p>
+    </div>
+
+    <p>贯穿六步的统一要点：RAG 评测在结构上就是复数的，因为 RAG 本身是复数的——检索、接地、生成。分别打分、按趋势发布而非按绝对值发布、从生产失败中扩集，并核验裁判。<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索</a>、<a class="xref" href="/zh/deep-dives/retrieval-and-rag/document-parsing-for-rag">解析</a>、<a class="xref" href="/zh/deep-dives/retrieval-and-rag/query-understanding-for-rag">查询理解</a>与<a class="xref" href="/zh/deep-dives/retrieval-and-rag/agentic-retrieval">智能体循环</a>中的架构选择，只有在存在一个能裁决它们的记分牌时才成为真正的工程决策。这就是那个记分牌。</p>
+  </div>
+</section>
