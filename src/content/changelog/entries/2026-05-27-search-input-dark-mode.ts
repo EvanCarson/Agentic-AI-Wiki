@@ -3,17 +3,21 @@ import { L, type ChangelogEntry } from '../types.ts';
 const entry: ChangelogEntry = {
   date: '2026-05-27',
   title: L(
-    'Fix: search input text invisible in dark mode',
-    '修复：深色模式下搜索框输入文字不可见',
+    'Search modal: dark-mode legibility + visual polish',
+    '搜索面板：深色模式可读性修复与视觉打磨',
   ),
   items: [
     L(
-      'The site-search input was overriding background but not color, so the typed query rendered in the user-agent default (near-black) on a dark background and was unreadable.',
-      '站内搜索框只覆盖了背景色而未覆盖文字颜色，导致用户输入在深色背景上以浏览器默认的近黑色渲染，几乎无法看清。',
+      'Fixed invisible search input text in dark mode — the override pinned background but not color, so the typed query rendered in the user-agent default near-black on the dark background (#69).',
+      '修复深色模式下搜索框输入文字不可见的问题——原样式只覆盖了背景色而未设置文字颜色，导致输入以浏览器默认的近黑色显示在深色背景上 (#69)。',
     ),
     L(
-      'Pinned input color to --ink so the query stays legible in both light and dark themes (#69).',
-      '将输入框文字颜色显式设置为 --ink，使搜索词在浅色与深色主题下都能清晰可见 (#69)。',
+      'Replaced the user-agent button/fieldset chrome around the Clear button and Section filter with the site\'s own monospace small-caps language, dropping the heavy 2px groove fieldset border and 2px outset button border.',
+      '将「Clear」按钮和「Section」筛选区原本的浏览器默认样式（2px groove 边框、2px outset 按钮边框）替换为站点统一的等宽小写字母排版语言。',
+    ),
+    L(
+      'Swapped the input\'s default blue focus outline for an accent-colored ring, and routed the "Section" label through JetBrains Mono uppercase to match other section labels on the site.',
+      '将输入框默认的蓝色聚焦轮廓替换为强调色描边；「Section」标签改用 JetBrains Mono 大写排版，与站点其它分区标签风格一致。',
     ),
   ],
 };
