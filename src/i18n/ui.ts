@@ -37,8 +37,10 @@ export interface UIStrings {
               readingPath: { badge: string; intro: string; escapePrefix: string; escapeLinkLabel: string } };
   deepDives: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
                readingPath: { badge: string; prefix: string; linkLabel: string } };
-  playbooks: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
-  operations: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
+  playbooks: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
+               readingPath: { badge: string; prefix: string; linkLabel: string } };
+  operations: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
+                readingPath: { badge: string; prefix: string; linkLabel: string } };
   blog: {
     metaTitle: string;
     metaDesc: string;
@@ -139,6 +141,11 @@ export const ui: Record<Locale, UIStrings> = {
       h1: 'Playbooks',
       tagline: 'Applied recipes for building agents in specific domains and roles.',
       emptyHtml: 'Playbook essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
+      readingPath: {
+        badge: 'NEW HERE?',
+        prefix: 'These playbooks assume Concepts fluency — new here?',
+        linkLabel: 'Start with Concepts →',
+      },
     },
     operations: {
       metaTitle: 'Operations — Agentic AI Wiki',
@@ -146,6 +153,11 @@ export const ui: Record<Locale, UIStrings> = {
       h1: 'Operations',
       tagline: 'How to run agents in production — evals, observability, cost, safety, governance.',
       emptyHtml: 'Operations essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
+      readingPath: {
+        badge: 'NEW HERE?',
+        prefix: 'These ops essays assume Concepts fluency — new here?',
+        linkLabel: 'Start with Concepts →',
+      },
     },
     blog: {
       metaTitle: 'AI Blog — Agentic AI Wiki',
@@ -257,6 +269,11 @@ export const ui: Record<Locale, UIStrings> = {
       h1: '实战手册',
       tagline: '在具体领域与角色中构建智能体的应用蓝本。',
       emptyHtml: '实战手册文章即将上线 — 在此之前，先深入阅读 <a href="%FG%" style="color:var(--accent);">实战指南</a>。',
+      readingPath: {
+        badge: '新手入门？',
+        prefix: '这些实战手册默认你已掌握「概念」—— 还是新手？',
+        linkLabel: '先看概念 →',
+      },
     },
     operations: {
       metaTitle: '运维 — Agentic AI 维基',
@@ -264,6 +281,11 @@ export const ui: Record<Locale, UIStrings> = {
       h1: '运维',
       tagline: '在生产环境中运行智能体——评测、可观测性、成本、安全与治理。',
       emptyHtml: '运维文章即将上线 — 在此之前，先深入阅读 <a href="%FG%" style="color:var(--accent);">实战指南</a>。',
+      readingPath: {
+        badge: '新手入门？',
+        prefix: '这些运维文章默认你已掌握「概念」—— 还是新手？',
+        linkLabel: '先看概念 →',
+      },
     },
     blog: {
       metaTitle: 'AI 博客 — 智能体 AI 维基',
