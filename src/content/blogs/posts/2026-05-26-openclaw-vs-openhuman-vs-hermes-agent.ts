@@ -1,7 +1,7 @@
 import { L, type BlogPost } from '../types.ts';
 
 const post: BlogPost = {
-  date: '2026-05-22',
+  date: '2026-05-26',
   slug: 'openclaw-vs-openhuman-vs-hermes-agent',
   title: L(
     'OpenClaw vs OpenHuman vs Hermes Agent: Three Architectures of the Open-Source Agent Stack',
