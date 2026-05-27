@@ -257,8 +257,9 @@ you are probably doing it wrong; ask for a design conversation instead.
 |---|---|---|
 | Body paragraphs | Inter sans 17px line-height 1.65 | inherited from `body` in `guide.css` |
 | Hook lede (`<p class="lede">` in body) | Fraunces italic 19px, 3px accent left border, 8/28px margins | `BlogLayout.astro` |
-| Section h2 | Fraunces 28px weight 400, margin 0/24px | `BlogLayout.astro` |
-| Subsection h3 | Fraunces 20px weight 500, margin 32/16px | `BlogLayout.astro` |
+| Section h2 (`<section><h2>`) | Fraunces 28px weight 400, margin 0/24px, **counter-numbered prefix** (`01`, `02`, …) in italic Fraunces accent at 30px on the left | `BlogLayout.astro` |
+| Subsection h3 | Fraunces 22px weight 600, margin 36/14px, **32×2px accent underline tab** anchored to the heading's bottom-left | `BlogLayout.astro` |
+| FAQ h3 (`<section class="faq"><h3>`) | Same as subsection h3 but **underline tab suppressed** so the Q→A rhythm stays dense | `BlogLayout.astro` |
 | Inline `<code>` | JetBrains Mono 0.9em, paper-2 background | `BlogLayout.astro` |
 | Body link `<a>` | accent-ink, underlined | `BlogLayout.astro` |
 | Block `<blockquote>` | Fraunces italic 19px, 3px accent left border | `BlogLayout.astro` |
@@ -266,6 +267,22 @@ you are probably doing it wrong; ask for a design conversation instead.
 | `<figure>` | 32px above/below; 8px after a direct heading | `BlogLayout.astro` |
 | `<figcaption>` | Inter 13px italic muted | `BlogLayout.astro` |
 | Tables | paper-2 header bg, uppercase JetBrains Mono `<th>`, 10/12px cell padding, hover row | `BlogLayout.astro` |
+
+**Heading hierarchy at a glance:**
+
+```
+h1            Fraunces 34px       (post title)
+.lede         Fraunces italic 19  (hook lede with 3px accent LEFT border)
+h2            Fraunces 28px       (with "01" / "02" / … italic accent COUNTER prefix)
+h3            Fraunces 22px w600  (with 32×2px accent UNDERLINE tab below)
+FAQ h3        Fraunces 22px w600  (no underline — keeps Q→A dense)
+body          Inter 17px          (inherited)
+```
+
+The accent palette (lede border / h2 counter / h3 underline) gives the
+three heading levels related-but-distinct visual anchors — left bar
+for the lede, prefix number for h2, bottom tab for h3. Same vocabulary,
+different roles.
 
 ## 6. The `is:global` gotcha (do not remove)
 
