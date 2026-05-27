@@ -1,0 +1,123 @@
+<section class="phase">
+  <div class="phase-num">R5</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>查询理解与变换：在你搜索之前，先修好问题。</h2>
+  <p class="goal">大多数 RAG 排查止步于检索器，从不看输入端。但查询是探入索引的探针，糟糕的探针无论下游栈多强都会保证糟糕的检索。"Cannot log in"在字面上不等于"authentication failure"，"那它的定价呢？"不是独立问题，"对比 Q3 与 Q4 的毛利率"也不是一条查询——而是两条。本条目讲在混合检索<em>之前</em>发生的变换，以及其中少数几个值得花延迟与提示词预算去做的。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>查询比检索器更常是瓶颈。</h3>
+
+    <p>每一种检索器——词法、稠密、混合、甚至<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">两阶段重排序</a>——都假设用户给出的查询就是正确的探针。这一假设以可预测的方式崩塌：</p>
+
+    <ul>
+      <li><strong>对话式查询。</strong>"那企业版呢？"完全依赖三轮之前讨论过什么。把这串字嵌入并在语料里搜，召回的是各种语境下的"企业版"切块。</li>
+      <li><strong>词汇错位。</strong>用户描述症状，文档描述机理。"我的屏幕一直卡死"与"v2.4 中 GPU 驱动内存泄漏"在嵌入空间里并不近。</li>
+      <li><strong>复合问题。</strong>"v3 相对 v2 改了什么，迁移是不是会破坏？"需要至少三份不同文档的证据。一次检索只能寄希望于某个切块同时覆盖这三件事，这很罕见。</li>
+      <li><strong>规格不足的查询。</strong>"什么是政策？"无任何限定词时，会返回第一个含"政策"的切块，几乎从不正确。</li>
+      <li><strong>规格过载。</strong>多从句、约束过多的长问题嵌入到一个不知所云的位置——查询向量落在一个没有清晰最近邻的区域中部。</li>
+    </ul>
+
+    <p><a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索与重排序</a> 中的诊断——"如果答案字符串在语料里却不在 top-50，bug 是检索器"——还有一个孪生：如果答案在语料里，对手写的理想查询检索器能找到、但对用户的真实查询找不到，那 bug 就在查询上。修的是另一个地方。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>改写：低风险的默认动作。</h3>
+
+    <p>查询改写是一次廉价的 LLM 调用，把原始查询变为独立、为搜索优化的版本。它解析代词、展开缩写、丢掉对话填充词，并从历史中补上下文。它是本页风险最低的变换，也是多数系统能放心地默认开启的唯一一个。</p>
+
+<pre class="standalone"><span class="c-cm"># conversational query rewrite — resolve references, drop filler</span>
+REWRITE_PROMPT = <span class="c-st">&quot;&quot;&quot;
+Given the conversation so far and the user's latest message,
+write ONE standalone search query that captures what the user is
+actually asking. Resolve pronouns, expand acronyms, keep entity
+names exact. Output the query only, no preamble.
+&quot;&quot;&quot;</span>
+
+<span class="c-kw">def</span> <span class="c-fn">rewrite_for_retrieval</span>(history, latest):
+    msg = <span class="c-fn">format_history</span>(history) + <span class="c-st">&quot;\nLatest: &quot;</span> + latest
+    <span class="c-kw">return</span> small_llm.<span class="c-fn">complete</span>(REWRITE_PROMPT, msg).<span class="c-fn">strip</span>()</pre>
+
+    <p>用一个小而快的模型（Haiku 量级、Llama-3.1-8B）。输出很短，查询理解的延迟预算紧——这一调用必须在检索开始之前完成。要避免的两个反模式：因为模型觉得实体名"看起来奇怪"而把它改掉（要原样保留这些片段），以及过度扩展（把一句话查询改成一段话，反而比原句更让嵌入模型困惑）。</p>
+
+    <p>对非对话、一次性的查询，改写常常是空操作——如果没有历史且查询本身已自洽，就别调 LLM。简单的长度与对话状态判断可以在它帮不上忙时跳过改写。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>分解：当一条问题其实是几条。</h3>
+
+    <p>复合与对比型问题是与改写不同的另一个问题。"对比 Q3 与 Q4 的毛利率"不能通过把"对比 Q3 与 Q4 的毛利率"扔到语料里检索来回答——含这一对比的文档<em>并不存在</em>。Q3 的数字在一份文档里、Q4 的数字在另一份里，对比要靠生成器组装。</p>
+
+    <p><strong>查询分解</strong>把复合查询切成子查询，对每条子查询检索，再拼接证据：</p>
+
+<pre class="standalone"><span class="c-cm"># decompose, retrieve per sub-query, then generate over the union</span>
+<span class="c-kw">def</span> <span class="c-fn">decompose_and_retrieve</span>(query, retriever):
+    sub_queries = <span class="c-fn">llm_decompose</span>(query)   <span class="c-cm"># 1..N standalone questions</span>
+    evidence    = []
+    <span class="c-kw">for</span> sq <span class="c-kw">in</span> sub_queries:
+        evidence.<span class="c-fn">extend</span>(retriever.<span class="c-fn">search</span>(sq, k=<span class="c-st">5</span>))
+    <span class="c-kw">return</span> <span class="c-fn">dedupe</span>(evidence)         <span class="c-cm"># by doc_id, preserve order</span></pre>
+
+    <p>分解对显式对比（"X vs Y"）、多实体问题（"A、B、C 三种计划的政策"）、含隐式子步骤的问题（"这次迁移安全吗？" &rarr; "schema 改了什么？" + "哪些代码依赖这些列？"）最有用。对简单的单事实查找则浪费，所以分解器在输入已经原子化时应允许只返回一条不变的子查询。</p>
+
+    <p>它的智能体式 RAG 变体——让智能体在运行时决定发多少次检索、查什么——见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/advanced-rag-architectures">进阶 RAG 架构</a>。静态分解是更便宜、低延迟的版本：一次 LLM 调用做切分，然后一批并行检索，无循环。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>多查询、HyDE、退一步：改写探针，而不是改写问题。</h3>
+
+    <p>如果分解处理的是"这其实是几个问题"，<strong>多查询</strong>处理的是"这一个问题只有一种表达方式"。模型生成查询的 3&ndash;5 个改写，每条独立检索，结果用 RRF 融合（见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索与重排序</a>）。收益是召回：若"cannot log in"漏检而"authentication failure"命中，并集能找到它。代价大约是 N 倍的检索调用，通常并行运行，影响成本多于延迟。</p>
+
+    <p><strong>HyDE</strong>（Hypothetical Document Embeddings，Gao 等，2022）生成一个对查询的假设<em>答案</em>——不是改写——并用这个假设答案的嵌入去搜索。直觉是：一个假答案在形状上像索引里的真段落，因而在嵌入空间里比裸问题更接近它们。HyDE 对弱或零样本检索器稳定有用。它可能<em>伤害</em>强的、经过微调的稠密检索器，因为假设文档引入了分布偏移，且有机会臆造错误实体，从而把检索拽偏。诚实的规则是：在你的检索器与语料上做 A/B，而不是把它当默认值采纳。这与<a class="xref" href="/zh/deep-dives/retrieval-and-rag/advanced-rag-architectures">进阶 RAG 架构</a>里的告诫一致——之所以重申，是因为这种失败模式很常见。</p>
+
+    <p><strong>退一步提示</strong>（Step-back，Zheng 等，2023）与分解相反：它把查询泛化到更高层次的问题（<em>"免费层每分钟 API 调用上限是多少？"</em> &rarr; <em>"免费层的速率限制是什么？"</em>），并用更宽的形式（通常与原查询一同）检索。当用户的具体问题对嵌入模型过于受限、而更宽话题在语料中确实存在时，它有用。</p>
+
+    <div class="callout warn">
+      <p>上面三种变换都通过更多探针发起更多检索来扩大召回。它们<em>同时</em>提高了离题切块进入候选池的速率，进而稀释交叉编码器的视野。务必把查询扩展类变换与下游真正的重排序器以及一个校准过的 <em>k_final</em> 配对——否则你以检索召回换生成精度，最终更糟。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>路由：在选"怎么搜"之前先选"在哪搜"。</h3>
+
+    <p>"我们的退款政策是什么？"应去客服知识库。"Q4 营收是多少？"应去财报。"Postgres 的分组语法？"应去 Postgres 文档索引。把每条查询发到每个索引既浪费（延迟、成本）也有害（跨语料的切块漏进来污染候选集）。</p>
+
+    <p><strong>查询路由</strong>是一个分类步骤，选定一个或少量索引去搜。两种可行实现：</p>
+
+    <ul>
+      <li><strong>LLM 路由。</strong>一个小模型拿到带单行描述的索引清单与查询，返回一个或多个索引名。便宜、灵活、易扩展——加一个新索引只要加一行描述。</li>
+      <li><strong>嵌入路由。</strong>每个索引有一个代表性嵌入（其文档的质心，或一段成文摘要）。查询嵌入匹配到最近的索引。极快、无需额外 LLM 调用，但随索引漂移更难校准。</li>
+    </ul>
+
+    <p>路由也支持非向量来源：看起来像结构化查找的查询（"3 月份来自客户 X 的订单"）应去 SQL，不去文档索引。看起来像日期或数字范围的查询应进过滤器，而不是相似度搜索。路由的工作是识别这条查询<em>是什么类型</em>的探针，并选对工具。这一思路与智能体式检索（见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/advanced-rag-architectures">进阶 RAG 架构</a>）平滑过渡——路由是同一思想的静态、单步版本。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>串起来：一个默认的查询理解流水线。</h3>
+
+    <p>多数系统并不需要上述全部六种变换。生产 RAG 系统可辩护的默认值，按顺序：</p>
+
+<pre class="standalone"><span class="c-cm"># before retrieval: a layered, mostly-skippable pipeline</span>
+<span class="c-kw">def</span> <span class="c-fn">prepare_query</span>(query, history):
+    <span class="c-cm"># 1. cheap rewrite if there is conversation context</span>
+    <span class="c-kw">if</span> history:
+        query = <span class="c-fn">rewrite_for_retrieval</span>(history, query)
+
+    <span class="c-cm"># 2. route to the right index/tool</span>
+    index = <span class="c-fn">route</span>(query)               <span class="c-cm"># may return SQL, KB, web, etc.</span>
+
+    <span class="c-cm"># 3. decompose only if the query has multiple sub-questions</span>
+    sub_queries = <span class="c-fn">decompose_if_needed</span>(query)
+
+    <span class="c-kw">return</span> {<span class="c-st">&quot;index&quot;</span>: index, <span class="c-st">&quot;queries&quot;</span>: sub_queries}</pre>
+
+    <p>多查询与 HyDE 在此默认中是<em>实验</em>，不是步骤。当召回是被证实的失败模式时按查询打开，当答案精度退化时关掉。退一步在查询过度受限时是有用的逃生阀，但同样不应作为默认。</p>
+
+    <p>统一原则：查询理解是给 RAG 系统加智能最便宜的地方，因为下游一切——检索器、重排序、生成器——都以"查询是合理探针"为条件。在生成端花一次大调用之前，先在这里花一次小的。并且度量：任何在带标注评测集上不能提升<em>最终答案准确率</em>的查询变换都是开销，无论它孤立看多聪明（见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/evaluating-rag">评估 RAG</a>）。</p>
+  </div>
+</section>

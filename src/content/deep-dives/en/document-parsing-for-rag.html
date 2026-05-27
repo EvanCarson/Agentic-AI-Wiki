@@ -1,0 +1,116 @@
+<section class="phase">
+  <div class="phase-num">R4</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Document parsing and ingestion quality: the upstream bottleneck most teams underestimate.</h2>
+  <p class="goal">Almost every "<a class="xref" href="/concepts/what-is-rag">RAG</a> doesn't work" investigation ends with the same finding: the chunks coming out of the retriever are technically correct but semantically broken &mdash; a table mangled into a wall of comma-separated numbers, a heading detached from its body, a footer leaking into every chunk, a PDF where column two reads as a continuation of column one. No reranker, query rewrite, or model upgrade can repair text that was destroyed before it was indexed. This entry is about treating ingestion as a first-class engineering problem: what parsing actually has to do, where it breaks, and the modern shortcut of skipping text extraction altogether.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why ingestion quality is usually the bottleneck.</h3>
+
+    <p>The retrieval-vs-generation split from <a class="xref" href="/concepts/what-is-rag">what is RAG</a> &mdash; "debug RAG in two halves" &mdash; is right but incomplete. There is a third half upstream of retrieval that decides whether the right answer was ever <em>indexable</em>:</p>
+
+<pre class="trace standalone"><span class="c-out">source documents
+       |
+       v
+[0 PARSE & EXTRACT]   PDFs, HTML, Word, slides, images
+                      -->  clean text + structure
+       |
+       v
+[1 CHUNK]             split along semantic boundaries
+       |
+       v
+[2 EMBED & INDEX]     dense + sparse vectors
+       |
+       v
+[3 RETRIEVE]   [4 GENERATE]   (the rest of the pipeline)</span></pre>
+
+    <p>Most teams instrument stages 3 and 4 carefully and treat stage 0 as "we used a PDF library." Then they spend months blaming the embedding model. The diagnostic that exposes this: take ten failure cases, find the source document containing the answer, and look at the chunk for that span in your index. If the chunk is unreadable &mdash; tables flattened, headers smashed into body, column order wrong &mdash; no downstream stage can recover. Ingestion is the failure.</p>
+
+    <div class="callout">
+      <p>The check takes ten minutes and changes most teams' roadmap. Open the highest-failure document in your corpus, dump its chunks to a text file, and read them. If <em>you</em> can't tell where the table ends and the prose begins, neither can the model.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>PDFs are not text. They are a visual format extracted by guessing.</h3>
+
+    <p>A PDF stores positioned glyphs &mdash; "draw character &lsquo;A&rsquo; at (x=72, y=540) in font Helvetica-Bold 11pt" &mdash; with no semantic notion of paragraph, table, or column. Every PDF text extractor reconstructs reading order by clustering glyphs by position and guessing where lines, paragraphs, and tables begin. The guesses fail predictably on:</p>
+
+    <ul>
+      <li><strong>Multi-column layouts.</strong> A naive top-to-bottom extractor reads across columns instead of down them, splicing column one line 1, column two line 1, column one line 2, &hellip; into nonsense.</li>
+      <li><strong>Tables.</strong> Cells become a stream of values with no row/column structure. A 10-row, 4-column rate table becomes 40 numbers in a row. Any question about "the rate for plan B in year 3" is now unanswerable from the chunk because the structure that made it answerable is gone.</li>
+      <li><strong>Headers, footers, page numbers, watermarks.</strong> Repeated on every page, they appear in every chunk as boilerplate noise that drowns out the signal during embedding and inflates the index. The same paragraph appearing under the same disclaimer footer 200 times also poisons BM25 statistics.</li>
+      <li><strong>Footnotes and sidebars.</strong> Spliced into the body mid-sentence because positionally they sit adjacent.</li>
+      <li><strong>Figures and equations.</strong> Either dropped entirely or rendered as garbled OCR of glyph positions.</li>
+    </ul>
+
+    <p>Two parser tiers exist. <strong>Text-only extractors</strong> (<code class="inline">pdfminer</code>, <code class="inline">pypdf</code>, <code class="inline">PyMuPDF</code>) are fast and adequate for well-structured born-digital text. <strong>Layout-aware parsers</strong> (Unstructured, LlamaParse, Reducto, Azure Document Intelligence, Marker, Docling) run a layout model first &mdash; columns, tables, headers, lists are detected as structural elements &mdash; and then extract within each region. They are slower (often LLM-backed) and not free, but they are the only correct answer for any non-trivial corpus.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Tables and other structured content need specialized handling.</h3>
+
+    <p>A table that lost its structure is worse than no table, because the model will confidently misread it. Three workable strategies, in increasing power and cost:</p>
+
+    <ul>
+      <li><strong>Serialize to Markdown or HTML tables.</strong> Layout-aware parsers reconstruct the grid and emit a table with rows, columns, and headers preserved. Embedding the markdown text gives the model enough structure to read across rows during generation. Cheap and usually sufficient.</li>
+      <li><strong>Row-as-chunk with column-name context.</strong> Index each row as a separate chunk, prefixed with the column headers and the table caption. This raises recall for "look up X in column Y" queries that would otherwise compete with the surrounding prose for embedding similarity.</li>
+      <li><strong>Table to text via LLM.</strong> Have an LLM transcribe each table into a paragraph of prose ("Plan A costs $20/mo in year 1, $25 in year 2 &hellip;") at ingestion time, and index both the original and the prose summary. Expensive at ingest, but query-time retrieval becomes trivially good. Worth it when tables are the answer-bearing content (financial filings, rate cards, lab results).</li>
+    </ul>
+
+    <p>The same logic applies to other structured content: equations should be preserved in LaTeX or normalized text rather than glyph soup, code blocks should be kept as code (not reflowed as prose), lists should retain bullets rather than being collapsed into running text. Each of these is a structural signal the retriever and the generator can use.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>OCR is its own pipeline, and modern OCR is mostly a vision-LLM.</h3>
+
+    <p>Scanned documents, photographed contracts, screenshots, and image-only PDFs need <strong>OCR</strong> before any of the above can happen. The honest summary of OCR in 2026:</p>
+
+    <ul>
+      <li><strong>Classical OCR</strong> (Tesseract, AWS Textract, Google Document AI) is fast, deterministic, and adequate for clean printed text. It produces a stream of words with bounding boxes; layout reconstruction is still a separate problem on top.</li>
+      <li><strong>End-to-end OCR transformers</strong> (Donut, Pix2Struct, and the newer Nougat for scientific docs) skip the bounding-box stage and produce structured text directly from page images. Better on complex layouts and tables; slower; brittle on out-of-distribution document types.</li>
+      <li><strong>Vision-LLM page understanding</strong> &mdash; passing the page image to a multimodal model (Claude, GPT-4o, Gemini) and asking for structured Markdown. By 2025&ndash;2026 this is competitive on quality with specialized parsers for messy documents and is easier to operate because there is no separate model to fine-tune. The trade-off is per-page inference cost and the usual non-determinism of generative output.</li>
+    </ul>
+
+    <p>The choice is governed by volume and document diversity. A million scanned invoices a day &rarr; classical OCR plus a layout model. A hundred contracts a week with varied formats &rarr; vision-LLM is probably both better and cheaper once you account for engineer time saved on edge cases.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Chunking is a parsing decision, not a tokenizer decision.</h3>
+
+    <p>The default "split every 500 tokens with 50-token overlap" is a tokenizer-driven heuristic that ignores structure. It will happily cut a 600-token section in half, separate a table from its caption, or merge a heading with the unrelated paragraph below it. Chunking quality is downstream of parsing quality, and the fix is to split along the structural boundaries the parser already detected:</p>
+
+    <ul>
+      <li><strong>Header-aware chunking.</strong> Treat each H1/H2/H3 section as a unit; only split further if it exceeds the token budget. Prefix each chunk with the breadcrumb of parent headings (<em>Manual &gt; Billing &gt; Refund policy</em>) so the chunk carries its own context.</li>
+      <li><strong>Element-aware chunking.</strong> Never split a table across chunks. Never split a code block. Keep figure captions with their figure. These are cheap rules that prevent the worst failures.</li>
+      <li><strong>Semantic chunking</strong> &mdash; using embedding similarity between consecutive sentences to detect topic shifts &mdash; is fashionable but in practice loses to header-aware chunking on real corpora. The headings the author wrote are usually better signals than embedding cosines, and they are free.</li>
+      <li><strong>Overlap</strong> exists to recover answers that straddle chunk boundaries. Ten to fifteen percent is conventional; more wastes index size without raising recall on well-bounded chunks.</li>
+    </ul>
+
+    <p>See <a class="xref" href="/concepts/chunking-and-vector-search">chunking and vector search</a> for the retrieval-side view. The point here is the inverse: <em>chunking decisions cascade into retrieval quality</em>, and the chunk you can make is bounded by what the parser handed you. Parsing fixes have larger downstream effects than chunking parameter tuning.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Skipping text entirely: vision-RAG (ColPali and friends).</h3>
+
+    <p>The newest move &mdash; <strong>vision-RAG</strong>, popularized by ColPali (Faysse et al., 2024) &mdash; is to give up text extraction and index the document <em>as images</em>. Each page is rendered to a screenshot, run through a vision-language model that produces a multi-vector (ColBERT-style) embedding per page, and indexed. At query time, the query text is embedded into the same space; matching pages are returned as images and passed directly to a vision-capable generator.</p>
+
+    <p>This sidesteps every parsing failure mode in this entry: tables, figures, equations, handwritten annotations, complex layouts &mdash; the model sees the page the way a human does. The cost is real:</p>
+
+    <ul>
+      <li>Index size grows roughly an order of magnitude (one vector per page region, not per chunk).</li>
+      <li>Generation requires a multimodal model with a sufficient image context budget; cost-per-answer is meaningfully higher than text RAG.</li>
+      <li>Citations get harder &mdash; "this claim came from this region of page 7" is now a bounding box, not a quotable text span.</li>
+    </ul>
+
+    <p>For visually-dense corpora (financial filings, scientific papers, technical manuals, slide decks), vision-RAG can outperform a heavily-engineered text pipeline at less engineering cost. For text-dominant corpora (Markdown wikis, support transcripts, code), it is overkill and the text path is both cheaper and easier to debug. Treat it as a tool for a specific class of document, not a default.</p>
+
+    <p>The unifying lesson across all six steps: ingestion is the half of RAG that doesn't get the dashboards, and it is also the half that decides whether the answer was ever recoverable. Before tuning the retriever or the prompt, read your chunks. Then fix the parser.</p>
+  </div>
+</section>

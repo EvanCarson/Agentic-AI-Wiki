@@ -1,0 +1,114 @@
+<section class="phase">
+  <div class="phase-num">R3</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Hybrid search and reranking: the production retrieval stack.</h2>
+  <p class="goal">A single retriever is almost never enough. Dense embeddings paraphrase well and fail on rare tokens; lexical search nails exact strings and fails on synonyms; a single first stage that has to be both broad <em>and</em> precise is a contradiction. The 2025&ndash;2026 default for serious <a class="xref" href="/concepts/what-is-rag">RAG</a> systems is a two-stage stack &mdash; a cheap fused retrieve that maximizes recall, followed by an expensive cross-encoder rerank that maximizes precision. This entry is about why that shape wins, how to wire it, and the tuning levers that actually move the score.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why one retriever is structurally not enough.</h3>
+
+    <p>Dense (embedding-based) retrieval and sparse (lexical, BM25) retrieval fail in opposite ways, and the failures are not noise &mdash; they are properties of the algorithm.</p>
+
+    <ul>
+      <li><strong>Dense retrieval</strong> &mdash; the query and each chunk become vectors, similarity is dot product or cosine. It matches "how do I reset my password" to "account recovery steps" with no shared words. It also confidently mis-matches rare strings: a product SKU like <code class="inline">A7-552-Q</code>, an error code <code class="inline">ECONNRESET</code>, a person's name not in pretraining &mdash; these collapse to nearly identical vectors and the right chunk does not surface. Dense retrievers are also <em>distributionally</em> fragile: queries that look unlike anything in the embedding model's training data drift in unpredictable directions.</li>
+      <li><strong>Sparse retrieval (BM25, SPLADE-style learned-sparse)</strong> &mdash; classic TF&middot;IDF with length normalization. It is exact on tokens, robust on rare terms, and explainable. It also misses every paraphrase: "cannot log in" and "authentication failure" share zero tokens and BM25 sees no match.</li>
+    </ul>
+
+    <p>You can paper over either failure with more <em>k</em>, but you cannot fix the failure mode. The right move is to <em>combine</em>: run both, fuse the lists, then let a stronger second stage sort the union. This is the same logic as a CPU cache &mdash; cheap-and-wide first, expensive-and-narrow second &mdash; applied to retrieval.</p>
+
+    <div class="callout">
+      <p>The fast diagnostic: take ten queries your system gets wrong and grep the corpus for the answer string. If the answer string is <em>in the corpus but not in the top-50 retrieved set</em>, your retriever is the bug, not your prompt. Then ask which retriever would have found it. Mostly synonyms &rarr; you need dense. Mostly exact strings, IDs, code &rarr; you need lexical. Mixed &rarr; you need both.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Fusion: combining lexical and dense without tuning weights.</h3>
+
+    <p>The clean way to merge two ranked lists is <strong>reciprocal rank fusion</strong> (RRF, Cormack et al., 2009). Each document gets a score that depends only on its <em>rank</em> in each list, not on the raw retrieval score &mdash; which means you do not have to calibrate BM25 scores against dense cosines (they live on different scales and cannot be added).</p>
+
+<pre class="standalone"><span class="c-cm"># reciprocal rank fusion across N ranked lists</span>
+<span class="c-kw">def</span> <span class="c-fn">rrf</span>(ranked_lists, k=<span class="c-st">60</span>):
+    scores = {}
+    <span class="c-kw">for</span> lst <span class="c-kw">in</span> ranked_lists:
+        <span class="c-kw">for</span> rank, doc_id <span class="c-kw">in</span> <span class="c-fn">enumerate</span>(lst):
+            scores[doc_id] = scores.<span class="c-fn">get</span>(doc_id, <span class="c-st">0.0</span>) + <span class="c-st">1.0</span> / (k + rank)
+    <span class="c-kw">return</span> <span class="c-fn">sorted</span>(scores.<span class="c-fn">items</span>(), key=<span class="c-kw">lambda</span> x: -x[<span class="c-st">1</span>])
+
+<span class="c-cm"># typical usage: top-100 from each retriever, fuse, take top-50 for rerank</span>
+fused = <span class="c-fn">rrf</span>([bm25_results[:<span class="c-st">100</span>], dense_results[:<span class="c-st">100</span>]])[:<span class="c-st">50</span>]</pre>
+
+    <p>The <code class="inline">k=60</code> constant is from the original paper and is conventional &mdash; it controls how quickly score decays with rank. RRF beats linearly-weighted fusion in practice because it is parameter-free across retrievers: you do not retune when the BM25 score distribution shifts after a corpus change. For three or more sources (e.g., BM25 + dense + a learned-sparse retriever like SPLADE), the same formula scales by passing more lists.</p>
+
+    <p>Fusion is a <em>recall</em> move. The fused top-50 reliably contains the right passage when either retriever would have found it alone &mdash; but it is still a noisy list with the right answer often sitting around rank 20&ndash;40. Sorting that noise is the next stage's job.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Reranking: cross-encoders, where the precision comes from.</h3>
+
+    <p>First-stage retrievers compute the query embedding and each document embedding <em>independently</em> &mdash; a <strong>bi-encoder</strong> &mdash; which is the only way to precompute the corpus index and search millions of vectors in milliseconds. The cost of that speed is that the model never sees the query and a candidate together, so it cannot perform fine-grained matching ("does <em>this specific clause</em> actually answer <em>this specific question</em>").</p>
+
+    <p>A <strong>cross-encoder</strong> takes the query and one candidate as a single concatenated input, runs full self-attention across both, and outputs a relevance score. It is dramatically more accurate than a bi-encoder for the same model size, because every query token can attend to every document token. The cost is also dramatic: it must run once per (query, candidate) pair, so it is too slow to score the whole corpus. The pattern that wins is therefore <em>two-stage</em>:</p>
+
+<pre class="standalone"><span class="c-cm"># two-stage retrieval: cheap recall, then expensive precision</span>
+<span class="c-kw">def</span> <span class="c-fn">retrieve_then_rerank</span>(query, k_first=<span class="c-st">50</span>, k_final=<span class="c-st">5</span>):
+    <span class="c-cm"># stage 1: fused bi-encoder + BM25, optimized for recall</span>
+    candidates = <span class="c-fn">hybrid_retrieve</span>(query, k=k_first)
+
+    <span class="c-cm"># stage 2: cross-encoder rescores every (query, candidate) pair</span>
+    pairs  = [(query, c.text) <span class="c-kw">for</span> c <span class="c-kw">in</span> candidates]
+    scores = cross_encoder.<span class="c-fn">predict</span>(pairs)        <span class="c-cm"># ~50 forward passes</span>
+
+    reranked = <span class="c-fn">sorted</span>(<span class="c-fn">zip</span>(candidates, scores), key=<span class="c-kw">lambda</span> x: -x[<span class="c-st">1</span>])
+    <span class="c-kw">return</span> [c <span class="c-kw">for</span> c, _ <span class="c-kw">in</span> reranked[:k_final]]</pre>
+
+    <p>Empirically, adding a cross-encoder rerank on top of a mediocre first stage usually beats every other "advanced RAG" trick measured in isolation. The relevant benchmarks (BEIR, MS MARCO) have shown this consistently since 2020, and it survived the embedding-model upgrade cycle. If a naive RAG system is underperforming and you have one upgrade to make, this is the one with the best ROI &mdash; ahead of HyDE, multi-query, fine-tuning embeddings, or graph indexing.</p>
+
+    <div class="callout warn">
+      <p>The cross-encoder is not free at runtime. A 50-candidate rerank with a ~100M-parameter cross-encoder is on the order of 50&ndash;200ms on a small GPU per query; latency adds linearly with candidate count. If you are latency-bound, the lever is <em>fewer candidates</em>, not a smaller model &mdash; cross-encoder quality drops sharply when you shrink the model, while shrinking <code class="inline">k_first</code> from 100 to 30 often costs less than 1&ndash;2 recall points.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Late interaction (ColBERT) when cross-encoders are too slow.</h3>
+
+    <p>Cross-encoders run full attention <em>per pair</em>. <strong>Late-interaction</strong> retrievers &mdash; ColBERT (Khattab &amp; Zaharia, 2020) and its descendants ColBERTv2 and PLAID &mdash; split the difference: they embed each query token and each document token independently (so the document index is precomputable), then at query time compute a <em>MaxSim</em> score that, for each query token, takes the maximum similarity over document tokens and sums those maxima.</p>
+
+    <p>The result is finer-grained than a bi-encoder (which collapses each side to one vector) and much faster than a cross-encoder (no per-pair forward pass). The cost is index size: storing one vector per token, not one per document, is roughly an order of magnitude larger on disk. PLAID and product-quantized variants narrow that gap.</p>
+
+    <p>When is late interaction worth it? When you need most of cross-encoder quality at retrieval-time latencies, typically on large corpora where you cannot afford to run a cross-encoder over even 50 candidates. For most teams shipping today, the right path is still <em>BM25 + dense + cross-encoder rerank</em>, and ColBERT-class retrievers are a serious option once you outgrow that pipeline's latency budget or want to drop the rerank stage entirely.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Tuning the stack: the knobs that actually move recall@k.</h3>
+
+    <p>Most teams underestimate the first-stage recall budget and overestimate the rerank's ability to recover. The rerank can only reorder what was retrieved &mdash; if the right chunk is at rank 200, no reranker over the top-50 will find it. The hierarchy of levers, in order of usual impact:</p>
+
+    <ul>
+      <li><strong>First-stage <code class="inline">k</code>.</strong> Going from <code class="inline">k_first=10</code> to <code class="inline">k_first=50</code> typically lifts answer-quality more than swapping the embedding model. Aim for the smallest <code class="inline">k_first</code> at which recall@k_first plateaus, then rerank from there. Measure this directly &mdash; do not guess.</li>
+      <li><strong>Adding BM25 to a dense-only system</strong> (or vice versa). On corpora with a lot of named entities, codes, or numeric identifiers, this single change is often worth 10&ndash;20 points of recall@10. It costs almost nothing &mdash; modern OpenSearch / Elastic / Postgres-pgvector setups can serve both from one query.</li>
+      <li><strong>Reranker model choice.</strong> Cross-encoder quality varies widely; a strong open model (e.g., BGE-reranker, Cohere rerank, mxbai-rerank) is typically a real upgrade over a small generic one. The gap between "any rerank" and "no rerank" is bigger than the gap between rerankers.</li>
+      <li><strong>Chunk size and overlap.</strong> Covered in <a class="xref" href="/concepts/chunking-and-vector-search">chunking and vector search</a>. Smaller chunks raise lexical precision but split answers; larger chunks improve coherence but blur similarity. Default 300&ndash;500 tokens with ~10% overlap is a defensible starting point, but it is a per-corpus tune.</li>
+      <li><strong>Score thresholds and abstention.</strong> If the cross-encoder's top score is below a calibrated threshold, return "insufficient evidence" rather than the best of a bad list. This is one of the highest-leverage interventions for trust and is usually skipped.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When the two-stage stack is overkill.</h3>
+
+    <p>Not every system needs this. Skip the rerank when:</p>
+
+    <ul>
+      <li>The corpus is small enough (a few hundred documents) that you can put the whole thing in a long-context prompt &mdash; see the RAG-vs-long-context discussion in <a class="xref" href="/concepts/what-is-rag">what is RAG</a>. The retrieval problem disappears.</li>
+      <li>Queries are simple keyword lookups (filename, ticket number, dictionary entry). BM25 alone is sufficient and faster.</li>
+      <li>You are p99-latency-bound below ~200ms and the cross-encoder will not fit the budget. Compensate with a better first stage &mdash; learned-sparse (SPLADE) or a domain-fine-tuned dense retriever &mdash; rather than serving a degraded rerank.</li>
+    </ul>
+
+    <p>The honest summary: hybrid retrieve + cross-encoder rerank is the default because the failure modes of any single retriever are structural, the fusion step is parameter-free, and the rerank stage attacks the precision problem at the only place precision is actually decidable &mdash; with the query and the candidate visible to the same model at the same time. Build this stack, measure recall@k_first and final answer quality separately (see <a class="xref" href="/concepts/what-is-rag">debug RAG in two halves</a>), and then ask whether anything more elaborate is justified by the gap that remains.</p>
+  </div>
+</section>

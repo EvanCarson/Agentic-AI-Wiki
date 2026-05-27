@@ -1,0 +1,123 @@
+<section class="phase">
+  <div class="phase-num">R5</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Query understanding and transformation: fixing the question before you search.</h2>
+  <p class="goal">Most RAG investigations end at the retriever and never look at the input. But the query is the probe into the index, and a bad probe guarantees a bad retrieval no matter how good the downstream stack is. "Cannot log in" is not literally "authentication failure," "and what about its pricing?" is not a standalone question, and "compare Q3 to Q4 margins" is not one query &mdash; it is two. This entry is about the transformations that happen <em>before</em> hybrid retrieve, and the small number of them worth the latency and the prompt budget.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The query is the bottleneck more often than the retriever.</h3>
+
+    <p>Every retriever &mdash; lexical, dense, hybrid, even <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">two-stage rerank</a> &mdash; assumes the query as posed is the right probe. That assumption breaks in predictable ways:</p>
+
+    <ul>
+      <li><strong>Conversational queries.</strong> "And what about for enterprise?" depends entirely on what was discussed three turns ago. Embedding that string and searching the corpus retrieves chunks about "enterprise" in random contexts.</li>
+      <li><strong>Vocabulary mismatch.</strong> Users describe symptoms; documentation describes mechanisms. "My screen keeps freezing" does not embed close to "GPU driver memory leak in v2.4."</li>
+      <li><strong>Compound questions.</strong> "What changed in v3 compared to v2 and is the migration breaking?" needs evidence from at least three different documents. A single retrieval has to hope one chunk covers all three, which is rare.</li>
+      <li><strong>Under-specified queries.</strong> "What's the policy?" with no qualifier returns the first chunk that says "policy," which is almost never the right one.</li>
+      <li><strong>Specification overload.</strong> A long, multi-clause question with too many constraints embeds to nowhere in particular &mdash; the query vector lands in the middle of a region with no clear nearest neighbor.</li>
+    </ul>
+
+    <p>The diagnostic from <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a> &mdash; "if the answer string is in the corpus but not in the top-50, the retriever is the bug" &mdash; has a sibling: if the answer is in the corpus, the retriever finds it for a hand-written ideal query, but not for the user's actual query, then the bug is in the query. Different fix.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Rewriting: the low-risk default.</h3>
+
+    <p>Query rewriting is a single cheap LLM call that turns the raw query into a standalone, search-optimized version. It resolves pronouns, expands acronyms, drops conversational filler, and adds context from the conversation history. It is the lowest-risk transform on this page and the only one most systems can safely turn on by default.</p>
+
+<pre class="standalone"><span class="c-cm"># conversational query rewrite — resolve references, drop filler</span>
+REWRITE_PROMPT = <span class="c-st">&quot;&quot;&quot;
+Given the conversation so far and the user's latest message,
+write ONE standalone search query that captures what the user is
+actually asking. Resolve pronouns, expand acronyms, keep entity
+names exact. Output the query only, no preamble.
+&quot;&quot;&quot;</span>
+
+<span class="c-kw">def</span> <span class="c-fn">rewrite_for_retrieval</span>(history, latest):
+    msg = <span class="c-fn">format_history</span>(history) + <span class="c-st">&quot;\nLatest: &quot;</span> + latest
+    <span class="c-kw">return</span> small_llm.<span class="c-fn">complete</span>(REWRITE_PROMPT, msg).<span class="c-fn">strip</span>()</pre>
+
+    <p>Use a small, fast model (Haiku-class, Llama-3.1-8B). The output is short and the latency budget for query understanding is tight &mdash; this call has to finish before retrieval can start. Two anti-patterns to avoid: rewriting away entity names because the model thinks they look strange (preserve verbatim spans), and over-expanding (a one-sentence query rewritten into a paragraph confuses the embedding model more than the original).</p>
+
+    <p>For non-conversational, one-shot queries the rewrite is often a no-op &mdash; do not call the LLM if there is no history and the query is already self-contained. A simple length-and-conversation-state check skips the rewrite when it cannot help.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Decomposition: when one question is actually several.</h3>
+
+    <p>Compound and comparison questions are a different problem from rewriting. "Compare Q3 to Q4 margins" cannot be answered by retrieving "compare Q3 to Q4 margins" against the corpus &mdash; the document with the comparison <em>doesn't exist</em>. The Q3 number lives in one document, the Q4 number in another, and the comparison has to be assembled by the generator.</p>
+
+    <p><strong>Query decomposition</strong> splits a compound query into sub-queries, retrieves for each, and concatenates the evidence:</p>
+
+<pre class="standalone"><span class="c-cm"># decompose, retrieve per sub-query, then generate over the union</span>
+<span class="c-kw">def</span> <span class="c-fn">decompose_and_retrieve</span>(query, retriever):
+    sub_queries = <span class="c-fn">llm_decompose</span>(query)   <span class="c-cm"># 1..N standalone questions</span>
+    evidence    = []
+    <span class="c-kw">for</span> sq <span class="c-kw">in</span> sub_queries:
+        evidence.<span class="c-fn">extend</span>(retriever.<span class="c-fn">search</span>(sq, k=<span class="c-st">5</span>))
+    <span class="c-kw">return</span> <span class="c-fn">dedupe</span>(evidence)         <span class="c-cm"># by doc_id, preserve order</span></pre>
+
+    <p>Decomposition is most useful for explicit comparisons ("X vs Y"), multi-entity questions ("the policy for plan A, B, and C"), and questions with implicit sub-steps ("is this migration safe?" &rarr; "what changed in the schema?" + "what code depends on those columns?"). It is wasteful for simple single-fact lookups, so the decomposer should be allowed to return one sub-query unchanged when the input is already atomic.</p>
+
+    <p>The agentic-RAG variant of this idea &mdash; let the agent decide on the fly how many retrievals to issue and what to ask for &mdash; is covered in <a class="xref" href="/deep-dives/retrieval-and-rag/advanced-rag-architectures">advanced RAG architectures</a>. Static decomposition is the cheaper, lower-latency version: one LLM call to split, then a parallel batch of retrievals, no loop.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Multi-query, HyDE, and step-back: paraphrase the probe, not the question.</h3>
+
+    <p>If decomposition handles "this is several questions," <strong>multi-query</strong> handles "this is one question expressed in only one way." The model generates 3&ndash;5 paraphrases of the query, each is searched independently, and the results are fused with RRF (see <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a>). The win is recall: if "cannot log in" misses but "authentication failure" hits, the union finds it. The cost is roughly N&times; the retrieval calls, which usually run in parallel and matter for cost more than latency.</p>
+
+    <p><strong>HyDE</strong> (Hypothetical Document Embeddings, Gao et al., 2022) generates a hypothetical <em>answer</em> to the query &mdash; not paraphrases &mdash; and embeds that hypothetical answer to search with. The intuition: a fake answer is shaped like the real passages in the index, so it is closer to them in embedding space than the bare question is. HyDE reliably helps weak or zero-shot retrievers. It can <em>hurt</em> strong fine-tuned dense retrievers, because the hypothetical document introduces a distribution shift and a chance to confabulate the wrong entities, which then drag retrieval off-target. The honest rule is to A/B it on your retriever and your corpus, not to adopt it as a default. This is the same caution from <a class="xref" href="/deep-dives/retrieval-and-rag/advanced-rag-architectures">advanced RAG architectures</a>, repeated because the failure mode is common.</p>
+
+    <p><strong>Step-back prompting</strong> (Zheng et al., 2023) does the opposite of decomposition: it generalizes the query to a higher-level question (<em>"What's the maximum number of API calls per minute for free tier?"</em> &rarr; <em>"What are the free-tier rate limits?"</em>) and retrieves with that broader form, often in addition to the original. It helps when the user's specific question is over-constrained for the embedding model but the broader topic exists in the corpus.</p>
+
+    <div class="callout warn">
+      <p>The three transforms above all expand recall by issuing more retrievals on more probes. They <em>also</em> raise the rate at which off-topic chunks enter the candidate pool, which then dilute the cross-encoder's view. Always pair query-expansion transforms with a real reranker downstream and a calibrated <em>k_final</em> &mdash; otherwise you trade retrieval recall for generation precision and end up worse off.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Routing: choosing where to search before choosing how.</h3>
+
+    <p>"What is our refund policy?" should go to the support knowledge base. "What was the Q4 revenue?" should go to the financial filings. "What's the syntax for grouping in Postgres?" should go to the Postgres docs index. Sending every query to every index is wasteful (latency, cost) and harmful (off-corpus chunks leak in and pollute the candidate set).</p>
+
+    <p><strong>Query routing</strong> is a classification step that picks one or a small set of indices to search. Two practical implementations:</p>
+
+    <ul>
+      <li><strong>LLM-based router.</strong> A small model gets a list of indices with one-line descriptions and the query, and returns one or more index names. Cheap, flexible, easy to extend &mdash; just add a new index and a new line of description.</li>
+      <li><strong>Embedding-based router.</strong> Each index has a representative embedding (centroid of its documents, or a written summary). The query embedding is matched to the closest index. Very fast, no extra LLM call, but harder to keep calibrated as indices drift.</li>
+    </ul>
+
+    <p>Routing also enables non-vector sources: a query that looks like a structured lookup ("orders from customer X in March") should go to SQL, not to the document index. A query that looks like a date or numeric range belongs to a filter, not a similarity search. The router's job is to recognize what kind of probe the query <em>is</em> and pick the right tool. This shades smoothly into agentic retrieval (see <a class="xref" href="/deep-dives/retrieval-and-rag/advanced-rag-architectures">advanced RAG architectures</a>) &mdash; routing is the static, single-step version of the same idea.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Putting it together: a default query-understanding pipeline.</h3>
+
+    <p>Most systems do not need all six transforms above. A defensible default for a production RAG system, in order:</p>
+
+<pre class="standalone"><span class="c-cm"># before retrieval: a layered, mostly-skippable pipeline</span>
+<span class="c-kw">def</span> <span class="c-fn">prepare_query</span>(query, history):
+    <span class="c-cm"># 1. cheap rewrite if there is conversation context</span>
+    <span class="c-kw">if</span> history:
+        query = <span class="c-fn">rewrite_for_retrieval</span>(history, query)
+
+    <span class="c-cm"># 2. route to the right index/tool</span>
+    index = <span class="c-fn">route</span>(query)               <span class="c-cm"># may return SQL, KB, web, etc.</span>
+
+    <span class="c-cm"># 3. decompose only if the query has multiple sub-questions</span>
+    sub_queries = <span class="c-fn">decompose_if_needed</span>(query)
+
+    <span class="c-kw">return</span> {<span class="c-st">&quot;index&quot;</span>: index, <span class="c-st">&quot;queries&quot;</span>: sub_queries}</pre>
+
+    <p>Multi-query and HyDE are <em>experiments</em>, not steps in this default. Turn them on per-query when recall is the demonstrated failure mode, and turn them off when answer precision degrades. Step-back is a useful escape valve when a query is over-constrained, but it should not be a default either.</p>
+
+    <p>The unifying principle: query understanding is the cheapest place to add intelligence to a RAG system, because everything downstream &mdash; retrievers, rerankers, generators &mdash; is conditional on the query being a sensible probe. Spend a small LLM call here before spending a large one at generation. And measure: any query transform that doesn't move <em>final answer accuracy</em> on a labeled eval set (see <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">evaluating RAG</a>) is overhead, regardless of how clever it looks in isolation.</p>
+  </div>
+</section>

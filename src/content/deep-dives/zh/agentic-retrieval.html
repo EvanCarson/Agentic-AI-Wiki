@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">R6</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>智能体式检索：把搜索做成一个工具，而不是一个前置步骤。</h2>
+  <p class="goal">经典 <a class="xref" href="/zh/concepts/what-is-rag">RAG</a> 是一条流水线：检索一次、增强、生成。智能体式检索把这一切反过来——检索器被暴露为模型可以多次调用的工具，模型自己选择查询，再由控制循环决定何时已收集够。它是 RAG 在智能体内部的自然形态，也是少数但重要的几类问题的正确形态：多跳、对比、探索，以及"我是否已拿到足够证据来作答"。本条目讲何时去用它、如何给它设界，以及为何它的失败模式与固定流水线不同。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>固定流水线为什么会触底。</h3>
+
+    <p>朴素的"先检索再生成"流水线只有一次检索机会。查询进、top-k 切块出、生成器拿到什么就用什么。当问题干净地映射到单段文本时——"退款窗口是多久？"——这是对的形状；对其它一切都是错的形状：</p>
+
+    <ul>
+      <li><strong>迭代精炼。</strong>第一次检索揭示了一个用户不知道该问的术语（"你说的其实是<em>延长版</em>退款窗口，那是另一种"）。以新术语为键的第二次检索找到真正的答案。流水线做不了这件事；它已经向前进入生成了。</li>
+      <li><strong>多跳推理。</strong>"是谁审了那个引发 on-call 警报的迁移？"需要先检索警报，再检索其中提到的迁移，再检索那个迁移的审阅者。每一跳的查询依赖上一跳的结果。静态<a class="xref" href="/zh/deep-dives/retrieval-and-rag/query-understanding-for-rag">分解</a>覆盖的是所有子问题事先可知的简单情形；智能体式检索覆盖的是子问题<em>需要被发现</em>的情形。</li>
+      <li><strong>多源对比。</strong>"文档怎么说 vs 工单怎么说？"需要文档索引与工单索引同时存在，并由 LLM 在结果之上做对比操作。</li>
+      <li><strong>充分性判断。</strong>有时一次检索就返回答案；有时它返回三段互相矛盾的看似合理切块。固定流水线无法说"我需要在作答前再多找一些"。智能体循环可以。</li>
+    </ul>
+
+    <p>对这些情形，限制是结构性的——流水线的一次性检索无法根据它学到的东西自适应。修复办法是把检索器作为工具给模型，让它决定何时停。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>搜索作为工具：基本形态。</h3>
+
+    <p>智能体式检索的最小版本是一个工具、一个循环：</p>
+
+<pre class="standalone"><span class="c-cm"># expose retrieval as a tool the model calls in a ReAct-style loop</span>
+TOOLS = [{
+    <span class="c-st">&quot;name&quot;</span>: <span class="c-st">&quot;search&quot;</span>,
+    <span class="c-st">&quot;description&quot;</span>: <span class="c-st">&quot;Search the company knowledge base. Returns up to 5 passages with source citations. Call multiple times with different queries to gather evidence before answering.&quot;</span>,
+    <span class="c-st">&quot;input_schema&quot;</span>: {<span class="c-st">&quot;query&quot;</span>: <span class="c-st">&quot;string&quot;</span>}
+}]
+
+<span class="c-kw">def</span> <span class="c-fn">agentic_rag</span>(question, max_steps=<span class="c-st">6</span>):
+    msgs = [{<span class="c-st">&quot;role&quot;</span>: <span class="c-st">&quot;user&quot;</span>, <span class="c-st">&quot;content&quot;</span>: question}]
+    <span class="c-kw">for</span> _ <span class="c-kw">in</span> <span class="c-fn">range</span>(max_steps):
+        resp = llm.<span class="c-fn">respond</span>(msgs, tools=TOOLS)
+        <span class="c-kw">if</span> resp.tool_calls:
+            <span class="c-kw">for</span> call <span class="c-kw">in</span> resp.tool_calls:
+                result = retriever.<span class="c-fn">search</span>(call.query, k=<span class="c-st">5</span>)
+                msgs.<span class="c-fn">append</span>(<span class="c-fn">tool_result</span>(call.id, result))
+        <span class="c-kw">else</span>:
+            <span class="c-kw">return</span> resp.text       <span class="c-cm"># model stopped calling tools = it's ready</span>
+    <span class="c-kw">return</span> <span class="c-st">&quot;exceeded retrieval budget&quot;</span></pre>
+
+    <p>这就是整个模式：模型读题，决定用自选的查询调用 <code class="inline">search</code>，读结果，再决定是用精炼查询再次调用 <code class="inline">search</code>，还是直接作答。这与 <a class="xref" href="/zh/deep-dives/architectures-and-patterns/react-pattern">ReAct</a> 是同一个循环，只是指向一个知识库而非通用工具。工具描述非常重要——"用不同查询多次调用"是解锁多步行为的那一句；没有这条提示，多数模型会默认只调一次。</p>
+
+    <p>外壳依然拥有：检索器质量（见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索与重排序</a>）、语料长什么样（见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/document-parsing-for-rag">文档解析</a>）、以及预算。模型拥有：调多少次、用什么查询、按什么顺序，以及何时停。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>不止一个工具。</h3>
+
+    <p>真正的威力在于检索是若干工具之一，而非唯一工具。一个研究型智能体可能拥有：</p>
+
+    <ul>
+      <li><code class="inline">search_docs</code>——内部文档索引。</li>
+      <li><code class="inline">search_tickets</code>——客服工单语料，带日期范围过滤。</li>
+      <li><code class="inline">run_sql</code>——对分析仓库的结构化查询。</li>
+      <li><code class="inline">web_search</code>——问题超出语料时的对外搜索。</li>
+      <li><code class="inline">read_url</code>——抓取模型判定重要的某条结果的全文。</li>
+    </ul>
+
+    <p>模型现在不仅决定<em>查什么</em>，还决定<em>在哪查</em>。这吸收了上一条目中的静态查询<a class="xref" href="/zh/deep-dives/retrieval-and-rag/query-understanding-for-rag">路由</a>——同一思路、运行时决策。代价是工具更多则动作空间更大，延迟更高（要做更多决策）且误路由风险上升（用 SQL 跑了一个本该走文档搜索的查询）。</p>
+
+    <p>一个实用启发式：工具应足够异质，使得正确选择通常从问题本身就显而易见。两个对相似内容、描述重叠的检索器会让模型迷惑并同时拖累两者。如果你有两个相似的文档索引，请把它们融合到一个工具背后、在工具内部路由，而不是在模型提示里。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>停止：困难的部分。</h3>
+
+    <p>智能体式检索的主要失败模式不是搜得太少，而是相反。如果你放任，模型会一直调用搜索，打磨一个已经够好的答案、绕去看支线、强迫性地反复核对。三个停止杠杆，依精细程度递增：</p>
+
+    <ul>
+      <li><strong>硬步数预算。</strong><code class="inline">max_steps</code> 设为 4&ndash;8 可避免病态循环。这个上限是金钱与延迟的保险，不是质量杠杆；若在合法问题上经常触顶，调高它。</li>
+      <li><strong>边际收益递减检查。</strong>若两次连续搜索返回的结果重叠（doc id 上的 Jaccard 高），智能体在原地踏步，多半学不到更多。强制进入作答阶段。这能拦住最常见的病态模式。</li>
+      <li><strong>充分性自检。</strong>每次检索之后给模型一个提示："基于已有证据，你能答这个问题吗？能就停。不能，则下一次搜索要填补哪个具体空缺？"这把"停下"从一种"没有决策"变成了一种主动决策。每步会多花一次小的生成，但通常是质量最高的杠杆。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>"让模型自己决定何时收手"是被包装成功能的失败模式。没有明确停止纪律的模型会把预算烧在没新增信息的确认型搜索上——这与驱动幻觉的同一种"寻求信心"模式同源。至少要把步数预算与一个质量感知的判据合并使用。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>新的失败模式。</h3>
+
+    <p>智能体式检索继承了底层检索器的失败模式（坏索引仍是坏索引），并新增自己的：</p>
+
+    <ul>
+      <li><strong>原地循环。</strong>智能体搜索、拿到结果、不满意、用近乎相同的查询再搜、拿到同样结果。缓解：第 4 步的边际收益递减检查，加上"若同一查询无新增证据，请用显著不同的角度或停止"的明确指令。</li>
+      <li><strong>过早停止。</strong>智能体在第一次看起来合理的检索之后就作答，不去核对其它文档是否有异议。缓解：充分性自检；对高代价问题，作答前强制再做一次不同角度的检索。</li>
+      <li><strong>漂移。</strong>智能体的查询改写把搜索拽离原始问题。到第 4 步它在搜一个边缘相关的东西并以此作答。缓解：每一检索步骤的提示中都把原始问题作为锚点放回去，并把查询记录下来，让漂移在追踪里可见。</li>
+      <li><strong>成本失控。</strong>一次智能体运行可能发出 10&ndash;20 次检索调用；在规模上这主导账单。缓解：紧的 <code class="inline">max_steps</code>，编排回合用更小的模型（"搜还是答"这种判断很少需要前沿模型），以及独立于步数的每会话检索预算。</li>
+      <li><strong>不可信的检索内容。</strong>从索引取回的每个切块都是不可信数据，是潜在的<a class="xref" href="/zh/operations/safety-and-security/prompt-injection">提示注入</a>载体。这一风险比固定 RAG 更糟，因为智能体会读到注入的指令、并替它发起更多工具调用。防御见 <a class="xref" href="/zh/operations/safety-and-security/rag-security">RAG 安全</a>。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>何时去用、何时不去用。</h3>
+
+    <p>这个决策主要看问题形状，而不是语料规模。以下情形采用智能体式检索：</p>
+
+    <ul>
+      <li>问题是多跳或对比型，子查询依赖前一步的结果。</li>
+      <li>每个问题需要把多个异质来源合起来（文档 + SQL + 网络）。</li>
+      <li>"证据不足"是一个有意义的答案，你需要智能体能识别并承认它，而不是总要产出点什么。</li>
+      <li>任务是探索型的——研究、调查、调试——用户无法预先指明需要什么证据。</li>
+    </ul>
+
+    <p>以下情形坚持用固定流水线：</p>
+
+    <ul>
+      <li>问题是单跳、边界清晰的（FAQ、单文档查找）。一条好的<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">两阶段检索器</a>更快、更便宜、更可预期。</li>
+      <li>延迟是主导约束（亚秒响应）。智能体循环至少在每次检索之前多加一次 LLM 调用；预算容不下。</li>
+      <li>可审计性比灵活性更重要——确定性流水线比工具调用循环更易推理与重放。</li>
+      <li>你还没有建好检测智能体式检索失败模式的评测集。一个静默失败且更贵的智能体，比一个可预测地失败的流水线更糟。</li>
+    </ul>
+
+    <p>诚实的小结：智能体式检索不是固定 RAG 的严格升级。它是为另一类问题准备的另一种工具。先用一条能解决多数流量的最简单流水线，识别它服务不了的查询，仅为这些查询加上循环。让它"智能体化"的就是这个控制循环——而这个控制循环正是需要本条目用六步来描述的那一套预算、停止与评估纪律的表面。</p>
+  </div>
+</section>
