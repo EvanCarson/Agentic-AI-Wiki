@@ -25,6 +25,14 @@ production by **Vercel on every push to `main`**. Content sections:
   `src/content/changelog/entries/<YYYY-MM-DD>-<slug>.ts` (each `export default`s
   a `ChangelogEntry`). `src/content/changelog.ts` is a thin aggregator that
   globs the directory at build time. Single page, no per-entry routes.
+- **AI Blog** — one file per post under
+  `src/content/blogs/posts/<YYYY-MM-DD>-<slug>.ts` + bilingual fragments at
+  `src/content/blogs/{en,zh}/<slug>.html` + co-located SVGs under
+  `public/blogs/<slug>/`. Detail layout: `BlogLayout.astro` (chapter-shell +
+  left-rail in-page TOC, `<style is:global>` — see the authoring guide).
+  **Read `src/content/blogs/AUTHORING.md` before drafting a new post** —
+  it captures the diagram conventions, the FAQ JSON-LD parsing rules, the
+  `is:global` requirement, and the typography decisions baked into the layout.
 - About/Home/nav copy lives in `src/i18n/ui.ts` (typed `UIStrings`, full `en`
   and `zh`); routes are thin `src/pages/<r>.astro` + `src/pages/zh/<r>.astro`.
 
