@@ -182,8 +182,23 @@ never translate code, comments, or identifiers.
 
 ## 3. Diagrams (SVG conventions)
 
-Every SVG goes under `public/blogs/<slug>/` (logos under `logos/`). Authoring
-rules — all enforced visually and by review, not by tests:
+Every SVG goes under `public/blogs/<slug>/` (logos under `logos/`). You
+reference them from the fragment with a normal `<img src="/blogs/<slug>/foo.svg" ... />`
+— `BlogLayout` then **inlines them at build time** before `set:html`, so
+the rendered HTML contains the SVG markup directly inside the article.
+The inlining means each SVG inherits the page's CSS custom properties
+(`--ink`, `--paper-2`, `--accent`, etc.) and the document's color
+cascade for `currentColor`. That's why these SVGs can theme-adapt in
+dark mode without any per-file `@media` rules.
+
+Mechanics: `inlineSvgs()` in `BlogLayout.astro` scans the body string,
+finds every `<img src="/blogs/…\.svg" …>` reference, reads the file
+from `public/`, strips the XML declaration, and transfers
+`width`/`height`/`class`/`style` from the `<img>` onto the `<svg>`
+opening tag. Accessibility carries through via the SVG's own
+`<title>+<desc>+role="img"` markup. The `<img>` was never displayed.
+
+Authoring rules — all enforced visually and by review, not by tests:
 
 - **viewBox-based, no fixed pixel sizes.** Architecture diagrams use
   `viewBox="0 0 900 500"`; cross-cutting comparisons use
@@ -192,7 +207,9 @@ rules — all enforced visually and by review, not by tests:
 - **Themeable colors only.** Every fill, stroke, and text color uses a CSS
   variable: `var(--ink)`, `var(--paper)`, `var(--paper-2)`, `var(--accent, #d4421e)`,
   `var(--accent-soft)`, `var(--muted)`, `var(--border-soft)`. **Never** a bare
-  hex literal (except as the fallback inside the `var(...)` call).
+  hex literal (except as the fallback inside the `var(...)` call). Because
+  SVGs are inlined into the page, these vars resolve to the active theme's
+  values — no per-SVG `@media` block is needed.
 - **Color hierarchy.** Solid `var(--accent)` for the hero / main box;
   `var(--accent-soft)` for accent-adjacent secondary boxes; `var(--paper-2)`
   for neutral / muted boxes; `currentColor` for arrows and strokes.
