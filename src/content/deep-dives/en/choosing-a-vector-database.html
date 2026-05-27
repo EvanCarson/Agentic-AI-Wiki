@@ -1,0 +1,126 @@
+<section class="phase">
+  <div class="phase-num">R8</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Choosing a vector database: a constraint-first guide to a noisy market.</h2>
+  <p class="goal">Vector-database shopping is one of the most overdone decisions in modern <a class="xref" href="/concepts/what-is-rag">RAG</a> engineering: dozens of vendors with confusingly similar pitches, benchmarks that mostly measure the wrong thing, and the worst possible default &mdash; picking by brand familiarity and switching twice later. This entry is opinionated. It explains what a vector DB actually is, what the four or five axes that genuinely differ between products are, just enough ANN internals to read a vendor's claims, and a constraint-first selection procedure that fits on one page. The conclusion most teams arrive at after doing this work is "Postgres with `pgvector` is fine" &mdash; and the value of this entry is letting you reach that conclusion deliberately, instead of after migrating off Pinecone twice.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What "a vector database" actually is.</h3>
+
+    <p>Strip the marketing and the minimum definition is three pieces of machinery glued together:</p>
+
+    <ul>
+      <li><strong>Vector storage.</strong> A typed column or table that holds fixed-dimension float arrays, with the metadata you index alongside them (doc id, source, tags, timestamps, tenant id).</li>
+      <li><strong>An approximate-nearest-neighbor (ANN) index.</strong> A data structure built over those vectors that returns the top-k nearest vectors to a query in sub-linear time. Exact nearest-neighbor at scale is too slow; <em>approximate</em> is the price you pay for being able to query millions of vectors in milliseconds.</li>
+      <li><strong>A query engine.</strong> Takes a query vector plus filter conditions plus a <em>k</em>, walks the ANN index, applies filters, and returns ranked results &mdash; ideally also fusing with a sparse (BM25) signal when you ask it to.</li>
+    </ul>
+
+    <p>By this definition, "vector database" includes the obvious dedicated products (Pinecone, Qdrant, Weaviate, Milvus, Chroma, Turbopuffer) <em>and</em> any general-purpose database that bolts on a vector column and an ANN index: Postgres with <code class="inline">pgvector</code>, OpenSearch with <code class="inline">knn_vector</code>, MongoDB Atlas Vector, SQLite with the <code class="inline">vss</code> extension. The first decision is not "which dedicated vector DB" but "do I need a dedicated one at all, or does a vector column on a database I already operate solve this?" For a large fraction of teams, the honest answer is the latter.</p>
+
+    <div class="callout">
+      <p>The diagnostic question, before any vendor evaluation: <em>what am I going to do with the vectors that my existing database cannot do?</em> If the answer is "I don't know yet," start with <code class="inline">pgvector</code> on the Postgres you already run. Migrating off it later is cheap; migrating off a managed dedicated vendor with proprietary APIs and a price floor is not.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The axes that actually differ between products.</h3>
+
+    <p>Most vendor comparison tables score the wrong things ("supports cosine similarity: yes/yes/yes"). The axes that move real production decisions:</p>
+
+    <ul>
+      <li><strong>ANN algorithm and its tuning surface.</strong> HNSW, IVF, IVF-PQ, DiskANN, ScaNN. Each implies a different recall&times;latency&times;memory profile (see Step 3). Vendors that lock the algorithm choice or hide the tuning knobs are making the trade-off for you.</li>
+      <li><strong>Filtering quality.</strong> "Retrieve top-k where <code class="inline">tenant_id = 7 AND lang = 'en' AND created &gt; '2026-01-01'</code>" is the realistic query shape, and it is exactly where naïve ANN implementations break (see Step 4 of <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a> for the related precision/recall question). Whether the vendor supports <em>pre-filtered</em>, <em>post-filtered</em>, or properly <em>filter-aware</em> ANN search dominates production recall.</li>
+      <li><strong>Freshness and update model.</strong> HNSW does not love deletes; some indexes are append-only, some require periodic rebuilds, some claim "real-time" but stall under heavy update load. If your corpus updates frequently &mdash; tickets, docs, code &mdash; freshness is a first-class requirement, not a footnote.</li>
+      <li><strong>Hybrid retrieval support.</strong> Two-stage <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">BM25 + dense + rerank</a> is the production default. Vendors with first-class BM25 in the same query path (OpenSearch, Weaviate, Qdrant, recent <code class="inline">pgvector</code> + Postgres FTS) save you a whole subsystem. Dense-only vendors that require you to operate a separate BM25 store are quietly more expensive.</li>
+      <li><strong>Multi-tenancy story.</strong> Many small tenants vs one big tenant changes everything: namespaces, per-tenant indexes, isolation, noisy-neighbor exposure, per-tenant cost. Some vendors handle this elegantly (Pinecone namespaces, Qdrant collections); others force you to manage shard-per-tenant yourself.</li>
+      <li><strong>Operational model.</strong> Managed cloud only, self-hostable, library-embedded, or "library plus standalone server." Each is a different on-call story. A managed cloud vendor goes down and you wait; a self-hosted cluster goes down and you fix it. Both are fine; they are different organizations.</li>
+      <li><strong>Cost shape.</strong> Per-vector storage, per-query, per-pod-hour, or rolled into a database bill. Pricing is often the deciding factor, but "cheap per vector" with a steep query-cost gradient can be more expensive at production QPS than a flat per-node cost.</li>
+    </ul>
+
+    <p>The trap is comparing vendors on the same axes that demos optimize for &mdash; latency at trivial scale, recall on synthetic benchmarks &mdash; while ignoring the axes that decide whether the system holds together in year two.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>ANN internals: just enough to read a vendor pitch.</h3>
+
+    <p>You do not need to implement HNSW to choose a vector DB. You do need to know what each of the major families <em>buys you</em> and <em>charges you for</em>, because every product pitches an algorithm and the algorithm constrains the trade-offs.</p>
+
+<pre class="trace standalone"><span class="c-out">algorithm   |  recall  |  latency  |  memory  |  build  |  updates
+----------------------------------------------------------------
+HNSW        |  high    |  low      |  HIGH    |  slow   |  poor (deletes)
+IVF (flat)  |  med     |  med      |  med     |  fast   |  good
+IVF-PQ      |  med-low |  low      |  LOW     |  med    |  good
+DiskANN     |  high    |  med      |  low(*)  |  slow   |  good (with care)
+ScaNN       |  high    |  low      |  med     |  med    |  ok
+
+(*) DiskANN keeps the bulk of the index on SSD, with a small RAM
+    working set — the headline trick that makes billion-scale on
+    one box plausible.</span></pre>
+
+    <ul>
+      <li><strong>HNSW</strong> is the default in most dedicated vendors and in <code class="inline">pgvector</code>. Best-in-class recall and latency at moderate scale; pays for it in memory (the whole graph lives in RAM) and unhappy update behavior (deletes leave tombstones that degrade quality over time).</li>
+      <li><strong>IVF</strong> (inverted file) clusters vectors into Voronoi cells and searches only the nearest few cells. Lower memory than HNSW, simpler, friendlier to updates &mdash; but tuning <code class="inline">nlist</code> and <code class="inline">nprobe</code> is more art than science.</li>
+      <li><strong>IVF-PQ</strong> adds product quantization on top of IVF: vectors are compressed 10&ndash;100&times;, memory drops dramatically, recall takes a hit. The right choice when you have hundreds of millions of vectors and cannot afford to hold them all in RAM.</li>
+      <li><strong>DiskANN</strong> is the modern "big vectors, one box" answer: most of the graph on SSD, a small RAM cache, careful prefetching. Billion-scale at low fixed cost. Adopted in some managed vendors (Turbopuffer, Vespa) and worth knowing about before you assume you need a sharded cluster.</li>
+      <li><strong>ScaNN</strong> (Google) and <strong>FAISS</strong> (Meta) are toolkits as much as indexes &mdash; ScaNN ships inside several products, FAISS is the library underneath many of them. Knowing they exist is enough.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>The recall&times;latency curve is not a vendor property; it is an algorithm-and-parameters property. A "fast and accurate" vendor running default HNSW with <code class="inline">ef_search=16</code> will lose to the same algorithm in another product at <code class="inline">ef_search=128</code>. Insist on apples-to-apples benchmark numbers (same algorithm, same recall target) or run your own &mdash; never trust marketing latency charts at face value.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The landscape, by category not by brand.</h3>
+
+    <p>Treat the market as four categories with different operational shapes. Pick the category first; the brand within a category is mostly a taste-and-pricing question.</p>
+
+    <ul>
+      <li><strong>Dedicated cloud (Pinecone, Turbopuffer, Zilliz Cloud).</strong> Pay someone else to operate the index. Zero ops, fastest path to production, opinionated APIs. Trade-offs: vendor lock-in (proprietary client libraries, migration is real work), price-per-vector that grows with the corpus, less control over the algorithm/tuning surface. Right for "I want to ship a feature this quarter and revisit the bill later."</li>
+      <li><strong>Open-source dedicated (Qdrant, Weaviate, Milvus, Chroma, Vespa).</strong> You run the cluster. More tuning surface, no vendor lock-in, the option of self-hosted or managed. Trade-offs: real operational burden (HA, backups, upgrades), tuning required to hit the latencies the cloud vendors hand you. Right when scale or cost or compliance pushes you off the managed-cloud path.</li>
+      <li><strong>General database + vectors (Postgres + <code class="inline">pgvector</code>, OpenSearch + <code class="inline">knn_vector</code>, MongoDB Atlas Vector, SQLite + <code class="inline">vss</code>).</strong> The vector index lives in a database you already operate. Joins, transactions, filters, BM25, and vectors in one query language. Cheaper than dedicated for small-to-medium corpora. Trade-offs: ANN quality and index size limits are bounded by the host DB's choices &mdash; <code class="inline">pgvector</code> with HNSW is excellent up to roughly 10&ndash;50M vectors per node and starts to hurt beyond that. Right for the majority of teams who do not actually have a billion-vector problem.</li>
+      <li><strong>Library + your own server (FAISS, ScaNN, hnswlib).</strong> You build the storage layer. Maximum flexibility, the lowest possible cost at scale, the highest ongoing engineering investment. Right when none of the above fit (custom compression, exotic distance, embedded in another system) and you have engineers who want to own this surface area.</li>
+    </ul>
+
+    <p>Two specific products worth naming because they shift the default. <strong><code class="inline">pgvector</code></strong> has gotten good enough since ~2024 that "just use Postgres" is the right answer for far more teams than the dedicated-vendor market wants to admit. <strong>Turbopuffer</strong> (and DiskANN-class products generally) made billion-scale single-node retrieval cheap enough that the old "you need a sharded cluster at 100M vectors" rule no longer holds. If your last vector-DB evaluation was before 2025, redo it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>A constraint-first selection procedure.</h3>
+
+    <p>The decision should run constraint-first, not vendor-first. Write down your real constraints, then map them to a category. The questions, in roughly this order:</p>
+
+    <ol>
+      <li><strong>How many vectors, at what QPS, with what p99 latency budget?</strong> Under 10M vectors and a few hundred QPS &rarr; <code class="inline">pgvector</code> on your existing Postgres handles it. 10&ndash;100M, growing &rarr; dedicated open-source or managed cloud is worth it. Hundreds of millions and up &rarr; the choice narrows to vendors with serious large-scale credentials (Milvus, Vespa, Turbopuffer, DiskANN-based) and the question shifts to ops.</li>
+      <li><strong>What does filtering look like?</strong> If queries are pure <em>k</em>-NN with no filters, almost any product is fine. If most queries carry tenant-id, language, date-range, or category filters, the vendor's filter implementation matters more than its peak QPS. Test the filtered query shape, not the bare one.</li>
+      <li><strong>How fresh does retrieval need to be?</strong> Minutes-old is fine for most knowledge-base RAG; seconds-old is needed for ticket-search-during-a-call style use cases. Vendors with batch-rebuild models cannot do the latter without engineering effort.</li>
+      <li><strong>Do you need hybrid (BM25 + dense)?</strong> Almost all production RAG does (see <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a>). Picking a dense-only vendor and operating BM25 separately is a real ongoing cost; picking a vendor with first-class BM25 in the same query path (OpenSearch, Weaviate, Qdrant, Postgres FTS + <code class="inline">pgvector</code>) saves a subsystem.</li>
+      <li><strong>What is your multi-tenancy story?</strong> Many small tenants &rarr; vendors with namespace/collection isolation. One giant tenant &rarr; doesn't matter; pick on other axes.</li>
+      <li><strong>What is the operational appetite?</strong> A team that already runs Postgres at scale should not adopt a new database to add a vector column. A team without strong ops capacity should not self-host a distributed dedicated vector DB.</li>
+      <li><strong>What is the cost ceiling?</strong> Estimate cost at 12&ndash;24 months of growth, not today. Dedicated managed vendors are cheap at small scale and expensive at production scale; the curve crosses around 10&ndash;30M vectors for typical pricing.</li>
+    </ol>
+
+    <p>Apply those filters and the answer is usually narrow: most teams end up at <code class="inline">pgvector</code> or OpenSearch (because they already run one of them), Pinecone or Turbopuffer (because the team has no ops headcount), or Qdrant/Milvus/Weaviate (because they need the tuning surface and have engineers who will operate it). The framework values for evaluating any of them are <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">recall@k and latency on your own data</a> &mdash; never the vendor's published benchmark.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Common selection mistakes, in declining order of frequency.</h3>
+
+    <ul>
+      <li><strong>Benchmark shopping.</strong> Picking the vendor with the best number on a public benchmark, run on a corpus and at a recall target that does not match yours. The benchmark numbers reflect one parameter setting on one dataset; your numbers will be different. Run a small evaluation (a few thousand queries) on your real corpus before signing anything.</li>
+      <li><strong>Ignoring the filter story until production.</strong> Demo on bare <em>k</em>-NN, ship with filters, watch recall collapse. Filter behavior is the single most common nasty surprise. Test it first.</li>
+      <li><strong>Optimizing for "billion-vector scale" you don't have.</strong> Most teams have 1&ndash;10M vectors and pick a vendor sized for 1B+. They pay for unused headroom and inherit complexity for nothing. Pick for next year's corpus, not the rocketship.</li>
+      <li><strong>Treating it as a one-way door.</strong> A vector DB is not your durable system of record; it is an index over content that lives elsewhere. As long as you can rebuild from source, migration is annoying but bounded. Picking a vendor where you <em>cannot</em> rebuild (because the source documents weren't preserved, or because the ingestion pipeline only existed inside the vendor) is the real lock-in &mdash; not the API.</li>
+      <li><strong>Switching too early.</strong> The first six months of any RAG system are dominated by retrieval-quality issues that no vendor change fixes. The right vendor at the wrong query, parsing (see <a class="xref" href="/deep-dives/retrieval-and-rag/document-parsing-for-rag">document parsing</a>), or chunking still loses to a worse vendor with the right ones. Fix the upstream before re-platforming the index.</li>
+      <li><strong>Skipping the rebuild drill.</strong> Build the script that recreates the entire vector index from source documents before you have an incident that requires it. Time it. If it takes a week and the index is your customer's search bar, that is a P0 you don't know you have yet.</li>
+    </ul>
+
+    <p>The unifying point: vector DB selection is mostly a constraint problem dressed as a vendor problem. Know your scale, your filter shape, your freshness target, your multi-tenancy story, your hybrid needs, your operational capacity, and your cost ceiling &mdash; in that order &mdash; and the right category usually picks itself. The brand within the category is the part that gets the marketing attention and matters least. Spend the evaluation budget on running your own corpus against two candidates, not on reading more comparison tables.</p>
+  </div>
+</section>

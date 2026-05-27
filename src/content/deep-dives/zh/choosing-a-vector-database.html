@@ -1,0 +1,126 @@
+<section class="phase">
+  <div class="phase-num">R8</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>选向量数据库：在嘈杂市场中以约束为先的指南。</h2>
+  <p class="goal">在现代 <a class="xref" href="/zh/concepts/what-is-rag">RAG</a> 工程中，"选向量库"是被过度操作得最厉害的决策之一：数十家厂商打着令人混淆的相似口号、基准多半在量错的东西，最糟的默认选择——按品牌熟悉度挑、随后再换两次。这一条目带立场。它讲清向量库究竟是什么、产品之间真正不同的那四五个轴是什么、读懂厂商话术所需的最少 ANN 内部知识，以及一份能写在一页纸上的"约束优先"选型流程。多数团队认真走完后得到的结论是"Postgres 加 <code class="inline">pgvector</code> 就够了"——而本条目的价值是让你<em>有意识地</em>得出这个结论，而不是在迁出 Pinecone 两次之后才得到。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>"向量数据库"到底是什么。</h3>
+
+    <p>剥掉营销话术，最小定义就是三件机械胶合在一起：</p>
+
+    <ul>
+      <li><strong>向量存储。</strong>一个保存定维浮点数组的列或表，以及与之同行索引的元数据（文档 id、来源、标签、时间戳、租户 id）。</li>
+      <li><strong>近似最近邻（ANN）索引。</strong>一个建立在这些向量之上的数据结构，能在亚线性时间内返回与查询向量最近的 top-k。规模上做精确最近邻太慢；<em>近似</em>是你为"能毫秒级查询数百万向量"付出的代价。</li>
+      <li><strong>查询引擎。</strong>接受一条查询向量、一组过滤条件和 <em>k</em>，遍历 ANN 索引、应用过滤、返回排序结果——在你要求时还能与稀疏（BM25）信号融合。</li>
+    </ul>
+
+    <p>按此定义，"向量数据库"既包括显而易见的专用产品（Pinecone、Qdrant、Weaviate、Milvus、Chroma、Turbopuffer），<em>也</em>包括任何在通用数据库上加一根向量列与 ANN 索引的方案：Postgres + <code class="inline">pgvector</code>、OpenSearch + <code class="inline">knn_vector</code>、MongoDB Atlas Vector、SQLite + <code class="inline">vss</code>。第一项决定不是"选哪一家专用向量库"，而是"我到底需不需要一家专用向量库——还是在已经运维的数据库上加一根向量列就够？"对相当大比例的团队而言，诚实的答案是后者。</p>
+
+    <div class="callout">
+      <p>在做任何厂商评估之前的诊断问题：<em>我打算用这些向量做的事情，我已有的数据库做不了哪些？</em>如果答案是"我还不知道"，请先在你已经运行的 Postgres 上启用 <code class="inline">pgvector</code>。日后从它迁走代价不大；从一家带专有 API 和价格下限的托管专用厂商迁走则代价不小。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>产品之间真正不同的那些轴。</h3>
+
+    <p>多数厂商对比表都在比错的东西（"支持余弦相似度：是/是/是"）。能真正左右生产决策的轴：</p>
+
+    <ul>
+      <li><strong>ANN 算法及其调参面。</strong>HSNW、IVF、IVF-PQ、DiskANN、ScaNN。每种隐含不同的"召回×延迟×内存"组合（见第 3 步）。把算法选择锁死、或把调参旋钮藏起来的厂商，是在替你做了权衡。</li>
+      <li><strong>过滤质量。</strong>"取 top-k，且 <code class="inline">tenant_id = 7 AND lang = 'en' AND created &gt; '2026-01-01'</code>"才是真实查询形状，而这正是朴素 ANN 实现崩塌的地方（与之相关的精度/召回问题见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索与重排序</a>第 4 步）。厂商支持的是<em>前过滤</em>、<em>后过滤</em>，还是真正的<em>过滤感知</em> ANN 搜索，主导着生产召回。</li>
+      <li><strong>新鲜度与更新模型。</strong>HNSW 不太喜欢删除；有的索引仅追加、有的需要周期性重建、有的号称"实时"但在重更新负载下卡顿。如果你的语料频繁更新——工单、文档、代码——新鲜度是一等需求，不是脚注。</li>
+      <li><strong>混合检索支持。</strong>两阶段 <a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">BM25 + 稠密 + 重排序</a>是生产默认。把 BM25 一等地集成在同一条查询路径里的厂商（OpenSearch、Weaviate、Qdrant、最近的 <code class="inline">pgvector</code> + Postgres FTS）能替你省一整套子系统。仅稠密的厂商让你另起一套 BM25，是一种隐形地更贵。</li>
+      <li><strong>多租户故事。</strong>很多小租户 vs 一个大租户，差别天差地别：命名空间、按租户分索引、隔离、噪声邻居暴露、按租户计费。有的厂商处理得很优雅（Pinecone namespaces、Qdrant collections）；有的则把"按租户分片"留给你自己。</li>
+      <li><strong>运维模型。</strong>仅托管云、可自托管、库内嵌、或"库 + 独立服务器"。每一种都是不同的 on-call 故事。一家托管云厂商挂了你只能等；一个自托管集群挂了你得修。两者都没问题；只是不同的组织能力。</li>
+      <li><strong>成本形状。</strong>按向量存储、按查询、按 pod 小时，或包在某个数据库账单里。定价往往是决定因素，但"按向量便宜"配上陡峭的"按查询涨价"曲线，在生产 QPS 下可能比按节点计费更贵。</li>
+    </ul>
+
+    <p>陷阱是：按演示所优化的同一组轴去比较——小规模延迟、合成基准上的召回——而忽略真正决定系统第二年是否还撑得住的那些轴。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>ANN 内部，刚够读懂厂商话术。</h3>
+
+    <p>你不必自己实现 HNSW 才能选向量库。但你需要知道每个主要家族<em>给你买到了什么</em>、<em>向你收了什么费</em>，因为每个产品都打着某个算法的旗号，而算法把权衡都框死了。</p>
+
+<pre class="trace standalone"><span class="c-out">algorithm   |  recall  |  latency  |  memory  |  build  |  updates
+----------------------------------------------------------------
+HNSW        |  high    |  low      |  HIGH    |  slow   |  poor (deletes)
+IVF (flat)  |  med     |  med      |  med     |  fast   |  good
+IVF-PQ      |  med-low |  low      |  LOW     |  med    |  good
+DiskANN     |  high    |  med      |  low(*)  |  slow   |  good (with care)
+ScaNN       |  high    |  low      |  med     |  med    |  ok
+
+(*) DiskANN keeps the bulk of the index on SSD, with a small RAM
+    working set — the headline trick that makes billion-scale on
+    one box plausible.</span></pre>
+
+    <ul>
+      <li><strong>HNSW</strong>是多数专用厂商与 <code class="inline">pgvector</code> 的默认。在中等规模上召回与延迟都是最好的；代价是内存（整张图常驻 RAM）与糟糕的更新行为（删除留下墓碑，质量随时间退化）。</li>
+      <li><strong>IVF</strong>（倒排文件）把向量聚类到 Voronoi 单元中，只搜最近的几个单元。内存比 HNSW 低、更简单、对更新更友好——但调 <code class="inline">nlist</code> 与 <code class="inline">nprobe</code> 更靠手感而非科学。</li>
+      <li><strong>IVF-PQ</strong>在 IVF 之上加乘积量化：向量被压缩 10&ndash;100&times;，内存大降，召回有损。当你有上亿向量、无法全部放进 RAM 时是对的选择。</li>
+      <li><strong>DiskANN</strong>是"大规模向量、单机搞定"的现代答案：图的大部分在 SSD、一小块 RAM 缓存、谨慎预取。在低固定成本下支撑十亿级。已被一些托管厂商采纳（Turbopuffer、Vespa），值得在你假设"必须分片集群"之前知道它存在。</li>
+      <li><strong>ScaNN</strong>（Google）与 <strong>FAISS</strong>（Meta）既是索引也是工具包——ScaNN 在多个产品中作为内核，FAISS 是许多产品底下的库。知道它们存在就够了。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>"召回×延迟"曲线不是厂商属性，而是"算法+参数"属性。一家"又快又准"的厂商若以默认 HNSW 配 <code class="inline">ef_search=16</code> 运行，会输给另一家产品里同样算法配 <code class="inline">ef_search=128</code> 的版本。坚持要看同算法、同召回目标下的可比基准数字，或者自己跑——绝不要按厂商的延迟图按面值采信。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>市场地图：按品类，而非按品牌。</h3>
+
+    <p>把市场当作四类不同运维形态去看。先选品类，品类内部的品牌大多是口味与价格问题。</p>
+
+    <ul>
+      <li><strong>专用托管云（Pinecone、Turbopuffer、Zilliz Cloud）。</strong>付钱让别人替你运维索引。零运维、最快上生产、API 立场鲜明。代价：厂商锁定（专有客户端库，迁移确是真活儿）、按向量价格随语料规模上升、对算法/调参面控制更少。适合"我这个季度先把功能上线，账单晚点再说"。</li>
+      <li><strong>开源专用（Qdrant、Weaviate、Milvus、Chroma、Vespa）。</strong>你来运行集群。调参面更大、无厂商锁定、可选自托管或托管。代价：实打实的运维负担（高可用、备份、升级），需要调参才能跑到云厂商现成给你的那个延迟。当规模、成本或合规把你逼下托管云路径时合适。</li>
+      <li><strong>通用数据库 + 向量（Postgres + <code class="inline">pgvector</code>、OpenSearch + <code class="inline">knn_vector</code>、MongoDB Atlas Vector、SQLite + <code class="inline">vss</code>）。</strong>向量索引活在你已经运维的数据库里。Join、事务、过滤、BM25 与向量在同一种查询语言下。对中小语料而言比专用更便宜。代价：ANN 质量与索引规模受宿主数据库的设计上限约束——<code class="inline">pgvector</code> 配 HNSW 在大约每节点 10&ndash;50M 向量内表现极好，再往上开始吃力。对多数其实并没有十亿向量问题的团队都合适。</li>
+      <li><strong>库 + 自建服务（FAISS、ScaNN、hnswlib）。</strong>你来搭存储层。最大灵活性、最低的规模化成本、最高的持续工程投入。当以上都不合（定制压缩、特殊距离、嵌入另一系统内部）且你有愿意拥有这块版图的工程师时合适。</li>
+    </ul>
+
+    <p>两个值得点名、足以改写默认值的产品。<strong><code class="inline">pgvector</code></strong>自 2024 年以来变得足够好，使得"直接用 Postgres"对远超专用厂商市场愿意承认的那部分团队都是正确答案。<strong>Turbopuffer</strong>（以及一般而言的 DiskANN 类产品）把"十亿规模单机检索"做到便宜得让"100M 向量就必须分片集群"的老规则不再成立。如果你上一次评估向量库还在 2025 年之前，请重做一次。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>约束优先的选型流程。</h3>
+
+    <p>决策应从约束出发，而非从厂商出发。先写下你真实的约束，再把约束映射到品类。问题大致按以下顺序：</p>
+
+    <ol>
+      <li><strong>有多少向量、什么 QPS、p99 延迟预算多少？</strong>不到 10M 向量、几百 QPS &rarr; 在已有的 Postgres 上用 <code class="inline">pgvector</code> 就够。10&ndash;100M、还在长 &rarr; 专用开源或托管云值得用。数亿以上 &rarr; 范围收窄到有大规模信用的厂商（Milvus、Vespa、Turbopuffer、DiskANN 路线），问题随之转向运维。</li>
+      <li><strong>过滤长什么样？</strong>纯 <em>k</em>-NN、无过滤——几乎任何产品都行。多数查询带租户 id、语言、日期范围或分类过滤——厂商的过滤实现比峰值 QPS 更重要。测带过滤的查询形状，不要测裸 <em>k</em>-NN。</li>
+      <li><strong>检索需要多新？</strong>对多数知识库 RAG，分钟级足够；"通话中工单搜索"这种场景需要秒级。批量重建模型的厂商在没有额外工程投入下做不到后者。</li>
+      <li><strong>你是否需要混合（BM25 + 稠密）？</strong>几乎所有生产 RAG 都需要（见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索与重排序</a>）。选一家仅稠密的厂商再另外运维 BM25，是真实的持续成本；选一家把 BM25 一等地集成进同一条查询路径的厂商（OpenSearch、Weaviate、Qdrant、Postgres FTS + <code class="inline">pgvector</code>）能省一套子系统。</li>
+      <li><strong>多租户怎么走？</strong>很多小租户 &rarr; 带命名空间/集合隔离的厂商。一个巨型租户 &rarr; 不重要；按其它轴挑。</li>
+      <li><strong>运维胃口有多大？</strong>一个已经在大规模运维 Postgres 的团队，不应为了多一根向量列而引入一套新数据库。一个没有强运维的团队，不应自托管一套分布式专用向量库。</li>
+      <li><strong>成本上限是多少？</strong>按 12&ndash;24 个月的增长估算成本，不要按今天。专用托管厂商在小规模便宜、在生产规模昂贵；典型定价下大约在 10&ndash;30M 向量处曲线交叉。</li>
+    </ol>
+
+    <p>套上这些筛子，答案通常很窄：多数团队最后落在 <code class="inline">pgvector</code> 或 OpenSearch（因为已经在跑其中之一）、Pinecone 或 Turbopuffer（因为团队没有运维人头）、或 Qdrant/Milvus/Weaviate（因为需要调参面，且有工程师愿意运维）。评估任何之一时的指标是<a class="xref" href="/zh/deep-dives/retrieval-and-rag/evaluating-rag">在自己数据上的 recall@k 与延迟</a>——绝不是厂商公布的基准。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>常见选型错误，按频率递减。</h3>
+
+    <ul>
+      <li><strong>基准购物。</strong>挑公开基准上数字最好的厂商，但那个基准跑在与你不匹配的语料上、瞄准与你不同的召回目标。基准数字反映的是某一组参数在某一份数据上的表现；你的数字会不一样。签合同之前，在自己真实语料上跑一小份评测（几千条查询）。</li>
+      <li><strong>把过滤故事拖到生产再说。</strong>用裸 <em>k</em>-NN 演示，上线带过滤，眼看召回崩盘。过滤行为是最常见的恶心意外。先测它。</li>
+      <li><strong>为你没有的"十亿向量规模"做优化。</strong>多数团队有 1&ndash;10M 向量，却选了对准 1B+ 规模的厂商。为没用上的余量付钱、白白继承复杂度。按明年的语料挑，不要按火箭飞船挑。</li>
+      <li><strong>把它当作不可逆的门。</strong>向量库不是你的持久记录源；它是建在其它地方的内容之上的一个索引。只要能从源头重建，迁移虽烦但有界。真正的锁定不是 API——是那种<em>无法</em>重建的情形（源文档没保留、或摄取流水线只在厂商内部存在）。</li>
+      <li><strong>切换得太早。</strong>任何 RAG 系统头六个月都被检索质量问题主导，而换厂商修不了这些。正确厂商配错误查询、解析（见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/document-parsing-for-rag">文档解析</a>）或分块，依然输给较差厂商配对的正确组合。先修上游，再换索引平台。</li>
+      <li><strong>跳过重建演练。</strong>在你需要它去应对事故之前，先写出"从源文档完整重建向量索引"的脚本。计时。如果它要花一周、而这个索引就是你客户的搜索框，那就是你还没意识到的一个 P0。</li>
+    </ul>
+
+    <p>贯穿全文的要点：向量库选型主要是一个被装扮成厂商问题的约束问题。把你的规模、过滤形状、新鲜度目标、多租户故事、混合需求、运维能力与成本上限——按这个顺序——弄清楚，对的品类通常自己就跳出来。品类内部的品牌是吸走最多营销注意力、却最不重要的部分。把评估预算花在用自己的语料跑两个候选上，而不是再多读几张对比表。</p>
+  </div>
+</section>
