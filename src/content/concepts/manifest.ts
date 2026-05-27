@@ -76,6 +76,20 @@ export const entries: Entry[] = [
 /** Flat, ordered list of all entries (mirrors field-guide CHAPTERS). */
 export const ENTRIES = entries;
 
+/**
+ * The recommended five-entry "new here?" reading path for newcomers,
+ * shown as a chip-list callout on the Concepts index. Ordered: LLM →
+ * agent → loop → tool-calling → RAG. Kept in the manifest (not the
+ * component) so the slugs sit next to the underlying entries.
+ */
+export const CORE_PATH_SLUGS = [
+  'what-is-an-llm',
+  'what-is-an-agent',
+  'the-agent-loop',
+  'tool-calling-explained',
+  'what-is-rag',
+] as const;
+
 export type FlatEntry = (typeof ENTRIES)[number];
 
 export function entryBySlug(slug: string): Entry | undefined {

@@ -33,8 +33,10 @@ export interface UIStrings {
           parts: string; chapters: string; startReading: string;
           latest: string };
   fg: { metaTitle: string; metaDesc: string };
-  concepts: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
-  deepDives: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
+  concepts: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
+              readingPath: { badge: string; intro: string; escapePrefix: string; escapeLinkLabel: string } };
+  deepDives: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
+               readingPath: { badge: string; prefix: string; linkLabel: string } };
   playbooks: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
   operations: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string };
   blog: {
@@ -112,6 +114,12 @@ export const ui: Record<Locale, UIStrings> = {
       h1: 'Concepts',
       tagline: 'AI & agentic AI explained — plain-language entries for newcomers and intermediates.',
       emptyHtml: 'Concept entries are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
+      readingPath: {
+        badge: 'NEW HERE?',
+        intro: 'New to agentic AI? Read these five concepts in order:',
+        escapePrefix: 'Or follow the full guided path in the',
+        escapeLinkLabel: 'Field Guide →',
+      },
     },
     deepDives: {
       metaTitle: 'Deep-Dives — Agentic AI Wiki',
@@ -119,6 +127,11 @@ export const ui: Record<Locale, UIStrings> = {
       h1: 'Deep-Dives',
       tagline: 'Engineering fundamentals — architectures, memory, RAG, protocols, tools, reasoning, training, multi-agent.',
       emptyHtml: 'Deep-dive essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
+      readingPath: {
+        badge: 'NEW HERE?',
+        prefix: 'These essays assume Concepts fluency — new here?',
+        linkLabel: 'Start with Concepts →',
+      },
     },
     playbooks: {
       metaTitle: 'Playbooks — Agentic AI Wiki',
@@ -219,6 +232,12 @@ export const ui: Record<Locale, UIStrings> = {
       h1: '概念',
       tagline: 'AI 与 Agentic AI 通俗解读 — 面向新手与进阶者的白话词条。',
       emptyHtml: '概念词条即将上线 — 在此之前，先深入阅读 <a href="%FG%" style="color:var(--accent);">实战指南</a>。',
+      readingPath: {
+        badge: '新手入门？',
+        intro: '初次接触智能体 AI？按顺序读完这五个概念：',
+        escapePrefix: '也可以跟着完整引导路径走：',
+        escapeLinkLabel: '实战指南 →',
+      },
     },
     deepDives: {
       metaTitle: '深度剖析 — Agentic AI 维基',
@@ -226,6 +245,11 @@ export const ui: Record<Locale, UIStrings> = {
       h1: '深度剖析',
       tagline: '工程基础 —— 架构、记忆、RAG、协议、工具、推理、训练、多智能体。',
       emptyHtml: '深度剖析文章即将上线 — 在此之前，先深入阅读 <a href="%FG%" style="color:var(--accent);">实战指南</a>。',
+      readingPath: {
+        badge: '新手入门？',
+        prefix: '这些文章默认你已掌握「概念」—— 还是新手？',
+        linkLabel: '先看概念 →',
+      },
     },
     playbooks: {
       metaTitle: '实战手册 — Agentic AI 维基',
