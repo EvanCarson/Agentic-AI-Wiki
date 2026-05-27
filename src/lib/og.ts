@@ -9,6 +9,7 @@ const SLUG: Record<OgSectionKey, string> = {
   deepDives: 'deep-dives',
   playbooks: 'playbooks',
   operations: 'operations',
+  blog: 'blog',
   changelog: 'changelog',
 };
 

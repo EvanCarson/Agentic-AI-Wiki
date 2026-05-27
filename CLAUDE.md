@@ -25,6 +25,14 @@ production by **Vercel on every push to `main`**. Content sections:
   `src/content/changelog/entries/<YYYY-MM-DD>-<slug>.ts` (each `export default`s
   a `ChangelogEntry`). `src/content/changelog.ts` is a thin aggregator that
   globs the directory at build time. Single page, no per-entry routes.
+- **AI Blog** — one file per post under
+  `src/content/blogs/posts/<YYYY-MM-DD>-<slug>.ts` + bilingual fragments at
+  `src/content/blogs/{en,zh}/<slug>.html` + co-located SVGs under
+  `public/blogs/<slug>/`. Detail layout: `BlogLayout.astro` (chapter-shell +
+  left-rail in-page TOC, `<style is:global>` — see the authoring guide).
+  **Read `src/content/blogs/AUTHORING.md` before drafting a new post** —
+  it captures the diagram conventions, the FAQ JSON-LD parsing rules, the
+  `is:global` requirement, and the typography decisions baked into the layout.
 - About/Home/nav copy lives in `src/i18n/ui.ts` (typed `UIStrings`, full `en`
   and `zh`); routes are thin `src/pages/<r>.astro` + `src/pages/zh/<r>.astro`.
 
@@ -74,6 +82,25 @@ require weakening it to little value); the other security headers in
 - `<pre>` code blocks must be **byte-identical** between the en and zh copies
   (translate prose only, never code/comments).
 - Deep-Dive in-page header line: en `Deep Dive · <Group>`, zh `深入解析 · <Group>`.
+
+## Document openers
+
+Every content fragment opens with a **hook lede** — one short paragraph between
+the title and the first `<h2>` that does two jobs in one breath:
+
+1. **Lead with the stakes.** Why a reader who clicks away loses something concrete.
+2. **Name the takeaway.** A skimmer who reads only the first 30 words leaves with
+   a useful idea.
+
+No header label ("TL;DR", "Summary", "Overview", "Intro" — banned). No bullet
+list, no table, no fenced block. No throat-clearing ("In this post we'll…",
+"AI agents are everywhere…" — banned).
+
+Self-test: which sentence in your lede is doing the eye-catching work? If you
+can't point to one, rewrite until you can — and put it first.
+
+Both `en` and `zh` ledes are translated faithfully, not byte-mirrored. The rule
+applies to all new content; existing fragments are not required to retrofit.
 
 ## Verification gates (must pass before any PR/merge)
 

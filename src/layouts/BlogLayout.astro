@@ -1,0 +1,590 @@
+---
+// Detail layout for AI Blog posts.
+//
+// Renders the post header (title, date, author, reading-time, tags) + body + footer
+// (latest posts / more tagged X). Emits BlogPosting JSON-LD always. If the post
+// fragment includes a <section class="faq"> block with <h3> Q + immediately-following
+// <p> A pairs, also emits FAQPage JSON-LD.
+//
+// Structural pattern: chapter-shell + left-rail BlogPostTOC (in-page TOC) +
+// chapter-main content. Mirrors SectionEntryLayout / ChapterLayout; uses the site
+// design-system classes throughout — no inline styles.
+import { readFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import BaseLayout from './BaseLayout.astro';
+import BlogPostTOC from '../components/BlogPostTOC.astro';
+import type { Locale } from '../i18n/index';
+import { localizeHref } from '../i18n/index';
+import { ui } from '../i18n/ui';
+import { POSTS, postBySlug, postsByTag } from '../content/blogs/manifest';
+import { ogImageFor, pagefindFilterFor } from '../lib/og';
+
+const PUBLIC_ROOT = fileURLToPath(new URL('../../public/', import.meta.url));
+
+// Replace every <img src="/blogs/.../foo.svg" ...> in the body with the
+// SVG file's content inlined. This lets the SVG inherit CSS custom
+// properties from the page's :root (so --paper-2, --ink, --accent etc.
+// resolve to the current theme's values) and lets `currentColor` strokes
+// pick up the document's color cascade. Without inlining, SVGs loaded
+// via <img> are isolated documents that cannot see the parent's vars.
+//
+// Width/height/class/style attrs from the original <img> are transferred
+// onto the <svg> opening tag. Other attrs (loading, decoding, alt) don't
+// apply to inline SVG and are dropped — accessibility is preserved by
+// each SVG's own <title>+<desc>+role="img" markup. If a referenced file
+// is missing, the original <img> tag is left untouched.
+function inlineSvgs(html: string): string {
+  return html.replace(
+    /<img\b([^>]*)\/?>/g,
+    (originalTag, attrs) => {
+      const srcMatch = attrs.match(/\bsrc="(\/blogs\/[^"]+\.svg)"/);
+      if (!srcMatch) return originalTag;
+      const src = srcMatch[1];
+
+      const filePath = path.join(PUBLIC_ROOT, src.replace(/^\//, ''));
+      if (!existsSync(filePath)) return originalTag;
+
+      let svg = readFileSync(filePath, 'utf8').replace(/^\s*<\?xml[^>]*\?>\s*/i, '').trim();
+      if (!svg.startsWith('<svg')) return originalTag;
+
+      const transfer: string[] = [];
+      const w = attrs.match(/\bwidth="([^"]+)"/);
+      const h = attrs.match(/\bheight="([^"]+)"/);
+      const cls = attrs.match(/\bclass="([^"]+)"/);
+      const sty = attrs.match(/\bstyle="([^"]+)"/);
+      if (w)   transfer.push(`width="${w[1]}"`);
+      if (h)   transfer.push(`height="${h[1]}"`);
+      if (cls) transfer.push(`class="${cls[1]}"`);
+      if (sty) transfer.push(`style="${sty[1]}"`);
+
+      if (transfer.length === 0) return svg;
+      return svg.replace(/<svg\b/, `<svg ${transfer.join(' ')}`);
+    },
+  );
+}
+
+export interface Props { slug: string; locale?: Locale }
+const { slug, locale = 'en' } = Astro.props;
+const t = ui[locale];
+
+const post = postBySlug(slug);
+if (!post) throw new Error(`Unknown blog post slug: ${slug}`);
+
+const bodies = import.meta.glob('../content/blogs/*/*.html', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
+const otherLocale: Locale = locale === 'en' ? 'zh' : 'en';
+const rawBody =
+  (bodies[`../content/blogs/${locale}/${post.slug}.html`] as string | undefined) ??
+  (bodies[`../content/blogs/${otherLocale}/${post.slug}.html`] as string | undefined) ??
+  '';
+const body = inlineSvgs(rawBody);
+
+const title    = post.title[locale];
+const summary  = post.summary[locale];
+const author   = post.author?.[locale] ?? t.blog.defaultAuthor;
+const ogImg    = post.ogImage ?? ogImageFor('blog', locale);
+const pfFilter = pagefindFilterFor('blog', locale);
+
+// Reading time: explicit override else estimate from word count (Chinese counted by
+// non-whitespace runs; English by whitespace splits).
+function estimateReadingTime(html: string, loc: Locale): number {
+  const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  if (loc === 'zh') {
+    const chars = text.replace(/\s+/g, '').length;
+    return Math.max(1, Math.round(chars / 400));
+  }
+  const words = text ? text.split(/\s+/).length : 0;
+  return Math.max(1, Math.round(words / 225));
+}
+const readingTimeMin = post.readingTimeMin ?? estimateReadingTime(body, locale);
+
+// Footer recommendation lists.
+const primaryTag = post.tags[0];
+const moreInTag = postsByTag(primaryTag).filter(p => p.slug !== post.slug).slice(0, 3);
+const latest    = POSTS.filter(p => p.slug !== post.slug).slice(0, 3);
+
+// JSON-LD BlogPosting.
+const pageUrl = new URL(Astro.url.pathname, Astro.site).toString();
+const ogImageUrl = new URL(ogImg, Astro.site).toString();
+const blogPosting = {
+  '@context': 'https://schema.org',
+  '@type': 'BlogPosting',
+  headline: title,
+  description: summary,
+  datePublished: post.date,
+  dateModified: post.date,
+  author: { '@type': 'Organization', name: author },
+  image: ogImageUrl,
+  mainEntityOfPage: pageUrl,
+  inLanguage: locale === 'zh' ? 'zh-Hans' : 'en',
+  keywords: post.tags.join(', '),
+};
+
+// JSON-LD FAQPage — parse <section class="faq"> for <h3> Q + immediately-following <p> A pairs.
+// Tolerant: silent no-op if the section is absent or malformed.
+//
+// Limitation: the section match is non-greedy and terminates at the first </section> tag,
+// so nested <section> elements inside class="faq" will cause Q/A pairs that appear after
+// the nested section to be silently dropped. Post authors: do not nest <section> inside
+// the FAQ block.
+function extractFaq(html: string): { question: string; answer: string }[] {
+  const section = html.match(/<section[^>]*class="[^"]*\bfaq\b[^"]*"[^>]*>([\s\S]*?)<\/section>/i);
+  if (!section) return [];
+  const inner = section[1];
+  const pairs: { question: string; answer: string }[] = [];
+  const re = /<h3[^>]*>([\s\S]*?)<\/h3>\s*<p[^>]*>([\s\S]*?)<\/p>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(inner)) !== null) {
+    const question = m[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    const answer   = m[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    if (question && answer) pairs.push({ question, answer });
+  }
+  return pairs;
+}
+const faq = extractFaq(body);
+const faqPage = faq.length > 0 ? {
+  '@context': 'https://schema.org',
+  '@type': 'FAQPage',
+  mainEntity: faq.map(({ question, answer }) => ({
+    '@type': 'Question',
+    name: question,
+    acceptedAnswer: { '@type': 'Answer', text: answer },
+  })),
+} : null;
+
+const safeJsonLd = (obj: unknown) =>
+  JSON.stringify(obj).replace(/</g, String.fromCharCode(92) + 'u003c');
+---
+<BaseLayout title={`${title} — ${t.blog.h1}`} description={summary} locale={locale} image={ogImg} pagefindFilter={pfFilter}>
+  <script type="application/ld+json" set:html={safeJsonLd(blogPosting)} is:inline />
+  {faqPage && <script type="application/ld+json" set:html={safeJsonLd(faqPage)} is:inline />}
+
+  <div class="chapter-shell blog-shell">
+    <aside class="chapter-side" data-pagefind-ignore>
+      <BlogPostTOC locale={locale} />
+    </aside>
+
+    <div class="chapter-main">
+      <div class="breadcrumb" data-pagefind-ignore>
+        <a href={localizeHref('/blogs', locale)}>{t.blog.h1}</a> / {title}
+      </div>
+      <nav class="mobile-section-nav" aria-label={t.blog.h1} data-pagefind-ignore>
+        <a href={localizeHref('/blogs', locale)}>{locale === 'zh' ? `浏览全部 AI 博客 →` : `Browse all AI Blog →`}</a>
+      </nav>
+
+      <header class="blog-header">
+        <div class="kicker">{t.blog.h1}</div>
+        <h1>{title}</h1>
+        <p class="blog-header-summary">{summary}</p>
+        <div class="blog-meta">
+          <time datetime={post.date}>{t.blog.postedOn} {post.date}</time>
+          <span aria-hidden="true">·</span>
+          <span>{t.blog.byline} {author}</span>
+          <span aria-hidden="true">·</span>
+          <span>{readingTimeMin} {t.blog.readingTime}</span>
+        </div>
+        <ul class="blog-tags" aria-label={t.blog.taggedWith}>
+          {post.tags.map(tag => (
+            <li><a href={localizeHref(`/blogs/tag/${tag}`, locale)} class="blog-tag" aria-label={`${t.blog.taggedWith}: ${tag}`}>{tag}</a></li>
+          ))}
+        </ul>
+      </header>
+
+      <article class="blog-article" set:html={body} />
+
+      <footer class="blog-footer" data-pagefind-ignore>
+        {moreInTag.length > 0 && (
+          <div class="blog-footer-col">
+            <h2>{t.blog.taggedWith}: {primaryTag}</h2>
+            <ul>
+              {moreInTag.map(p => (
+                <li><a href={localizeHref(`/blogs/${p.slug}`, locale)}>{p.title[locale]}</a></li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {latest.length > 0 && (
+          <div class="blog-footer-col">
+            <h2>{t.blog.latestPosts}</h2>
+            <ul>
+              {latest.map(p => (
+                <li><a href={localizeHref(`/blogs/${p.slug}`, locale)}>{p.title[locale]}</a></li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <p class="blog-footer-back"><a href={localizeHref('/blogs', locale)}>{t.blog.backToBlog}</a></p>
+      </footer>
+    </div>
+  </div>
+</BaseLayout>
+
+<!--
+  Note on `is:global`: this <style> block has to be global because
+  ~2/3 of its rules target elements inside <article class="blog-article"
+  set:html={body}>. Astro's default scoping adds a `data-astro-cid-*`
+  attribute to template-rendered elements; set:html descendants don't
+  receive it, so scoped selectors like `.blog-article > section > h2`
+  never match. The `.blog-*` class prefix gives us namespacing without
+  the scope mechanic.
+-->
+<style is:global>
+  /* ---- Blog post header ------------------------------------------------ */
+  /* Lives inside .chapter-main so no full-bleed hero padding. Uses the site's
+     .kicker / h1 / .lede token system; adds border-bottom + breathing room. */
+  .blog-header {
+    padding: 28px 20px 24px;
+    border-bottom: 1px solid var(--border-soft);
+    margin-bottom: 8px;
+  }
+  /* The .kicker class from guide.css already handles font/color/spacing;
+     no override needed here. */
+  .blog-header h1 {
+    font-family: 'Fraunces', serif;
+    font-weight: 400;
+    font-size: 34px;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    margin: 0 0 14px;
+    color: var(--ink);
+  }
+  /* Subtitle-style summary line — smaller than h1, muted, serif.
+     Intentionally calmer than the hook lede inside the article body
+     (the hook lede will receive .lede styling from guide.css and appears
+     below the meta/tags block). */
+  .blog-header-summary {
+    font-family: 'Fraunces', serif;
+    font-size: 18px;
+    line-height: 1.55;
+    color: var(--muted);
+    font-weight: 300;
+    margin: 4px 0 22px;
+  }
+
+  /* ---- Meta line (date · author · reading time) ----------------------- */
+  .blog-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--muted);
+    margin-bottom: 16px;
+  }
+
+  /* ---- Tag pills -------------------------------------------------------- */
+  .blog-tags {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  /* ---- Blog footer ------------------------------------------------------ */
+  .blog-footer {
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid var(--border-soft);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 28px;
+  }
+  /* Back-link spans full width below the recommendation columns. */
+  .blog-footer-back {
+    grid-column: 1 / -1;
+    margin: 4px 0 0;
+  }
+  .blog-footer h2 {
+    font-family: 'Fraunces', serif;
+    font-size: 18px;
+    font-weight: 400;
+    margin: 0 0 12px;
+    color: var(--ink);
+  }
+  .blog-footer ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    gap: 8px;
+  }
+  .blog-footer ul a {
+    color: var(--ink);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .blog-footer ul a:hover {
+    color: var(--accent-ink);
+  }
+  .blog-footer-back a {
+    color: var(--accent-ink);
+    text-decoration: none;
+    border-bottom: 1px solid currentColor;
+    padding-bottom: 1px;
+  }
+  .blog-footer-back a:hover {
+    opacity: 0.8;
+  }
+
+  /* Mobile: footer collapses to single column automatically via auto-fit. */
+  @media (max-width: 600px) {
+    .blog-header {
+      padding: 20px 16px 18px;
+    }
+    .blog-header h1 {
+      font-size: 26px;
+    }
+  }
+
+  /* ---- Wider shell for blog detail pages ------------------------------ */
+  /* The default .chapter-shell maxes at 1180px (article column ≈ 868px),
+     which is fine for narrow prose but cramps wide content like the
+     "At a glance" 8-column comparison table. Widen specifically for
+     blog detail pages so the article column gets ~1050px. */
+  :global(.blog-shell) {
+    max-width: 1080px;
+  }
+
+  /* ---- Article body content typography ------------------------------- */
+  /* The body fragment uses plain semantic HTML (<section>, <h2>, <h3>,
+     <p>, <table>, <figure>) — no .phase/.step wrapping like Deep-Dives.
+     These rules style raw HTML inside .blog-article so the post reads
+     well without forcing the author into a rigid class vocabulary. */
+  .blog-article {
+    padding: 0 20px;
+  }
+  .blog-article > section {
+    padding: 32px 0 24px;
+  }
+  .blog-article > section + section {
+    border-top: 1px solid var(--border-softer);
+  }
+  /* Top-level section headings get a counter-numbered prefix in italic
+     Fraunces accent ("01 At a glance" / "02 …") — distinct from h3's
+     underline tab and matches the site's existing .phase-num / .step-num
+     vocabulary. Adds wayfinding through a long post without competing
+     with the in-page TOC on the left rail. */
+  .blog-article {
+    counter-reset: blog-section;
+  }
+  .blog-article > section > h2 {
+    counter-increment: blog-section;
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    font-family: 'Fraunces', serif;
+    font-weight: 400;
+    font-size: 28px;
+    line-height: 1.2;
+    letter-spacing: -0.01em;
+    margin: 0 0 24px;
+    color: var(--ink);
+  }
+  .blog-article > section > h2::before {
+    content: counter(blog-section, decimal-leading-zero);
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-weight: 300;
+    font-size: 30px;
+    line-height: 1;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+  /* h3 gets a slightly heavier weight, a tick larger size, and a short
+     accent underline tab so subsections read as distinct landmarks rather
+     than blending into body prose. The underline tab echoes the lede's
+     accent left border without copying it directly — same visual
+     vocabulary (accent + 2/3px stroke), different anchor. */
+  .blog-article h3 {
+    position: relative;
+    font-family: 'Fraunces', serif;
+    font-weight: 600;
+    font-size: 22px;
+    line-height: 1.3;
+    margin: 36px 0 14px;
+    padding-bottom: 10px;
+    color: var(--ink);
+  }
+  .blog-article h3::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 32px;
+    height: 2px;
+    background: var(--accent);
+  }
+  /* FAQ questions are also h3s but the underline tab there reads as
+     decorative clutter inside the dense Q→A rhythm. Suppress it. */
+  .blog-article > section.faq > h3 {
+    padding-bottom: 0;
+  }
+  .blog-article > section.faq > h3::after {
+    display: none;
+  }
+  /* Body paragraphs inherit the site's body font (Inter sans-serif at 17px,
+     line-height 1.65) from the global `body` rule in guide.css — matches the
+     register used by Deep-Dives / Concepts / Playbooks / Operations. */
+  .blog-article p {
+    margin: 0 0 16px;
+    color: var(--ink);
+  }
+  /* Hook lede — sits inside the body at the very top of the article.
+     Same Fraunces italic emphasis the rest of the site uses for ledes
+     (see .hero .lede in guide.css), with an accent left border to mark it
+     as the post's opener. */
+  .blog-article p.lede {
+    font-family: 'Fraunces', serif;
+    font-size: 19px;
+    line-height: 1.55;
+    font-style: italic;
+    color: var(--ink);
+    margin: 8px 0 28px;
+    padding-left: 18px;
+    border-left: 3px solid var(--accent);
+  }
+  /* ---- Pull-quote / blockquote ---------------------------------------- */
+  .blog-article blockquote {
+    margin: 24px 0;
+    padding: 4px 0 4px 22px;
+    border-left: 3px solid var(--accent);
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 19px;
+    line-height: 1.5;
+    color: var(--ink);
+  }
+  .blog-article blockquote p {
+    margin: 0;
+    font-size: inherit;
+    font-family: inherit;
+    font-style: inherit;
+    line-height: inherit;
+  }
+
+  .blog-article ul,
+  .blog-article ol {
+    margin: 0 0 20px;
+    padding-left: 24px;
+  }
+  .blog-article li {
+    margin-bottom: 8px;
+    line-height: 1.65;
+  }
+  /* Nested lists indent further but lose the extra bottom margin
+     so they sit closer to their parent item. */
+  .blog-article li > ul,
+  .blog-article li > ol {
+    margin: 6px 0 0;
+  }
+  .blog-article code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.9em;
+    background: var(--paper-2);
+    color: var(--ink);
+    padding: 1px 6px;
+    border-radius: 3px;
+  }
+  .blog-article a {
+    color: var(--accent-ink);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    text-decoration-thickness: 1px;
+  }
+  .blog-article a:hover {
+    color: var(--ink);
+  }
+  .blog-article figure {
+    /* 32px above + below so figures clearly separate from surrounding prose.
+       The figure itself is transparent — SVGs are inlined by BlogLayout
+       at build time so they inherit the page's CSS variables and theme
+       correctly through the cascade. */
+    margin: 32px 0;
+    text-align: center;
+  }
+  .blog-article figure img,
+  .blog-article figure svg {
+    max-width: 100%;
+    height: auto;
+  }
+  .blog-article figcaption {
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--muted);
+    margin-top: 12px;
+    font-style: italic;
+  }
+  /* When a figure immediately follows an h2/h3, tighten the top margin
+     so the heading and its figure read as one unit (matches the Deep-Dive
+     pattern where the diagram is owned by the section, not floating). */
+  .blog-article h2 + figure,
+  .blog-article h3 + figure {
+    margin-top: 8px;
+  }
+
+  /* ---- Tables (notably the "At a glance" 8-column comparison) -------- */
+  /* display:block + overflow-x:auto makes the table its own horizontal
+     scroll container when it would otherwise crush column content into
+     1-word-per-line wrap. On wide viewports the table breaks out of the
+     article column slightly to gain extra horizontal room. */
+  .blog-article table {
+    display: block;
+    overflow-x: auto;
+    width: 100%;
+    border-collapse: collapse;
+    margin: 18px 0 24px;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .blog-article thead {
+    background: var(--paper-2);
+  }
+  .blog-article th {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 2px solid var(--ink);
+    color: var(--ink);
+    vertical-align: bottom;
+    white-space: nowrap;
+  }
+  .blog-article td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-softer);
+    vertical-align: top;
+    color: var(--ink);
+    min-width: 120px;
+  }
+  .blog-article tbody tr:hover {
+    background: var(--paper-2);
+  }
+  /* On wide viewports let the comparison table break out beyond the
+     article column so 8 columns aren't crushed into narrow wraps.
+     The chapter-main has flex:1 so there is room to the right. */
+  @media (min-width: 1000px) {
+    .blog-article table {
+      margin-left: 0;
+      margin-right: -140px;
+      width: calc(100% + 140px);
+    }
+  }
+
+  /* ---- Strong typography hierarchy in body ---------------------------- */
+  .blog-article strong {
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .blog-article em {
+    font-style: italic;
+  }
+</style>
