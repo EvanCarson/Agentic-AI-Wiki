@@ -1,1 +1,267 @@
-<p class="lede">STUB — replaced in Task 7.</p>
+<p class="lede">"Make the failing test pass." Hand that prompt to four coding agents pointed at the same repo, as of late May 2026, and you get four different theories of what should happen next: Claude Code spins up a task-list plan, Codex CLI starts a sandboxed run, Cursor drafts a multi-file diff and waits for your review, Aider goes architect→editor→one commit. The feature lists barely diverge. The traces look like four different species — because the architecture is the product, not the tool catalog.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four agents, four answers to the same question: where does the trust boundary sit, and who decides the next step? The table below sets the basics; the matrix that follows shows where each one leans hardest across the axes that actually differ.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Project</th>
+        <th>Released</th>
+        <th>Primary niche</th>
+        <th>Deployment shape</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/logos/claude-code.svg" width="24" height="24" alt="Claude Code logo" style="vertical-align:middle;margin-right:8px;" />Claude Code</td>
+        <td>2025</td>
+        <td>Terminal harness with a typed tool catalog</td>
+        <td>CLI on your machine, OS-sandboxed</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/logos/codex-cli.svg" width="24" height="24" alt="Codex CLI logo" style="vertical-align:middle;margin-right:8px;" />Codex CLI</td>
+        <td>2025</td>
+        <td>Sandboxed, shell-first coding agent</td>
+        <td>CLI, workspace-scoped sandbox on by default</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/logos/cursor.svg" width="24" height="24" alt="Cursor logo" style="vertical-align:middle;margin-right:8px;" />Cursor Agent</td>
+        <td>2023 (Agent mode later)</td>
+        <td>IDE-mediated agent with reviewable diffs</td>
+        <td>Editor app; agents run local / worktree / SSH / cloud</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/logos/aider.svg" width="24" height="24" alt="Aider logo" style="vertical-align:middle;margin-right:8px;" />Aider</td>
+        <td>2023</td>
+        <td>Git-first pair-programmer in the terminal</td>
+        <td>CLI in a local git repo; no sandbox</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">Snapshot: 2026-05-28. Behavior observed the preceding week; verify in your own environment.</p>
+
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/data-feature-matrix.svg" alt="Feature comparison matrix: four agents across six axes — sandbox model, planning loop, MCP support, multi-file edits, IDE-native, commit policy — colored by strength" width="900" height="500" loading="lazy" />
+    <figcaption>Where each agent leans hardest. The differences cluster on four axes, not on the feature checklist.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Claude Code — deep dive</h2>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/arch-claude-code.svg" alt="Claude Code architecture: a terminal harness drives a typed tool catalog (Read, Edit, Bash, Glob, Grep) plus deferred tools, skills, and MCP servers, all running under an OS sandbox with permission modes, against a persisted task list" width="900" height="500" loading="lazy" />
+    <figcaption>Claude Code wraps a typed tool catalog and a persisted task list inside an OS sandbox with permission modes.</figcaption>
+  </figure>
+
+  <h3>The harness model</h3>
+  <p>Claude Code is a terminal harness, not an IDE plugin or a hosted service. The model drives a fixed, typed tool catalog — <code>Read</code>, <code>Edit</code>, <code>Bash</code>, <code>Glob</code>, <code>Grep</code> — where each tool has a declared schema instead of being a free-text shell string. That typing is deliberate: a structured <code>Edit</code> that names a file and an exact old/new string is checkable and reversible in a way that <code>sed -i</code> piped through a shell is not. The harness still has a shell (the <code>Bash</code> tool), but the shell is one tool among several rather than the whole interface, which is the architectural choice that distinguishes it from Codex CLI.</p>
+  <p>The trust boundary is the operating system. Claude Code runs your machine inside an OS sandbox — bubblewrap on Linux, seatbelt on macOS — gated by permission modes that scale from cautious to autonomous: <code>default</code> prompts on writes and commands, <code>acceptEdits</code> lets file edits through but still asks before commands, <code>plan</code> forbids mutation entirely, <code>dontAsk</code> stops the prompts, and <code>bypassPermissions</code> removes the sandbox guardrails outright. You choose how much rope per session rather than accepting one fixed posture.</p>
+
+  <h3>Deferred tools, skills, and MCP</h3>
+  <p>The catalog is small on purpose, but it is not the ceiling. Beyond the core tools, Claude Code exposes <em>deferred</em> tools — capabilities whose full schemas are fetched on demand via a search step rather than loaded into context up front — plus reusable Skills and a full <a href="/deep-dives/protocols-and-interop/mcp-architecture">MCP</a> client for third-party servers. That structure is a direct application of <a href="/deep-dives/tool-capability-design/tool-design-principles">sound tool-design principles</a>: a typed, minimal default surface keeps the model's choices legible, while deferral keeps a large catalog from drowning the context window. Typed schemas also make <a href="/deep-dives/architectures-and-patterns/tool-error-recovery">tool-error recovery</a> tractable — a malformed call fails against a schema with a specific message the model can act on, rather than returning an opaque shell error.</p>
+  <p>Models are Anthropic-first. You can point Claude Code at a local or third-party model, but only through a LiteLLM-style proxy — it is possible, not first-class — which matters if model portability is a hard requirement for your team.</p>
+
+  <h3>The task-list loop</h3>
+  <p>The loop's defining feature is an explicit, persisted task list. Faced with a multi-step job, Claude Code writes out the steps as durable state, marks them in progress and done as it works, and reads that list back as the source of truth for what to do next. This is the classic <a href="/concepts/the-agent-loop">agent loop</a> with its plan externalized: instead of holding the plan implicitly in a chain of <a href="/deep-dives/architectures-and-patterns/react-pattern">ReAct-style</a> reasoning turns, the harness commits it to a structure that survives a long run and stays auditable. The payoff shows on large jobs where an implicit plan would drift; the cost is ceremony on a one-line fix. Nothing commits to git unless you ask — the task list is the work record, not the version history.</p>
+</section>
+
+<section>
+  <h2>Codex CLI — deep dive</h2>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/arch-codex-cli.svg" alt="Codex CLI architecture: a shell-first agent runs inside a workspace-scoped OS sandbox that is on by default, gated by three approval modes, editing the working directory and producing a PR as output" width="900" height="500" loading="lazy" />
+    <figcaption>Codex CLI runs shell-first inside a workspace sandbox, gated by three approval modes, oriented toward a PR.</figcaption>
+  </figure>
+
+  <h3>The workspace sandbox and approval modes</h3>
+  <p>Codex CLI's trust boundary is a workspace-scoped OS sandbox that is on by default — the agent can read, edit, and run inside the working directory, but stepping outside it or reaching the network requires explicit consent. Three approval modes set the posture. <em>Auto</em>, the default, allows read/edit/run inside the workspace and asks before anything outside it or networked. <em>Read-only</em> is consultative: the agent plans and proposes but does not mutate, which is the mode you use to interrogate a codebase before letting it touch anything. <em>Full Access</em> drops the prompts entirely, including network, for trusted batch runs. The escalation is the safety story — the sandbox is the floor, and you raise the ceiling deliberately.</p>
+
+  <h3>Shell-first tool surface</h3>
+  <p>Where Claude Code leads with typed tools, Codex CLI leads with the shell. The agent's primary surface is running commands, and file edits, builds, and tests all flow through that single channel. The advantage is zero impedance with the existing developer toolchain — anything you would type at a prompt, the agent can run — and the constraint is that <a href="/deep-dives/architectures-and-patterns/tool-error-recovery">error recovery</a> leans on parsing command output rather than reading a typed failure. Codex CLI also speaks MCP, with the standing rule that destructive tools always require approval no matter the mode, and it benefits from <a href="/deep-dives/protocols-and-interop/structured-tool-io">structured tool I/O</a> where a server provides it. Local models are a first-class option here: set <code>model_provider</code> to <code>"oss"</code> and run against Ollama.</p>
+
+  <h3>PR-as-output</h3>
+  <p>Codex CLI edits the working directory and is oriented toward producing a pull request. The natural end state of a run is a reviewable branch of changes rather than a chat transcript — the agent does the work in the sandbox, and the deliverable is the diff you ship. That orientation pairs with the approval modes: you let it run in Auto, then review the resulting PR the way you would a colleague's, which keeps a human gate at the point where the work leaves the sandbox.</p>
+</section>
+
+<section>
+  <h2>Cursor Agent — deep dive</h2>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/arch-cursor-agent.svg" alt="Cursor Agent architecture: the IDE mediates the filesystem; the agent plans, stages edits as reviewable diffs with accept-per-file before writing, and an Agents Window runs multiple agents across local, worktree, SSH, and cloud targets" width="900" height="500" loading="lazy" />
+    <figcaption>Cursor mediates every write through the IDE: the agent stages diffs you accept per file before they hit disk.</figcaption>
+  </figure>
+
+  <h3>IDE-mediated FS and accept-per-file</h3>
+  <p>Cursor's trust boundary is the editor itself. In Agent mode the model does not write to disk directly; its edits stage as reviewable diffs that you accept file by file before they are committed to the filesystem. The IDE is the sandbox — not an OS-level jail like Codex CLI's, but a human-in-the-loop gate that makes "the agent edited fourteen files" a reviewable event rather than a fait accompli. For developers who want to keep their hand on the wheel, the diff queue is the whole point.</p>
+
+  <h3>The plan-then-diff loop</h3>
+  <p>Agent mode <em>acts</em> — it plans a change, edits across many files, and runs commands — which is what separates it from plain chat, which only answers. The loop is a textbook <a href="/deep-dives/architectures-and-patterns/plan-and-execute">plan-and-execute</a> shape: the agent forms a plan, materializes it as a concrete multi-file diff, and then hands that diff back for human acceptance before it lands. The plan is real work, but the diff is the artifact, and the accept step is where your judgment enters the loop. Cursor supports MCP, exposing roughly the first 40 tools to a given agent, and runs local models via an OpenAI-compatible base URL such as Ollama.</p>
+
+  <h3>Multi-file edits and the Agents Window</h3>
+  <p>Cursor 3 (April 2026) reframed the editor as an "agent execution runtime." The Agents Window runs multiple agents in parallel across distinct targets — your local checkout, separate git worktrees, an SSH host, or the cloud — so one agent refactors in a worktree while another investigates on a remote box, each producing its own reviewable diff stream. The IDE stops being where one human types and becomes the console where several agents work concurrently and report back through the same accept-per-file gate.</p>
+</section>
+
+<section>
+  <h2>Aider — deep dive</h2>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/arch-aider.svg" alt="Aider architecture: a terminal REPL in a local git repo uses a repo-map and an architect/editor model pair; the editor emits SEARCH/REPLACE edit-blocks, and each successful edit auto-commits to git with a generated message" width="900" height="500" loading="lazy" />
+    <figcaption>Aider uses git as its protocol: an architect plans, an editor emits edit-blocks, and each success auto-commits.</figcaption>
+  </figure>
+
+  <h3>Git as the protocol (auto-commit per edit)</h3>
+  <p>Aider has no sandbox. It runs directly in your local git repository, and git history <em>is</em> the safety net — every successful edit is auto-committed as its own granular commit with a generated message. There is no diff queue and no permission prompt; if a change is wrong, you reach for <code>git revert</code> or <code>git reset</code> rather than an accept/reject gate. The trust model is "the repo is checkpointed after every step, so undo is always one git command away." That makes Aider exceptionally fast to iterate with and exceptionally dependent on you working in a clean git tree.</p>
+
+  <h3>The architect/editor pair</h3>
+  <p>Aider's loop splits reasoning from editing across two models. An <em>architect</em> model reasons about the change and describes what to do; a cheaper, faster <em>editor</em> model turns that description into concrete diffs. The two-pass design measurably cuts multi-file edit errors — the strong model is not also burdened with emitting byte-exact patch syntax, and the cheap model is not asked to reason about architecture. You can run both roles on any LLM, including fully local models via Ollama or LM Studio, which makes Aider the most model-portable agent in this lineup.</p>
+
+  <h3>Edit-blocks and the repo-map</h3>
+  <p>Aider's surface is not a tool catalog. It builds a <em>repo-map</em> — a compact summary of the repository's structure and key symbols — to give the model orientation without loading every file, and the editor model emits changes in a SEARCH/REPLACE edit-block format that Aider applies directly to disk. This is why MCP is not native to Aider: its world model is repo-map plus diffs, not a tool-catalog host. You can wire external capability around it, but Aider itself is not an MCP client the way the other three are, and that is an honest architectural difference rather than a missing feature.</p>
+</section>
+
+<section>
+  <h2>Cross-cutting comparison</h2>
+
+  <h3>Sandbox &amp; filesystem trust</h3>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/compare-sandbox.svg" alt="Four-column comparison of the filesystem trust boundary: Claude Code's OS sandbox with permission modes, Codex CLI's default-on workspace sandbox, Cursor's IDE-mediated diff gate, Aider's no-sandbox git-undo net" width="900" height="300" loading="lazy" />
+    <figcaption>Four places to draw the trust boundary, from kernel sandbox to git-undo.</figcaption>
+  </figure>
+  <p>The four sit at four distinct points on the trust spectrum. Claude Code and Codex CLI both put the boundary at the operating system — Claude Code with a sandbox plus tiered permission modes you dial per session, Codex CLI with a workspace-scoped sandbox that is on by default and escalated through three approval modes. Cursor moves the boundary up into the application layer: the IDE mediates every write as a per-file diff you accept, so the gate is human review rather than a kernel jail. Aider removes the boundary entirely and substitutes git — no sandbox, no prompt, just an auto-commit after each step so undo is always a revert away. The practical reading: Codex CLI is safest by default for untrusted runs, Cursor is safest for "I want to see every change," Claude Code is the most tunable, and Aider trades isolation for raw speed in a repo you trust.</p>
+
+  <h3>Planning loop shape</h3>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/compare-plan-loop.svg" alt="Four-column comparison of planning loops: Claude Code's persisted task list, Codex CLI's sandboxed run toward a PR, Cursor's plan-then-diff with human accept, Aider's architect-to-editor two-pass" width="900" height="300" loading="lazy" />
+    <figcaption>Same job, four loop shapes — externalized list, sandboxed run, review gate, model pair.</figcaption>
+  </figure>
+  <p>Each agent externalizes a different part of the loop. Claude Code externalizes the <em>plan</em>: a persisted task list it reads back as the source of truth, which keeps long jobs coherent at the cost of ceremony on short ones. Codex CLI externalizes the <em>run</em>: it works autonomously inside the sandbox toward a PR, so the loop is "execute, then review the branch" rather than "plan, then approve steps." Cursor externalizes the <em>review</em>: the plan-then-diff shape makes the human acceptance of a concrete multi-file diff a first-class loop step. Aider externalizes the <em>roles</em>: the architect/editor split puts reasoning and patch-emission in separate models, a two-pass that cuts multi-file errors. None of these is merely a <a href="/deep-dives/architectures-and-patterns/react-pattern">ReAct</a> variant with cosmetic differences — the place each one chooses to make state explicit is the place it expects the hard problems to live.</p>
+
+  <h3>Tool catalog vs the shell</h3>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/compare-tools-vs-shell.svg" alt="Four-column comparison of tool surfaces: Claude Code's typed catalog plus MCP, Codex CLI's shell-first surface plus MCP, Cursor's IDE-wrapped tools plus MCP, Aider's repo-map plus edit-blocks with no native MCP" width="900" height="300" loading="lazy" />
+    <figcaption>Typed catalog, shell, IDE-wrapped, or repo-map plus diffs — four ways to give the model hands.</figcaption>
+  </figure>
+  <p>The tool surface is where "capability" and "architecture" come apart most clearly. Claude Code leads with a typed catalog — structured <code>Read</code>/<code>Edit</code>/<code>Grep</code> plus deferred tools, Skills, and full MCP — so the model's actions are schema-checked. Codex CLI leads with the shell: one command channel for everything, plus MCP, trading typed safety for toolchain reach. Cursor wraps tools in the IDE and exposes MCP up to roughly the first 40 tools per agent, mediating through the editor. Aider declines a tool catalog altogether — its surface is the repo-map plus SEARCH/REPLACE edit-blocks, and MCP is not native because its world model is diffs, not a tool host. All four can edit a repo competently, which is exactly the point: the catalog is not the capability. For teams standardizing on shared <a href="/deep-dives/protocols-and-interop/mcp-architecture">MCP servers</a> and <a href="/deep-dives/protocols-and-interop/building-interoperable-agents">interoperable agents</a>, three of the four are MCP hosts and Aider is the odd one out, and each handles the resulting <a href="/deep-dives/memory-and-context/context-budgeting">context budget</a> differently — deferred tools, shell output, a 40-tool cap, or a compact repo-map.</p>
+
+  <h3>Commit &amp; output policy</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Agent</th>
+        <th>What lands</th>
+        <th>When</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Claude Code</td>
+        <td>Commits / PRs only on request</td>
+        <td>When you ask — never automatically</td>
+      </tr>
+      <tr>
+        <td>Codex CLI</td>
+        <td>Working-dir edits, oriented toward a PR</td>
+        <td>After a sandboxed run, for review</td>
+      </tr>
+      <tr>
+        <td>Cursor Agent</td>
+        <td>Per-file diffs to the working tree</td>
+        <td>On your accept, file by file</td>
+      </tr>
+      <tr>
+        <td>Aider</td>
+        <td>One git commit per successful edit</td>
+        <td>Automatically, immediately</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Use case</th>
+        <th>Pick Claude Code if…</th>
+        <th>Pick Codex CLI if…</th>
+        <th>Pick Cursor if…</th>
+        <th>Pick Aider if…</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Greenfield feature, many steps</td>
+        <td>You want a persisted task-list plan that keeps a long multi-step build coherent and auditable.</td>
+        <td>You want it to run autonomously in a sandbox and hand you a reviewable PR.</td>
+        <td>You want to watch the plan materialize as diffs and accept changes file by file.</td>
+        <td>You want fast iteration with each step auto-committed, so undo is one git command away.</td>
+      </tr>
+      <tr>
+        <td>Large monorepo</td>
+        <td>You want typed Read/Grep/Glob plus deferred tools to navigate breadth without flooding context.</td>
+        <td>You want shell-native search and builds against the existing toolchain inside a sandbox.</td>
+        <td>You want IDE indexing and parallel agents across worktrees via the Agents Window.</td>
+        <td>You accept that a repo-map gives orientation but very large trees stress it more than the others.</td>
+      </tr>
+      <tr>
+        <td>Fully local / offline</td>
+        <td>You can stand up a LiteLLM-style proxy — local models are possible but not first-class.</td>
+        <td>You want local models first-class via <code>model_provider="oss"</code> and Ollama.</td>
+        <td>You point it at a local model through an OpenAI-compatible base URL such as Ollama.</td>
+        <td>You want the most model-portable option — any LLM, including local via Ollama or LM Studio.</td>
+      </tr>
+      <tr>
+        <td>Heavy review discipline / regulated</td>
+        <td>You want tiered permission modes and a plan mode that forbids mutation while you investigate.</td>
+        <td>You want a default-on sandbox where destructive and networked actions always prompt.</td>
+        <td>You want every write to pass a human accept-per-file gate before it touches disk.</td>
+        <td>Less ideal — auto-commit lands changes without a review gate, though git history records each one.</td>
+      </tr>
+      <tr>
+        <td>Quick one-file fix</td>
+        <td>Workable, but the task-list ceremony is overhead for a trivial change.</td>
+        <td>Workable, though spinning up the sandboxed run is heavier than the task warrants.</td>
+        <td>Great — edit, see the single diff, accept, done.</td>
+        <td>Great — describe the fix, get one commit, move on.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>What's the actual difference between Claude Code and Codex CLI?</h3>
+  <p>Both are terminal coding agents that edit your repo under an OS sandbox, but they make opposite tool-surface bets: Claude Code leads with a small typed tool catalog (Read/Edit/Bash/Glob/Grep) plus deferred tools, Skills, and MCP, and externalizes its plan as a persisted task list, while Codex CLI leads with the shell, escalates through three approval modes, and orients toward producing a PR. Claude Code is Anthropic-model-first; Codex CLI treats local models as first-class via Ollama.</p>
+
+  <h3>Does Cursor's Agent mode replace its chat?</h3>
+  <p>No — they do different jobs. Chat answers questions; Agent mode acts, planning a change, editing across many files, and running commands, then staging the result as diffs you accept per file. You use chat to understand code and Agent mode to change it.</p>
+
+  <h3>Can Aider use MCP servers?</h3>
+  <p>Not natively. Aider's world model is a repo-map plus SEARCH/REPLACE edit-blocks rather than a tool-catalog host, so it is not an MCP client the way Claude Code, Codex CLI, and Cursor are. You can wire external capability around it, but MCP is not a built-in feature.</p>
+
+  <h3>Which coding agent is best for a large monorepo?</h3>
+  <p>It depends on how you want to navigate breadth: Claude Code's typed Grep/Glob plus deferred tools and Cursor's IDE indexing with parallel worktree agents both handle large trees well, and Codex CLI leans on shell-native search inside its sandbox. Aider's repo-map gives orientation but is the most stressed by very large repositories, so it is the weakest fit at extreme scale.</p>
+
+  <h3>Do these agents send my code to the cloud?</h3>
+  <p>By default yes — all four call a hosted model API, so prompts and the code context they include leave your machine unless you configure a local model. The sandbox and IDE boundaries control what the agent can do to your filesystem, not whether the model itself runs in the cloud. Running fully local (see the next question) is how you keep code on-device.</p>
+
+  <h3>Can I run any of these against a local model?</h3>
+  <p>Yes, with different effort. Codex CLI (<code>model_provider="oss"</code> + Ollama), Aider (any LLM, including local via Ollama or LM Studio), and Cursor (an OpenAI-compatible base URL such as Ollama) all support local models directly. Claude Code can too, but only through a LiteLLM-style proxy — possible rather than first-class.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/what-is-an-agent">What Is an Agent?</a> — the perceive-decide-act definition that all four of these tools instantiate, and the baseline for telling an agent apart from a fancy autocomplete.</li>
+    <li><a href="/concepts/tool-calling-explained">Tool Calling Explained</a> — how a model turns intent into a structured tool invocation, the mechanism beneath Claude Code's typed catalog and Codex CLI's shell channel alike.</li>
+    <li><a href="/deep-dives/tool-capability-design/tool-design-antipatterns">Tool Design Antipatterns</a> — the failure modes a typed, minimal catalog avoids and a sprawling shell-everything surface invites.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://code.claude.com/docs" rel="noopener noreferrer">Claude Code documentation</a> — tools, permission modes, Skills, and MCP setup.</li>
+    <li><a href="https://developers.openai.com/codex" rel="noopener noreferrer">OpenAI Codex</a> — Codex CLI approval modes, sandbox behavior, and local-model configuration.</li>
+    <li><a href="https://cursor.com" rel="noopener noreferrer">Cursor</a> — Agent mode, the Agents Window, MCP support, and model configuration.</li>
+    <li><a href="https://aider.chat" rel="noopener noreferrer">Aider</a> — architect/editor mode, edit-blocks, repo-map, and git workflow (source at <a href="https://github.com/Aider-AI/aider" rel="noopener noreferrer">github.com/Aider-AI/aider</a>).</li>
+  </ul>
+</section>
