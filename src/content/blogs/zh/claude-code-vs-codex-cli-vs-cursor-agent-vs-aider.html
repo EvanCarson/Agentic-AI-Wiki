@@ -1,0 +1,267 @@
+<p class="lede">"修好这个失败的测试。"截至 2026 年 5 月下旬，把同一句提示词交给指向同一个仓库的四个编码智能体，你会得到四套关于"接下来该做什么"的理论：Claude Code 拉起一份任务清单计划，Codex CLI 启动一次沙箱化运行，Cursor 起草一份跨文件 diff 并等你审阅，Aider 走 architect→editor→单次提交。它们的功能清单几乎没有分别，运行轨迹却像四个不同的物种——因为产品的本质是架构，而非工具目录。</p>
+
+<section>
+  <h2>速览</h2>
+  <p>四个智能体，对同一个问题给出四种回答：信任边界划在哪里，又由谁来决定下一步？下表先列基本信息；紧接的矩阵则呈现各自在真正有分歧的几条轴上最发力的方向。</p>
+  <table>
+    <thead>
+      <tr>
+        <th>项目</th>
+        <th>发布时间</th>
+        <th>主打场景</th>
+        <th>部署形态</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/logos/claude-code.svg" width="24" height="24" alt="Claude Code logo" style="vertical-align:middle;margin-right:8px;" />Claude Code</td>
+        <td>2025</td>
+        <td>带类型化工具目录的终端 harness</td>
+        <td>本机 CLI，OS 级沙箱</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/logos/codex-cli.svg" width="24" height="24" alt="Codex CLI logo" style="vertical-align:middle;margin-right:8px;" />Codex CLI</td>
+        <td>2025</td>
+        <td>沙箱化、Shell 优先的编码智能体</td>
+        <td>CLI，默认开启工作区范围沙箱</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/logos/cursor.svg" width="24" height="24" alt="Cursor logo" style="vertical-align:middle;margin-right:8px;" />Cursor Agent</td>
+        <td>2023（Agent 模式后续推出）</td>
+        <td>IDE 中介、diff 可审阅的智能体</td>
+        <td>编辑器应用；智能体可在本地 / worktree / SSH / 云端运行</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/logos/aider.svg" width="24" height="24" alt="Aider logo" style="vertical-align:middle;margin-right:8px;" />Aider</td>
+        <td>2023</td>
+        <td>终端里的 git 优先结对程序员</td>
+        <td>本地 git 仓库中的 CLI；无沙箱</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">快照：2026-05-28。行为为前一周观察所得，请在你自己的环境中验证。</p>
+
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/data-feature-matrix.svg" alt="特性对比矩阵：四个智能体 × 六条轴——沙箱模型、规划循环、MCP 支持、跨文件编辑、IDE 原生、提交策略——按强度着色" width="900" height="500" loading="lazy" />
+    <figcaption>每个智能体最发力的方向。差异聚集在四条轴上，而非功能清单上。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Claude Code — 架构详解</h2>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/arch-claude-code.svg" alt="Claude Code 架构：一个终端 harness 驱动类型化工具目录（Read、Edit、Bash、Glob、Grep），外加延迟加载工具、Skills 与 MCP 服务器，全部在带权限模式的 OS 沙箱内、针对一份持久化任务清单运行" width="900" height="500" loading="lazy" />
+    <figcaption>Claude Code 把类型化工具目录与持久化任务清单，包裹进一个带权限模式的 OS 沙箱中。</figcaption>
+  </figure>
+
+  <h3>harness 模型</h3>
+  <p>Claude Code 是一个终端 harness，而非 IDE 插件或托管服务。模型驱动一份固定的、类型化的工具目录——<code>Read</code>、<code>Edit</code>、<code>Bash</code>、<code>Glob</code>、<code>Grep</code>——其中每个工具都有声明式 schema，而不是一段自由文本的 Shell 字符串。这种类型化是刻意为之的：一个指明文件以及精确旧/新字符串的结构化 <code>Edit</code>，是可校验、可回退的，而经 Shell 管道执行的 <code>sed -i</code> 则不然。harness 仍然带有 Shell（即 <code>Bash</code> 工具），但 Shell 只是众多工具之一，而非整个界面——这正是它区别于 Codex CLI 的架构选择。</p>
+  <p>信任边界是操作系统。Claude Code 在 OS 沙箱内运行你的机器——Linux 上用 bubblewrap，macOS 上用 seatbelt——并由从谨慎到自主层层递进的权限模式来把关：<code>default</code> 在写入与命令前询问，<code>acceptEdits</code> 放行文件编辑但命令前仍会询问，<code>plan</code> 完全禁止任何变更，<code>dontAsk</code> 停止询问，而 <code>bypassPermissions</code> 则直接移除沙箱护栏。你按会话决定放出多少绳子，而非接受某种固定姿态。</p>
+
+  <h3>延迟加载工具、Skills 与 MCP</h3>
+  <p>目录刻意保持精简，但这并不是上限。在核心工具之外，Claude Code 还提供<em>延迟加载</em>工具——其完整 schema 通过一个搜索步骤按需获取，而非预先载入上下文——以及可复用的 Skills 与一个完整的 <a href="/zh/deep-dives/protocols-and-interop/mcp-architecture">MCP</a> 客户端来接入第三方服务器。这种结构是<a href="/zh/deep-dives/tool-capability-design/tool-design-principles">扎实的工具设计原则</a>的直接应用：一个类型化、最小化的默认表面让模型的选择清晰可读，而延迟加载则避免庞大的目录淹没上下文窗口。类型化 schema 也让<a href="/zh/deep-dives/architectures-and-patterns/tool-error-recovery">工具错误恢复</a>变得可控——一次格式错误的调用会针对 schema 失败并给出具体消息，模型可据此行动，而不是返回一个不透明的 Shell 错误。</p>
+  <p>模型以 Anthropic 优先。你可以让 Claude Code 指向本地或第三方模型，但只能通过类似 LiteLLM 的代理——可行，但并非一等公民——如果模型可移植性是你团队的硬性要求，这一点很关键。</p>
+
+  <h3>任务清单循环</h3>
+  <p>这个循环的标志性特征，是一份显式的、持久化的任务清单。面对一项多步骤工作，Claude Code 会把步骤写成持久状态，在推进过程中标记为进行中和已完成，并把这份清单回读为"接下来该做什么"的真实来源。这就是经典的<a href="/zh/concepts/the-agent-loop">智能体循环</a>，只是把计划外化了：与其把计划隐式地保留在一连串 <a href="/zh/deep-dives/architectures-and-patterns/react-pattern">ReAct 式</a>推理回合中，harness 将其落实为一个能撑过长时间运行、且始终可审计的结构。回报体现在大型工作上——隐式计划在那里会漂移；代价则是给一行小修复套上一层仪式感。除非你要求，否则什么都不会提交到 git——任务清单是工作记录，而非版本历史。</p>
+</section>
+
+<section>
+  <h2>Codex CLI — 架构详解</h2>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/arch-codex-cli.svg" alt="Codex CLI 架构：一个 Shell 优先的智能体在默认开启的工作区范围 OS 沙箱内运行，由三种审批模式把关，编辑工作目录并以一个 PR 作为产出" width="900" height="500" loading="lazy" />
+    <figcaption>Codex CLI 以 Shell 优先的方式在工作区沙箱内运行，由三种审批模式把关，面向产出一个 PR。</figcaption>
+  </figure>
+
+  <h3>工作区沙箱与审批模式</h3>
+  <p>Codex CLI 的信任边界是一个默认开启的、工作区范围的 OS 沙箱——智能体可以在工作目录内读取、编辑和运行，但跨出目录或访问网络则需要明确同意。三种审批模式设定姿态。<em>Auto</em>（默认）允许在工作区内读 / 编辑 / 运行，对任何越界或联网的操作则先询问。<em>Read-only</em> 是咨询式的：智能体规划并提出建议，但不做变更——这是你在让它动手之前用来盘查代码库的模式。<em>Full Access</em> 完全取消询问（包括网络），用于受信任的批量运行。逐级放权就是它的安全叙事——沙箱是下限，而上限由你刻意抬高。</p>
+
+  <h3>Shell 优先的工具表面</h3>
+  <p>Claude Code 以类型化工具为先，Codex CLI 则以 Shell 为先。智能体的主要表面是运行命令，文件编辑、构建和测试统统经由这同一个通道流转。好处是与现有开发者工具链零阻抗——凡是你能在提示符里敲出来的，智能体都能运行——约束则在于<a href="/zh/deep-dives/architectures-and-patterns/tool-error-recovery">错误恢复</a>依赖解析命令输出，而非读取一个类型化的失败。Codex CLI 同样会说 MCP，并有一条铁律：无论何种模式，破坏性工具始终需要审批；当服务器提供<a href="/zh/deep-dives/protocols-and-interop/structured-tool-io">结构化工具 I/O</a> 时它也能从中获益。本地模型在这里是一等选项：把 <code>model_provider</code> 设为 <code>"oss"</code>，针对 Ollama 运行即可。</p>
+
+  <h3>以 PR 为产出</h3>
+  <p>Codex CLI 编辑工作目录，并面向产出一个 pull request。一次运行的自然终态，是一个可审阅的变更分支，而非一段聊天记录——智能体在沙箱里完成工作，交付物则是你要发布的那份 diff。这种取向与审批模式相配合：你让它在 Auto 下运行，然后像审阅同事的 PR 那样审阅最终结果，从而在工作离开沙箱的那一刻保留一道人工关卡。</p>
+</section>
+
+<section>
+  <h2>Cursor Agent — 架构详解</h2>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/arch-cursor-agent.svg" alt="Cursor Agent 架构：IDE 中介文件系统；智能体规划、在写入磁盘前把编辑暂存为可审阅、可逐文件接受的 diff，并由 Agents Window 跨本地、worktree、SSH 与云端目标运行多个智能体" width="900" height="500" loading="lazy" />
+    <figcaption>Cursor 让每一次写入都经由 IDE 中介：智能体把 diff 暂存起来，由你在落盘前逐文件接受。</figcaption>
+  </figure>
+
+  <h3>IDE 中介的文件系统与逐文件接受</h3>
+  <p>Cursor 的信任边界是编辑器本身。在 Agent 模式下，模型不会直接写盘；它的编辑暂存为可审阅的 diff，由你逐个文件接受后才提交到文件系统。IDE 就是沙箱——不像 Codex CLI 那样是 OS 级别的牢笼，而是一道人在回路中的关卡，把"智能体改了十四个文件"从既成事实变成一个可审阅的事件。对于想把手始终放在方向盘上的开发者，这个 diff 队列就是全部意义所在。</p>
+
+  <h3>先规划后 diff 的循环</h3>
+  <p>Agent 模式会<em>行动</em>——它规划一项变更、跨多个文件编辑、运行命令——这正是它区别于只会作答的纯聊天之处。这个循环是教科书式的<a href="/zh/deep-dives/architectures-and-patterns/plan-and-execute">规划-执行</a>形态：智能体形成计划，将其具象化为一份具体的跨文件 diff，再把这份 diff 交回给人来接受、然后才落地。计划是实打实的工作，但 diff 才是产物，而接受这一步正是你的判断进入循环的地方。Cursor 支持 MCP，大致向单个智能体暴露前 40 个工具，并通过 OpenAI 兼容的 base URL（例如 Ollama）运行本地模型。</p>
+
+  <h3>跨文件编辑与 Agents Window</h3>
+  <p>Cursor 3（2026 年 4 月）把编辑器重新定位为一个"智能体执行运行时"。Agents Window 跨不同目标并行运行多个智能体——你的本地检出、独立的 git worktree、一台 SSH 主机，或者云端——于是一个智能体在 worktree 里做重构，另一个在远程机器上做调查，各自产出自己那条可审阅的 diff 流。IDE 不再是某个人敲代码的地方，而是成为多个智能体并发工作、并通过同一道逐文件接受关卡回报的控制台。</p>
+</section>
+
+<section>
+  <h2>Aider — 架构详解</h2>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/arch-aider.svg" alt="Aider 架构：本地 git 仓库中的终端 REPL 使用 repo-map 与 architect/editor 模型对；editor 发出 SEARCH/REPLACE 编辑块，每次成功的编辑都带着自动生成的消息自动提交到 git" width="900" height="500" loading="lazy" />
+    <figcaption>Aider 以 git 作为协议：architect 规划，editor 发出编辑块，每次成功都自动提交。</figcaption>
+  </figure>
+
+  <h3>以 git 为协议（每次编辑自动提交）</h3>
+  <p>Aider 没有沙箱。它直接在你的本地 git 仓库里运行，git 历史<em>就是</em>那张安全网——每次成功的编辑都会作为一个粒度细小的提交、带着自动生成的消息自动提交。这里没有 diff 队列，也没有权限询问；如果某次改动有误，你伸手去用 <code>git revert</code> 或 <code>git reset</code>，而非一道接受/拒绝关卡。它的信任模型是"每一步之后仓库都打了检查点，所以撤销永远只差一条 git 命令"。这让 Aider 迭代起来格外快，也格外依赖于你在一个干净的 git 树里工作。</p>
+
+  <h3>architect/editor 模型对</h3>
+  <p>Aider 的循环把推理与编辑拆分到两个模型上。一个 <em>architect</em> 模型对变更进行推理并描述该做什么；一个更便宜、更快的 <em>editor</em> 模型把这份描述变成具体的 diff。这种两遍式设计可量化地减少了跨文件编辑的错误——强模型不必同时背负发出字节精确补丁语法的负担，廉价模型也不必去推理架构。这两个角色你都可以跑在任意 LLM 上，包括通过 Ollama 或 LM Studio 运行的完全本地模型——这让 Aider 成为本阵容中模型可移植性最强的智能体。</p>
+
+  <h3>编辑块与 repo-map</h3>
+  <p>Aider 的表面不是一份工具目录。它会构建一份 <em>repo-map</em>——对仓库结构与关键符号的紧凑摘要——在不加载每个文件的情况下给模型提供方向感，而 editor 模型则以 SEARCH/REPLACE 编辑块的格式发出变更，由 Aider 直接落盘应用。这正是 MCP 对 Aider 而言并非原生的原因：它的世界模型是 repo-map 加 diff，而不是一个工具目录宿主。你可以在它周围接上外部能力，但 Aider 本身并不像另外三者那样是一个 MCP 客户端——这是一项诚实的架构差异，而非缺失的功能。</p>
+</section>
+
+<section>
+  <h2>横向对比</h2>
+
+  <h3>沙箱与文件系统信任</h3>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/compare-sandbox.svg" alt="文件系统信任边界四栏对比：Claude Code 带权限模式的 OS 沙箱、Codex CLI 默认开启的工作区沙箱、Cursor 的 IDE 中介 diff 关卡、Aider 无沙箱的 git 撤销安全网" width="900" height="300" loading="lazy" />
+    <figcaption>划定信任边界的四个位置，从内核沙箱到 git 撤销。</figcaption>
+  </figure>
+  <p>这四者落在信任谱系上四个截然不同的点上。Claude Code 与 Codex CLI 都把边界划在操作系统——Claude Code 用一个沙箱外加你按会话调节的分层权限模式，Codex CLI 用一个默认开启、并通过三种审批模式逐级放权的工作区范围沙箱。Cursor 把边界上移到应用层：IDE 把每一次写入都中介为你逐文件接受的 diff，于是关卡是人工审阅而非内核牢笼。Aider 则彻底移除边界，代之以 git——没有沙箱、没有询问，只有每一步之后的一次自动提交，撤销永远只差一次 revert。实用结论是：对不受信任的运行，Codex CLI 默认最安全；对"我想看到每一处改动"，Cursor 最安全；Claude Code 最可调；而 Aider 则在你信任的仓库里，用隔离换取纯粹的速度。</p>
+
+  <h3>规划循环形态</h3>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/compare-plan-loop.svg" alt="规划循环四栏对比：Claude Code 的持久化任务清单、Codex CLI 面向 PR 的沙箱化运行、Cursor 带人工接受的先规划后 diff、Aider 的 architect 到 editor 两遍式" width="900" height="300" loading="lazy" />
+    <figcaption>同一项工作，四种循环形态——外化的清单、沙箱化运行、审阅关卡、模型对。</figcaption>
+  </figure>
+  <p>每个智能体外化了循环中不同的一部分。Claude Code 外化的是<em>计划</em>：一份它回读为真实来源的持久化任务清单，让长任务保持连贯，代价是给短任务套上仪式感。Codex CLI 外化的是<em>运行</em>：它在沙箱内自主工作、面向一个 PR，于是循环是"先执行、再审阅分支"，而非"先规划、再逐步审批"。Cursor 外化的是<em>审阅</em>：先规划后 diff 的形态，让人对一份具体跨文件 diff 的接受成为循环里的一等步骤。Aider 外化的是<em>角色</em>：architect/editor 的拆分把推理与补丁发出放进各自独立的模型，这种两遍式减少了跨文件错误。这些都不仅仅是带点表面差异的 <a href="/zh/deep-dives/architectures-and-patterns/react-pattern">ReAct</a> 变体——每一个选择把状态显式化的位置，正是它预期那些难题会出现的位置。</p>
+
+  <h3>工具目录对阵 Shell</h3>
+  <figure>
+    <img src="/blogs/claude-code-vs-codex-cli-vs-cursor-agent-vs-aider/compare-tools-vs-shell.svg" alt="工具表面四栏对比：Claude Code 的类型化目录加 MCP、Codex CLI 的 Shell 优先表面加 MCP、Cursor 的 IDE 封装工具加 MCP、Aider 的 repo-map 加编辑块且无原生 MCP" width="900" height="300" loading="lazy" />
+    <figcaption>类型化目录、Shell、IDE 封装，或 repo-map 加 diff——给模型装上双手的四种方式。</figcaption>
+  </figure>
+  <p>工具表面，正是"能力"与"架构"分道扬镳最清晰的地方。Claude Code 以一份类型化目录为先——结构化的 <code>Read</code>/<code>Edit</code>/<code>Grep</code> 外加延迟加载工具、Skills 与完整 MCP——于是模型的动作经过 schema 校验。Codex CLI 以 Shell 为先：一切都走同一条命令通道，外加 MCP，以类型化安全换取工具链的触达广度。Cursor 把工具封装进 IDE，并向每个智能体暴露大致前 40 个工具，经由编辑器中介。Aider 干脆不要工具目录——它的表面是 repo-map 加 SEARCH/REPLACE 编辑块，MCP 并非原生，因为它的世界模型是 diff、而非一个工具宿主。四者都能胜任地编辑一个仓库，而这恰恰是要点所在：目录不等于能力。对于围绕共享 <a href="/zh/deep-dives/protocols-and-interop/mcp-architecture">MCP 服务器</a>与<a href="/zh/deep-dives/protocols-and-interop/building-interoperable-agents">可互操作智能体</a>做标准化的团队，四者中有三个是 MCP 宿主，Aider 是那个例外；而每一个对由此产生的<a href="/zh/deep-dives/memory-and-context/context-budgeting">上下文预算</a>的处理方式也各不相同——延迟加载工具、Shell 输出、40 个工具上限，或一份紧凑的 repo-map。</p>
+
+  <h3>提交与产出策略</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>智能体</th>
+        <th>落地的是什么</th>
+        <th>何时落地</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Claude Code</td>
+        <td>仅在请求时提交 / 开 PR</td>
+        <td>当你要求时——绝不自动</td>
+      </tr>
+      <tr>
+        <td>Codex CLI</td>
+        <td>工作目录编辑，面向一个 PR</td>
+        <td>一次沙箱化运行之后，供审阅</td>
+      </tr>
+      <tr>
+        <td>Cursor Agent</td>
+        <td>对工作树的逐文件 diff</td>
+        <td>由你逐个文件接受时</td>
+      </tr>
+      <tr>
+        <td>Aider</td>
+        <td>每次成功编辑一个 git 提交</td>
+        <td>自动、即时</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>该选哪一个</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>使用场景</th>
+        <th>选 Claude Code，当……</th>
+        <th>选 Codex CLI，当……</th>
+        <th>选 Cursor，当……</th>
+        <th>选 Aider，当……</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>从零起步的功能，步骤众多</td>
+        <td>你想要一份持久化的任务清单计划，让漫长的多步骤构建保持连贯且可审计。</td>
+        <td>你想让它在沙箱里自主运行，再交给你一个可审阅的 PR。</td>
+        <td>你想看着计划具象成 diff，并逐个文件接受改动。</td>
+        <td>你想要快速迭代、每一步自动提交，撤销只差一条 git 命令。</td>
+      </tr>
+      <tr>
+        <td>大型 monorepo</td>
+        <td>你想用类型化的 Read/Grep/Glob 外加延迟加载工具，在不淹没上下文的前提下穿行广阔代码。</td>
+        <td>你想要在沙箱内、针对现有工具链做 Shell 原生的搜索与构建。</td>
+        <td>你想要 IDE 索引，并通过 Agents Window 跨 worktree 运行并行智能体。</td>
+        <td>你接受 repo-map 提供方向感，但超大代码树对它的压力比对其他几者更大。</td>
+      </tr>
+      <tr>
+        <td>完全本地 / 离线</td>
+        <td>你能搭起一个类似 LiteLLM 的代理——本地模型可行，但并非一等公民。</td>
+        <td>你想要本地模型作为一等公民，通过 <code>model_provider="oss"</code> 与 Ollama 实现。</td>
+        <td>你通过 OpenAI 兼容的 base URL（例如 Ollama）让它指向一个本地模型。</td>
+        <td>你想要模型可移植性最强的选项——任意 LLM，包括经由 Ollama 或 LM Studio 的本地模型。</td>
+      </tr>
+      <tr>
+        <td>严格的审阅纪律 / 受监管</td>
+        <td>你想要分层权限模式，以及一个在你盘查期间禁止任何变更的 plan 模式。</td>
+        <td>你想要一个默认开启的沙箱，破坏性与联网操作始终会询问。</td>
+        <td>你想要每一次写入在落盘前都经过一道人工逐文件接受关卡。</td>
+        <td>不太理想——自动提交会在没有审阅关卡的情况下落地改动，尽管 git 历史会逐一记录。</td>
+      </tr>
+      <tr>
+        <td>快速的单文件修复</td>
+        <td>可用，但对一处微小改动来说，任务清单的仪式感是额外开销。</td>
+        <td>可用，不过为此拉起一次沙箱化运行，比这件事本身要重。</td>
+        <td>很合适——编辑、看那一份 diff、接受，搞定。</td>
+        <td>很合适——描述修复、得到一个提交、继续前进。</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+
+  <h3>Claude Code 和 Codex CLI 之间真正的区别是什么？</h3>
+  <p>两者都是在 OS 沙箱下编辑你仓库的终端编码智能体，但它们在工具表面上下了相反的赌注：Claude Code 以一份精简的类型化工具目录（Read/Edit/Bash/Glob/Grep）外加延迟加载工具、Skills 与 MCP 为先，并把计划外化为一份持久化任务清单；而 Codex CLI 以 Shell 为先，通过三种审批模式逐级放权，并面向产出一个 PR。Claude Code 以 Anthropic 模型优先；Codex CLI 则通过 Ollama 把本地模型视为一等公民。</p>
+
+  <h3>Cursor 的 Agent 模式会取代它的聊天吗？</h3>
+  <p>不会——它们做的是不同的事。聊天回答问题；Agent 模式则会行动，规划一项变更、跨多个文件编辑、运行命令，再把结果暂存为你逐文件接受的 diff。你用聊天来理解代码，用 Agent 模式来改动代码。</p>
+
+  <h3>Aider 能用 MCP 服务器吗？</h3>
+  <p>原生不支持。Aider 的世界模型是 repo-map 加 SEARCH/REPLACE 编辑块，而非一个工具目录宿主，因此它不像 Claude Code、Codex CLI 和 Cursor 那样是一个 MCP 客户端。你可以在它周围接上外部能力，但 MCP 并不是一项内置功能。</p>
+
+  <h3>哪个编码智能体最适合大型 monorepo？</h3>
+  <p>这取决于你想怎样穿行广阔代码：Claude Code 的类型化 Grep/Glob 外加延迟加载工具，以及 Cursor 带并行 worktree 智能体的 IDE 索引，都能很好地应对大型代码树，而 Codex CLI 则依靠沙箱内的 Shell 原生搜索。Aider 的 repo-map 提供方向感，但在超大型仓库下承压最重，因此在极端规模下契合度最弱。</p>
+
+  <h3>这些智能体会把我的代码发到云端吗？</h3>
+  <p>默认会——四者都会调用一个托管模型 API，所以提示词以及其中携带的代码上下文都会离开你的机器，除非你配置了本地模型。沙箱与 IDE 边界控制的是智能体能对你文件系统做什么，而非模型本身是否在云端运行。完全本地运行（见下一问）才是把代码留在设备上的办法。</p>
+
+  <h3>这些工具能针对本地模型运行吗？</h3>
+  <p>能，只是所需的工夫各异。Codex CLI（<code>model_provider="oss"</code> + Ollama）、Aider（任意 LLM，包括经由 Ollama 或 LM Studio 的本地模型）以及 Cursor（OpenAI 兼容的 base URL，例如 Ollama）都直接支持本地模型。Claude Code 也可以，但只能通过类似 LiteLLM 的代理——可行，而非一等公民。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关内容：</h3>
+  <ul>
+    <li><a href="/zh/concepts/what-is-an-agent">什么是智能体？</a>——感知-决策-行动的定义，这四款工具都是它的实例，也是把智能体与花哨的自动补全区分开来的基准。</li>
+    <li><a href="/zh/concepts/tool-calling-explained">工具调用详解</a>——模型如何把意图转化为一次结构化的工具调用，这正是 Claude Code 类型化目录与 Codex CLI Shell 通道之下共同的机制。</li>
+    <li><a href="/zh/deep-dives/tool-capability-design/tool-design-antipatterns">工具设计反模式</a>——一份类型化、最小化的目录所规避、而一个无所不包的 Shell 表面所招致的那些失败模式。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://code.claude.com/docs" rel="noopener noreferrer">Claude Code 文档</a>——工具、权限模式、Skills 与 MCP 配置。</li>
+    <li><a href="https://developers.openai.com/codex" rel="noopener noreferrer">OpenAI Codex</a>——Codex CLI 审批模式、沙箱行为与本地模型配置。</li>
+    <li><a href="https://cursor.com" rel="noopener noreferrer">Cursor</a>——Agent 模式、Agents Window、MCP 支持与模型配置。</li>
+    <li><a href="https://aider.chat" rel="noopener noreferrer">Aider</a>——architect/editor 模式、编辑块、repo-map 与 git 工作流（源码见 <a href="https://github.com/Aider-AI/aider" rel="noopener noreferrer">github.com/Aider-AI/aider</a>）。</li>
+  </ul>
+</section>
