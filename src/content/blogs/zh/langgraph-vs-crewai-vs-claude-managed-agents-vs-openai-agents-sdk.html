@@ -1,1 +1,266 @@
-<p class="lede">占位 —— 将在任务 7 中替换。</p>
+<p class="lede">用这四个框架分别搭建同一个三步工作流——检索、起草、审核——代码看上去几乎一模一样：声明几个 Agent，给它们配上工具，跑起来。可第一次运行跑到一半崩溃，它们就开始剧烈分化。LangGraph 从最后一个 checkpoint 重放；Anthropic 的托管运行时压根没丢过线索，因为状态从一开始就不在你的机器上；CrewAI 和 OpenAI Agents SDK 则从零重来。截至 2026 年 5 月下旬，它们的特性矩阵几乎重合。真正决定你能否在生产环境里运维它的那一点，在特性清单上根本看不见：<strong>你的智能体状态究竟存在哪里。</strong></p>
+
+<section>
+  <h2>速览</h2>
+  <p>四个框架，对同一个问题给出四种答案——编排层需要记住什么，又由谁负责不把它弄丢。下表先列基本信息；其下的矩阵则呈现各自在真正存在差异的那几条轴上最用力的方向。</p>
+  <table>
+    <thead>
+      <tr>
+        <th>框架</th>
+        <th>发布时间 / 维护方</th>
+        <th>主打场景</th>
+        <th>运行位置</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/logos/langgraph.svg" width="24" height="24" alt="LangGraph 标志" style="vertical-align:middle;margin-right:8px;" />LangGraph</td>
+        <td>2024 年，LangChain Inc.</td>
+        <td>显式图状态机，持久化执行</td>
+        <td>你的基础设施（或 LangGraph Platform）</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/logos/crewai.svg" width="24" height="24" alt="CrewAI 标志" style="vertical-align:middle;margin-right:8px;" />CrewAI</td>
+        <td>2024 年，CrewAI Inc.</td>
+        <td>基于角色的多智能体 Crews + Flows</td>
+        <td>你的基础设施</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/logos/claude-managed-agents.svg" width="24" height="24" alt="Claude Managed Agents 标志" style="vertical-align:middle;margin-right:8px;" />Claude Managed Agents</td>
+        <td>2026 年 4 月（beta），Anthropic</td>
+        <td>托管的服务端自主 harness</td>
+        <td>Anthropic 基础设施（Environment 可自托管）</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/logos/openai-agents-sdk.svg" width="24" height="24" alt="OpenAI Agents SDK 标志" style="vertical-align:middle;margin-right:8px;" />OpenAI Agents SDK</td>
+        <td>2025 年，OpenAI</td>
+        <td>极简的代码优先 Agent + handoffs</td>
+        <td>你的基础设施</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">快照：2026-05-28。这些框架更新很快，请对照最新文档核实。</p>
+
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/data-feature-matrix.svg" alt="特性矩阵：四个框架横跨六条轴——状态持久性、控制流模型、多智能体是否一等公民、流式输出、人工介入、自托管 vs 托管——按强度着色" width="900" height="500" loading="lazy" />
+    <figcaption>每个框架最用力的方向。除了状态持久性和谁来运维运行时，其余各轴几乎处处趋同。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>LangGraph — 架构详解</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/arch-langgraph.svg" alt="LangGraph 架构：由条件边与循环边连接的节点构成的图，对一个共享状态对象进行变更，可插拔的 checkpointer 在每一步之后将其持久化" width="900" height="500" loading="lazy" />
+    <figcaption>LangGraph 在你拥有的状态对象上运行一张节点图；checkpointer 在每一步之后对该状态拍快照。</figcaption>
+  </figure>
+
+  <h3>图节点与边</h3>
+  <p>LangGraph 要求你把控制流画成一张图。节点是函数——调用模型、运行工具、转换数据——边决定接下来运行什么。边可以是条件的（按状态分支），也可以是循环的（回环），所以这个结构是状态机，而非线性流水线。这与<a href="/zh/concepts/the-agent-loop">智能体循环</a>所描述的感知-决策-行动循环本质相同，只是被显式化了：循环不再是模型 harness 内部一个不透明的 while 循环，而是一张你能读、能测、能逐条边推敲的图。监督者-路由到-专家的模式，或者经典的<a href="/zh/deep-dives/architectures-and-patterns/plan-and-execute">先规划后执行</a>切分，都自然地呈现为图的拓扑。</p>
+
+  <h3>状态对象</h3>
+  <p>每个节点都从一个由你定义的、带类型的单一状态对象中读取并写回。不存在框架在你背后偷偷控制的隐藏对话缓冲区——状态<em>就是</em>你所写的那个 schema，节点的返回值由你可自定义的 reducer 合并进去。这使得 LangGraph 成为这里唯一一个对"我的智能体此刻知道什么？"在每一步都有具体、可检视答案的框架。它也划清了这种短期工作状态与<a href="/zh/deep-dives/memory-and-context/short-vs-long-term-memory">短期 vs 长期记忆</a>中所讨论的持久化知识存储之间的界线：图状态是单次运行的草稿纸；长期记忆是另一处独立的存储，由某个节点读取后注入其中。</p>
+
+  <h3>checkpointer 与持久性</h3>
+  <p>状态对象是主角；而 checkpointer 才是它在生产环境中重要的原因。LangGraph 通过一个可插拔的 checkpointer 在每个节点之后对完整状态拍快照——测试用内存，单机用 SQLite，集群用 Postgres。由于每一步在下一步运行前就已提交，运行时支持持久化执行与重放：进程在运行中途崩溃，它会从最后一个成功的步骤恢复，而不是从零重启。同样的 checkpoint 边界也支撑起人工介入式中断（在某个节点暂停，等待批准，再恢复）和 token 级流式输出。持久性不是事后再装上去的附加件；它是拥有一个带 checkpoint 的状态对象后的默认结果。</p>
+</section>
+
+<section>
+  <h2>CrewAI — 架构详解</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/arch-crewai.svg" alt="CrewAI 架构：一支基于角色的智能体 crew 在顺序或层级化流程下执行任务，可选的事件驱动 Flows 层在其上承载显式状态" width="900" height="500" loading="lazy" />
+    <figcaption>CrewAI 把基于角色的智能体组合成一支 crew；Flows 在其上加一层显式的、事件驱动的状态。</figcaption>
+  </figure>
+
+  <h3>crew / agent / task 模型</h3>
+  <p>CrewAI 的核心抽象是 <strong>Crew</strong>：一组各自声明了角色、目标和背景故事的智能体，协同完成一系列任务。你描述这些智能体<em>是谁</em>，而不是手工接出控制流——框架会把这些角色声明加上任务描述，转化为一场运行中的协作。它在构造上就是多智能体的，与<a href="/zh/deep-dives/multi-agent-systems/supervisor-worker-pattern">监督者-工作者模式</a>所讲的监督者-与-专家形态相同，只不过你是通过声明角色、而非画一张图来抵达它。</p>
+
+  <h3>顺序 vs 层级化流程，以及 Flows</h3>
+  <p>一支 crew 在某种<strong>流程</strong>下运行：顺序式（任务依次运行，每个输出喂给下一个）或层级化（一个 manager 智能体负责委派和审核）。要实现确定性的、事件驱动的控制——条件分支、显式状态、循环——CrewAI 增加了 <strong>Flows</strong>，一个独立的编排层，在那里状态是一等公民而非隐含存在。心智模型干净地一分为二：想要涌现式的、基于角色的协作时用 Crews，想要受控的流水线时用 Flows。许多真实系统会把一支 crew 嵌进一个 flow 里。</p>
+
+  <h3>上下文在何处被隐式串联</h3>
+  <p>在一支普通的 crew 里，状态大多是<em>隐式</em>的：上下文从一个任务的输出流入下一个智能体的提示词，由框架串联，而不是存放在你拥有的某个 schema 中。这对原型来说很顺手，也正因如此，它的持久性弱于 LangGraph 的 checkpointer 模型——除非你采用 Flows 并自行管理状态，否则没有内置的快照可供恢复。CrewAI 还原生支持 MCP 和 A2A，因此 crew 可以调用外部工具、并通过开放协议与其他智能体对话。有一点值得直说清楚：CrewAI 历史上确实建立在 LangChain 之上，但该项目<strong>现已独立于 LangChain</strong>——它当前的 README 将其描述为一个完全独立的框架。</p>
+</section>
+
+<section>
+  <h2>Claude Managed Agents — 架构详解</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/arch-claude-managed-agents.svg" alt="Claude Managed Agents 架构：一个轻量客户端与运行在 Anthropic 基础设施上的服务端自主循环之间双向流式传递 events，Sessions 在那里保存对话历史、容器状态与输出" width="900" height="500" loading="lazy" />
+    <figcaption>客户端提交目标并流式接收 events；Anthropic 的服务器运行循环并持有 Session 状态。</figcaption>
+  </figure>
+
+  <h3>客户端 / 服务端的分工</h3>
+  <p>Claude Managed Agents（2026 年 4 月发布，处于 beta）把归属问题彻底反转过来。你运行一个轻量客户端；Anthropic 运行循环。该框架的概念是 Agent、Environment、Session 和 Events：你提交一个目标并流式接收这次运行，但编排发生在 Anthropic 基础设施上的服务端。这与 <strong>Claude Agent SDK</strong> 不同，后者在<em>你的</em>环境里运行循环——Managed Agents 是它的托管对应物，运行时是供应商的责任，而非你的。</p>
+
+  <h3>服务端循环与工具执行</h3>
+  <p>控制流是一个服务端的自主循环。一个 <strong>Session</strong> 在 Anthropic 基础设施上保存对话历史、容器状态与输出，因此运行在暂停之后能干净地恢复——线索从来不在你的机器上，也就无从丢失。你通过 <strong>Events</strong> 来观察和引导：运行通过 SSE 流式输出，你可以在运行途中发回 events 来中断或改变它的方向。<strong>Environment</strong>——工具和代码实际执行的地方——即使在循环本身保持托管的同时，也可以是你自己基础设施上的自托管沙箱，这让工具执行贴近你的数据，而无需你去运维编排器。</p>
+
+  <h3>你放弃了什么，又得到了什么</h3>
+  <p>你白白得到了持久性：没有 checkpointer 要配置，没有 Postgres 要运维，没有恢复逻辑要写。你放弃两件事。第一，这是一个<strong>单一的自主 harness，而非多智能体框架</strong>——子智能体不是它的招牌原语，所以别指望靠它拿到一等公民的 crews 或 handoffs。第二，由于 Session 状态存在 Anthropic 基础设施上，它<strong>不符合 ZDR 或 HIPAA 资格</strong>；那个让它"永不丢线索"的持久性特质，同时也意味着状态实实在在地离开了你的边界。这笔交易正是它的全部卖点：把运行时的运维权交出去，换来再也不用写恢复代码。</p>
+</section>
+
+<section>
+  <h2>OpenAI Agents SDK — 架构详解</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/arch-openai-agents-sdk.svg" alt="OpenAI Agents SDK 架构：在你的进程里运行的 runner 循环驱动带工具的 Agent，在 Agent 之间交接控制权，应用输入与输出 guardrails，并维护一个进程本地的 Sessions 存储" width="900" height="500" loading="lazy" />
+    <figcaption>你进程里一个轻量的 runner 循环：带工具的 Agent、它们之间的 handoffs、guardrails，以及一个进程本地的 Sessions 存储。</figcaption>
+  </figure>
+
+  <h3>Agent + 工具</h3>
+  <p>OpenAI Agents SDK 是这四者中最极简的：一个你在自己进程里运行的轻量库。一个 Agent 就是模型加指令加一组工具，一个小小的 runner 循环以普通代码的形式驱动"模型调用工具再评估"的循环。没有图 DSL，也没有角色声明要学——控制流就是你本就在写的 Python，SDK 只提供恰到好处的循环、追踪和结构来让它规矩起来。</p>
+
+  <h3>handoffs</h3>
+  <p>多智能体在这里通过 <strong>handoffs</strong> 成为一等公民：一个 Agent 把控制权转交给另一个，并连同完整上下文一起传过去。一个分诊 Agent 交接给一个专家 Agent；专家接管对话。这是这四者中最轻量的多智能体原语——比起图或托管的 crew，更接近一次函数调用——它直接对应到<a href="/zh/deep-dives/architectures-and-patterns/single-vs-multi-agent">单智能体 vs 多智能体</a>中的权衡：先从一个智能体起步，只在明确的专业化值得切出接缝时才拆成 handoffs。</p>
+
+  <h3>guardrails 与 sessions（以及通过 LiteLLM 跑 Claude）</h3>
+  <p>安全与人工介入来自 <strong>guardrails</strong>（可以中止运行的输入/输出校验器）和工具审批模式，并内置追踪以便观测。状态存放在一个进程本地的 <strong>Sessions</strong> 抽象中——默认在内存里，后端可插拔——而关键在于<strong>没有内置的 checkpoint 或重放</strong>：持久性是你的责任。运行中途崩溃，除非你自己持久化了 session，否则只能从头来过。一个务实的强项：捆绑的 <strong>LiteLLM adapter</strong> 能运行非 OpenAI 的模型，所以你可以用 <code>LitellmModel(model="anthropic/claude-opus-4-7", ...)</code> 来驱动 Claude，或者不离开 SDK 就换成 Gemini、Bedrock、Azure 或 Ollama。</p>
+</section>
+
+<section>
+  <h2>横向对比</h2>
+
+  <h3>状态存在哪里与持久性</h3>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/compare-state.svg" alt="状态存放位置的四列对比：LangGraph 你拥有的带 checkpoint 的对象、CrewAI 隐式的 crew 内上下文、Claude Managed Agents 服务器持有的 Session、OpenAI Agents SDK 进程本地的内存 session" width="900" height="300" loading="lazy" />
+    <figcaption>主角那条轴：你的智能体状态有四个不同的家，对应四种不同的持久性故事。</figcaption>
+  </figure>
+  <p>这正是把四者区分开来的那条轴，也是特性清单藏起来的那条。LangGraph 交给你一个你拥有的、在每一步之后拍快照的显式状态对象，于是持久性与重放成了默认——你可以丢掉进程而不丢掉这次运行。Claude Managed Agents 从相反方向抵达同样的"永不丢线索"持久性：Session 存在 Anthropic 的服务器上，所以状态之所以持久，恰恰是因为它从来就不归你持有（也正因如此，它离开了你的数据边界）。CrewAI 把状态隐式地留在 crew 里——上下文在任务之间串联，没有内置快照——除非你采用 Flows 并显式地管理它。OpenAI Agents SDK 维护一个进程本地的 Sessions 存储，默认在内存里、没有内置 checkpoint，于是持久性完全落在你身上。两个框架让恢复免费奉送；两个把它留成你的作业。分清谁是谁，正是一个 demo 和一个你能运维的东西之间的区别。</p>
+
+  <h3>控制流模型</h3>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/compare-control-flow.svg" alt="控制流模型的四列对比：LangGraph 由节点与边构成的图、CrewAI 的角色与任务声明、Claude Managed Agents 的服务端自主循环、OpenAI Agents SDK 的普通代码加 handoffs" width="900" height="300" loading="lazy" />
+    <figcaption>从最显式到最自主：一张画出来的图、声明的角色、普通代码，以及一个托管的循环。</figcaption>
+  </figure>
+  <p>这四者落在一条从"画出来"到"交出去"的谱系上。LangGraph 最显式：你把控制流写成一张由节点和条件边、循环边构成的图，每条分支都可见、可测。OpenAI Agents SDK 以另一种习惯用法体现显式——控制流就是你进程里的普通代码，handoffs 是唯一那个结构化的分支。CrewAI 是声明式的：你描述角色和任务，让顺序或层级化的流程去决定排序，需要确定性的分支回环时再搬出 Flows。Claude Managed Agents 最"交出去"：循环在服务器上自主运行，你通过流式发送 events 来引导它，而不是去编写它的结构。循环能否干净地终止——这正是<a href="/zh/concepts/planning-and-termination">规划与终止</a>所关心的问题——你要么把它设计进一条 LangGraph 边里，要么通过 OpenAI SDK 的追踪去观察，要么就信任托管运行时来处理。</p>
+
+  <h3>多智能体立场</h3>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/compare-multi-agent.svg" alt="多智能体立场的四列对比：LangGraph 的 subgraphs 与监督者、CrewAI 构造上即多智能体、Claude Managed Agents 作为单一 harness、OpenAI Agents SDK 的 handoffs" width="900" height="300" loading="lazy" />
+    <figcaption>三种把多智能体当一等公民的立场，加一个刻意为之的单一 harness。</figcaption>
+  </figure>
+  <p>四者中有三个把多智能体当作一等公民；一个刻意不这么做。CrewAI 在构造上就是多智能体——一支 crew 就是一队基于角色的智能体，这正是这个抽象的全部意义。LangGraph 通过 subgraphs 和监督者模式把它做成一等公民，将智能体作为节点组合进一张更大的图里。OpenAI Agents SDK 通过 handoffs 实现，这是三者中最轻量的控制权转交原语。Claude Managed Agents 是例外：它是一个<strong>单一的自主 harness，而非多智能体框架</strong>，所以子智能体不是招牌原语——选它是为了一个有能力的智能体，而不是一支 crew。在搬出多智能体那三者中的任何一个之前，值得先看看<a href="/zh/deep-dives/multi-agent-systems/multi-agent-when-and-why">多智能体：何时与为何</a>，以及紧随其后的<a href="/zh/deep-dives/multi-agent-systems/multi-agent-topologies">拓扑结构</a>，因为最便宜的多智能体系统，往往是你没有去拆的那个单智能体。</p>
+
+  <h3>运行在哪里与谁来运维</h3>
+  <p>状态问题最终坍缩成一个运维问题：如果状态存在你的基础设施上，运行时就由你运维；如果存在供应商那里，就由他们运维。四者中有三个跑在你的环境里，把持久性、扩容和可用性压在你的团队身上；Claude Managed Agents 把运行时连同数据边界一起搬到了 Anthropic。</p>
+  <table>
+    <thead>
+      <tr>
+        <th>框架</th>
+        <th>运行于</th>
+        <th>你来运维？</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>LangGraph</td>
+        <td>你的基础设施（或 LangGraph Platform / LangSmith Deployment）</td>
+        <td>是——除非你用托管的 Platform</td>
+      </tr>
+      <tr>
+        <td>CrewAI</td>
+        <td>你的基础设施</td>
+        <td>是</td>
+      </tr>
+      <tr>
+        <td>Claude Managed Agents</td>
+        <td>Anthropic 基础设施（Environment 可自托管）</td>
+        <td>否——由 Anthropic 运维循环</td>
+      </tr>
+      <tr>
+        <td>OpenAI Agents SDK</td>
+        <td>你的基础设施</td>
+        <td>是</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>该选哪一个</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>使用场景</th>
+        <th>选 LangGraph，当……</th>
+        <th>选 CrewAI，当……</th>
+        <th>选 Claude Managed，当……</th>
+        <th>选 OpenAI Agents SDK，当……</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>持久化的长周期工作流</td>
+        <td>你想要一个带 checkpoint 的状态对象，在崩溃后从最后一步恢复，且跑在你掌控的基础设施上。</td>
+        <td>你能接受 Flows 管理的状态和显式持久化，或者你的运行足够短、重启代价很低。</td>
+        <td>你想白白得到持久性，且不介意 Session 状态存在 Anthropic 的服务器上。</td>
+        <td>不是天然合适——没有内置 checkpoint，所以你必须自己持久化 session。</td>
+      </tr>
+      <tr>
+        <td>快速搭一个基于角色的原型</td>
+        <td>杀鸡用牛刀——画一张图比一个原型所需的仪式感重得多。</td>
+        <td>你想声明几个带角色和任务的智能体，以最少的接线看它们协作。</td>
+        <td>对单智能体原型可行，但你并不是在为一队角色建模。</td>
+        <td>你想用普通代码搭出少数几个 Agent 和 handoffs，不必学新的 DSL。</td>
+      </tr>
+      <tr>
+        <td>不想运维基础设施</td>
+        <td>否——运行时由你运维（除非你采用托管的 Platform）。</td>
+        <td>否——CrewAI 跑在你的环境里。</td>
+        <td>是——Anthropic 运行循环并持有状态；你只流式接一个轻量客户端。</td>
+        <td>否——runner 循环就在你的进程里。</td>
+      </tr>
+      <tr>
+        <td>极简、代码优先</td>
+        <td>比你想要的更重；图抽象恰恰是极简的反面。</td>
+        <td>你偏好声明而非代码，所以这背离了代码优先。</td>
+        <td>否——循环是托管的，不是你编写的代码。</td>
+        <td>你想要一个轻量库，大部分就是你自己的 Python，再加上 handoffs、guardrails 和追踪。</td>
+      </tr>
+      <tr>
+        <td>复杂的分支控制流</td>
+        <td>你需要能显式编写和测试的条件边与循环边——这是 LangGraph 的主场。</td>
+        <td>你会在 crews 之上搬出 Flows 来做事件驱动的分支。</td>
+        <td>你乐于让服务端循环自行决定，并通过 events 来引导它。</td>
+        <td>你会把分支表达成普通代码和 handoffs，并接受复杂图会变得笨重。</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+
+  <h3>LangGraph 和 OpenAI Agents SDK 有什么区别？</h3>
+  <p>两者都跑在你自己的基础设施里，但它们处在显式状态谱系的两端。LangGraph 给你一张由节点和边构成的显式图，运行在你拥有的、带 checkpoint 的状态对象之上，内置持久化执行与重放——运行中途崩溃，它会从最后一步恢复。OpenAI Agents SDK 是一个更轻量的库：控制流就是普通代码，多智能体通过 handoffs 实现，状态是一个进程本地的 Sessions 存储，默认在内存里、没有内置 checkpoint，所以持久性是你的责任。需要一个持久、可检视的状态机时选 LangGraph；想要极简的代码优先 Agent、并愿意自己处理持久化时选 OpenAI Agents SDK。</p>
+
+  <h3>CrewAI 建立在 LangChain 之上吗？</h3>
+  <p>不再是了。CrewAI 历史上确实建立在 LangChain 之上，但该项目现已独立——它当前的 README 将其描述为一个完全独立、不依赖 LangChain 的框架。它还原生支持 MCP 和 A2A，可通过开放协议与外部工具及其他智能体对话。</p>
+
+  <h3>LangGraph 必须自托管吗，还是有托管版本？</h3>
+  <p>你可以在任何能跑 Python 的地方自托管 LangGraph，并选择一个 checkpointer（内存、SQLite、Postgres）来匹配你的持久性需求。也有托管选项——历史上叫"LangGraph Platform"，如今归入"LangSmith Deployment"旗下——它替你运行编排。确切的产品名称随时间几经变动，所以请查阅当前的 LangChain 文档确认叫法，但托管路径确实存在。</p>
+
+  <h3>OpenAI Agents SDK 能用 Claude 或其他非 OpenAI 的模型吗？</h3>
+  <p>能。该 SDK 捆绑了一个 LiteLLM adapter，所以你可以用类似 <code>LitellmModel(model="anthropic/claude-opus-4-7", ...)</code> 的方式运行 Claude，也能用 Gemini、Bedrock、Azure 或 Ollama。名字里的"OpenAI"指的是谁在维护这个库，而非锁定到 OpenAI 的模型。</p>
+
+  <h3>到底什么时候该用框架，而不是一个普通的 while 循环？</h3>
+  <p>对于一个调用几个工具、没有持久性或多智能体需求的单智能体来说，围绕一次模型调用的普通 while 循环其实完全够用——参见<a href="/zh/concepts/the-agent-loop">智能体循环</a>。当你需要某个循环不会免费给你的东西时，再搬出框架：持久的 checkpoint 与重放、显式的分支控制流、一等公民的多智能体协调，或者一个你不必运维的托管运行时。框架的分量在"我以后再加持久化吧"不再是个小改动的那一刻，才真正物有所值。更宏观的权衡见<a href="/zh/concepts/agent-frameworks">智能体框架</a>。</p>
+
+  <h3>长周期、持久化的工作流，哪个框架最合适？</h3>
+  <p>有两个选项开箱即给你持久性，方向相反。LangGraph 在每一步之后对一个你拥有的状态对象拍 checkpoint，崩溃后从最后一个成功步骤恢复——在你掌控的基础设施上持久。Claude Managed Agents 把 Session 存在 Anthropic 的服务器上，所以暂停之后能干净恢复，而无需你写任何恢复逻辑，代价是状态离开了你的边界（并且不符合 ZDR/HIPAA 资格）。CrewAI 的普通 crews 和 OpenAI Agents SDK 都把持久性留给你，所以除非你自己持久化状态，否则它们是较弱的选择。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关内容：</h3>
+  <ul>
+    <li><a href="/zh/concepts/agent-frameworks">智能体框架</a>——框架在裸模型调用之上添加了什么，以及这层抽象相对于一个普通循环何时物有所值。</li>
+    <li><a href="/zh/concepts/the-agent-loop">智能体循环</a>——这四者无一例外都包裹着的感知-决策-行动循环，被显式化后，你就能看清 LangGraph 画的是什么、OpenAI SDK 写的是什么、Anthropic 在服务端跑的又是什么。</li>
+    <li><a href="/zh/deep-dives/multi-agent-systems/supervisor-worker-pattern">监督者-工作者模式</a>——CrewAI 默认内建、LangGraph 用 subgraphs 组合出来的协调形态，以及把工作委派给专家的种种权衡。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://langchain-ai.github.io/langgraph/" rel="noopener noreferrer">LangGraph 文档</a>——图、状态、checkpointers 与持久化执行（也见于 docs.langchain.com）。</li>
+    <li><a href="https://docs.crewai.com/" rel="noopener noreferrer">CrewAI 文档</a>——Crews、Flows、流程，以及 MCP/A2A 支持（源码在 <a href="https://github.com/crewAIInc/crewAI" rel="noopener noreferrer">github.com/crewAIInc/crewAI</a>）。</li>
+    <li><a href="https://platform.claude.com/docs" rel="noopener noreferrer">Claude Managed Agents 文档</a>——Agent、Environment、Session 与 Events 概念，以及客户端/服务端的分工。</li>
+    <li><a href="https://openai.github.io/openai-agents-python/" rel="noopener noreferrer">OpenAI Agents SDK 文档</a>——Agent、工具、handoffs、guardrails、sessions，以及 LiteLLM adapter。</li>
+  </ul>
+</section>
