@@ -1,0 +1,266 @@
+<p class="lede">Wire up the same three-step workflow — research, draft, review — in all four of these and the code looks nearly identical: name some agents, give them tools, hit run. Then the first run crashes halfway and they diverge violently. LangGraph replays from its last checkpoint; Anthropic's managed runtime never lost the thread, because the state was never on your machine; CrewAI and the OpenAI Agents SDK start from nothing. As of late May 2026 the feature matrices almost match. The thing that decides which one you can actually operate in production is invisible on the feature list: <strong>where your agent's state lives.</strong></p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four frameworks, four answers to the same question — what does the orchestration layer have to remember, and who is responsible for not losing it. The table sets the basics; the matrix below it shows where each one leans hardest across the axes that actually differ.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Framework</th>
+        <th>Released / maintainer</th>
+        <th>Primary niche</th>
+        <th>Where it runs</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/logos/langgraph.svg" width="24" height="24" alt="LangGraph logo" style="vertical-align:middle;margin-right:8px;" />LangGraph</td>
+        <td>2024, LangChain Inc.</td>
+        <td>Explicit graph state machine, durable execution</td>
+        <td>Your infra (or LangGraph Platform)</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/logos/crewai.svg" width="24" height="24" alt="CrewAI logo" style="vertical-align:middle;margin-right:8px;" />CrewAI</td>
+        <td>2024, CrewAI Inc.</td>
+        <td>Role-based multi-agent crews + Flows</td>
+        <td>Your infra</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/logos/claude-managed-agents.svg" width="24" height="24" alt="Claude Managed Agents logo" style="vertical-align:middle;margin-right:8px;" />Claude Managed Agents</td>
+        <td>April 2026 (beta), Anthropic</td>
+        <td>Managed server-side autonomous harness</td>
+        <td>Anthropic infra (Environment can self-host)</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/logos/openai-agents-sdk.svg" width="24" height="24" alt="OpenAI Agents SDK logo" style="vertical-align:middle;margin-right:8px;" />OpenAI Agents SDK</td>
+        <td>2025, OpenAI</td>
+        <td>Minimal code-first agents + handoffs</td>
+        <td>Your infra</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">Snapshot: 2026-05-28. These frameworks change fast; verify against current docs.</p>
+
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/data-feature-matrix.svg" alt="Feature matrix: four frameworks across six axes — state durability, control-flow model, multi-agent first-class, streaming, human-in-the-loop, and self-hosted vs managed — colored by strength" width="900" height="500" loading="lazy" />
+    <figcaption>Where each framework leans hardest. The axes converge everywhere except state durability and who operates the runtime.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>LangGraph — deep dive</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/arch-langgraph.svg" alt="LangGraph architecture: a graph of nodes connected by conditional and cyclic edges, mutating a shared state object that a pluggable checkpointer persists after every step" width="900" height="500" loading="lazy" />
+    <figcaption>LangGraph runs a graph of nodes over a state object you own; a checkpointer snapshots that state after every step.</figcaption>
+  </figure>
+
+  <h3>Graph nodes &amp; edges</h3>
+  <p>LangGraph asks you to draw the control flow as a graph. Nodes are functions — call a model, run a tool, transform data — and edges decide what runs next. Edges can be conditional (branch on the state) and cyclic (loop back), so the structure is a state machine, not a linear pipeline. This is the same perceive-decide-act cycle described in <a href="/concepts/the-agent-loop">The Agent Loop</a>, but made explicit: instead of an opaque while-loop inside a model harness, the loop is a diagram you can read, test, and reason about edge by edge. A supervisor-routes-to-specialists pattern, or the classic <a href="/deep-dives/architectures-and-patterns/plan-and-execute">plan-and-execute</a> split, both fall out naturally as graph topologies.</p>
+
+  <h3>The state object</h3>
+  <p>Every node reads from and writes to a single typed state object that you define. There is no hidden conversation buffer the framework controls behind your back — the state <em>is</em> the schema you wrote, and node return values are merged into it by reducers you can customize. That makes LangGraph the only framework here where the question "what does my agent know right now?" has a concrete, inspectable answer at every step. It also draws the line between this short-term working state and the durable knowledge stores discussed in <a href="/deep-dives/memory-and-context/short-vs-long-term-memory">short-vs-long-term memory</a>: the graph state is the per-run scratchpad; long-term memory is a separate store a node reads into it.</p>
+
+  <h3>The checkpointer &amp; durability</h3>
+  <p>The state object is the headline; the checkpointer is why it matters in production. LangGraph snapshots the full state after every node via a pluggable checkpointer — in-memory for tests, SQLite for a single box, Postgres for a fleet. Because each step is committed before the next runs, the runtime supports durable execution and replay: crash the process mid-run and it resumes from the last successful step rather than restarting from zero. That same checkpoint boundary powers human-in-the-loop interrupts (pause at a node, wait for approval, resume) and token-level streaming. Durability is not an add-on you bolt on later; it is the default consequence of owning a checkpointed state object.</p>
+</section>
+
+<section>
+  <h2>CrewAI — deep dive</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/arch-crewai.svg" alt="CrewAI architecture: a crew of role-based agents executing tasks under a sequential or hierarchical process, with an optional event-driven Flows layer carrying explicit state" width="900" height="500" loading="lazy" />
+    <figcaption>CrewAI composes role-based agents into a crew; Flows add an explicit, event-driven state layer on top.</figcaption>
+  </figure>
+
+  <h3>The crew / agent / task model</h3>
+  <p>CrewAI's core abstraction is a <strong>Crew</strong>: a set of agents, each declared with a role, a goal, and a backstory, working through a list of tasks. You describe <em>who</em> the agents are rather than wiring the control flow by hand — the framework turns those role declarations plus task descriptions into a running collaboration. It is multi-agent by construction, the same supervisor-and-specialists shape covered in the <a href="/deep-dives/multi-agent-systems/supervisor-worker-pattern">supervisor-worker pattern</a>, except you reach it by declaring roles instead of drawing a graph.</p>
+
+  <h3>Sequential vs hierarchical process, plus Flows</h3>
+  <p>A crew runs under a <strong>process</strong>: sequential (tasks run in order, each output feeding the next) or hierarchical (a manager agent delegates and reviews). For deterministic, event-driven control — conditional branching, explicit state, looping — CrewAI adds <strong>Flows</strong>, a separate orchestration layer where state is first-class rather than implied. The mental model splits cleanly: Crews when you want emergent role-based collaboration, Flows when you want a controlled pipeline. Many real systems nest a crew inside a flow.</p>
+
+  <h3>Where context is threaded implicitly</h3>
+  <p>In a plain crew, state is mostly <em>implicit</em>: context flows from one task's output into the next agent's prompt, threaded by the framework rather than stored in a schema you own. That is ergonomic for prototypes and is exactly why durability is weaker here than LangGraph's checkpointer model — there is no built-in snapshot to resume from unless you adopt Flows and manage the state yourself. CrewAI also speaks native MCP and A2A, so crews can call external tools and talk to other agents over open protocols. One correction worth stating plainly: CrewAI was historically built on LangChain, but the project is <strong>independent of LangChain now</strong> — its current README describes it as a fully standalone framework.</p>
+</section>
+
+<section>
+  <h2>Claude Managed Agents — deep dive</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/arch-claude-managed-agents.svg" alt="Claude Managed Agents architecture: a thin client streams events to and from a server-side autonomous loop on Anthropic infrastructure, where Sessions hold conversation history, container state, and outputs" width="900" height="500" loading="lazy" />
+    <figcaption>The client submits a goal and streams events; Anthropic's server runs the loop and holds the Session state.</figcaption>
+  </figure>
+
+  <h3>The client / server split</h3>
+  <p>Claude Managed Agents (launched April 2026, in beta) inverts the ownership question entirely. You run a thin client; Anthropic runs the loop. The framework's concepts are Agent, Environment, Session, and Events: you submit a goal and stream the run, but the orchestration happens server-side on Anthropic's infrastructure. This is distinct from the <strong>Claude Agent SDK</strong>, which runs the loop in <em>your</em> environment — Managed Agents is the hosted counterpart, where the runtime is the vendor's responsibility, not yours.</p>
+
+  <h3>The server-side loop &amp; tool execution</h3>
+  <p>The control flow is a server-side autonomous loop. A <strong>Session</strong> stores conversation history, container state, and outputs on Anthropic infrastructure, so a run resumes cleanly after a pause — the thread is never on your machine to lose. You observe and steer through <strong>Events</strong>: the run streams over SSE, and you can interrupt or redirect it mid-flight by sending events back. The <strong>Environment</strong> — where tools and code actually execute — can be a self-hosted sandbox on your own infra even while the loop itself stays managed, which keeps tool execution close to your data without making you operate the orchestrator.</p>
+
+  <h3>What you give up and gain</h3>
+  <p>You gain durability for free: no checkpointer to configure, no Postgres to operate, no resume logic to write. You give up two things. First, this is a <strong>single autonomous harness, not a multi-agent framework</strong> — sub-agents are not a headline primitive, so do not pick it expecting first-class crews or handoffs. Second, because Session state lives on Anthropic infrastructure, it is <strong>not ZDR- or HIPAA-eligible</strong>; the same property that makes it never-lose-the-thread durable also means the state physically leaves your boundary. That trade is the whole pitch: hand over operation of the runtime, and in return never write resume code again.</p>
+</section>
+
+<section>
+  <h2>OpenAI Agents SDK — deep dive</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/arch-openai-agents-sdk.svg" alt="OpenAI Agents SDK architecture: a runner loop in your process drives agents with tools, hands off control between agents, applies input and output guardrails, and keeps a process-local Sessions store" width="900" height="500" loading="lazy" />
+    <figcaption>A thin runner loop in your process: agents with tools, handoffs between them, guardrails, and a process-local Sessions store.</figcaption>
+  </figure>
+
+  <h3>Agents + tools</h3>
+  <p>The OpenAI Agents SDK is the most minimal of the four: a lightweight library you run in your own process. An agent is a model plus instructions plus a set of tools, and a small runner loop drives the model-calls-tool-evaluates cycle as plain code. There is no graph DSL and no role declarations to learn — control flow is the Python you already write, with the SDK supplying just enough loop, tracing, and structure to keep it honest.</p>
+
+  <h3>Handoffs</h3>
+  <p>Multi-agent is first-class here through <strong>handoffs</strong>: one agent transfers control to another, passing full context along. A triage agent hands off to a specialist; the specialist takes over the conversation. This is the lightest-weight multi-agent primitive of the four — closer to a function call than to a graph or a managed crew — and it maps directly onto the trade-offs in <a href="/deep-dives/architectures-and-patterns/single-vs-multi-agent">single vs multi-agent</a>: start with one agent, split into handoffs only when a clear specialization earns the seam.</p>
+
+  <h3>Guardrails &amp; sessions (and running Claude via LiteLLM)</h3>
+  <p>Safety and human-in-the-loop come from <strong>guardrails</strong> (input/output validators that can halt a run) and tool-approval patterns, with tracing built in for observability. State lives in a process-local <strong>Sessions</strong> abstraction — in-memory by default, with pluggable backends — and crucially there is <strong>no built-in checkpoint or replay</strong>: durability is your responsibility. Crash mid-run and, unless you persisted the session yourself, you start over. One pragmatic strength: the bundled <strong>LiteLLM adapter</strong> runs non-OpenAI models, so you can drive Claude with <code>LitellmModel(model="anthropic/claude-opus-4-7", ...)</code>, or swap in Gemini, Bedrock, Azure, or Ollama without leaving the SDK.</p>
+</section>
+
+<section>
+  <h2>Cross-cutting comparison</h2>
+
+  <h3>Where state lives &amp; durability</h3>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/compare-state.svg" alt="Four-column comparison of where state lives: LangGraph's owned checkpointed object, CrewAI's implicit in-crew context, Claude Managed Agents' server-held Session, and the OpenAI Agents SDK's process-local in-memory session" width="900" height="300" loading="lazy" />
+    <figcaption>The headline axis: four different homes for your agent's state, with four different durability stories.</figcaption>
+  </figure>
+  <p>This is the axis that separates the four, and it is the one the feature lists hide. LangGraph hands you an explicit state object you own and snapshots after every step, so durability and replay are the default — you can lose the process and not the run. Claude Managed Agents reaches the same never-lose-the-thread durability from the opposite direction: the Session lives on Anthropic's servers, so the state is durable precisely because it was never yours to hold (and, for the same reason, it leaves your data boundary). CrewAI keeps state implicit in the crew — context threaded between tasks, with no built-in snapshot — unless you adopt Flows and manage it explicitly. The OpenAI Agents SDK keeps a process-local Sessions store that is in-memory by default with no built-in checkpoint, so durability is entirely on you. Two frameworks make resume free; two make it your homework. Knowing which is which is the difference between a demo and something you can operate.</p>
+
+  <h3>Control-flow model</h3>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/compare-control-flow.svg" alt="Four-column comparison of control-flow models: LangGraph's graph of nodes and edges, CrewAI's role-and-task declarations, Claude Managed Agents' server-side autonomous loop, and the OpenAI Agents SDK's plain code plus handoffs" width="900" height="300" loading="lazy" />
+    <figcaption>From most explicit to most autonomous: a drawn graph, declared roles, plain code, and a managed loop.</figcaption>
+  </figure>
+  <p>The four sit on a spectrum from drawn to delegated. LangGraph is the most explicit: you author the control flow as a graph of nodes and conditional, cyclic edges, and every branch is visible and testable. The OpenAI Agents SDK is explicit in a different idiom — the control flow is plain code in your process, with handoffs as the one structured branch. CrewAI is declarative: you describe roles and tasks and let the sequential or hierarchical process decide ordering, reaching for Flows when you need deterministic branching back. Claude Managed Agents is the most delegated: the loop runs autonomously on the server and you steer it by streaming events rather than by authoring its structure. Whether the loop terminates cleanly — the concern in <a href="/concepts/planning-and-termination">planning and termination</a> — is something you design into a LangGraph edge, observe through OpenAI SDK tracing, or trust the managed runtime to handle.</p>
+
+  <h3>Multi-agent stance</h3>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk/compare-multi-agent.svg" alt="Four-column comparison of multi-agent stance: LangGraph subgraphs and supervisors, CrewAI multi-agent by construction, Claude Managed Agents as a single harness, and OpenAI Agents SDK handoffs" width="900" height="300" loading="lazy" />
+    <figcaption>Three first-class multi-agent stances and one deliberately single harness.</figcaption>
+  </figure>
+  <p>Three of the four treat multi-agent as first-class; one deliberately does not. CrewAI is multi-agent by construction — a crew is a team of role-based agents, and that is the whole point of the abstraction. LangGraph makes it first-class through subgraphs and supervisor patterns, composing agents as nodes within a larger graph. The OpenAI Agents SDK does it through handoffs, the lightest-weight transfer-of-control primitive of the three. Claude Managed Agents is the exception: it is a <strong>single autonomous harness, not a multi-agent framework</strong>, so sub-agents are not a headline primitive — pick it for one capable agent, not a crew. Before reaching for any of the multi-agent three, it is worth checking <a href="/deep-dives/multi-agent-systems/multi-agent-when-and-why">multi-agent: when and why</a> and the <a href="/deep-dives/multi-agent-systems/multi-agent-topologies">topologies</a> that follow, because the cheapest multi-agent system is often the single agent you did not split.</p>
+
+  <h3>Where it runs &amp; who operates it</h3>
+  <p>The state question collapses into an operations question: if the state lives on your infra, you operate the runtime; if it lives on the vendor's, they do. Three of the four run in your environment and put durability, scaling, and uptime on your team; Claude Managed Agents moves the runtime to Anthropic and the data boundary with it.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Framework</th>
+        <th>Runs on</th>
+        <th>You operate?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>LangGraph</td>
+        <td>Your infra (or LangGraph Platform / LangSmith Deployment)</td>
+        <td>Yes — unless you use the managed Platform</td>
+      </tr>
+      <tr>
+        <td>CrewAI</td>
+        <td>Your infra</td>
+        <td>Yes</td>
+      </tr>
+      <tr>
+        <td>Claude Managed Agents</td>
+        <td>Anthropic infra (Environment can be self-hosted)</td>
+        <td>No — Anthropic operates the loop</td>
+      </tr>
+      <tr>
+        <td>OpenAI Agents SDK</td>
+        <td>Your infra</td>
+        <td>Yes</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Use case</th>
+        <th>Pick LangGraph if…</th>
+        <th>Pick CrewAI if…</th>
+        <th>Pick Claude Managed if…</th>
+        <th>Pick OpenAI Agents SDK if…</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Durable long-running workflow</td>
+        <td>You want a checkpointed state object that resumes from the last step after a crash, on infra you control.</td>
+        <td>You can accept Flows-managed state and explicit persistence, or your runs are short enough that restart is cheap.</td>
+        <td>You want durability for free and are fine with Session state living on Anthropic's servers.</td>
+        <td>Not the natural fit — there is no built-in checkpoint, so you must persist sessions yourself.</td>
+      </tr>
+      <tr>
+        <td>Quick role-based prototype</td>
+        <td>Overkill — drawing a graph is more ceremony than a prototype needs.</td>
+        <td>You want to declare a few agents with roles and tasks and watch them collaborate with minimal wiring.</td>
+        <td>Workable for a single-agent prototype, but you are not modeling a team of roles.</td>
+        <td>You want a handful of agents and handoffs in plain code, no new DSL to learn.</td>
+      </tr>
+      <tr>
+        <td>Don't want to run infra</td>
+        <td>No — you operate the runtime (unless you adopt the managed Platform).</td>
+        <td>No — CrewAI runs in your environment.</td>
+        <td>Yes — Anthropic runs the loop and holds the state; you stream a thin client.</td>
+        <td>No — the runner loop lives in your process.</td>
+      </tr>
+      <tr>
+        <td>Minimal, code-first</td>
+        <td>Heavier than you want; the graph abstraction is the opposite of minimal.</td>
+        <td>You prefer declarations over code, so this leans away from code-first.</td>
+        <td>No — the loop is managed, not code you author.</td>
+        <td>You want a thin library that is mostly your own Python, with handoffs, guardrails, and tracing added.</td>
+      </tr>
+      <tr>
+        <td>Complex branching control flow</td>
+        <td>You need conditional and cyclic edges you can author and test explicitly — this is LangGraph's home turf.</td>
+        <td>You reach for Flows for event-driven branching on top of crews.</td>
+        <td>You are comfortable letting the server-side loop decide and steering it via events.</td>
+        <td>You will express branches as plain code and handoffs, accepting that complex graphs get unwieldy.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>What's the difference between LangGraph and the OpenAI Agents SDK?</h3>
+  <p>Both run in your own infrastructure, but they sit at opposite ends of the explicit-state spectrum. LangGraph gives you an explicit graph of nodes and edges over a checkpointed state object you own, with built-in durable execution and replay — crash mid-run and it resumes from the last step. The OpenAI Agents SDK is a thinner library: control flow is plain code, multi-agent happens through handoffs, and state is a process-local Sessions store that is in-memory by default with no built-in checkpoint, so durability is your responsibility. Reach for LangGraph when you need a durable, inspectable state machine; reach for the OpenAI Agents SDK when you want minimal code-first agents and will handle persistence yourself.</p>
+
+  <h3>Is CrewAI built on LangChain?</h3>
+  <p>Not anymore. CrewAI was historically built on LangChain, but the project is independent now — its current README describes it as a completely standalone framework with no LangChain dependency. It also has native MCP and A2A support for talking to external tools and other agents over open protocols.</p>
+
+  <h3>Do I have to self-host LangGraph, or is there a managed version?</h3>
+  <p>You can self-host LangGraph anywhere you run Python, choosing a checkpointer (in-memory, SQLite, Postgres) to match your durability needs. There is also a managed option — historically branded "LangGraph Platform," now offered under the "LangSmith Deployment" umbrella — that runs the orchestration for you. The exact product name has shifted over time, so check the current LangChain docs for the label, but the managed path does exist.</p>
+
+  <h3>Can I use Claude or other non-OpenAI models with the OpenAI Agents SDK?</h3>
+  <p>Yes. The SDK bundles a LiteLLM adapter, so you can run Claude with something like <code>LitellmModel(model="anthropic/claude-opus-4-7", ...)</code>, as well as Gemini, Bedrock, Azure, or Ollama. The "OpenAI" in the name refers to who maintains the library, not a lock-in to OpenAI models.</p>
+
+  <h3>When should I use a framework at all instead of a plain while loop?</h3>
+  <p>For a single agent calling a couple of tools with no durability or multi-agent needs, a plain while loop around a model call is honestly fine — see <a href="/concepts/the-agent-loop">The Agent Loop</a>. Reach for a framework when you need one of the things a loop does not give you for free: durable checkpointing and replay, explicit branching control flow, first-class multi-agent coordination, or a managed runtime you do not operate. The framework earns its weight exactly when "I'll just add persistence later" stops being a small change. See <a href="/concepts/agent-frameworks">Agent Frameworks</a> for the broader trade-off.</p>
+
+  <h3>Which framework is best for long-running, durable workflows?</h3>
+  <p>Two options give you durability out of the box, from opposite directions. LangGraph checkpoints an owned state object after every step and resumes from the last successful step after a crash — durable on infrastructure you control. Claude Managed Agents keeps the Session on Anthropic's servers, so it resumes cleanly after pauses without you writing any resume logic, at the cost of the state leaving your boundary (and not being ZDR/HIPAA-eligible). CrewAI's plain crews and the OpenAI Agents SDK both leave durability to you, so they are weaker fits unless you persist state yourself.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/agent-frameworks">Agent Frameworks</a> — what a framework adds over raw model calls, and when the abstraction earns its weight versus a plain loop.</li>
+    <li><a href="/concepts/the-agent-loop">The Agent Loop</a> — the perceive-decide-act cycle every one of these four wraps, made explicit so you can see what LangGraph draws, the OpenAI SDK codes, and Anthropic runs server-side.</li>
+    <li><a href="/deep-dives/multi-agent-systems/supervisor-worker-pattern">Supervisor-Worker Pattern</a> — the coordination shape CrewAI builds in by default and LangGraph composes from subgraphs, with the trade-offs of delegating to specialists.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://langchain-ai.github.io/langgraph/" rel="noopener noreferrer">LangGraph docs</a> — graphs, state, checkpointers, and durable execution (also at docs.langchain.com).</li>
+    <li><a href="https://docs.crewai.com/" rel="noopener noreferrer">CrewAI docs</a> — Crews, Flows, processes, and MCP/A2A support (source at <a href="https://github.com/crewAIInc/crewAI" rel="noopener noreferrer">github.com/crewAIInc/crewAI</a>).</li>
+    <li><a href="https://platform.claude.com/docs" rel="noopener noreferrer">Claude Managed Agents docs</a> — Agent, Environment, Session, and Events concepts, and the client/server split.</li>
+    <li><a href="https://openai.github.io/openai-agents-python/" rel="noopener noreferrer">OpenAI Agents SDK docs</a> — agents, tools, handoffs, guardrails, sessions, and the LiteLLM adapter.</li>
+  </ul>
+</section>
