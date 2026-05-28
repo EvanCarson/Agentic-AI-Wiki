@@ -1,7 +1,7 @@
 import { L, type ChangelogEntry } from '../types.ts';
 
 const entry: ChangelogEntry = {
-  date: '2026-05-27',
+  date: '2026-05-28',
   title: L(
     'Reading-path callout extended to Playbooks and Operations',
     '阅读路径提示扩展至「实战手册」与「运维」',
