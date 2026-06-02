@@ -1,0 +1,235 @@
+<p class="lede">把这四款向量库的功能页一字排开，几乎可以互换：ANN、元数据过滤、混合检索、多租户——四家全都打勾。可真正决定谁能在生产环境的智能体 RAG 栈中扛下去的那一点，在功能清单上根本看不见：<strong>索引相对于它所索引的那些行所在的位置。</strong>pgvector 就活在那个已经持有你主数据的 Postgres 里；Pinecone 是一项完全托管的外部服务；Weaviate 在向量引擎之上加了一层知识图谱式的 schema，想要成为第二份事实来源；Qdrant 则是一款开源引擎，整个设计原点就是大规模下的过滤型 ANN。先按这条轴选；其余一切随之而定。</p>
+
+<section>
+  <h2>速览</h2>
+  <p>四款向量库，对同一个问题给出四种答案——索引贴着什么，而你又要运维什么来让它待在那里。下表先列基本信息；其下的矩阵呈现各自在真正存在差异的那几条轴上最用力的方向。</p>
+  <table>
+    <thead>
+      <tr>
+        <th>项目</th>
+        <th>发布时间 / 维护方</th>
+        <th>主打场景</th>
+        <th>运行位置</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/logos/pgvector.svg" width="24" height="24" alt="pgvector 标志" style="vertical-align:middle;margin-right:8px;" />pgvector</td>
+        <td>2021 年，开源（社区维护）</td>
+        <td>以 Postgres 扩展形式提供向量检索</td>
+        <td>你的 Postgres 跑在哪儿就跑在哪儿</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/logos/pinecone.svg" width="24" height="24" alt="Pinecone 标志" style="vertical-align:middle;margin-right:8px;" />Pinecone</td>
+        <td>2019 年，Pinecone Systems Inc.</td>
+        <td>完全托管的 serverless 向量数据库</td>
+        <td>Pinecone 云（仅托管）</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/logos/weaviate.svg" width="24" height="24" alt="Weaviate 标志" style="vertical-align:middle;margin-right:8px;" />Weaviate</td>
+        <td>2019 年，Weaviate B.V.（开源）</td>
+        <td>向量引擎 + 知识图谱式 schema</td>
+        <td>自托管，或 Weaviate Cloud</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/logos/qdrant.svg" width="24" height="24" alt="Qdrant 标志" style="vertical-align:middle;margin-right:8px;" />Qdrant</td>
+        <td>2021 年，Qdrant Solutions（开源）</td>
+        <td>面向大规模过滤型 ANN 优化的 Rust 引擎</td>
+        <td>自托管，或 Qdrant Cloud</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">快照：2026-06-01。向量库的功能演进很快，请对照最新文档核实。</p>
+
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/data-feature-matrix.svg" alt="特性矩阵：四款向量库横跨六条轴——与主数据是否同居、规模下的过滤型 ANN、混合检索、schema 与图模型、是否可自托管、是否有托管选项——按强度着色" width="900" height="400" loading="lazy" />
+    <figcaption>每款向量库最用力的方向。除了索引放在哪里、上面又附加了什么之外，其余各轴几乎处处趋同。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>pgvector — 架构详解</h2>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/arch-pgvector.svg" alt="pgvector 架构：Postgres 内的一张 documents 表，含有标量列、JSONB 元数据，以及一列 embedding vector(1536)；向量上建有 HNSW 或 IVFFlat 索引，标量列上有 B-tree/GIN 索引，由同一个查询计划器统一调度" width="900" height="500" loading="lazy" />
+    <figcaption>pgvector 为 Postgres 增添了向量类型和 ANN 索引；索引和 SQL 数据落在同一行上，归同一个计划器、同一笔事务管辖。</figcaption>
+  </figure>
+
+  <h3>存储与索引模型</h3>
+  <p>pgvector 是一个 Postgres 扩展。你在一张已有的表上加一列 <code>vector(d)</code>，嵌入就和这一行的其他数据放在一起——同一个主键、同一组外键、同一份事务日志。ANN 索引可在两种结构中选其一：<strong>HNSW</strong>，一张保留在 shared buffers 中的可导航小世界图；或 <strong>IVFFlat</strong>，把向量聚成若干列表，查询时扫描可配置数量的最近列表。无论哪种，索引文件都是一个普通的 Postgres 关系；备份、副本和按时间点恢复都不需要任何新东西。这与<a href="/zh/concepts/chunking-and-vector-search">分块与向量搜索</a>入门里讲的那套向量检索机制完全相同，只不过被放在了那个已经权威回答 <em>"这行数据是什么？"</em> 的数据库内部。</p>
+
+  <h3>查询路径（向量 + 过滤 + 混合）</h3>
+  <p>查询就是普通的 SQL。<code>ORDER BY embedding &lt;=&gt; $1 LIMIT k</code> 走 ANN 索引；标量列上的 <code>WHERE</code> 条件走已有的 B-tree 或 GIN 索引；Postgres 计划器再决定是先过滤、再对幸存者做 ANN，还是先 ANN、再过滤。混合检索则由已有零件组合而成：Postgres 全文检索（<code>tsvector</code> + <code>ts_rank</code>）和持有向量的那一行做联表，秩融合在 SQL 里完成——模式与<a href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索与重排序</a>里那套一致，只是写成一条查询，而非两个服务。由于联表目标就是那一行本身，那些既需要向量匹配、又需要业务字段（"标题、正文、作者名、最后更新时间"）的智能体查询，一次往返就能拿到。</p>
+
+  <h3>运行时让什么变难</h3>
+  <p>两件事。第一，超大规模下的过滤型 ANN 是个已知的尖角——计划器有时会选出一条让 HNSW 索引剪枝失效的路径，达到数十亿向量加上高基数过滤时，你可能不得不用索引提示或分区表来"教"它。第二，写放大：HNSW 索引的构建与增量重建会消耗同一台 Postgres 实例的资源，而这台机器还在为事务负载服务，因此重摄取会和 OLTP 路径抢 I/O 和 CPU。务实做法是当摄取量真的上去时把 pgvector 放到一台只读副本（或一份专用的逻辑复制副本）上，这基本就是你本来就会为任何读重型 Postgres 工作负载安排的运维剧本。</p>
+</section>
+
+<section>
+  <h2>Pinecone — 架构详解</h2>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/arch-pinecone.svg" alt="Pinecone 架构：你的主数据库与摄取流水线在你的基础设施上；向量 upsert 进 Pinecone 托管云中的索引，索引拆分为 namespace，附带一个 serverless 存储层，由查询引擎通过 HTTPS 对外暴露" width="900" height="500" loading="lazy" />
+    <figcaption>Pinecone 完全托管：向量和元数据存在 Pinecone 的云里，智能体通过 HTTPS 访问索引，再凭 ID 回到主数据库做联表。</figcaption>
+  </figure>
+
+  <h3>存储与索引模型</h3>
+  <p>Pinecone 是把向量数据库做成服务。你创建一个 <strong>index</strong>：起个名字，定义维度、距离度量和区域；用 <strong>namespace</strong> 做租户或集合隔离；通过 HTTPS upsert 形如 <code>{ id, values, metadata }</code> 的记录。当前的 serverless 层把热计算与冷的 blob 存储层解耦，因此你付的存储费用与查询吞吐解耦——没有分片要规划、没有副本要预置、没有 HNSW 参数要调。内部索引和 ANN 算法不在契约之中；Pinecone 拥有实现，你以透明度换取"再也不必想它"。</p>
+
+  <h3>查询路径（向量 + 过滤 + 混合）</h3>
+  <p>查询是一次 HTTPS POST：向量、top-k、可选的 metadata filter、可选的 namespace。元数据过滤在遍历过程中应用，而非事后，所以高基数过滤也大致能拿回正确的 top-k。Pinecone 通过同时接收一个稀疏向量与稠密向量并对分数做融合来支持 <strong>sparse-dense hybrid</strong>；想要 BM25 式的词法检索，由你自己计算稀疏向量（BM25、SPLADE 或同类），两者一起传入。查询返回 ID、分数以及你在 upsert 时存入的元数据——但完整的业务行数据仍在你的主数据库里，于是智能体接着会向你的 Postgres 或 Mongo 发出第二次查询来丰满结果。</p>
+
+  <h3>运行时让什么变难</h3>
+  <p>三件事。第一，<strong>两份事实来源</strong>：每一行写进主数据库的数据，都得被嵌入、upsert，并与 Pinecone 保持一致，于是"陈旧向量"或"缺失向量"成为你过去没有的一类 bug。第二，<strong>按定义就是供应商锁定</strong>——服务不可自托管，所以最便宜的对冲是给读写加一层干净的抽象。第三，<strong>数据边界</strong>：向量与其附带的元数据离开了你的基础设施，于是受监管的内容需要企业区域或 BYOC 方案，而 Pinecone 的一次故障就是你检索路径的一次故障。这项服务上手快、运维轻；运维成本是把它当成远端依赖、而非你自己拥有的数据库的那份纪律。</p>
+</section>
+
+<section>
+  <h2>Weaviate — 架构详解</h2>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/arch-weaviate.svg" alt="Weaviate 架构：一份带类型的 schema，包含若干 class（Article、Author、Topic）与它们之间的 cross-reference；inline module 在服务端完成向量化与重排序；每个 class 有自己的 HNSW 图，并配以标量上的倒排索引；GraphQL 客户端一次查询同时拿回向量匹配和被联表的引用对象" width="900" height="500" loading="lazy" />
+    <figcaption>Weaviate 在向量引擎之上加了一层知识图谱式的 schema：class 带类型化属性和 cross-reference，module 把向量化与重排序内置在服务端，一条 GraphQL 查询同时返回向量匹配和图遍历结果。</figcaption>
+  </figure>
+
+  <h3>存储与索引模型</h3>
+  <p>Weaviate 是一款开源向量引擎，内置一层 <strong>schema</strong>。你声明 <strong>class</strong>，每个 class 有类型化的属性，包括 class 之间的 <strong>cross-reference</strong>——于是 <code>Article</code> 引用 <code>Author</code> 与 <code>Topic</code>，就像图数据库一样，每个 class 都有自己针对 class 级别嵌入的 HNSW 索引。向量化在服务端通过 <strong>module</strong> 完成：<code>text2vec-openai</code>、<code>text2vec-cohere</code>、<code>text2vec-transformers</code>，再加 reranker 和一个能在数据库里跑 RAG 的 generative module。这套架构在四者中最接近一个"装在盒子里"的小型 <a href="/zh/deep-dives/retrieval-and-rag/graph-rag">graph RAG</a> 系统——向量与类型化关系合住一处。</p>
+
+  <h3>查询路径（向量 + 过滤 + 混合）</h3>
+  <p>默认查询语言是 <strong>GraphQL</strong>。一条 <code>Get { Article(nearVector: …, where: …) { _additional { distance } author { name } } }</code> 一次往返就把向量匹配、分数与被联表的 cross-reference 对象一并拿回。混合检索是一等公民算子：<code>hybrid(query, alpha)</code> 把 BM25 与向量结果按 alpha 参数控制的融合权重混合起来；reranker module 还能在查询时再跑一遍 cross-encoder。多租户按 class 切分——每个租户拿到一份隔离的 HNSW 图，避免租户互相污染召回，代价是要维护更多的图。</p>
+
+  <h3>运行时让什么变难</h3>
+  <p>schema 演化就是那个尖角。schema 是一份契约——加属性没问题，但更换 vectorizer、修改属性类型或重构 cross-reference，通常意味着一次重新向量化加一次迁移，而这恰恰是 pgvector 靠搭车在应用现有 schema 上让你省下的工。Weaviate 同时是你拓扑里另一个有状态的服务——一个独立的故障域，有自己的备份策略、版本升级与 module 配置。这笔交易很实在：你在数据库里得到 RAG 相关的原语（向量化、重排序、图遍历），但要多运维一个 schema 必须维护得整整齐齐的系统。</p>
+</section>
+
+<section>
+  <h2>Qdrant — 架构详解</h2>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/arch-qdrant.svg" alt="Qdrant 架构：collection 中的 point 由向量与 JSON payload 组成，filter-aware HNSW 在图遍历时即评估 payload 过滤条件，scalar/product/binary quantization 压缩内存占用，通过 gRPC 与 REST 暴露的集群按 point ID 做分片与复制并伴随 WAL" width="900" height="500" loading="lazy" />
+    <figcaption>Qdrant 是一款围绕过滤型 ANN 设计的 Rust 向量引擎：payload 索引喂给 filter-aware HNSW，quantization 压缩向量体积，集群按 point ID 做分片与复制。</figcaption>
+  </figure>
+
+  <h3>存储与索引模型</h3>
+  <p>Qdrant 是一款用 Rust 写的开源向量引擎。数据组织成 <strong>collection</strong>，每个 collection 有向量维度、距离度量，以及可选的具名多向量槽位（例如一个槽位放稠密嵌入，一个槽位放 ColBERT 式的晚交互向量）。每条记录是一个 <strong>point</strong>：一个 ID、一个或多个向量，以及一份 <strong>payload</strong>——任意结构的 JSON，并支持按字段建立 <strong>payload 索引</strong>，相当于元数据上的倒排索引。主索引仍是 HNSW，但 Qdrant 提供 <strong>quantization</strong>——scalar、product 或 binary——把内存里的向量体积压缩 4× 到 32×，并用完整向量对幸存者做 rescore，这正是单节点能装下大量 point 的原因。</p>
+
+  <h3>查询路径（向量 + 过滤 + 混合）</h3>
+  <p>招牌特性是 <strong>filter-aware HNSW</strong>：图遍历在前进过程中即评估 payload 过滤条件，而不是先做 ANN 检索、再事后丢弃不匹配项。收益是重过滤下的召回率——那种"我在最近的 200 个里没找到 tenant_id=42，抱歉"的事后过滤失败模式，在这里基本不会发生，因为遍历不会把预算浪费在不匹配的邻居上。混合检索通过稀疏向量与稠密向量配合实现（BM25 式的稀疏向量在查询时与稠密向量融合），API 还在普通 search 之外暴露 recommend、batch search、scroll，组合进<a href="/zh/deep-dives/retrieval-and-rag/agentic-retrieval">智能体式检索</a>这种由智能体反复发出有针对性查询的循环里很顺手。</p>
+
+  <h3>运行时让什么变难</h3>
+  <p>你来自托管（或用 Qdrant Cloud），这意味着你运维另一个有状态的服务，连同它的分片、复制因子、WAL 与快照。quantization 强大却非免费——你要自己选 quantization 级别、rescore 深度和分片数，所以运维开销是"再多一套分布式数据库要运维"，而不是"在你已有的数据库上加个扩展"。payload 模型是 JSON 而非 schema，因此没有 Weaviate 那种类型化 cross-reference 的等价物；关系由应用层自己重建。一句实话：在这套对比里，Qdrant 给你最强的过滤型 ANN 引擎，代价是一个由你自己运维的独立有状态系统。</p>
+</section>
+
+<section>
+  <h2>横向对比</h2>
+
+  <h3>索引相对于主数据所在的位置</h3>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/compare-index-location.svg" alt="索引位置的四列对比：pgvector 位于持有你主行数据的 Postgres 内部；Pinecone 位于通过 HTTPS 访问的外部托管服务；Weaviate 是自带 schema 层、想成为第二份事实来源的独立引擎；Qdrant 是与主数据库并列自托管的独立引擎" width="900" height="300" loading="lazy" />
+    <figcaption>主角那条轴。索引的四种家，对应四种不同的一致性与可联表性故事。</figcaption>
+  </figure>
+  <p>这正是功能清单藏起来的那条轴，也是决定哪款向量库能在生产环境下与一个真实智能体过招的那条轴。pgvector 把索引放在与你主数据同一行上，归同一个计划器与事务日志管辖，于是一条 SQL 就能把"最近向量"与"真实业务字段"联起来，无需第二跳。Pinecone 把索引搬进托管云里，运维变得容易，但每次检索都变成跨系统联表：向量在那边、源行在这边，应用要负责把两者维护一致。Weaviate 处境更微妙——它的 schema 层想"成为"事实来源（class、cross-reference、服务端向量化），当应用恰好契合 Weaviate 的形态时令人惊艳，当应用的领域 schema 与 Weaviate 的 schema 开始漂移时则令人疲惫。Qdrant 取最朴素的立场：它就是隔壁的一个向量索引，payload 是不透明的 JSON，联表在应用里完成——但这台引擎正是为这种形态而造，做得很好。</p>
+
+  <h3>规模下的过滤型 ANN 行为</h3>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/compare-filtered-ann.svg" alt="过滤型 ANN 行为的四列对比：pgvector 由 Postgres 计划器结合 B-tree 过滤与 HNSW；Pinecone 在托管规模下在遍历过程中应用元数据过滤；Weaviate 在 HNSW 之外配以每 class 的倒排索引；Qdrant 的 filter-aware HNSW 在重过滤下仍能保持高召回" width="900" height="300" loading="lazy" />
+    <figcaption>四者拉得最开的一条轴。过滤型 ANN 正是智能体 RAG 工作负载做得最多的事。</figcaption>
+  </figure>
+  <p>智能体 RAG 查询几乎从不是"给我无过滤的最近 k 个向量"——它们是"<em>属于该租户、该文档类型、该日期范围内</em>的最近 k 个向量"。pgvector 把策略交给 Postgres 计划器：在中等规模下它能挑出 B-tree 与 HNSW 的正确组合，但在高基数下可能落在一条让 ANN 索引剪枝失效的路径上，修法是索引调优或分区。Pinecone 与 Weaviate 都在遍历时过滤，大体可用；Pinecone 隐藏算法、请你信任它，Weaviate 在每 class 上暴露倒排索引，并在召回比延迟更重要时提供 flat-search 的逃生阀。Qdrant 把 filter-aware ANN 当作设计原点：HNSW 遍历在前进时评估 payload 条件，于是"重过滤下召回坍塌"那种让前三者头疼的失败模式，在 Qdrant 这里按构造就不该出现。如果你的智能体过滤又宽又浅，四者都行；如果它窄而精（"只看这位客户最近 30 天的文档，且只看发票类目"），Qdrant 的行为最可预测。</p>
+
+  <h3>运维与部署故事</h3>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/compare-operations.svg" alt="运维故事的四列对比：pgvector 复用你已有的 Postgres 运维；Pinecone 完全托管、不需要服务器；Weaviate 是另一个需要维护 schema 迁移的有状态服务；Qdrant 是一个由你自托管、自己调分片与 quantization 的单一 Rust 二进制" width="900" height="300" loading="lazy" />
+    <figcaption>状态问题最终坍缩成一个运维问题——谁来运维这个索引，又由谁为这第二份事实来源买单。</figcaption>
+  </figure>
+  <p>四者分得很干净。pgvector 几乎不增加运维面——你已有的 Postgres 备份、副本、监控、RLS，以及云上的托管 Postgres（RDS、Neon、Supabase、Aurora）就覆盖了它，这正是从 pgvector 起步的团队大多就此停下的最大单一理由。Pinecone 把整个运维面交给供应商：无服务器、无分片规划、无 HNSW 调优，代价是检索关键路径上的一项远端依赖和一条独立的账单。Weaviate 是四者中最重的——它本身是一个有状态服务，版本升级、module 配置、schema 迁移都是你应用数据库里没有对应物的工作。Qdrant 比 Weaviate 轻，但仍是一个独立的有状态服务：一份 Rust 二进制可以从一个 Docker 容器扩到一个分片集群，但分片、复制因子、quantization 这些选择都得你来定。一个反直觉的结论：对大多数团队，"应该运维更少的系统还是更能干的系统？"这个问题会自己回答——直到某种查询模式（极大规模、极重过滤、跨区域）真的逼你换成"更能干的那个"为止，"更少的系统"始终领先。</p>
+</section>
+
+<section>
+  <h2>该选哪一个</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>使用场景</th>
+        <th>选 pgvector，当……</th>
+        <th>选 Pinecone，当……</th>
+        <th>选 Weaviate，当……</th>
+        <th>选 Qdrant，当……</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>你已经在跑 Postgres</td>
+        <td>选——索引与数据同居、不增加系统、与已有行天然联表。</td>
+        <td>只有当 Pinecone 的规模或零运维故事比"多一份事实来源"更划算时。</td>
+        <td>只有当那套知识图谱 schema 就是你的应用模型时。</td>
+        <td>只有当你的规模下"过滤型 ANN 行为"成为唯一卡点时。</td>
+      </tr>
+      <tr>
+        <td>你不想运维这个索引</td>
+        <td>用托管 Postgres（RDS、Neon、Supabase）——pgvector 一并捎上。</td>
+        <td>选——仅托管就是这整款产品；无服务器、无调优。</td>
+        <td>Weaviate Cloud 是存在的，但 schema 与 module 仍归你。</td>
+        <td>Qdrant Cloud 是存在的；默认期待仍是自托管。</td>
+      </tr>
+      <tr>
+        <td>巨大规模下的重过滤型 ANN</td>
+        <td>HNSW + 分区可行，但调优开始尖利。</td>
+        <td>托管的元数据过滤无需你来调优，可以扩。</td>
+        <td>每 class HNSW + 倒排索引可用；必要时退到 flat-search。</td>
+        <td>选——filter-aware HNSW 正是设计原点。</td>
+      </tr>
+      <tr>
+        <td>带类型化实体与关系的 RAG</td>
+        <td>用 SQL 建模关系——可行，但没有原生图遍历。</td>
+        <td>namespace 是扁平的；关系仍在你的主数据库里。</td>
+        <td>选——类型化 class + cross-reference 是一等公民。</td>
+        <td>只有 JSON payload；关系由应用重建。</td>
+      </tr>
+      <tr>
+        <td>受监管数据、硬性数据边界</td>
+        <td>选——边界就是你 Postgres 的边界。</td>
+        <td>需要企业区域或 BYOC。</td>
+        <td>在你的边界内自托管。</td>
+        <td>在你的边界内自托管。</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+
+  <h3>pgvector "够不够"撑生产 RAG？</h3>
+  <p>对大多数团队，够——而且"不够"的门槛比厂商话术里讲的高得多。用 HNSW 的 pgvector 能在普通规格的 Postgres 实例上从容承载数千万级向量；它真正变尖利的角落是高基数下的重过滤型 ANN、写吞吐与 OLTP 负载相互挤压，以及索引大到构建时间本身成了运维痛点。在搬出专用向量库之前，便宜的招数有：把向量放只读副本、按租户或日期分区、把嵌入流水线从 OLTP 节点上挪走。要把决策走得更细，可看团队的<a href="/zh/deep-dives/retrieval-and-rag/choosing-a-vector-database">选向量数据库</a>深入解析。</p>
+
+  <h3>Pinecone、Weaviate、Qdrant 之间究竟有何不同？</h3>
+  <p>三者都是专用向量引擎，但站位不同。Pinecone 完全托管、闭源——不可自托管、不对索引透明，但也无需运维。Weaviate 是开源的，内置一层知识图谱式 schema：类型化 class、cross-reference、内联的向量化 module 与 GraphQL API；它是三者中最重运维、最对建模方式有立场的一个。Qdrant 也是开源的、且更简朴——向量加 JSON payload，把 filter-aware HNSW 作为设计原点，面向大规模过滤型 ANN 做优化；比 Weaviate 轻运维，对你的 schema 要求也更少。</p>
+
+  <h3>过滤型 ANN 在这几款向量库之间到底表现差在哪？</h3>
+  <p>要盯的失败模式是："过滤太窄，以至于 ANN 图遍历返回的大多是不匹配项，召回坍塌，智能体什么都拿不到。"pgvector 与 Pinecone 在宽过滤下没问题；pgvector 在 Postgres 计划器选错主导索引时开始吃力，得靠提示或分区来救；Weaviate 的每 class HNSW 加倒排索引在 class 内部表现良好。Qdrant 是唯一一个把 filter-aware HNSW 明确当作首要设计约束的——图遍历在前进时即评估 payload 过滤，于是"窄过滤、低召回"那种失败基本不发生。如果你的智能体查询非常有选择性，这就是最值得关注的那一维。</p>
+
+  <h3>一个向量库里的 embeddings 能拿到另一个里用吗？</h3>
+  <p>能——embeddings 不过是一些浮点数数组，同一个模型（OpenAI <code>text-embedding-3-large</code>、Cohere、BGE、voyage-3，随便哪个）产出的向量，四款向量库都能索引。向量库不拥有 embedding；embedding 模型才拥有。这就是为什么在向量库之间迁移通常是<em>"把同样的向量按同样的 ID 重新 upsert"</em>，而不是"从零再嵌入一遍"——前提是你把源文本和模型名都钉死了。底层直觉见<a href="/zh/concepts/embeddings">嵌入：意义即几何</a>。</p>
+
+  <h3>Pinecone 闭源这件事有多重要？</h3>
+  <p>它的重要程度与你检索关键路径上任何一项托管云依赖相当。务实的问题不是"开源 vs 闭源"，而是"如果这家供应商的定价、区域可用性或 SLO 在十八个月后不再适合我们，会发生什么？"对 Pinecone 来说，答案是"把你的向量重新 upsert 到别处"，这件事比许多人想象的便宜——embedding 模型与源文本才是资产，索引可替换。零成本的对冲是给读写加一层薄抽象；有成本的对冲是坚持选择可自托管的向量库，让退出代价微不足道。</p>
+
+  <h3>这一层在更大的 RAG 栈里处于什么位置？</h3>
+  <p>向量库只是检索流水线中的一层，流水线还包括分块、嵌入、混合检索、重排序与查询改写。选对向量库救不回糟糕的分块策略，也凭空生不出 embedding 本就没有的召回。诚实的顺序是：先用手边最近的那个向量库（很多时候就是 pgvector）把<a href="/zh/concepts/what-is-rag">RAG</a> 端到端跑通，按<a href="/zh/deep-dives/retrieval-and-rag/evaluating-rag">评估 RAG</a> 里那套办法测出检索究竟在哪里失败，只有当数据这么告诉你时，再去搬动索引。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关内容：</h3>
+  <ul>
+    <li><a href="/zh/concepts/what-is-rag">检索增强生成（RAG）详解</a>——向量库托住的那个检索→增强→生成循环，以及为何检索与生成应作为两半来调试。</li>
+    <li><a href="/zh/concepts/chunking-and-vector-search">分块与向量搜索直觉</a>——embedding 究竟是什么、最近邻搜索做什么，以及混合检索与重排序如何叠在其上。</li>
+    <li><a href="/zh/concepts/embeddings">嵌入：意义即几何</a>——为什么同一份向量在四款向量库之间都能用，以及真正归"模型"（而非索引）所有的是什么。</li>
+    <li><a href="/zh/deep-dives/retrieval-and-rag/choosing-a-vector-database">选向量数据库</a>——一份约束优先的选型指南，覆盖 ANN、过滤、新鲜度、混合检索、运维这些产品之间真正不同的轴。</li>
+    <li><a href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索与重排序</a>——为什么单一检索器在结构上不够，以及如何把 BM25、稠密向量与一遍 cross-encoder 组合起来。</li>
+    <li><a href="/zh/deep-dives/retrieval-and-rag/agentic-retrieval">智能体式检索：把搜索做成工具</a>——当智能体把检索当作可反复调用的工具时，这些向量库实际承托的那个循环。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://github.com/pgvector/pgvector" rel="noopener noreferrer">pgvector 仓库</a>——扩展本体，含 HNSW 与 IVFFlat 索引文档。</li>
+    <li><a href="https://docs.pinecone.io/" rel="noopener noreferrer">Pinecone 文档</a>——serverless 索引、namespace、sparse-dense hybrid、metadata filter。</li>
+    <li><a href="https://weaviate.io/developers/weaviate" rel="noopener noreferrer">Weaviate 文档</a>——schema、module、GraphQL 查询 API、混合检索。</li>
+    <li><a href="https://qdrant.tech/documentation/" rel="noopener noreferrer">Qdrant 文档</a>——collection、point、payload 索引、filter-aware HNSW、quantization。</li>
+  </ul>
+</section>
