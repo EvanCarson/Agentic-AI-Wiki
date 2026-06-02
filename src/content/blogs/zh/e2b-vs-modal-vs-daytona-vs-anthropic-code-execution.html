@@ -1,0 +1,233 @@
+<p class="lede">把同一段 Python 交给智能体去跑——拟合一条回归、把它画成图、再总结结果——能托管它的这四款运行时表面上几乎没有区别：起一个沙箱、把代码送进去、把 stdout 流回来。底下,它们给出不同答案的那个问题,正是会在生产里咬人的那个:<strong>沙箱的生命周期归谁所有</strong>。E2B 把原始的 Firecracker microVM 当成 SDK 原语递给你的应用。Modal 把 serverless 容器养在热池里、按调用计费。Daytona 把沙箱当成一个比任何单次运行都活得更久的开发者工作区。Anthropic Code Execution 把容器深深埋进模型循环,以至于"启动沙箱"不过是 assistant 消息上的又一次工具调用而已。挑错了所有者,你要么在运维一层你本不想运维的基础设施,要么把本来该握在手里的控制权交给了平台。</p>
+
+<section>
+  <h2>速览</h2>
+  <p>四款运行时,智能体代码所跑的那个容器有四种不同的归宿——对"谁创建它、它活多久、运行结束时会发生什么"也给出了四种不同的答案。</p>
+  <table>
+    <thead>
+      <tr>
+        <th>运行时</th>
+        <th>发布时间 / 维护方</th>
+        <th>主打场景</th>
+        <th>沙箱生命期</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/logos/e2b.svg" width="24" height="24" alt="E2B 标志" style="vertical-align:middle;margin-right:8px;" />E2B</td>
+        <td>2023 年,E2B(开源)</td>
+        <td>把 Firecracker microVM 作为 SDK 原语暴露</td>
+        <td>数秒到约 24 小时,由应用控制</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/logos/modal.svg" width="24" height="24" alt="Modal 标志" style="vertical-align:middle;margin-right:8px;" />Modal</td>
+        <td>2022 年,Modal Labs</td>
+        <td>把 serverless 函数作为按调用的容器</td>
+        <td>按调用,热池复用</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/logos/daytona.svg" width="24" height="24" alt="Daytona 标志" style="vertical-align:middle;margin-right:8px;" />Daytona</td>
+        <td>2024 年,Daytona Platforms</td>
+        <td>开发环境即代码、IDE 形态的工作区</td>
+        <td>数小时至数天,IDE 会话</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/logos/anthropic-code-execution.svg" width="24" height="24" alt="Anthropic Code Execution 标志" style="vertical-align:middle;margin-right:8px;" />Anthropic Code Execution</td>
+        <td>2025 年 5 月,Anthropic</td>
+        <td>嵌在模型循环里的服务端容器工具</td>
+        <td>按会话,由 API 持有</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">快照:2026-06-01。沙箱运行时变动很快,请对照最新文档核实。</p>
+
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/data-feature-matrix.svg" alt="特性矩阵:四款沙箱运行时横跨六条轴——隔离强度、生命周期归属、持久文件系统、网络范围、可装包、托管 vs 自托管——按强度着色" width="900" height="400" loading="lazy" />
+    <figcaption>每款运行时最用力的方向。营销页面互相重叠;真正分化它们的是生命周期归属与隔离原语。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>E2B — 架构详解</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/arch-e2b.svg" alt="E2B 架构:你的智能体 SDK 调用 e2b.Sandbox.create() 启动一台 Firecracker microVM;然后 SDK 在该 VM 内驱动一个 runtime daemon 来执行 Python 或 bash、交换文件、转发 stdout,最后由应用显式杀掉这个沙箱" width="900" height="500" loading="lazy" />
+    <figcaption>E2B 把 Firecracker microVM 当成 SDK 对象来暴露:由你的应用创建它、驱动它、销毁它。</figcaption>
+  </figure>
+
+  <h3>隔离模型:Firecracker microVM</h3>
+  <p>E2B 的沙箱是 <strong>Firecracker microVM</strong>——也就是 AWS Lambda 所运行的那种基于 KVM、攻击面极小的 VM 技术。每个沙箱大约在 200 毫秒内启动一个全新的 Linux 内核,拥有自己独立的内核、init 与文件系统。这是比共享内核的容器明显更强的隔离原语:沙箱里的进程无法利用 Linux 内核漏洞越狱到相邻沙箱,因为根本就没有共享的内核可以利用。智能体拿到的是真正的 <code>/</code>、真正的 <code>/proc</code> 和真正的网络栈,全部隔在 hypervisor 边界之后。当被运行的代码来自一个攻击者可能注入过提示的模型时,这一点很重要。</p>
+
+  <h3>沙箱生命周期:由应用拥有</h3>
+  <p>生命周期完全握在你手里。<code>e2b.Sandbox.create()</code> 起一台 microVM(默认 5 分钟超时,可配置至约 24 小时);<code>sandbox.kill()</code> 把它销毁;<code>sandbox.set_timeout()</code> 在运行中延长它;<code>Sandbox.connect(sandbox_id)</code> 跨进程重连,让长时间运行的智能体能扛过自己的重启。你可以为每个会话保留一个沙箱,也可以跨用户共用一池,或者每次工具调用都烧掉一个——E2B 不预设形态。模板(预装好的镜像)让启动成本很低,所以"总是新建"的模式是行得通的,而不是浪费。持久状态在沙箱的文件系统里存活其生命期之内;若你需要它活得比 VM 还久,得自己上传、下载或挂载。</p>
+
+  <h3>集成形态:SDK 原语</h3>
+  <p>集成方式是<strong>一个库,不是某种服务抽象</strong>。你导入 SDK(Python 或 JS),拿到一个 <code>Sandbox</code> 对象,在上面调用方法——<code>run_code</code>、<code>commands.run</code>、<code>files.write</code>、<code>files.read</code>。你所用的智能体框架(LangGraph、OpenAI Agents SDK,或自己写的循环)把这些调用包装成工具。E2B 不在智能体形态上强加任何东西;它就处在智能体循环之下,角色就像一个数据库客户端。仓库是开源的(Apache-2.0),如果必须把一切都留在自己边界内,你可以自托管控制面。</p>
+</section>
+
+<section>
+  <h2>Modal — 架构详解</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/arch-modal.svg" alt="Modal 架构:一个被 @app.function 装饰的 Python 函数被发到 Modal 平台,平台按需从热池里调度一个容器、运行该函数、返回结果;另一个独立的 Sandbox 原语让智能体可以在容器里执行任意代码" width="900" height="500" loading="lazy" />
+    <figcaption>Modal 把 Python 函数作为容器来服务,并额外提供 Sandbox 原语供智能体执行任意代码。</figcaption>
+  </figure>
+
+  <h3>隔离模型:gVisor 风格的容器</h3>
+  <p>Modal 把代码跑在<strong>容器</strong>里、而非 VM,但在负载与宿主内核之间夹了一层用户态内核(gVisor / runsc)。这比纯 runc 容器的隔离更强——负载所看见的系统调用面被 gVisor sentry 拦截,而不是直达宿主内核——代价是每次系统调用都有可感知的开销。这与 E2B 的取舍正好相反:容器冷启动更快、热池更暖,但隔离原语是一个用户态内核,而不是 hypervisor。对大多数智能体负载(在用户数据上跑模型生成的 Python)而言,这是一个比较合理的折中点。</p>
+
+  <h3>沙箱生命周期:由平台拥有</h3>
+  <p>Modal 拥有生命周期。一个 <code>@app.function()</code> 就是一个 serverless 函数:每次调用都会配出一个容器、运行函数、返回结果,然后容器回到热池里等下一次调用。扩缩、排队、资源限制是平台的事,不是你的事。智能体真正用来跑任意代码的 <strong>Sandbox</strong> 原语,是它的同胞抽象:<code>modal.Sandbox.create()</code> 打开一个长生命周期的容器,智能体可以 shell 进去并对它执行命令,可配置超时,也可在运行途中再挂上更多进程。你仍然要写一个 Modal app 并部署它;由平台决定容器落在哪台物理机上,以及热池什么时候回收。</p>
+
+  <h3>集成形态:serverless 函数 + Sandbox</h3>
+  <p>Modal <strong>首先是一个计算平台,其次才是面向智能体的沙箱</strong>。它招牌式的人体工学——在 Python 里定义一个函数、加个装饰器、把它当作可按需用上 GPU 的云计算来跑——是为 ML 推理和批处理打造的;Sandbox 原语是后来才为智能体用例补上的。这在实操上意味着:如果工作流是"智能体先要微调一个模型、再把结果画出来"这种把重型 GPU 计算与代码执行作为工具混在一起的场景,Modal 是这四款里最强的一档。如果你只想要"一行代码给我一个沙箱"的 SDK 调用、又不想去学 Modal 的 app / function 模型,它就是这四款里最弱的一档。</p>
+</section>
+
+<section>
+  <h2>Daytona — 架构详解</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/arch-daytona.svg" alt="Daytona 架构:从一份工作区定义(devcontainer.json 或类似文件)配出一个长生命周期的容器或 VM,带挂载的文件系统,既经 SSH 暴露给开发者的 IDE,也经 API 暴露给智能体;工作区跨会话持久存在" width="900" height="500" loading="lazy" />
+    <figcaption>Daytona 从一份定义里配出 IDE 形态的工作区,再把同一个容器同时暴露给人和智能体。</figcaption>
+  </figure>
+
+  <h3>隔离模型:容器/VM 工作区</h3>
+  <p>Daytona 的沙箱是一个<strong>工作区</strong>:一个从工作区定义里配出来的容器(在某些部署里则是完整的 VM)——可以是 devcontainer.json、Dockerfile 或 Daytona 自有的配置——项目源码已经 check out 好、开发工具链已经装好。默认的隔离原语是普通的容器隔离;它讲的安全故事更接近"这是你的开发者环境,不是不可信代码的执行环境",而不是 E2B 那种 hypervisor 边界的故事。如果你的智能体是在为你团队拥有的代码做事(重构这个仓库、跑这些测试),那这套威胁模型是对的;但若它要跑终端用户提交的对抗性代码,那就不是了。</p>
+
+  <h3>沙箱生命周期:工作区形态,生命周期更长</h3>
+  <p>它对生命周期的假设和 Modal 正好相反:工作区是<strong>长生命周期</strong>的,以小时和天计,而不是按调用。一个工作区只启动一次,把项目状态留在它的文件系统上跨越许多次工具调用与 IDE 会话,只有在被显式停止或自动挂起时才会消失。这与它原本的产品形态吻合——"别再跟你的开发环境较劲,30 秒拿到一个可复现的环境"——也与"一个 coding agent 对同一个 checkout 做大量编辑与测试"的场景吻合。同一个工作区可以同时被开发者通过 SSH/JetBrains/VS Code 接入,所以智能体和人本来就是共享状态的设计。</p>
+
+  <h3>集成形态:开发环境 API</h3>
+  <p>Daytona 以<strong>平台 + CLI + SDK</strong> 的形态发布。Daytona 平台是开源的(AGPL);你可以在自己的 Kubernetes 上跑,也可以用其托管云。智能体侧的集成是一个 SDK,用它创建工作区、在里面跑命令、读写文件、销毁工作区——薄薄一层,底下用的是 IDE 用的同一套原语。这套形态对 coding agent 与开发环境式的任务来说很合适;但若你只想"给我 30 秒的 Python REPL 来跑一张模型生成的图",它就重了。</p>
+</section>
+
+<section>
+  <h2>Anthropic Code Execution — 架构详解</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/arch-anthropic-code-execution.svg" alt="Anthropic Code Execution 架构:当 Messages API 请求中包含 code_execution 工具时,assistant 会发出一个 code_execution_tool_use 块,由 Anthropic 服务端在沙箱容器里执行;容器在一个 1 小时的会话窗口内跨多轮持续存在,并把 stdout、stderr 与文件输出回灌进模型上下文" width="900" height="500" loading="lazy" />
+    <figcaption>容器活在 Messages API 内部:声明该工具,由模型决定什么时候在里面跑代码。</figcaption>
+  </figure>
+
+  <h3>隔离模型:服务端沙箱容器</h3>
+  <p>Anthropic 的 Code Execution 工具把模型生成的 Python 跑在 <strong>Anthropic 基础设施上的沙箱容器</strong>里。隔离原语不像 Firecracker 或 gVisor 那样有详细的文档说明——官方描述是"安全的沙箱环境"——但关键属性是:这个容器不是你的,你不去配它,你看不到宿主,API endpoint 之外你也无法挑选区域。网络出站被限制在一份有文档的白名单(PyPI 安装包、少量被批准的端点);没有入站网络。智能体拿到的是一个类 Jupyter 的 Python 环境,科学计算栈已经预装好。</p>
+
+  <h3>沙箱生命周期:由 API 拥有、按会话作用域</h3>
+  <p>生命周期完全归 API 所有。你通过在 Messages 请求的 <code>tools</code> 数组里传入 <code>{"type": "code_execution_20250522", "name": "code_execution"}</code> 来启用该工具;然后由模型决定何时调用它,由 Anthropic 配置、复用、销毁容器。关键在于,容器在<strong>同一会话内跨多轮持续存在</strong>,最多约一小时、约 1 GB 状态,因此变量与文件能像 Jupyter 内核那样跨多轮模型回合存活。你既不能延长它,也不能从另一个会话重连,更无法把状态迁出去——只能通过 Files API 把文件读回来。一旦会话过期,容器就消失了。</p>
+
+  <h3>集成形态:嵌在模型循环里的工具</h3>
+  <p>集成方式是<strong>零 SDK</strong>:这是一个嵌在模型循环里的服务端工具,跟 web search 或 computer-use 工具完全是同一种东西。你发一次 Messages API 调用,把工具声明上、把你的提示放进去;响应回来时,模型的计划、它跑过的代码、它看到的 stdout 与最终回答会以内容块的形式交错呈现。你的代码里没有任何沙箱对象。这种取舍与生态中的 Claude Managed Agents 完全对称:你交出运行时控制权(区域、内核、默认之外的包、网络策略),换来一个你不需运维的运行时。</p>
+</section>
+
+<section>
+  <h2>横向对比</h2>
+
+  <h3>隔离原语</h3>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/compare-isolation.svg" alt="四列对比隔离原语:E2B 用 Firecracker microVM(hypervisor 边界),Modal 用 gVisor 风格容器(用户态内核),Daytona 用标准容器/VM 工作区隔离,Anthropic Code Execution 用一个内部不透明的服务端沙箱容器" width="900" height="300" loading="lazy" />
+    <figcaption>从 hypervisor 边界到一个不透明的服务端沙箱,四种隔离原语分布在一条谱系上。</figcaption>
+  </figure>
+  <p>这是四者分得最开的那条轴,也是对抗性代码执行场景生死攸关的那条轴。E2B 最强:Firecracker 是一个真正的 hypervisor 边界,沙箱之间没有共享内核——这正是 AWS 为 Lambda 与 Fargate 选定的原语。Modal 离宿主更近一步:gVisor 的用户态内核拦截系统调用,这比纯容器明显更难被逃逸,但它仍然是一道运行在宿主内核地址空间里的软件边界。Daytona 默认是最宽松的——标准容器隔离,适合可信的开发者代码,而非用户提交的对抗性代码——尽管你可以用自己的 Kubernetes 网络策略给它加固。Anthropic Code Execution 最不透明:文档承诺一个"安全的沙箱环境",但没给出具体原语,所以你信任的是 Anthropic 的运维故事,而不是你自己去审计这道边界。在能满足你延迟与人体工学预算的前提下,选这条谱系上最靠左的那一档。</p>
+
+  <h3>生命周期归属</h3>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/compare-lifecycle.svg" alt="四列对比生命周期归属:E2B 由应用拥有(你的代码创建并杀掉沙箱),Modal 由平台拥有(Modal 按调用维护热池),Daytona 由工作区拥有(长生命周期的开发环境),Anthropic Code Execution 由 API 拥有(容器只在一个会话内存在)" width="900" height="300" loading="lazy" />
+    <figcaption>谁创建沙箱、它什么时候死、状态去哪——四种不同的所有者。</figcaption>
+  </figure>
+  <p>生命周期这一问题问的是"谁来决定这个容器何时诞生何时死亡、它泄漏时谁来背锅"。E2B 把这个决定放在你的应用代码里:你调用 create、你调用 kill、你跨进程重连,忘了调一次 <code>kill()</code> 就是你要付的账单。Modal 把它交给平台:热池、按调用配置、自动扩缩,泄漏风险是它的问题、不是你的。Daytona 把生命期推到工作区那一层,意味着沙箱更像是智能体和人在一个项目的整段时间里共享的开发环境——这种形态对 coding agent 是绝配,对一次性的模型工具调用就是噩梦。Anthropic Code Execution 干脆把这个问题坍缩掉:容器活一个会话,然后消失,容不得你跟它讨价还价。怎么选取决于你的智能体最自然的工作单元是一次工具调用(Modal、Anthropic)、一段会话(E2B),还是一个项目(Daytona)。</p>
+
+  <h3>智能体看到的运行时面</h3>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/compare-surface.svg" alt="四列对比智能体所看到的运行时面:E2B 暴露一整套 Linux microVM,可任意上网与文件操作;Modal 暴露一个容器,可任意上网与文件操作;Daytona 暴露一个挂载了项目和完整工具链的开发者工作区;Anthropic Code Execution 暴露一个类 Jupyter 的 Python 环境、网络出站受限" width="900" height="300" loading="lazy" />
+    <figcaption>模型所看到的面:完整的 Linux VM、完整的容器、IDE 工作区,或一个精挑过的 Python 环境。</figcaption>
+  </figure>
+  <p>从智能体的视角看——什么样的文件系统、什么样的网络、什么样的包管理——这四款是四间很不一样的房间。E2B 与 Modal 给智能体的是一个完整的 Linux 环境,你在模板镜像里塞什么它就有什么:任意 <code>apt install</code>、任意出站网络、Modal 上还有 GPU。Daytona 在工具链上走得更远:项目源码已经挂载好,语言运行时按工作区定义装好,git 和 shell 立即可用。Anthropic Code Execution 是最精挑的:一个固定的 Python 3 环境,科学计算栈预装(numpy、pandas、scipy、matplotlib、scikit-learn),允许 <code>pip install</code> 但限制到 PyPI,没有入站网络,出站则限制在一份有文档的白名单上。含义很直接:若智能体要 <code>curl</code> 一个随机 API 或要跑一段 TypeScript,这四款里有三款可以,Anthropic 那款做不到。如果智能体永远只需要跑模型建议的、做数据分析的 Python,这个精挑的环境反倒是更安全的默认选项,因为可攻击的面更小。</p>
+</section>
+
+<section>
+  <h2>该选哪一款</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>使用场景</th>
+        <th>选 E2B,如果……</th>
+        <th>选 Modal,如果……</th>
+        <th>选 Daytona,如果……</th>
+        <th>选 Anthropic Code Execution,如果……</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>跑不可信的模型代码</td>
+        <td>你想要这张表上最强的隔离原语——一个真正的 hypervisor 边界,每个沙箱独立。</td>
+        <td>gVisor 的隔离已经满足你的威胁模型,你又看重热池带来的延迟故事。</td>
+        <td>不合适——工作区默认假设的是可信的开发者代码。</td>
+        <td>你愿意让 Anthropic 拥有沙箱边界,而一个精挑的 Python 环境对你而言够用。</td>
+      </tr>
+      <tr>
+        <td>对真实仓库工作的 coding agent</td>
+        <td>可行但偏重——你会去重造一个工作区已经给你的东西。</td>
+        <td>可行,适合短时测试运行;不太适合长生命周期的开发环境形态。</td>
+        <td>你想要一个带 checkout、带工具链、IDE 形态的工作区,智能体可以 shell 进去工作数小时。</td>
+        <td>不可以——没有项目 checkout、没有 shell,容器还会随会话消失。</td>
+      </tr>
+      <tr>
+        <td>在聊天里跑一次性的 Python</td>
+        <td>可行——create、run、kill——但你每次都要为启动和集成代码付出成本。</td>
+        <td>你喜欢热池在你自有基础设施上重复短调用的延迟表现。</td>
+        <td>过重——工作区启动慢于按调用沙箱。</td>
+        <td>你想要它就内建在模型循环里,自己这边一行基础设施代码都不写。</td>
+      </tr>
+      <tr>
+        <td>需要伴随执行的重型 GPU 计算</td>
+        <td>用自定义模板能做,但不是最强的路径。</td>
+        <td>最强匹配——Modal 的 GPU 故事是其根基,Sandbox 就坐在它旁边。</td>
+        <td>能做,但形态是工作区式的,不是 serverless GPU 原语。</td>
+        <td>不可以——没有 GPU 访问,也没有精挑 Python 镜像之外的自定义算力。</td>
+      </tr>
+      <tr>
+        <td>在你边界内自托管</td>
+        <td>可以——开源,可以把控制面跑在自己基础设施上。</td>
+        <td>不可以——Modal 是托管平台。</td>
+        <td>可以——Daytona 是开源的(AGPL),跑在你的 Kubernetes 上。</td>
+        <td>不可以——按设计,容器就在 Anthropic 基础设施上。</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>E2B 与 Anthropic Code Execution 的区别是什么?</h3>
+  <p>它们分别坐在"生命周期归属"这条谱系的两端。E2B 是一个 SDK:你的应用调用 <code>e2b.Sandbox.create()</code> 来起一台 Firecracker microVM,通过方法调用驱动它,再显式杀掉它——每一个生命周期决定都在你的代码里,且你可以自托管控制面。Anthropic Code Execution 是嵌在 Messages API 里的服务端工具:在 <code>tools</code> 数组里声明它,由模型决定何时在一个由 Anthropic 配置、按一次会话持有并最终销毁的容器里跑代码。当你想要一个强隔离原语、并且基础设施握在自己手里时选 E2B;当你想要零基础设施代码、并要一个内建于模型循环的精挑 Python 环境时选 Anthropic Code Execution。</p>
+
+  <h3>Modal 是沙箱运行时还是 serverless 平台?</h3>
+  <p>两者都是,但它一开始是后者。Modal 招牌式的人体工学——给一个 Python 函数加个装饰器,把它当作可按需用上 GPU 的 serverless 云计算——是为 ML 推理与批处理打造的。智能体真正用来跑任意模型生成代码的 <strong>Sandbox</strong> 原语,是后来才补上的同胞抽象。这一点在选型时很重要:如果你的智能体要先微调一个模型、再对结果跑代码,Modal 是这四款里最强的;但若你只想要"一行代码给我一个 Python REPL"那种 SDK,它就比其他几款重了。</p>
+
+  <h3>Daytona 能跑终端用户的不可信代码吗?</h3>
+  <p>默认情况下,把答案当作"不行"来处理。Daytona 的威胁模型是开发体验——给智能体和开发者一个可复现的、装好工具链、checkout 好项目的工作区——它的隔离原语是标准的容器隔离。这对你团队拥有的代码、或对智能体针对你自己仓库生成的代码来说是合适的,但对用户提交的对抗性代码就不是合适的边界。如果你确实要在 Daytona 上跑不可信代码,得靠 Kubernetes 网络策略、按租户分簇、或在底下叠一层更强的运行时(例如 gVisor),并仔细审计配置。</p>
+
+  <h3>Anthropic Code Execution 的容器会持续多久?</h3>
+  <p>最多约一小时、约 1 GB 状态,作用域是单次会话。在此范围内,容器表现得像一个长生命周期的 Jupyter 内核:变量、文件、import 跨多轮模型回合存活,所以模型可以在这一回合算一个 dataframe、在下一回合把它画出来。会话过期时容器就消失了,你既不能延长它,也无法从另一个会话重连——如果你需要长生命周期的、按用户保留的状态,得用 Files API 把文件读回来,在下次会话开始时再传上去。</p>
+
+  <h3>为什么要选 microVM 而不是容器?</h3>
+  <p>换来的是每个沙箱更强的隔离,代价是冷启动稍慢。一个 Firecracker microVM 在 hypervisor 之后拥有自己独立的内核、init 与地址空间——沙箱里的进程无法借 Linux 内核漏洞越狱到相邻沙箱,因为根本没有共享的内核可以利用。普通容器共享宿主内核;即便受 gVisor 保护的容器,也只是宿主内核地址空间里的一道软件边界。对那种"代码来自一个可能被攻击者注入过提示的模型"的智能体负载,hypervisor 边界是更保守的选择。对可信代码,容器更快也更便宜。</p>
+
+  <h3>什么时候该自己写沙箱、而不是用这四款里的一种?</h3>
+  <p>几乎从来不该——团队越小,这个"从来不该"就越绝对。代码执行运行时的难处——强隔离、装包、文件 IO、stdout 流、闲置回收、计费、多租户安全——正是这四个项目的全部产品,它们已经吸收了多年你自己一定会重新踩到的故障模式。"自己写"在现实里的门槛是"我们有一条监管边界,这四款都不满足"或"我们已有的平台已经给我们一个我们信任的容器原语"。可以看看<a href="/zh/concepts/tools-actions-environments">工具、动作与环境</a>,了解为什么"环境"通常才是智能体变危险的地方——选对运行时,就是这道防御里的大半。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站内:</h3>
+  <ul>
+    <li><a href="/zh/concepts/tools-actions-environments">工具、动作与环境</a>——为什么"环境"才是智能体变危险的地方,以及这些运行时要回应的威胁模型。</li>
+    <li><a href="/zh/concepts/tool-calling-explained">工具调用是怎么回事</a>——工具调用在协议层的形态,这正是这四款运行时最终被接入的地方。</li>
+    <li><a href="/zh/concepts/the-agent-loop">智能体循环</a>——感知-决策-行动循环包裹着每一个代码执行沙箱,把它画出来你就看得见运行时在循环里的位置。</li>
+    <li><a href="/zh/concepts/agentic-risks-intro">智能体风险概览</a>——决定你究竟需要多强隔离原语的风险分类。</li>
+  </ul>
+  <h3>项目资源:</h3>
+  <ul>
+    <li><a href="https://e2b.dev/docs" rel="noopener noreferrer">E2B 文档</a>——Sandbox SDK、Firecracker microVM、模板与自托管(源码见 <a href="https://github.com/e2b-dev/E2B" rel="noopener noreferrer">github.com/e2b-dev/E2B</a>)。</li>
+    <li><a href="https://modal.com/docs" rel="noopener noreferrer">Modal 文档</a>——app、function、Sandbox 原语、GPU 与热池。</li>
+    <li><a href="https://www.daytona.io/docs" rel="noopener noreferrer">Daytona 文档</a>——工作区、定义与智能体 SDK(源码见 <a href="https://github.com/daytonaio/daytona" rel="noopener noreferrer">github.com/daytonaio/daytona</a>)。</li>
+    <li><a href="https://docs.claude.com/en/docs/agents-and-tools/tool-use/code-execution-tool" rel="noopener noreferrer">Anthropic Code Execution 文档</a>——<code>code_execution_20250522</code> 工具、运行时环境与限制。</li>
+  </ul>
+</section>
