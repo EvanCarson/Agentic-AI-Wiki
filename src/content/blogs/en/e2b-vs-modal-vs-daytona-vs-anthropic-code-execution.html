@@ -1,0 +1,233 @@
+<p class="lede">Give the same agent a Python snippet to run — fit a regression, plot it, summarize the result — and the four runtimes that can host it look identical on the surface: spin up a sandbox, send the code, stream stdout. Underneath, the question they answer differently is the one that bites in production: <strong>who owns the sandbox lifecycle</strong>. E2B hands your app raw Firecracker microVMs as an SDK primitive. Modal pools warm serverless containers and bills you by the call. Daytona treats the sandbox as a developer workspace that outlives any single run. Anthropic Code Execution buries the container inside the model loop so deeply that "starting a sandbox" is just another tool call on the assistant message. Pick the wrong owner and you are either operating an infrastructure layer you did not want to operate, or letting the platform decide things you needed control over.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four runtimes, four different homes for the container the agent's code runs in — and four different answers to who creates it, how long it lives, and what happens when the run ends.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Runtime</th>
+        <th>Released / maintainer</th>
+        <th>Primary niche</th>
+        <th>Sandbox lifetime</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/logos/e2b.svg" width="24" height="24" alt="E2B logo" style="vertical-align:middle;margin-right:8px;" />E2B</td>
+        <td>2023, E2B (open source)</td>
+        <td>Firecracker microVMs as an SDK primitive</td>
+        <td>Seconds to ~24h, app-controlled</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/logos/modal.svg" width="24" height="24" alt="Modal logo" style="vertical-align:middle;margin-right:8px;" />Modal</td>
+        <td>2022, Modal Labs</td>
+        <td>Serverless functions as per-call containers</td>
+        <td>Per call, warm pool reused</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/logos/daytona.svg" width="24" height="24" alt="Daytona logo" style="vertical-align:middle;margin-right:8px;" />Daytona</td>
+        <td>2024, Daytona Platforms</td>
+        <td>Dev-environment-as-code, IDE-shaped workspaces</td>
+        <td>Hours to days, IDE session</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/logos/anthropic-code-execution.svg" width="24" height="24" alt="Anthropic Code Execution logo" style="vertical-align:middle;margin-right:8px;" />Anthropic Code Execution</td>
+        <td>May 2025, Anthropic</td>
+        <td>Server-side container tool inside the model loop</td>
+        <td>Per conversation, API-owned</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">Snapshot: 2026-06-01. Sandbox runtimes change quickly; verify against current docs.</p>
+
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/data-feature-matrix.svg" alt="Feature matrix: four sandbox runtimes across six axes — isolation strength, lifecycle ownership, persistent filesystem, network reach, package install, and managed-vs-self — colored by strength" width="900" height="400" loading="lazy" />
+    <figcaption>Where each runtime leans hardest. The marketing pages overlap; lifecycle ownership and isolation primitive are where they actually split.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>E2B — deep dive</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/arch-e2b.svg" alt="E2B architecture: your agent SDK calls e2b.Sandbox.create() to spin up a Firecracker microVM; the SDK then drives a runtime daemon inside that VM to execute Python or bash, exchange files, and forward stdout, before the app explicitly kills the sandbox" width="900" height="500" loading="lazy" />
+    <figcaption>E2B exposes a Firecracker microVM as an SDK object: your app creates it, drives it, and disposes of it.</figcaption>
+  </figure>
+
+  <h3>Isolation model: Firecracker microVMs</h3>
+  <p>E2B's sandboxes are <strong>Firecracker microVMs</strong> — the same KVM-based, minimal-attack-surface VM technology that AWS Lambda runs on. Each sandbox boots a fresh Linux kernel in roughly 200ms, with its own kernel, init, and filesystem. That is a meaningfully stronger isolation primitive than a shared-kernel container: a sandboxed process cannot exploit a Linux kernel bug to break out into a peer sandbox, because there is no shared kernel to exploit. The agent gets a real <code>/</code>, real <code>/proc</code>, and a real network stack, all behind a hypervisor boundary. That matters when the code being run came from a model that an attacker may have prompt-injected.</p>
+
+  <h3>Sandbox lifecycle: app-owned</h3>
+  <p>The lifecycle is entirely in your hands. <code>e2b.Sandbox.create()</code> spins up a microVM (default timeout 5 minutes, configurable up to ~24 hours); <code>sandbox.kill()</code> tears it down; <code>sandbox.set_timeout()</code> extends it mid-run; <code>Sandbox.connect(sandbox_id)</code> reattaches across processes so a long-running agent can survive its own restarts. You can keep one sandbox per conversation, pool them across users, or burn one per tool call — E2B does not assume a shape. Templates (preinstalled images) make boots cheap, so the "always create fresh" pattern is workable rather than wasteful. Persistent state lives inside the sandbox's filesystem for its lifetime; if you need it to outlive the VM, you upload, download, or mount it yourself.</p>
+
+  <h3>Integration shape: SDK primitive</h3>
+  <p>The integration is a <strong>library, not a service abstraction</strong>. You import the SDK (Python or JS), get a <code>Sandbox</code> object, and call methods on it — <code>run_code</code>, <code>commands.run</code>, <code>files.write</code>, <code>files.read</code>. The agent framework you are using (LangGraph, OpenAI Agents SDK, your own loop) wraps those calls as tools. E2B does not push a particular agent shape on you; it is the layer below your agent loop, just like a database client is. The repo is open source (Apache-2.0), and you can self-host the control plane if you must keep everything inside your own boundary.</p>
+</section>
+
+<section>
+  <h2>Modal — deep dive</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/arch-modal.svg" alt="Modal architecture: a Python function decorated with @app.function is shipped to Modal's platform, which provisions a container on demand from a warm pool, runs the function, and returns the result; a separate Sandbox primitive lets the agent execute arbitrary code inside a container" width="900" height="500" loading="lazy" />
+    <figcaption>Modal serves Python functions as containers and exposes a Sandbox primitive for arbitrary agent-driven code execution.</figcaption>
+  </figure>
+
+  <h3>Isolation model: gVisor-style containers</h3>
+  <p>Modal runs your code in <strong>containers</strong> rather than VMs, but with a userspace kernel (gVisor / runsc) sitting between the workload and the host kernel. That gives stronger isolation than a vanilla runc container — the syscall surface visible to the workload is intercepted by the gVisor sentry instead of going straight to the host — at a noticeable per-syscall cost. The trade is the inverse of E2B's: containers cold-start faster and pool warmer, but the isolation primitive is a userspace kernel, not a hypervisor. For most agent workloads (running model-generated Python on user data), that is a sensible point on the curve.</p>
+
+  <h3>Sandbox lifecycle: platform-owned</h3>
+  <p>Modal owns the lifecycle. A <code>@app.function()</code> is a serverless function: each call provisions a container, runs the function, returns the result, and the container goes back to a warm pool to wait for the next call. Scaling, queueing, and resource limits are the platform's job, not yours. The <strong>Sandbox</strong> primitive — the one agents actually use for arbitrary code — is a sibling abstraction: <code>modal.Sandbox.create()</code> opens a long-lived container the agent can shell into and execute against, with a configurable timeout and the ability to attach more processes mid-run. You still write a Modal app and deploy it; the platform decides which physical host the container lands on and when warm pools recycle.</p>
+
+  <h3>Integration shape: serverless function + Sandbox</h3>
+  <p>Modal is a <strong>compute platform first, sandbox-for-agents second</strong>. The headline ergonomics — define a function in Python, decorate it, run it as cloud compute with GPUs available on demand — were built for ML inference and batch jobs; the Sandbox primitive landed later for agent use cases. Practically that means Modal is the strongest of the four for "agent that needs to fine-tune a model, then plot the result" workflows where heavy GPU compute and code-execution-as-tool overlap. It is the weakest of the four if all you want is a one-line "give me a sandbox" SDK call without learning Modal's app / function model.</p>
+</section>
+
+<section>
+  <h2>Daytona — deep dive</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/arch-daytona.svg" alt="Daytona architecture: a workspace definition (devcontainer.json or similar) is provisioned as a long-lived container or VM with an attached filesystem, exposed both to a developer's IDE over SSH and to an agent over an API; the workspace persists across sessions" width="900" height="500" loading="lazy" />
+    <figcaption>Daytona provisions IDE-shaped workspaces from a definition, then exposes the same container to both humans and agents.</figcaption>
+  </figure>
+
+  <h3>Isolation model: container/VM workspace</h3>
+  <p>Daytona's sandbox is a <strong>workspace</strong>: a container (or, on some deployments, a full VM) provisioned from a workspace definition — devcontainer.json, a Dockerfile, or a Daytona-specific config — with the project's source already checked out and the dev toolchain already installed. The isolation primitive is plain container isolation by default; the security story is closer to "this is your developer environment, not untrusted code" than to E2B's hypervisor boundary. If your agent is doing operations on code your team owns (refactor this repo, run these tests), that matches the threat model; if the agent is running adversarial code from end users, it does not.</p>
+
+  <h3>Sandbox lifecycle: workspace-shaped, longer-lived</h3>
+  <p>The lifecycle assumption is the inverse of Modal's: workspaces are <strong>long-lived</strong>, measured in hours and days rather than per-call. A workspace boots once, holds the project state on its filesystem across many tool calls and IDE sessions, and only goes away when explicitly stopped or auto-suspended. That matches the original product — "stop fighting your dev environment, get a reproducible one in 30 seconds" — and it matches a coding agent that runs many edits and tests against the same checkout. The same workspace can be attached by a human developer over SSH/JetBrains/VS Code at the same time, so the agent and the human share state by design.</p>
+
+  <h3>Integration shape: dev-environment API</h3>
+  <p>Daytona ships as a <strong>platform + CLI + SDK</strong>. The Daytona platform is open source (AGPL); you can run it on your own Kubernetes or use the managed cloud. The agent integration is an SDK that creates workspaces, runs commands in them, reads and writes files, and tears them down — a thin layer over the same primitives the IDE uses. The shape is right for coding agents and developer-environment-style tasks; it is heavier than necessary for "give me a Python REPL for the next 30 seconds to run a model's plot."</p>
+</section>
+
+<section>
+  <h2>Anthropic Code Execution — deep dive</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/arch-anthropic-code-execution.svg" alt="Anthropic Code Execution architecture: when the Messages API request includes the code_execution tool, the assistant emits a code_execution_tool_use block that Anthropic's server runs in a sandboxed container; the container persists across turns within a 1-hour conversation window and returns stdout, stderr, and any file outputs back into the model's context" width="900" height="500" loading="lazy" />
+    <figcaption>The container lives inside the Messages API: declare the tool, and the model decides when to run code in it.</figcaption>
+  </figure>
+
+  <h3>Isolation model: server-side sandboxed container</h3>
+  <p>Anthropic's Code Execution tool runs your model-generated Python in a <strong>sandboxed container on Anthropic infrastructure</strong>. The isolation primitive is not documented as deeply as Firecracker or gVisor — the official description is "secure, sandboxed environment" — but the relevant property is that the container is not yours: you do not provision it, you do not see the host, and you do not pick the region beyond the API endpoint. Network egress is restricted to a documented allowlist (PyPI for installs, a few approved endpoints); inbound network is not available. The agent gets a Jupyter-like Python environment with the scientific stack preinstalled.</p>
+
+  <h3>Sandbox lifecycle: API-owned, conversation-scoped</h3>
+  <p>The lifecycle is owned entirely by the API. You enable the tool by passing <code>{"type": "code_execution_20250522", "name": "code_execution"}</code> in the <code>tools</code> array of a Messages request; the model then decides when to call it, and Anthropic provisions, reuses, and tears down the container. Crucially, the container <strong>persists across turns within the same conversation</strong> for up to one hour and ~1 GB of state, so variables and files survive multiple model turns the way a Jupyter kernel does. You cannot extend it, reattach to it from a different conversation, or migrate the state out except by reading files back via the Files API. The container is gone when the conversation ages out.</p>
+
+  <h3>Integration shape: model-loop tool</h3>
+  <p>The integration is <strong>zero-SDK</strong>: this is a server-side tool baked into the model loop, exactly like web search or the computer-use tool. You make a Messages API call with the tool declared and your prompt; the response comes back with the model's plan, the code it ran, the stdout it saw, and the final answer interleaved as content blocks. No sandbox object lives in your code. The trade-off is symmetrical to Claude Managed Agents elsewhere in the ecosystem: you give up control of the runtime (region, kernel, package set beyond defaults, network policy) and gain a runtime you do not operate.</p>
+</section>
+
+<section>
+  <h2>Cross-cutting comparison</h2>
+
+  <h3>Isolation primitive</h3>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/compare-isolation.svg" alt="Four-column comparison of isolation primitive: E2B uses Firecracker microVMs (hypervisor boundary), Modal uses gVisor-style containers (userspace kernel), Daytona uses standard container/VM workspace isolation, Anthropic Code Execution uses a server-side sandboxed container with undocumented internals" width="900" height="300" loading="lazy" />
+    <figcaption>From hypervisor boundary to undocumented server sandbox — the four isolation primitives sit on a spectrum.</figcaption>
+  </figure>
+  <p>This is the axis where the four sit furthest apart, and it is the axis adversarial code-execution scenarios live or die on. E2B is the strongest: Firecracker is a real hypervisor boundary, with no shared kernel between sandboxes — the same primitive AWS chose for Lambda and Fargate. Modal sits a step closer to the host: gVisor's userspace kernel intercepts syscalls, which is meaningfully harder to escape than vanilla containers but is still a software boundary in the host's kernel address space. Daytona is the most relaxed by default — standard container isolation suitable for trusted developer code, not for adversarial user-submitted code — though you can harden it with your own Kubernetes network policies. Anthropic Code Execution is the least transparent: the docs promise a "secure, sandboxed environment" but do not name the primitive, so you are trusting Anthropic's operational story rather than auditing the boundary. Choose the leftmost primitive that still meets your latency and ergonomic budget.</p>
+
+  <h3>Lifecycle ownership</h3>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/compare-lifecycle.svg" alt="Four-column comparison of lifecycle ownership: E2B is app-owned (your code creates and kills the sandbox), Modal is platform-owned (Modal pools warm containers per call), Daytona is workspace-owned (long-lived dev environments), Anthropic Code Execution is API-owned (container exists for one conversation only)" width="900" height="300" loading="lazy" />
+    <figcaption>Who creates the sandbox, when it dies, and where the state goes — four different owners.</figcaption>
+  </figure>
+  <p>The lifecycle question is "who decides when this container is born and dies, and who is on the hook when it leaks." E2B puts that decision in your application code: you call create, you call kill, you reattach across processes, and a forgotten <code>kill()</code> is a bill you pay. Modal hands it to the platform: warm pools, per-call provisioning, autoscaling, and the leak risk is its problem, not yours. Daytona pushes the lifetime out to the workspace, meaning a sandbox is something more like a dev environment that an agent and a human both share for the duration of a project — a shape that is a great fit for coding agents and a terrible fit for one-shot model tool calls. Anthropic Code Execution collapses the question entirely: the container lives for a conversation, then is gone, and you do not get to argue with that. The right pick depends on whether your agent's natural unit of work is a tool call (Modal, Anthropic), a session (E2B), or a project (Daytona).</p>
+
+  <h3>What the agent actually sees</h3>
+  <figure>
+    <img src="/blogs/e2b-vs-modal-vs-daytona-vs-anthropic-code-execution/compare-surface.svg" alt="Four-column comparison of the runtime surface seen by the agent: E2B exposes a full Linux microVM with arbitrary network and filesystem, Modal exposes a container with arbitrary network and filesystem, Daytona exposes a developer workspace with the project mounted plus full toolchain, Anthropic Code Execution exposes a Jupyter-like Python environment with restricted network egress" width="900" height="300" loading="lazy" />
+    <figcaption>The surface the model sees: full Linux VM, full container, IDE workspace, or a curated Python environment.</figcaption>
+  </figure>
+  <p>From the agent's point of view — what filesystem, what network, what package manager — the four are very different rooms. E2B and Modal give the agent a full Linux environment with whatever you put in the template image: arbitrary <code>apt install</code>, arbitrary outbound network, GPUs on Modal. Daytona goes further on toolchain: the project source is already mounted, the language runtime is installed per the workspace definition, git and a shell are immediate. Anthropic Code Execution is the most curated: a fixed Python 3 environment with the scientific stack preinstalled (numpy, pandas, scipy, matplotlib, scikit-learn), <code>pip install</code> permitted but restricted to PyPI, no inbound network, outbound limited to a documented allowlist. The implication is direct: if the agent needs to <code>curl</code> a random API or run a TypeScript script, three of these can and Anthropic cannot. If the agent only ever needs to run model-suggested data-analysis Python, the curated environment is the safer default precisely because there is less surface to attack.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Use case</th>
+        <th>Pick E2B if…</th>
+        <th>Pick Modal if…</th>
+        <th>Pick Daytona if…</th>
+        <th>Pick Anthropic Code Execution if…</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Running untrusted model code</td>
+        <td>You want the strongest isolation primitive on the list — a real hypervisor boundary, per-sandbox.</td>
+        <td>gVisor isolation is enough for your threat model and you value the warm-pool latency story.</td>
+        <td>Not the natural fit — workspace defaults assume trusted developer code.</td>
+        <td>You want Anthropic to own the sandbox boundary, and a curated Python environment is enough.</td>
+      </tr>
+      <tr>
+        <td>Coding agent on a real repo</td>
+        <td>Workable but heavier than needed — you will rebuild what a workspace already gives you.</td>
+        <td>Workable for short-lived test runs; awkward for the long-lived dev-environment shape.</td>
+        <td>You want a checkout + toolchain + IDE-shaped workspace the agent can shell into for hours.</td>
+        <td>No — there is no project checkout, no shell, and the container vanishes per conversation.</td>
+      </tr>
+      <tr>
+        <td>One-shot Python in a chat</td>
+        <td>Workable — create, run, kill — but you pay for boot + integration code each time.</td>
+        <td>You like the warm-pool latency for repeated short calls inside your own infra.</td>
+        <td>Overkill — workspace boot is slower than a per-call sandbox.</td>
+        <td>You want it built into the model loop with zero infrastructure code on your side.</td>
+      </tr>
+      <tr>
+        <td>GPU-heavy compute alongside execution</td>
+        <td>Possible with a custom template, but not the strongest path.</td>
+        <td>Strongest fit — Modal's GPU story is its origin, and the Sandbox sits alongside it.</td>
+        <td>Possible but workspace-shaped; not a serverless GPU primitive.</td>
+        <td>No — no GPU access, no custom compute beyond the curated Python image.</td>
+      </tr>
+      <tr>
+        <td>Self-host inside your boundary</td>
+        <td>Yes — open source, you can run the control plane on your own infra.</td>
+        <td>No — Modal is a hosted platform.</td>
+        <td>Yes — Daytona is open source (AGPL) and runs on your Kubernetes.</td>
+        <td>No — by design, the container lives on Anthropic infrastructure.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>What's the difference between E2B and Anthropic Code Execution?</h3>
+  <p>They sit at opposite ends of the lifecycle-ownership spectrum. E2B is an SDK: your app calls <code>e2b.Sandbox.create()</code> to spin up a Firecracker microVM, drives it with method calls, and explicitly kills it — every lifecycle decision is in your code, and you can self-host the control plane. Anthropic Code Execution is a server-side tool inside the Messages API: declare it in the <code>tools</code> array and the model decides when to run code in a container that Anthropic provisions, persists for one conversation, and tears down. Reach for E2B when you want a strong isolation primitive on infrastructure you control; reach for Anthropic Code Execution when you want zero infrastructure code and a curated Python environment built into the model loop.</p>
+
+  <h3>Is Modal a sandbox runtime or a serverless platform?</h3>
+  <p>Both, but it started as the latter. Modal's original ergonomics — decorate a Python function, run it as serverless cloud compute with GPUs available on demand — were built for ML inference and batch jobs. The <strong>Sandbox</strong> primitive, which is the one agents actually use for arbitrary model-generated code, is a sibling abstraction added later. That matters when picking: Modal is the strongest of the four if your agent needs to fine-tune a model and then run code against the result; it is heavier than the others if all you want is a one-line "give me a Python REPL" SDK.</p>
+
+  <h3>Can Daytona run untrusted code from end users?</h3>
+  <p>By default, treat it as no. Daytona's threat model is the developer experience — give the agent and the developer a reproducible workspace with the project checked out and the toolchain installed — and the isolation primitive is standard container isolation. That is fine for code your team owns or that an agent generates against your own repo, but it is not the right boundary for adversarial user-submitted code. If you do need to run untrusted code through Daytona, lean on Kubernetes-level network policies, per-tenant clusters, or a stronger runtime like gVisor underneath, and audit the configuration carefully.</p>
+
+  <h3>How long does the Anthropic Code Execution container persist?</h3>
+  <p>Up to one hour and ~1 GB of state, scoped to a single conversation. Within those bounds the container behaves like a long-lived Jupyter kernel: variables, files, and imports survive across model turns, so the model can compute a dataframe in one turn and plot it in the next. The container is gone when the conversation ages out, and you cannot extend it or reattach from a different conversation — if you need long-lived per-user state, you must read files back via the Files API and re-upload them on the next conversation.</p>
+
+  <h3>Why would I pick a microVM over a container?</h3>
+  <p>Stronger isolation per sandbox, at the cost of slightly higher cold-start. A Firecracker microVM has its own kernel, init, and address space behind a hypervisor — a sandboxed process cannot exploit a Linux kernel bug to break out into a peer sandbox, because there is no shared kernel to exploit. A standard container shares the host kernel; even a gVisor-protected container is a software boundary in the host kernel's address space. For agent workloads where the code came from a model an attacker may have prompt-injected, the hypervisor boundary is the conservative choice. For trusted code, the container is faster and cheaper.</p>
+
+  <h3>When should I write my own sandbox instead of using one of these?</h3>
+  <p>Almost never, and the smaller the team the more never it is. The hard parts of a code-execution runtime — strong isolation, package install, file IO, stdout streaming, idle eviction, billing, multi-tenant security — are the entire product of these four projects, and they have absorbed years of failure modes you would otherwise rediscover. The realistic write-your-own threshold is "we have a regulatory boundary that none of these meet" or "our existing platform already gives us a container primitive we trust." See <a href="/concepts/tools-actions-environments">tools, actions, and environments</a> for why the environment is usually where agents become dangerous — picking the right runtime is most of that defense.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/tools-actions-environments">Tools, actions, and environments</a> — why the environment, not the model, is usually where agents become dangerous, and the threat model these runtimes are answering.</li>
+    <li><a href="/concepts/tool-calling-explained">Tool calling explained</a> — the wire-level shape of a tool call, which is what each of these four runtimes ultimately gets wired into.</li>
+    <li><a href="/concepts/the-agent-loop">The Agent Loop</a> — the perceive-decide-act cycle that wraps every code-execution sandbox, made explicit so you can see where the runtime sits.</li>
+    <li><a href="/concepts/agentic-risks-intro">Agentic risks intro</a> — the risk taxonomy that decides how strong an isolation primitive you actually need.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://e2b.dev/docs" rel="noopener noreferrer">E2B docs</a> — Sandbox SDK, Firecracker microVMs, templates, and self-hosting (source at <a href="https://github.com/e2b-dev/E2B" rel="noopener noreferrer">github.com/e2b-dev/E2B</a>).</li>
+    <li><a href="https://modal.com/docs" rel="noopener noreferrer">Modal docs</a> — apps, functions, the Sandbox primitive, GPUs, and warm pools.</li>
+    <li><a href="https://www.daytona.io/docs" rel="noopener noreferrer">Daytona docs</a> — workspaces, definitions, and the agent SDK (source at <a href="https://github.com/daytonaio/daytona" rel="noopener noreferrer">github.com/daytonaio/daytona</a>).</li>
+    <li><a href="https://docs.claude.com/en/docs/agents-and-tools/tool-use/code-execution-tool" rel="noopener noreferrer">Anthropic Code Execution docs</a> — the <code>code_execution_20250522</code> tool, runtime environment, and limits.</li>
+  </ul>
+</section>
