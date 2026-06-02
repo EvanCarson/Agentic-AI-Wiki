@@ -1,0 +1,235 @@
+<p class="lede">Read the feature pages and these four vector stores are nearly interchangeable: ANN, metadata filters, hybrid search, multi-tenancy — all four claim every box. The thing that decides which one survives the agentic-RAG stack at scale is invisible there: <strong>where the index sits relative to the rows it indexes.</strong> pgvector lives inside the Postgres that already holds your primary data; Pinecone is a fully managed external service; Weaviate ships a knowledge-graph schema layer that wants to become a second source of truth; Qdrant is an open-source engine whose whole design point is filtered ANN at scale. Pick on that axis first; everything else follows.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four vector stores, four answers to the same question — what does the index sit next to, and what do you have to operate to keep it there. The table lists the basics; the matrix below it shows where each one leans hardest across the axes that actually differ.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Project</th>
+        <th>Released / maintainer</th>
+        <th>Primary niche</th>
+        <th>Where it runs</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/logos/pgvector.svg" width="24" height="24" alt="pgvector logo" style="vertical-align:middle;margin-right:8px;" />pgvector</td>
+        <td>2021, open source (community)</td>
+        <td>Vector search as a Postgres extension</td>
+        <td>Wherever your Postgres runs</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/logos/pinecone.svg" width="24" height="24" alt="Pinecone logo" style="vertical-align:middle;margin-right:8px;" />Pinecone</td>
+        <td>2019, Pinecone Systems Inc.</td>
+        <td>Fully managed serverless vector DB</td>
+        <td>Pinecone cloud (managed-only)</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/logos/weaviate.svg" width="24" height="24" alt="Weaviate logo" style="vertical-align:middle;margin-right:8px;" />Weaviate</td>
+        <td>2019, Weaviate B.V. (open source)</td>
+        <td>Vector engine + knowledge-graph schema</td>
+        <td>Self-host or Weaviate Cloud</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/logos/qdrant.svg" width="24" height="24" alt="Qdrant logo" style="vertical-align:middle;margin-right:8px;" />Qdrant</td>
+        <td>2021, Qdrant Solutions (open source)</td>
+        <td>Rust engine optimized for filtered ANN at scale</td>
+        <td>Self-host or Qdrant Cloud</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">Snapshot: 2026-06-01. Vector-store features move quickly; verify against current docs.</p>
+
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/data-feature-matrix.svg" alt="Feature matrix: four vector stores across six axes — co-location with primary data, filtered ANN at scale, hybrid search, schema/graph model, self-hostability, and managed option — colored by strength" width="900" height="400" loading="lazy" />
+    <figcaption>Where each store leans hardest. The axes converge everywhere except where the index sits and what it ships on top.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>pgvector — deep dive</h2>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/arch-pgvector.svg" alt="pgvector architecture: a documents table inside Postgres with scalar columns, JSONB metadata, and an embedding vector(1536) column; an HNSW or IVFFlat index on the vector, B-tree/GIN indexes on the scalars, and a single planner that combines them" width="900" height="500" loading="lazy" />
+    <figcaption>pgvector adds a vector type and ANN indexes to Postgres; the index sits on the same rows as the SQL data, under the same planner and the same transaction.</figcaption>
+  </figure>
+
+  <h3>Storage and index model</h3>
+  <p>pgvector is a Postgres extension. You add a column of type <code>vector(d)</code> to an existing table, and the embeddings live on the same row as the rest of your data — same primary key, same foreign keys, same transaction log. The ANN index is one of two shapes: <strong>HNSW</strong>, a navigable small-world graph kept in shared buffers, or <strong>IVFFlat</strong>, which clusters the vectors into lists and scans a configurable number of nearest lists at query time. Either way, the index file is a normal Postgres relation; backups, replicas, and point-in-time recovery work without anything new. This is the same vector-search machinery covered in the <a href="/concepts/chunking-and-vector-search">chunking and vector search</a> primer, but located inside the database that already authoritatively answers <em>"what is this row?"</em>.</p>
+
+  <h3>Query path (vector + filter + hybrid)</h3>
+  <p>Queries are plain SQL. <code>ORDER BY embedding &lt;=&gt; $1 LIMIT k</code> runs the ANN index; a <code>WHERE</code> clause on scalar columns goes through the existing B-tree or GIN index; and the Postgres planner decides whether to filter first and then ANN-search the survivors, or ANN-search and then filter. Hybrid search composes from existing parts: Postgres full-text search (<code>tsvector</code> + <code>ts_rank</code>) joined to the same row that holds the vector, with rank fusion done in SQL — the pattern is the same one in <a href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a>, but written as one query instead of two services. Because the join target is the row itself, agentic queries that need a vector match <em>and</em> the actual business fields ("title, body, author name, last updated") return in one round-trip.</p>
+
+  <h3>What the runtime makes hard</h3>
+  <p>Two things. First, filtered ANN at very large scale is a known sharp edge — the planner can sometimes pick a strategy that defeats the HNSW index's pruning, and at billions of vectors with high-cardinality filters you may have to coach it with index hints or partition tables. Second, write amplification: HNSW index build and incremental rebuilds tax the same Postgres instance that serves your transactional workload, so heavy ingestion competes for I/O and CPU with the OLTP path. The pragmatic move is to put pgvector on a read replica (or a dedicated logical-replicated copy) when ingest volume gets serious, which is more or less the same playbook you would already run for any read-heavy Postgres workload.</p>
+</section>
+
+<section>
+  <h2>Pinecone — deep dive</h2>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/arch-pinecone.svg" alt="Pinecone architecture: your primary database and ingest pipeline live on your infra; vectors upsert into a Pinecone managed cloud index split into namespaces, with a serverless storage tier and a query engine reached over HTTPS" width="900" height="500" loading="lazy" />
+    <figcaption>Pinecone is fully managed: vectors and metadata live in Pinecone's cloud, and your agent reaches the index over HTTPS while joining back to your primary DB by ID.</figcaption>
+  </figure>
+
+  <h3>Storage and index model</h3>
+  <p>Pinecone is a vector database as a service. You create an <strong>index</strong> with a name, a dimension, a distance metric, and a region; you partition it into <strong>namespaces</strong> for tenant or collection isolation; you upsert <code>{ id, values, metadata }</code> records over HTTPS. The current serverless tier separates hot compute from a blob-storage cold tier, so the storage you pay for is decoupled from query throughput — there are no shards to size, no replicas to provision, no HNSW parameters to tune. The internal index and ANN algorithm are not part of the contract; Pinecone owns the implementation, and you trade transparency for never having to think about it.</p>
+
+  <h3>Query path (vector + filter + hybrid)</h3>
+  <p>Queries are an HTTPS POST: vector, top-k, optional metadata filter, optional namespace. Metadata filters are applied during traversal rather than after, so a high-cardinality filter still returns roughly the right top-k. Pinecone supports <strong>sparse-dense hybrid</strong> by accepting a sparse vector alongside the dense one and fusing the scores; if you want BM25-style lexical search you compute the sparse vector yourself (BM25, SPLADE, or similar) and pass both. The query returns IDs and scores plus the metadata you stored at upsert time — but the full row of business data still lives in your primary DB, so the agent then issues a second query to your Postgres or Mongo to enrich the results.</p>
+
+  <h3>What the runtime makes hard</h3>
+  <p>Three things. First, <strong>two systems of record</strong>: every row written to your primary DB has to be embedded, upserted, and kept consistent with Pinecone, so a stale-vector or missing-vector bug is a class of problem you did not have before. Second, <strong>vendor lock-in by definition</strong> — the service is not self-hostable, so the cheapest hedge is a clean abstraction layer over reads and writes. Third, <strong>data boundary</strong>: vectors and their attached metadata leave your infra, so regulated content needs an enterprise-region or BYOC plan, and an outage in Pinecone is an outage in your retrieval path. The service is fast to start with and easy to operate; the operating cost is the discipline to treat it as a remote dependency rather than a database you own.</p>
+</section>
+
+<section>
+  <h2>Weaviate — deep dive</h2>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/arch-weaviate.svg" alt="Weaviate architecture: a typed schema of classes (Article, Author, Topic) with cross-references; inline modules that vectorize and rerank server-side; per-class HNSW graphs with inverted indexes on scalars; GraphQL clients that fetch vectors plus joined references in one query" width="900" height="500" loading="lazy" />
+    <figcaption>Weaviate ships a knowledge-graph schema layer on top: classes have typed properties and cross-references, modules embed and rerank inline, and a GraphQL query returns vector matches plus graph traversals together.</figcaption>
+  </figure>
+
+  <h3>Storage and index model</h3>
+  <p>Weaviate is an open-source vector engine with a <strong>schema layer</strong> baked into it. You declare <strong>classes</strong> with typed properties, including <strong>cross-references</strong> between classes — so <code>Article</code> references <code>Author</code> and <code>Topic</code>, the way a graph database does, and each class gets its own HNSW index over a class-level embedding. Vectorization happens server-side via <strong>modules</strong>: <code>text2vec-openai</code>, <code>text2vec-cohere</code>, <code>text2vec-transformers</code>, plus rerankers and a generative module that can run RAG-in-DB. The architecture is the closest of the four to a small <a href="/deep-dives/retrieval-and-rag/graph-rag">graph RAG</a> system in a box — vectors and typed relationships in one place.</p>
+
+  <h3>Query path (vector + filter + hybrid)</h3>
+  <p>The default query language is <strong>GraphQL</strong>. A <code>Get { Article(nearVector: …, where: …) { _additional { distance } author { name } } }</code> returns the vector match, the score, and joined cross-referenced objects in one round-trip. Hybrid search is a first-class operator: <code>hybrid(query, alpha)</code> blends BM25 with vector results, with the alpha parameter controlling fusion weight, and the reranker module can apply a cross-encoder pass at query time. Multi-tenancy is per-class — each tenant gets an isolated HNSW graph, which keeps tenants from polluting each other's recall at the cost of more graphs to maintain.</p>
+
+  <h3>What the runtime makes hard</h3>
+  <p>Schema evolution is the sharp edge. The schema is a contract — adding a property is fine, but changing a vectorizer, retypeing a property, or restructuring cross-references usually means a re-vectorize and a migration, which is exactly the work pgvector lets you skip by piggy-backing on whatever the application schema already is. Weaviate is also another stateful service in your topology — a separate failure domain with its own backup story, version upgrades, and module configuration. The trade is real: you get RAG-relevant primitives (vectorize, rerank, graph traversal) inside the database, but you operate one more system whose schema you have to keep honest.</p>
+</section>
+
+<section>
+  <h2>Qdrant — deep dive</h2>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/arch-qdrant.svg" alt="Qdrant architecture: a collection of points with vectors and JSON payloads, filter-aware HNSW that respects payload filters during graph traversal, scalar/product/binary quantization to shrink RAM, and sharded replicas with a WAL exposed over gRPC and REST" width="900" height="500" loading="lazy" />
+    <figcaption>Qdrant is a Rust vector engine designed around filtered ANN: payload indexes feed a filter-aware HNSW, quantization shrinks vectors, and the cluster shards and replicates by point ID.</figcaption>
+  </figure>
+
+  <h3>Storage and index model</h3>
+  <p>Qdrant is an open-source vector engine written in Rust. Data is organized into <strong>collections</strong>, each of which has a vector size, a distance metric, and optional named multi-vector slots (for example one slot for a dense embedding, one for ColBERT-style late-interaction vectors). Each item is a <strong>point</strong>: an ID, one or more vectors, and a <strong>payload</strong> — arbitrary structured JSON, with per-field <strong>payload indexes</strong> that act like an inverted index on the metadata. The index of interest is HNSW, but Qdrant offers <strong>quantization</strong> — scalar, product, or binary — that shrinks the in-memory vector footprint by 4× to 32× and rescours the survivors with the full vectors, which is what lets a single node hold a lot of points.</p>
+
+  <h3>Query path (vector + filter + hybrid)</h3>
+  <p>The signature feature is <strong>filter-aware HNSW</strong>: the graph traversal evaluates payload filters as it walks, rather than ANN-searching first and discarding non-matches afterwards. The win is recall under heavy filters — the failure mode where a post-filter ANN query returns "I found nothing matching tenant_id=42 in the nearest 200, sorry" mostly does not happen here, because the traversal does not waste its budget on non-matching neighbors. Hybrid search is supported through sparse vectors plus dense (BM25-style sparse vectors fused with dense at query time), and the API exposes recommend, batch search, and scroll alongside plain search, which composes well into <a href="/deep-dives/retrieval-and-rag/agentic-retrieval">agentic retrieval</a> loops where the agent issues repeated, scoped queries.</p>
+
+  <h3>What the runtime makes hard</h3>
+  <p>You self-host (or use Qdrant Cloud), which means you run another stateful service with its own sharding, replication factor, WAL, and snapshots. Quantization is powerful but not free — you choose the quantization level, rescore depth, and shard count yourself, so the operating overhead is "another distributed database to operate," not "an extension on the database you already have." The payload model is JSON rather than a schema, so there is no equivalent of Weaviate's typed cross-references; relationships are something the application reconstitutes. The honest position: Qdrant gives you the strongest filtered-ANN engine in this set, and the price is a separate stateful system you operate.</p>
+</section>
+
+<section>
+  <h2>Cross-cutting comparison</h2>
+
+  <h3>Where the index sits relative to your primary data</h3>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/compare-index-location.svg" alt="Four-column comparison of where the index sits: pgvector inside the Postgres that holds your primary rows; Pinecone in a managed external service over HTTPS; Weaviate as its own engine with a schema layer that becomes a parallel source of truth; Qdrant as a separate self-hosted engine alongside" width="900" height="300" loading="lazy" />
+    <figcaption>The headline axis. Four homes for the index, four different consistency and joinability stories.</figcaption>
+  </figure>
+  <p>This is the axis the feature lists hide, and it is the one that decides which store survives contact with a production agent. pgvector puts the index on the same rows as your primary data, under the same planner and transaction log, so a single SQL query can join "nearest vector" to "actual business fields" without a second hop. Pinecone moves the index to a managed cloud, which makes operations easy but turns every retrieval into a cross-system join: vectors there, source rows here, and the application is responsible for keeping the two consistent. Weaviate is something stranger — its schema layer wants to <em>be</em> a source of truth (classes, cross-references, server-side vectorization), which is wonderful when the application happens to fit Weaviate's shape, and exhausting when the application's domain schema and Weaviate's schema start to drift. Qdrant takes the most modest position: it is a vector index next door, the payload is opaque JSON, and you join in the application — but the engine is built for that exact shape and does it well.</p>
+
+  <h3>Filtered ANN behavior at scale</h3>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/compare-filtered-ann.svg" alt="Four-column comparison of filtered ANN behavior: pgvector relies on the Postgres planner combining B-tree filters with HNSW; Pinecone applies metadata filters during traversal at managed scale; Weaviate uses inverted indexes alongside HNSW per class; Qdrant's filter-aware HNSW keeps recall high under heavy filters" width="900" height="300" loading="lazy" />
+    <figcaption>The axis where the four pull furthest apart. Filtered ANN is what an agentic-RAG workload does most.</figcaption>
+  </figure>
+  <p>Agentic RAG queries are almost never "give me the nearest k vectors with no filter" — they are "the nearest k vectors <em>that belong to this tenant, this document type, this date range</em>." pgvector defers the strategy to the Postgres planner: at modest scale it picks the right combination of B-tree and HNSW, but at high cardinality you can land on a plan that defeats the ANN index's pruning, and the fix is index tuning or partitioning. Pinecone and Weaviate both filter during traversal, which mostly works; Pinecone hides the algorithm and asks you to trust it, Weaviate exposes inverted indexes per class and gives you a flat-search escape hatch when recall matters more than latency. Qdrant takes filter-aware ANN as its design point: the HNSW traversal evaluates payload conditions as it walks, so the recall-under-heavy-filters failure mode that hurts the other three is, by construction, the case Qdrant tunes for. If your agent's filters are wide and shallow, all four are fine; if they are narrow and selective ("only this customer's docs from the last 30 days, only invoice category"), Qdrant's behavior is the most predictable.</p>
+
+  <h3>Operations and deployment story</h3>
+  <figure>
+    <img src="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant/compare-operations.svg" alt="Four-column comparison of operations: pgvector reuses existing Postgres operations; Pinecone is fully managed with zero servers; Weaviate is another stateful service with schema migrations to maintain; Qdrant is a single Rust binary you self-host with sharding and quantization to tune" width="900" height="300" loading="lazy" />
+    <figcaption>The state question collapses into an operations question — who runs the index, and who pays for the second system of record.</figcaption>
+  </figure>
+  <p>The four split cleanly. pgvector adds zero new operational surface — your existing Postgres backups, replicas, monitoring, RLS, and cloud-DB managed services (RDS, Neon, Supabase, Aurora) cover it, which is the single biggest reason teams that start with pgvector mostly stay there. Pinecone moves the entire operational surface to the vendor: no servers, no shard sizing, no HNSW tuning, in exchange for a remote dependency in your retrieval critical path and a separate billing line. Weaviate is the heaviest of the four to operate — it is its own stateful service, with version upgrades, module configuration, and schema migrations that have no analog in your application database. Qdrant is lighter than Weaviate but still a separate stateful service: a single Rust binary scales from one Docker container to a sharded cluster, but the sharding, replication factor, and quantization choices are yours. Counterintuitively the question "should we operate fewer systems or more capable ones?" answers itself for most teams: fewer systems wins until a query pattern (massive scale, very heavy filters, multi-region) actively forces a more capable one.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Use case</th>
+        <th>Pick pgvector if…</th>
+        <th>Pick Pinecone if…</th>
+        <th>Pick Weaviate if…</th>
+        <th>Pick Qdrant if…</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>You already run Postgres</td>
+        <td>Yes — co-located index, no new system, joins to existing rows for free.</td>
+        <td>Only if Pinecone's scale or zero-ops story outweighs adding a second source of truth.</td>
+        <td>Only if the knowledge-graph schema is the actual application model.</td>
+        <td>Only if filtered-ANN behavior at your scale is the binding constraint.</td>
+      </tr>
+      <tr>
+        <td>You do NOT want to operate the index</td>
+        <td>Use managed Postgres (RDS, Neon, Supabase) — pgvector rides along.</td>
+        <td>Yes — managed-only is the whole product; no servers, no tuning.</td>
+        <td>Weaviate Cloud exists, but you still own the schema and modules.</td>
+        <td>Qdrant Cloud exists; self-hosting is the default expectation.</td>
+      </tr>
+      <tr>
+        <td>Heavy filtered ANN at huge scale</td>
+        <td>Possible with HNSW + partitioning, but tuning gets sharp.</td>
+        <td>Managed metadata filtering scales without your tuning.</td>
+        <td>Per-class HNSW + inverted indexes work; flat-search fallback available.</td>
+        <td>Yes — filter-aware HNSW is the design point.</td>
+      </tr>
+      <tr>
+        <td>RAG over typed entities with relationships</td>
+        <td>Model the relationships in SQL — works, but no native graph traversal.</td>
+        <td>Namespaces are flat; relationships live in your primary DB.</td>
+        <td>Yes — typed classes + cross-references are first-class.</td>
+        <td>JSON payloads only; the app reconstitutes relationships.</td>
+      </tr>
+      <tr>
+        <td>Regulated data, hard data-boundary</td>
+        <td>Yes — same boundary as your Postgres.</td>
+        <td>Requires enterprise region or BYOC.</td>
+        <td>Self-host inside your boundary.</td>
+        <td>Self-host inside your boundary.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>Is pgvector "good enough" for production RAG?</h3>
+  <p>For most teams, yes — and the threshold for "no" is higher than the vendor pitches suggest. pgvector handles tens of millions of vectors comfortably on a normally-sized Postgres instance with HNSW; the corners where it gets sharp are very heavy filtered ANN at high cardinality, write throughput colliding with OLTP load, and indexes large enough that build time becomes operational pain. Before reaching for a dedicated vector DB, the cheap moves are: a read replica for vectors, partitioning by tenant or date, and pushing the embedding pipeline off the OLTP node. The team's <a href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">choosing a vector database</a> deep-dive walks the decision in more detail.</p>
+
+  <h3>What is the actual difference between Pinecone, Weaviate, and Qdrant?</h3>
+  <p>All three are dedicated vector engines, but they sit in different places. Pinecone is fully managed and proprietary — no self-host, no transparency into the index, but no operational work either. Weaviate is open source with a knowledge-graph schema layer baked in: typed classes, cross-references, inline vectorization modules, and a GraphQL API; it is the heaviest to operate and the most opinionated about how you model your data. Qdrant is open source and minimal — vectors plus JSON payloads, with filter-aware HNSW as its design point, optimized for filtered ANN at scale; it is lighter to operate than Weaviate and asks less of your schema.</p>
+
+  <h3>How does filtered ANN actually behave differently between these stores?</h3>
+  <p>The failure mode to watch is "the filter is narrow enough that the ANN graph traversal returns mostly non-matches, recall collapses, and the agent gets nothing useful." pgvector and Pinecone are fine for wide filters; pgvector starts to struggle when the Postgres planner picks the wrong leading index and you have to hint or partition; Weaviate's per-class HNSW plus inverted indexes works well within a class. Qdrant is the one that explicitly treats filter-aware HNSW as a primary design constraint: the graph traversal evaluates payload filters as it walks, so the "narrow filter, low recall" failure mostly does not happen. If your agent's queries are very selective, this is the dimension that matters most.</p>
+
+  <h3>Can I use embeddings from one store with another?</h3>
+  <p>Yes — embeddings are just floating-point arrays, so the same model (OpenAI <code>text-embedding-3-large</code>, Cohere, BGE, voyage-3, whatever) produces vectors any of the four can index. The store does not own the embedding; the embedding model does. This is why migrating between vector stores is usually <em>"re-upsert the same vectors with the same IDs"</em>, not "re-embed everything from scratch" — assuming you kept the source text and the model name pinned. See <a href="/concepts/embeddings">embeddings: meaning as geometry</a> for the underlying intuition.</p>
+
+  <h3>Does it matter that Pinecone is closed source?</h3>
+  <p>It matters about as much as any managed cloud dependency in your retrieval critical path. The pragmatic question is not "open vs closed" but "what happens if this vendor's pricing, region availability, or SLO no longer fits us in eighteen months?" The answer for Pinecone is "re-upsert your vectors elsewhere," which is cheaper than people think — the embedding model and source text are the assets, the index is replaceable. The hedge that costs nothing is a thin abstraction layer over reads and writes; the hedge that costs something is sticking with self-hostable stores so the exit is trivial.</p>
+
+  <h3>Where does this sit in the broader RAG stack?</h3>
+  <p>The vector store is one layer inside a retrieval pipeline that also includes chunking, embedding, hybrid search, reranking, and query rewriting. Picking the right store does not save a bad chunking strategy and does not invent recall the embeddings did not have. The honest sequence is: get <a href="/concepts/what-is-rag">RAG</a> working end-to-end with whatever store is closest at hand (very often pgvector), measure where retrieval is actually failing using the patterns in <a href="/deep-dives/retrieval-and-rag/evaluating-rag">evaluating RAG</a>, and only then move the index if the data tells you to.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/what-is-rag">Retrieval-augmented generation (RAG) explained</a> — the retrieve→augment→generate loop the vector store sits beneath, and why retrieval and generation are debugged as two separate halves.</li>
+    <li><a href="/concepts/chunking-and-vector-search">Chunking &amp; vector search intuition</a> — what an embedding actually is, what nearest-neighbour search does, and how hybrid + reranking layer on top.</li>
+    <li><a href="/concepts/embeddings">Embeddings: meaning as geometry</a> — why the same vectors work across any of these stores, and what the model (not the index) actually owns.</li>
+    <li><a href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">Choosing a vector database</a> — a constraint-first selection guide with the ANN / filter / freshness / hybrid / ops axes that genuinely differ between products.</li>
+    <li><a href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">Hybrid search and reranking</a> — why one retriever is structurally not enough and how to combine BM25, dense, and a cross-encoder pass.</li>
+    <li><a href="/deep-dives/retrieval-and-rag/agentic-retrieval">Agentic retrieval: search as a tool</a> — the loop these stores end up backing when an agent calls retrieval iteratively rather than once.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://github.com/pgvector/pgvector" rel="noopener noreferrer">pgvector repo</a> — the extension, with HNSW and IVFFlat index docs.</li>
+    <li><a href="https://docs.pinecone.io/" rel="noopener noreferrer">Pinecone docs</a> — serverless indexes, namespaces, sparse-dense hybrid, metadata filters.</li>
+    <li><a href="https://weaviate.io/developers/weaviate" rel="noopener noreferrer">Weaviate docs</a> — schema, modules, GraphQL query API, hybrid search.</li>
+    <li><a href="https://qdrant.tech/documentation/" rel="noopener noreferrer">Qdrant docs</a> — collections, points, payload indexes, filter-aware HNSW, quantization.</li>
+  </ul>
+</section>
