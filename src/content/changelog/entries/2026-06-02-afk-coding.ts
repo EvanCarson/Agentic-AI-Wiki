@@ -1,7 +1,7 @@
 import { L, type ChangelogEntry } from '../types.ts';
 
 const entry: ChangelogEntry = {
-  date: '2026-06-01',
+  date: '2026-06-02',
   title: L(
     'New AI Blog post: AFK coding',
     '新增 AI Blog 文章：AFK 编程',

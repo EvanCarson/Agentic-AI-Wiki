@@ -1,7 +1,7 @@
 import { L, type BlogPost } from '../types.ts';
 
 const post: BlogPost = {
-  date: '2026-06-01',
+  date: '2026-06-02',
   slug: 'afk-coding',
   title: L(
     'AFK Coding: Managing Parallel AI Agents Instead of Typing',
