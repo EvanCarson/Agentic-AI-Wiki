@@ -1,7 +1,7 @@
 import { L, type BlogPost } from '../types.ts';
 
 const post: BlogPost = {
-  date: '2026-06-02',
+  date: '2026-06-03',
   slug: 'llama-4-vs-deepseek-v3-vs-qwen3-vs-mistral-large-3',
   title: L(
     'Llama 4 vs DeepSeek V3 vs Qwen3 vs Mistral Large 3: Four Open-Weights Flagships, Four Different Bets',
