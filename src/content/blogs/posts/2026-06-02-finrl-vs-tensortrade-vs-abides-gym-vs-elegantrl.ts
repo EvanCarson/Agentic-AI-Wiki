@@ -2,7 +2,7 @@ import { L, type BlogPost } from '../types.ts';
 
 const post: BlogPost = {
   date: '2026-06-02',
-  slug: 'finrl-vs-tensortrade-vs-marketgym-vs-elegantrl',
+  slug: 'finrl-vs-tensortrade-vs-abides-gym-vs-elegantrl',
   title: L(
     'FinRL vs TensorTrade vs ABIDES-Gym vs ElegantRL: Who Controls the Simulation Contract',
     'FinRL、TensorTrade、ABIDES-Gym 与 ElegantRL：谁来掌控仿真契约',
