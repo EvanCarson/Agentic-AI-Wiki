@@ -1,7 +1,7 @@
 import { L, type ChangelogEntry } from '../types.ts';
 
 const entry: ChangelogEntry = {
-  date: '2026-06-02',
+  date: '2026-06-03',
   title: L(
     'New AI Blog post: four RL-for-trading frameworks, compared',
     'AI 博客新文章：四款面向交易的 RL 框架对比',

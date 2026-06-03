@@ -1,7 +1,7 @@
 import { L, type BlogPost } from '../types.ts';
 
 const post: BlogPost = {
-  date: '2026-06-02',
+  date: '2026-06-03',
   slug: 'finrl-vs-tensortrade-vs-abides-gym-vs-elegantrl',
   title: L(
     'FinRL vs TensorTrade vs ABIDES-Gym vs ElegantRL: Who Controls the Simulation Contract',
