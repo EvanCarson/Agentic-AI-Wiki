@@ -1,7 +1,7 @@
 import { L, type BlogPost } from '../types.ts';
 
 const post: BlogPost = {
-  date: '2026-06-22',
+  date: '2026-06-23',
   slug: 'elevenlabs-vs-vapi-vs-retell-vs-openai-gpt-realtime',
   title: L(
     'ElevenLabs vs Vapi vs Retell vs OpenAI gpt-realtime: Four Bets on How Your Agent Should Talk Back',

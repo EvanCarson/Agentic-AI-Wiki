@@ -1,7 +1,7 @@
 import { L, type BlogPost } from '../types.ts';
 
 const post: BlogPost = {
-  date: '2026-06-22',
+  date: '2026-06-23',
   slug: 'temporal-vs-inngest-vs-restate-vs-cloudflare-workflows',
   title: L(
     'Temporal vs Inngest vs Restate vs Cloudflare Workflows: Four Bets on Keeping Your Agent Alive for 30 Minutes',
