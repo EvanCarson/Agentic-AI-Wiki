@@ -1,0 +1,232 @@
+<p class="lede">Naive agent loops die on minute 29 of a 30-minute job. The model picks the right tool, the pod gets rescheduled, the deploy hits halfway through — and the user gets nothing, because nothing was written down. Durable execution is the runtime that makes any orchestration framework actually survive production: every step journaled, the next process picks up exactly where the previous one died. As of late June 2026, four engines compete on that primitive with architecturally opposite bets — <strong>Temporal</strong> ships code-as-workflow with a history event journal, <strong>Inngest</strong> sells DX-first event-driven step functions, <strong>Restate</strong> bets on virtual objects with per-object journals, and <strong>Cloudflare Workflows</strong> stitches durable execution into the <code>Workers</code> edge runtime.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four engines, four answers to the same question: how do you keep a long-running process resumable when the underlying machine is allowed to vanish at any moment.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Engine</th>
+        <th>Approach</th>
+        <th>Self-hosted?</th>
+        <th>Pricing shape</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/logos/temporal.svg" width="24" height="24" alt="Temporal logo" style="vertical-align:middle;margin-right:8px;" />Temporal</td>
+        <td>Workflow-as-code + history event journal</td>
+        <td>Yes (MIT) or Temporal Cloud</td>
+        <td>Per-action on Cloud; infra cost self-hosted</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/logos/inngest.svg" width="24" height="24" alt="Inngest logo" style="vertical-align:middle;margin-right:8px;" />Inngest</td>
+        <td>Event-driven step functions, dev-server-first</td>
+        <td>Yes (self-hosted server) or Inngest Cloud</td>
+        <td>Per-step on Cloud, with a generous free tier</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/logos/restate.svg" width="24" height="24" alt="Restate logo" style="vertical-align:middle;margin-right:8px;" />Restate</td>
+        <td>Virtual objects + per-object journal, exactly-once</td>
+        <td>Yes (single Rust binary) or Restate Cloud</td>
+        <td>Per-invocation on Cloud; single-binary self-host</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/logos/cloudflare.svg" width="24" height="24" alt="Cloudflare logo" style="vertical-align:middle;margin-right:8px;" />Cloudflare Workflows</td>
+        <td>V8-isolate engine inside the <code>Workers</code> runtime</td>
+        <td>No — managed only on Cloudflare</td>
+        <td>Bundled with <code>Workers</code>: CPU-ms + requests + storage</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">Snapshot: 2026-06-23. These engines change fast; verify against current docs before standardizing on any one.</p>
+
+  <figure>
+    <img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/data-stars-comparison.svg" alt="Horizontal bar chart of GitHub stars: Temporal ~14k, Inngest ~4.5k, Restate ~3k, Cloudflare Workflows N/A (ships inside Workers)" width="900" height="400" loading="lazy" />
+    <figcaption>GitHub stars — conservative snapshot. Temporal has been public the longest (forked from Uber's Cadence in 2019); Cloudflare Workflows has no standalone repo because it ships inside the <code>Workers</code> runtime.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/data-feature-matrix.svg" alt="Feature matrix: four engines across five axes — programming model, self-hosted, determinism story, cold-start, multi-region — colored by strength" width="900" height="400" loading="lazy" />
+    <figcaption>No engine wins every axis; the lit-up cells tell you what each one optimized for.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Temporal</h2>
+  <figure>
+    <img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/arch-temporal.svg" alt="Temporal architecture: a workflow worker process runs workflow-as-code and emits events to the Temporal service, which holds the history DB, task queues, and worker pool" width="900" height="500" loading="lazy" />
+    <figcaption>The worker runs your code; the Temporal service holds the history. Crash a worker and the next one replays history to reconstruct state.</figcaption>
+  </figure>
+
+  <h3>Workflow-as-code</h3>
+  <p>Temporal's central abstraction is the <strong>workflow</strong>: a regular function in Go, Java, Python, TypeScript, .NET, Ruby, or PHP that calls other functions ("activities") to do work. You write what looks like ordinary procedural code — <code>await activity.charge_card()</code>, <code>await workflow.sleep(timedelta(hours=24))</code> — and the runtime makes that code crash-proof. The workflow function must be deterministic: same inputs, same code, same outputs. That constraint is what lets Temporal re-execute the function from the top on a new worker and arrive at the same state. Activities are the side-effecting pieces — HTTP calls, model invocations, database writes — with at-least-once retry semantics of their own.</p>
+  <p>This is "durable execution at maximum control": you author the control flow yourself in a language you already use, and Temporal supplies the machinery for retries, timeouts, cancellation, and resume. No DSL, no YAML. The trade is the discipline — non-deterministic constructs (random, system time, raw network) have to go through Temporal's APIs so they land in history, and that learning curve is real.</p>
+
+  <h3>History event journal</h3>
+  <p>Every step is recorded in a <strong>history</strong> — a per-workflow-execution append-only log held in Temporal's database (Cassandra, PostgreSQL, or MySQL). The history contains everything needed to reconstruct state: which activities ran, what arguments they got, what they returned, when timers fired, which signals arrived. When a worker crashes mid-workflow, a new one replays the history to the exact line that was executing — then resumes.</p>
+  <p>Workflow code and durable state are physically separated. Workers are stateless; the Temporal service is the source of truth. You can run thousands of workers, kill any of them, and lose nothing. The cost of that separation is operational: the service wants Cassandra or Postgres, a history shard count chosen up front, and a worker pool sized to your concurrency. Temporal Cloud takes that off your hands at per-action pricing; self-hosted, it is the heaviest of the four to operate.</p>
+
+  <h3>Durable timers, queries, signals</h3>
+  <p>Three primitives ride on top of the history journal. <strong>Durable timers</strong> are <code>workflow.sleep()</code> calls that survive process death — a workflow that sleeps for 30 days does not hold a worker; it parks in history and a worker wakes it up when the timer fires. <strong>Signals</strong> let external systems push events into a running workflow (approval clicked, webhook arrived) without polling. <strong>Queries</strong> let external systems read current state without disturbing the run. Together these are why long-running agent jobs — a research agent that runs for an hour, an approval flow that waits days for a human — feel native here rather than bolted on.</p>
+</section>
+
+<section>
+  <h2>Inngest</h2>
+  <h3>Function-as-workflow with step-level retries</h3>
+  <p>Inngest's abstraction is the <strong>function</strong>: a TypeScript, Python, Go, or Kotlin handler triggered by an event, a schedule, or another function. Inside, the unit of durability is the <strong>step</strong> — you wrap side effects in <code>step.run("name", async () =&gt; ...)</code>, <code>step.sleep("wait-24h", "24h")</code>, or <code>step.waitForEvent("approval", ...)</code>, and the runtime journals each step's result. If the function crashes between steps, the next invocation replays the function from the top, but each completed <code>step.run</code> short-circuits and returns its cached result. Same replay-to-resume model as Temporal; smaller surface area.</p>
+  <p>That smaller surface is the point. Where Temporal asks you to learn workflow-vs-activity, history shards, task queues, and worker pools, Inngest mostly asks you to remember to wrap side effects in <code>step.run</code>. Retries are per-step, flow control (rate limits, per-tenant concurrency, throttling) is a few lines on the function, and there are no idempotency keys to pass around — the step name is the idempotency key. The trade is less control over the orchestration shape.</p>
+
+  <h3>Dev-server-first DX</h3>
+  <p><code>npx inngest-cli@latest dev</code> spins up a local server with a dashboard at <code>localhost:8288</code> that shows every event, every function run, every step in every run, plus an in-browser replay button. Trigger a function, watch each step execute live, see exactly which step failed and what it returned, re-run a single failed step without re-running the whole function. No separate APM to wire up — the trace is the dashboard, and Inngest Cloud is the same UI pointed at production data.</p>
+  <p>That tight inner loop is genuinely uncommon in this space. The cost: Inngest's mental model is built around events. If your application is not event-driven — a long-running synchronous request-response service, say — you end up faking it.</p>
+
+  <h3>Agent kit integration</h3>
+  <p>Inngest ships an <strong>Agent Kit</strong>: a thin TypeScript layer that wraps step-based durability around agent loops. Each model call is a <code>step.run</code>, each tool invocation is a <code>step.run</code>, and the trace shows the whole agent's tool-call history in the same dashboard as ordinary functions. The point is not that you couldn't build this on bare Inngest; it is that the framework opinion exists, making "wrap <code>LangGraph</code> in durable execution" a few lines rather than a weekend. For teams on <code>LangGraph</code>, <code>CrewAI</code>, or the OpenAI Agents SDK that want production durability without standing up Temporal, Agent Kit is the lowest-friction path.</p>
+</section>
+
+<section>
+  <h2>Restate</h2>
+  <figure>
+    <img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/arch-restate.svg" alt="Restate architecture: an HTTP RPC call enters the Restate runtime; four virtual object instances each maintain their own per-object journal that records exactly-once handler invocations" width="900" height="500" loading="lazy" />
+    <figcaption>Restate fans durability out across virtual-object instances rather than centralizing it in one workflow history.</figcaption>
+  </figure>
+
+  <h3>Virtual objects + RPC</h3>
+  <p>Restate's abstraction is the <strong>virtual object</strong>: a single-writer stateful entity keyed by an identifier (a user ID, an order ID, an agent session ID). Each instance owns its own consistent key/value state and serializes its own handler invocations — two concurrent calls to <code>cart-42.add_item()</code> queue rather than race. You invoke handlers over HTTP RPC, and the runtime keeps the object's state and journal locally so handler invocations are exactly-once with respect to the journal, not at-least-once with retries on top. The mental shift from Temporal: durability is not centralized in a workflow execution; it is distributed across object instances, each with its own focused journal.</p>
+  <p>That shape maps unusually well onto agent workloads where the natural unit of state is "this session" or "this user's thread" rather than "this 30-step pipeline." Each agent session is its own virtual object; its memory, tool-call log, and pending interrupts live in that object's state; multiple agents do not contend for a single workflow history.</p>
+
+  <h3>Journal exactly-once</h3>
+  <p>The claim that distinguishes Restate is <strong>exactly-once handler execution</strong>. Temporal and Inngest promise at-least-once activity / step execution and ask you to make those operations idempotent. Restate's runtime journals each handler's effect before acknowledging it externally — a handler that increments a counter increments it exactly once even if the network drops the response, because the next attempt sees the journaled outcome and returns it without re-running.</p>
+  <p>The honest caveat: exactly-once applies to effects the runtime can journal — calls back into Restate, state writes inside an object, outbound calls Restate brokers. Side effects to systems Restate does not mediate (a third-party API with no idempotency token) still need the usual care. Restate just shrinks the surface where you have to think about it.</p>
+
+  <h3>No idempotency keys required</h3>
+  <p>For ordinary cases inside Restate's world — object-to-object calls, object-to-workflow calls, scheduled invocations — you do not pass idempotency keys around in user code. The journal entry's identity is implicit in the call graph, and the runtime handles deduplication. That is a meaningful ergonomic difference from Temporal, where activity authors carry the idempotent-semantics burden, and from Inngest, where the <code>step.run</code> name is the key you have to choose. Restate's bet is that the runtime can carry that burden without leaking it back to the developer — and for code that lives entirely inside Restate's world, it largely does.</p>
+</section>
+
+<section>
+  <h2>Cloudflare Workflows</h2>
+  <h3>V8-isolate runtime</h3>
+  <p>Cloudflare Workflows runs inside the same <code>V8 isolate</code> runtime as <code>Workers</code> — no containers, no per-invocation Linux process boot, just a JavaScript isolate started in a few milliseconds at the edge. A workflow is a TypeScript class with a <code>run(event, step)</code> method; inside it you call <code>step.do("name", async () =&gt; ...)</code>, <code>step.sleep("name", "24 hours")</code>, or <code>step.waitForEvent("name", { ... })</code> — the same step-as-durability-unit shape Inngest popularized, executed in Cloudflare's isolate runtime instead of a Node or Python worker process.</p>
+  <p>The architectural payoff is cold-start: a workflow that sleeps for a week resumes in milliseconds, not seconds, because the isolate model does not need to boot a container. The ceiling is the same isolate constraints any <code>Workers</code> app already lives with — CPU-time budgets per invocation, no arbitrary native dependencies, no long-lived TCP sockets within a single step.</p>
+
+  <h3>Integrated with Workers / Queues / D1</h3>
+  <p>Workflows is not a standalone product; it is one primitive in a stack. A workflow's steps can call other <code>Workers</code>, enqueue messages into <code>Queues</code>, read and write <code>D1</code> (Cloudflare's serverless SQLite), put objects in <code>R2</code>, and invoke <code>Workers AI</code> — all inside the same control plane, with shared auth and observability. For an agent that does retrieval against <code>Vectorize</code>, calls a tool that hits <code>D1</code>, and writes results to <code>R2</code>, the round trip is one bill, one dashboard, one deploy. The cost of that integration is its inverse: there is no self-hosted Workflows server, no on-prem option, no "move my workflow logic to AWS next year."</p>
+
+  <h3>GA in 2025</h3>
+  <p>Cloudflare Workflows reached general availability on <strong>April 7, 2025</strong>, after roughly a year in open beta, with a <code>waitForEvent</code> primitive for human-in-the-loop pauses, scaled concurrency, and Cloudflare Agents SDK integration landing in the same release. Pricing folds into the Workers paid plan: CPU-milliseconds, requests, and (starting September 15, 2025) workflow state storage — and crucially, sleep time and time spent waiting for events do not bill CPU, which matters for any workflow that genuinely waits days for an external signal.</p>
+</section>
+
+<section>
+  <h2>Cross-cutting comparison</h2>
+
+  <h3>Programming model</h3>
+  <p>The four sit on a spectrum from "code I already write" to "platform-shaped functions." Temporal is the most code-native: workflows are ordinary functions in seven SDK languages, control flow is plain <code>if</code> / <code>for</code> / <code>await</code>, and the discipline is determinism rather than API surface. Inngest and Cloudflare Workflows both adopt the step-function shape — a handler wrapped around <code>step.run</code> / <code>step.do</code> calls the runtime journals individually — Inngest leaning event-driven, Cloudflare leaning into the <code>Workers</code> runtime. Restate is the outlier: virtual objects are not a workflow shape but a stateful-entity shape, closer to the actor model than step functions, where the unit of durability is the object instance rather than the workflow execution.</p>
+
+  <h3>Determinism story</h3>
+  <p>All four replay to resume, but they ask for different determinism contracts. Temporal asks the most: the workflow function must be deterministic top to bottom, and non-deterministic operations (time, random, IO) have to go through Temporal APIs so they get journaled — a workflow that calls <code>Date.now()</code> directly will break on replay. Inngest and Cloudflare Workflows are more forgiving because only the code inside <code>step.run</code> / <code>step.do</code> wrappers gets re-executed; the rest of the function is glue. Restate's exactly-once handler journal sidesteps the question for ordinary cases — the handler runs once, the result is cached, and replay returns the cached value. In practice: Temporal codebases grow lint rules to catch non-determinism; Inngest and Cloudflare ones just need developers to remember to wrap side effects; Restate codebases barely think about it for journaled effects.</p>
+
+  <h3>Pricing shape</h3>
+  <p>Four engines, four billing units. Temporal Cloud charges per-action (workflow start, activity execution, signal, query) plus storage and active-execution time; the open-source server is free but you pay for the Cassandra / Postgres cluster, the worker fleet, and the on-call. Inngest Cloud bills per-step with a generous free tier; self-hosted, you pay for the server's compute. Restate Cloud bills per-invocation; the self-hosted single Rust binary has the lightest operational footprint of the four — no external database. Cloudflare Workflows folds into the standard Workers paid plan: CPU-milliseconds, requests, and storage, with sleep and wait-for-event time excluded from CPU billing. The non-obvious properties: a Cloudflare workflow that mostly sleeps costs almost nothing, and a Temporal workflow with many small activities can be surprisingly expensive at scale.</p>
+
+  <h3>Operational footprint</h3>
+  <p>Self-hosting cost varies by more than an order of magnitude. Temporal self-hosted is heaviest: a multi-component service that wants a real database, a chosen shard count, a worker pool, and meaningful operator attention — battle-tested at OpenAI, Salesforce, and DoorDash, but not a weekend project. Inngest self-hosted is moderate: one server binary plus your application workers. Restate self-hosted is the lightest of the three self-hosting options: a single Rust binary that bundles journal storage. Cloudflare Workflows has no self-hosted option — you pay Cloudflare to operate it, full stop. For regulated data residency or air-gapped environments, Cloudflare is off the table and Restate's single-binary footprint is probably the lightest defensible choice.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Use case</th>
+        <th>Pick Temporal if…</th>
+        <th>Pick Inngest if…</th>
+        <th>Pick Restate if…</th>
+        <th>Pick CF Workflows if…</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Long-running LLM workflows</td>
+        <td>You want maximum control and multi-language SDKs, with durable timers, signals, and queries as first-class primitives.</td>
+        <td>You want step-level retries and a dashboard that traces every model and tool call without a separate APM.</td>
+        <td>Each LLM session is one virtual object and you want exactly-once handler semantics, not at-least-once-with-idempotency.</td>
+        <td>You already run on Cloudflare and want the workflow next to <code>Workers AI</code>, <code>D1</code>, and <code>Vectorize</code>.</td>
+      </tr>
+      <tr>
+        <td>Agent tool-call retries</td>
+        <td>Activities are the natural fit, with per-activity retry policies separated from the workflow's deterministic shell.</td>
+        <td>Each tool call wraps in <code>step.run</code>; Agent Kit ships the framework for TypeScript.</td>
+        <td>Each tool invocation is a handler on the agent's virtual object; the journal handles dedup without an idempotency key.</td>
+        <td><code>step.do</code> wraps each tool call; millisecond cold-start means short retries do not pay a container-boot tax.</td>
+      </tr>
+      <tr>
+        <td>Event-driven SaaS</td>
+        <td>Workable, but workflow-as-code is heavier than this case rewards.</td>
+        <td>Native fit — events trigger functions, functions sleep until the next event, the dashboard shows the whole funnel.</td>
+        <td>Workable if user-keyed virtual objects map to your domain (one onboarding object per user).</td>
+        <td>Native fit — events from <code>Queues</code> or webhooks trigger workflows; <code>waitForEvent</code> handles the pauses.</td>
+      </tr>
+      <tr>
+        <td>Edge-deployed agents</td>
+        <td>Self-hosted multi-region is possible but operationally serious; not the natural fit.</td>
+        <td>Self-host close to your users, but the platform is not built around edge primitives.</td>
+        <td>The single-binary model can be deployed at the edge; multi-region coordination is your problem.</td>
+        <td>Native fit — runs at whichever Cloudflare PoP serves the request, no extra config.</td>
+      </tr>
+      <tr>
+        <td>Regulated data residency</td>
+        <td>Self-host on the database and region you choose; Cloud also offers region-pinned deployments.</td>
+        <td>Self-hosted server in your region; Cloud offers region-pinned plans.</td>
+        <td>Single-binary self-hosted is the lightest footprint to keep entirely in your environment.</td>
+        <td>Off the table — workflow state lives on Cloudflare's infrastructure.</td>
+      </tr>
+      <tr>
+        <td>Polyglot stack</td>
+        <td>Strongest fit — SDKs for Go, Java, Python, TypeScript, .NET, Ruby, and PHP share one workflow service.</td>
+        <td>SDKs for TypeScript, Python, Go, and Kotlin/Java; smaller language surface than Temporal.</td>
+        <td>SDKs for TypeScript, Java/Kotlin, Python, Go, and Rust; viable in most polyglot shops.</td>
+        <td>TypeScript / JavaScript only inside the <code>Workers</code> runtime; off the table for Java / Python / Go services.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>Is durable execution different from a job queue?</h3>
+  <p>Yes, meaningfully. A job queue (Sidekiq, BullMQ, SQS-plus-workers) gives you at-least-once execution of a single job and leaves multi-step coordination, retry policies, and resume-after-crash to you. Durable execution adds the ability to write a multi-step process as a single function — with sleeps, waits-for-events, parallel branches, conditional logic — and have the runtime guarantee it survives crashes by journaling each step. You can build durable execution on a queue (people did, for years), but the engines here ship it as the primitive rather than something you assemble.</p>
+
+  <h3>Do I need this if I use LangGraph checkpoints?</h3>
+  <p>Sometimes. <a href="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk"><code>LangGraph</code></a>'s checkpointer gives state durability for the agent graph itself — crash mid-graph, resume from the last node. That covers single-process resume. It does not give you durable timers (sleep 24 hours and survive), durable wait-for-event (pause until a webhook arrives), exactly-once side effects across retries, or multi-region resume. If your agent runs end-to-end in a single process in under a minute, LangGraph checkpoints are probably enough. If it sleeps, waits for humans, fans out across services, or has to survive deploys, you want a durable execution engine underneath.</p>
+
+  <h3>What about AWS Step Functions / Durable Functions?</h3>
+  <p>AWS Step Functions has been GA since 2016, with a JSON state-machine DSL (ASL) and tight AWS-service integration. Azure Durable Functions has been GA since 2017 with workflow-as-code via async/await. Both are credible if you are already deep on AWS or Azure. We left them out of the head-to-head because they are the safe-default answers in each hyperscaler's ecosystem; the four in this post are where the design space is actively moving in 2026.</p>
+
+  <h3>Can I run all four self-hosted?</h3>
+  <p>Three of the four. Temporal ships an MIT-licensed server (you supply Cassandra, PostgreSQL, or MySQL). Inngest ships an open-source self-hosted server. Restate ships as a single Rust binary. Cloudflare Workflows has no self-hosted edition — it runs only on Cloudflare's platform, by design.</p>
+
+  <h3>What's the cold-start cost?</h3>
+  <p>Cloudflare Workflows wins this axis decisively: <code>V8 isolate</code>s start in single-digit milliseconds, and a sleeping workflow resumes essentially without warm-up. Inngest and Temporal run worker processes that are usually long-lived, but a newly scheduled worker pays a container-or-process-boot cost in the hundreds of milliseconds to seconds. Restate's runtime is one Rust binary that is usually warm; reloading an object instance from the journal is fast for ordinary state sizes. For a workflow that mostly sleeps and occasionally wakes, Cloudflare's model is the cheapest in both wall-clock latency and billable time.</p>
+
+  <h3>Which one survives a region outage?</h3>
+  <p>All four claim multi-region durability; operator burden varies. Temporal Cloud offers multi-region replication; self-hosted Temporal can do it but you operate the Cassandra / Postgres replication yourself. Inngest Cloud and Restate Cloud run multi-region by default on paid plans; the self-hosted equivalents are your responsibility. Cloudflare Workflows runs on the global network — state is replicated across PoPs and a region failure is largely invisible to your code, the strongest position on this axis and also the one you can do least to influence.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk">LangGraph vs CrewAI vs Claude Managed Agents vs OpenAI Agents SDK</a> — the orchestration-frameworks comparison that pairs with this one. Orchestration frameworks decide what the agent does next; durable execution engines keep that decision alive across process death. The two layers compose: <code>LangGraph</code> nodes call Temporal activities, Inngest steps wrap CrewAI tool calls, and the OpenAI Agents SDK's runner loop can sit inside a Cloudflare Workflow.</li>
+    <li><a href="/concepts/the-agent-loop">The Agent Loop</a> — the perceive-decide-act cycle every agent runs. Durable execution is what keeps that loop resumable across the failure modes a naive <code>while True</code> ignores.</li>
+    <li><a href="/concepts/planning-and-termination">Planning and Termination</a> — how an agent decides what to do next and how to stop. Durable timers and wait-for-event primitives are what let the planner pause cleanly without holding a worker.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://temporal.io/" rel="noopener noreferrer">Temporal</a> — docs at <a href="https://docs.temporal.io/" rel="noopener noreferrer">docs.temporal.io</a>, source at <a href="https://github.com/temporalio/temporal" rel="noopener noreferrer">github.com/temporalio/temporal</a>.</li>
+    <li><a href="https://www.inngest.com/" rel="noopener noreferrer">Inngest</a> — docs at <a href="https://www.inngest.com/docs" rel="noopener noreferrer">inngest.com/docs</a>, source at <a href="https://github.com/inngest/inngest" rel="noopener noreferrer">github.com/inngest/inngest</a>.</li>
+    <li><a href="https://restate.dev/" rel="noopener noreferrer">Restate</a> — docs at <a href="https://docs.restate.dev/" rel="noopener noreferrer">docs.restate.dev</a>, source at <a href="https://github.com/restatedev/restate" rel="noopener noreferrer">github.com/restatedev/restate</a>.</li>
+    <li><a href="https://developers.cloudflare.com/workflows/" rel="noopener noreferrer">Cloudflare Workflows</a> — developer docs; GA announcement on the <a href="https://blog.cloudflare.com/" rel="noopener noreferrer">Cloudflare blog</a> (April 7, 2025).</li>
+  </ul>
+</section>

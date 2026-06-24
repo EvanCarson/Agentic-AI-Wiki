@@ -1,0 +1,232 @@
+<p class="lede">朴素的 agent 循环会死在一份 30 分钟任务的第 29 分钟。模型挑对了工具，pod 却被重新调度，发布恰好打到任务跑到一半——用户什么都拿不到，因为什么都没被写下来。durable execution 是让任何编排框架在生产环境真正活下来的运行时：每一步都被记入 journal，下一个进程从前一个倒下的那一行恰好接着跑。截至 2026 年 6 月下旬，有四套引擎在这条原语上竞争，押注方向在架构上截然相反——<strong>Temporal</strong> 主打"workflow 即代码"加上一份历史事件 journal，<strong>Inngest</strong> 卖的是 DX 优先的事件驱动 step functions，<strong>Restate</strong> 押注 virtual objects 加上每个对象自己的 journal，而 <strong>Cloudflare Workflows</strong> 则把 durable execution 缝进了 <code>Workers</code> 的边缘运行时。</p>
+
+<section>
+  <h2>速览</h2>
+  <p>四套引擎，对同一个问题给出四种答案：当底层机器随时可能消失时，要怎么让一个长周期进程仍可恢复。</p>
+  <table>
+    <thead>
+      <tr>
+        <th>引擎</th>
+        <th>路线</th>
+        <th>可自托管？</th>
+        <th>计费形态</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/logos/temporal.svg" width="24" height="24" alt="Temporal 标志" style="vertical-align:middle;margin-right:8px;" />Temporal</td>
+        <td>workflow 即代码 + 历史事件 journal</td>
+        <td>是（MIT）或 Temporal Cloud</td>
+        <td>Cloud 按 action 计费；自托管承担基础设施成本</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/logos/inngest.svg" width="24" height="24" alt="Inngest 标志" style="vertical-align:middle;margin-right:8px;" />Inngest</td>
+        <td>事件驱动的 step functions，dev-server 优先</td>
+        <td>是（自托管 server）或 Inngest Cloud</td>
+        <td>Cloud 按 step 计费，含相当宽松的免费额度</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/logos/restate.svg" width="24" height="24" alt="Restate 标志" style="vertical-align:middle;margin-right:8px;" />Restate</td>
+        <td>virtual objects + 每对象 journal，exactly-once</td>
+        <td>是（单一 Rust 二进制）或 Restate Cloud</td>
+        <td>Cloud 按调用次数计费；自托管为单二进制</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/logos/cloudflare.svg" width="24" height="24" alt="Cloudflare 标志" style="vertical-align:middle;margin-right:8px;" />Cloudflare Workflows</td>
+        <td>跑在 <code>Workers</code> 运行时里的 V8-isolate 引擎</td>
+        <td>否——仅在 Cloudflare 上托管</td>
+        <td>与 <code>Workers</code> 打包：CPU-ms + requests + 存储</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">快照：2026-06-23。这些引擎更新很快，标准化到某一个之前请对照最新文档核实。</p>
+
+  <figure>
+    <img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/data-stars-comparison.svg" alt="GitHub stars 水平条形图：Temporal 约 14k，Inngest 约 4.5k，Restate 约 3k，Cloudflare Workflows N/A（随 Workers 一起出货）" width="900" height="400" loading="lazy" />
+    <figcaption>GitHub stars——保守快照。Temporal 公开时间最长（2019 年从 Uber 的 Cadence fork 出来）；Cloudflare Workflows 没有独立仓库，因为它随 <code>Workers</code> 运行时一起出货。</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/data-feature-matrix.svg" alt="特性矩阵：四套引擎横跨五条轴——编程模型、自托管、确定性故事、cold-start、多区域——按强度着色" width="900" height="400" loading="lazy" />
+    <figcaption>没有哪个引擎在每条轴上都赢；点亮的格子告诉你它分别为什么做了优化。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Temporal</h2>
+  <figure>
+    <img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/arch-temporal.svg" alt="Temporal 架构：一个 workflow worker 进程跑着 workflow 即代码，把事件发往 Temporal service，service 持有历史数据库、任务队列与 worker pool" width="900" height="500" loading="lazy" />
+    <figcaption>worker 跑你的代码；Temporal service 持有历史。kill 掉一个 worker，下一个会重放历史以重建状态。</figcaption>
+  </figure>
+
+  <h3>workflow 即代码</h3>
+  <p>Temporal 的核心抽象是 <strong>workflow</strong>：一个用 Go、Java、Python、TypeScript、.NET、Ruby 或 PHP 写的普通函数，调用其他函数（"activities"）来干活。你写的看起来就是寻常的过程式代码——<code>await activity.charge_card()</code>、<code>await workflow.sleep(timedelta(hours=24))</code>——运行时则让这份代码具备抗崩溃能力。workflow 函数必须是确定性的：相同输入、相同代码、相同输出。正是这个约束，让 Temporal 能在新的 worker 上从头重放函数并抵达同一个状态。activities 是带副作用的部分——HTTP 调用、模型调用、数据库写入——自带 at-least-once 的重试语义。</p>
+  <p>这是"最大化掌控的 durable execution"：你用自己已经会用的语言亲手写出控制流，Temporal 提供重试、超时、取消和恢复的机器。没有 DSL，没有 YAML。代价是纪律——非确定性的构造（random、系统时间、原始网络）必须通过 Temporal 的 API 走，这样才能落到历史里，这条学习曲线是实打实存在的。</p>
+
+  <h3>历史事件 journal</h3>
+  <p>每一步都被记录在<strong>历史</strong>里——这是一份按 workflow execution 维度、只追加的日志，存放在 Temporal 的数据库里（Cassandra、PostgreSQL 或 MySQL）。历史里包含重建状态所需的一切：哪些 activities 跑了、传入了什么参数、返回了什么、timer 何时触发、哪些 signal 抵达。当一个 worker 在 workflow 中途崩溃，新的 worker 会把历史重放到正在执行的那一行——然后恢复。</p>
+  <p>workflow 代码与持久状态在物理上是分离的。worker 是无状态的；Temporal service 才是 source of truth。你可以跑成千上万个 worker，随便 kill 任何一个都不会丢东西。这种分离的代价在运维上：service 想要 Cassandra 或 Postgres、预先选好的 history shard 数量、按并发量配好的 worker pool。Temporal Cloud 以按 action 计费的方式替你扛下这些；自托管时它是这四者中运维最重的。</p>
+
+  <h3>durable timers、queries、signals</h3>
+  <p>历史 journal 之上有三个原语。<strong>durable timers</strong> 是能挺过进程死亡的 <code>workflow.sleep()</code> 调用——一个 sleep 30 天的 workflow 并不占着一个 worker；它停泊在历史里，timer 触发时由 worker 唤醒它。<strong>signals</strong> 让外部系统不必轮询就能把事件推进一个正在运行的 workflow（点了批准、来了 webhook）。<strong>queries</strong> 让外部系统在不打扰这次运行的情况下读取当前状态。三者合起来，正是为什么长周期 agent 任务——跑一个小时的 research agent、等人类好几天的审批流——在这里感觉是原生的，而不是后装上去的。</p>
+</section>
+
+<section>
+  <h2>Inngest</h2>
+  <h3>function 即 workflow，配上 step 级重试</h3>
+  <p>Inngest 的抽象是 <strong>function</strong>：一个由事件、日程或另一个 function 触发的 TypeScript、Python、Go 或 Kotlin handler。在它内部，持久化的单元是 <strong>step</strong>——你把副作用包进 <code>step.run("name", async () =&gt; ...)</code>、<code>step.sleep("wait-24h", "24h")</code> 或 <code>step.waitForEvent("approval", ...)</code>，运行时会把每个 step 的结果记入 journal。如果 function 在两个 step 之间崩了，下一次调用会从头重放该 function，但每个已完成的 <code>step.run</code> 会短路并返回它缓存的结果。和 Temporal 一样的"重放即恢复"模型；表面更小。</p>
+  <p>那份更小的表面正是它的卖点。Temporal 要你学 workflow vs activity、history shards、task queues 和 worker pools，而 Inngest 主要要你记得把副作用包进 <code>step.run</code> 就够了。重试是 per-step 的，流控（限速、单租户并发、节流）在 function 上加几行就行，也不必到处传 idempotency key——step 名字就是 idempotency key。代价是对编排形态的掌控更少。</p>
+
+  <h3>dev-server 优先的 DX</h3>
+  <p><code>npx inngest-cli@latest dev</code> 会拉起一个带 dashboard 的本地 server，地址在 <code>localhost:8288</code>，会展示每个 event、每次 function run、每次 run 里的每一个 step，外加一个浏览器内的 replay 按钮。触发一个 function，看着每个 step 实时执行，准确看到哪个 step 失败、它返回了什么，只重跑那个失败的 step 而不必重跑整个 function。不必额外接 APM——trace 就是 dashboard 本身，Inngest Cloud 也是同一个 UI，只是指向了生产数据。</p>
+  <p>这条紧凑的内循环在这个领域里实属少见。代价是：Inngest 的心智模型是围绕事件搭起来的。如果你的应用不是事件驱动的——比如一个长时间运行的同步请求-响应服务——你就得装着自己是。</p>
+
+  <h3>agent kit 集成</h3>
+  <p>Inngest 出货了一套 <strong>Agent Kit</strong>：一层很薄的 TypeScript，把基于 step 的持久性包到 agent 循环外面。每次模型调用是一个 <code>step.run</code>，每次工具调用是一个 <code>step.run</code>，trace 在与普通 function 同一个 dashboard 里展示整个 agent 的工具调用历史。重点不是说裸 Inngest 上你建不出这种东西；重点是框架方给出了主张，让"把 <code>LangGraph</code> 包进 durable execution"变成几行代码而非一个周末的活。对那些在 <code>LangGraph</code>、<code>CrewAI</code> 或 OpenAI Agents SDK 上、不想去搭一套 Temporal、却又想要生产级持久性的团队，Agent Kit 是阻力最小的路径。</p>
+</section>
+
+<section>
+  <h2>Restate</h2>
+  <figure>
+    <img src="/blogs/temporal-vs-inngest-vs-restate-vs-cloudflare-workflows/arch-restate.svg" alt="Restate 架构：一次 HTTP RPC 调用进入 Restate 运行时；四个 virtual object 实例各自维护自己的 per-object journal，记录 exactly-once 的 handler 调用" width="900" height="500" loading="lazy" />
+    <figcaption>Restate 把持久性扇出到各个 virtual-object 实例上，而不是集中在一份 workflow 历史里。</figcaption>
+  </figure>
+
+  <h3>virtual objects + RPC</h3>
+  <p>Restate 的抽象是 <strong>virtual object</strong>：一个按标识符（user ID、order ID、agent session ID）做键的单写有状态实体。每个实例拥有自己一致的键值状态，并对自己的 handler 调用做串行化——两次并发的 <code>cart-42.add_item()</code> 调用是排队而非竞态。你通过 HTTP RPC 调用 handler，运行时把对象的状态和 journal 留在本地，因此 handler 调用相对于 journal 是 exactly-once 的，而不是在 at-least-once 之上再套重试。相对 Temporal 的心智转变是：持久性不再集中在一次 workflow execution 里；它被分布到各个对象实例上，每个都有自己聚焦的 journal。</p>
+  <p>这种形态意外地很适合 agent 工作负载——它们天然的状态单位是"这个会话"或"这个用户的线程"，而不是"这条 30 步的流水线"。每个 agent session 就是它自己的 virtual object；它的记忆、工具调用日志和挂起的 interrupt 都活在那个对象的状态里；多个 agent 不必去抢同一份 workflow 历史。</p>
+
+  <h3>journal exactly-once</h3>
+  <p>Restate 真正与众不同的主张是 <strong>handler 的 exactly-once 执行</strong>。Temporal 和 Inngest 承诺的是 activity / step 的 at-least-once，并要求你把这些操作做成幂等的。Restate 的运行时在对外确认 handler 的效果之前就把它记入 journal——一个递增计数器的 handler 即使网络丢了响应也只会被递增一次，因为下一次尝试看到的是已记入 journal 的结果，会直接返回而不重跑。</p>
+  <p>诚实的注脚：exactly-once 适用于运行时能记入 journal 的效果——回到 Restate 的调用、对象内部的状态写入、由 Restate 代理的对外调用。对那些不由 Restate 居中调度的系统的副作用（一个没有 idempotency token 的第三方 API）仍然要照常小心。Restate 只是把你必须为之操心的表面缩小了。</p>
+
+  <h3>不需要 idempotency key</h3>
+  <p>对 Restate 世界里的寻常场景——对象到对象的调用、对象到 workflow 的调用、定时调用——你不必在用户代码里到处传 idempotency key。journal 条目的身份隐含在调用图里，运行时来处理去重。这与 Temporal 是一个有分量的人体工程差异：在 Temporal 里 activity 作者要扛幂等语义的担子；与 Inngest 也不同：那里 <code>step.run</code> 的名字就是你必须自己选的 key。Restate 的押注是：运行时能扛起这副担子，而不必把它泄漏回开发者那里——对于完全活在 Restate 世界里的代码，基本上做到了。</p>
+</section>
+
+<section>
+  <h2>Cloudflare Workflows</h2>
+  <h3>V8-isolate 运行时</h3>
+  <p>Cloudflare Workflows 跑在与 <code>Workers</code> 同一个 <code>V8 isolate</code> 运行时里——没有容器，没有每次调用都启动一个 Linux 进程，只有在边缘几毫秒内启动起来的一个 JavaScript isolate。一个 workflow 就是一个带 <code>run(event, step)</code> 方法的 TypeScript 类；在它内部你调用 <code>step.do("name", async () =&gt; ...)</code>、<code>step.sleep("name", "24 hours")</code> 或 <code>step.waitForEvent("name", { ... })</code>——和 Inngest 推广开来的"step 即持久化单元"是同一种形态，只是在 Cloudflare 的 isolate 运行时里执行，而非 Node 或 Python 的 worker 进程。</p>
+  <p>架构上的回报体现在 cold-start：一个 sleep 一周的 workflow 在毫秒内恢复，而不是秒级，因为 isolate 模型不必启动容器。天花板则是任何 <code>Workers</code> 应用都已在面对的 isolate 约束——每次调用的 CPU 时间预算、不接受任意原生依赖、单个 step 内不能有长连的 TCP socket。</p>
+
+  <h3>与 Workers / Queues / D1 一体化</h3>
+  <p>Workflows 不是一个独立产品；它是一整套技术栈里的一个原语。一个 workflow 的 step 可以调用其他 <code>Workers</code>、向 <code>Queues</code> 投递消息、读写 <code>D1</code>（Cloudflare 的 serverless SQLite）、把对象放进 <code>R2</code>、调用 <code>Workers AI</code>——全部在同一套控制面里，共享 auth 和可观测性。对一个去 <code>Vectorize</code> 检索、调用打到 <code>D1</code> 的工具、再把结果写到 <code>R2</code> 的 agent 来说，这一来回是一份账单、一个 dashboard、一次部署。这种一体化的代价是它的反面：没有自托管的 Workflows server，没有本地部署方案，也不会有"明年我把 workflow 逻辑搬到 AWS"。</p>
+
+  <h3>2025 年 GA</h3>
+  <p>Cloudflare Workflows 在 <strong>2025 年 4 月 7 日</strong>正式 GA，此前在开放 beta 里跑了大约一年，同一个版本里落地了用于 human-in-the-loop 暂停的 <code>waitForEvent</code> 原语、规模化并发以及与 Cloudflare Agents SDK 的集成。计费折进 Workers 付费计划：CPU 毫秒、requests，以及（自 2025 年 9 月 15 日起）workflow 状态存储——关键的是，sleep 时间和等待事件的时间不计入 CPU 计费，这对任何真正要为外部 signal 等上几天的 workflow 都很重要。</p>
+</section>
+
+<section>
+  <h2>横向对比</h2>
+
+  <h3>编程模型</h3>
+  <p>这四者处在从"我本来就写的代码"到"被平台塑形的 function"的一条谱系上。Temporal 最接近原生代码：workflow 就是七种 SDK 语言里的普通函数，控制流是朴素的 <code>if</code> / <code>for</code> / <code>await</code>，要的是确定性的纪律而不是 API 表面。Inngest 和 Cloudflare Workflows 都采用 step-function 形态——一个包着 <code>step.run</code> / <code>step.do</code> 调用的 handler，运行时把每一步分别记入 journal——Inngest 偏事件驱动，Cloudflare 则靠拢 <code>Workers</code> 运行时。Restate 是异类：virtual objects 不是一种 workflow 形态而是一种有状态实体形态，比起 step functions 更接近 actor model，持久化的单元是对象实例而非 workflow execution。</p>
+
+  <h3>确定性故事</h3>
+  <p>四者都靠重放来恢复，但它们要求的确定性契约不同。Temporal 要求最多：workflow 函数必须从上到下都是确定性的，非确定性的操作（时间、随机、IO）必须走 Temporal 的 API 才能被记入 journal——一个直接调 <code>Date.now()</code> 的 workflow 在重放时会断掉。Inngest 和 Cloudflare Workflows 更宽容，因为只有 <code>step.run</code> / <code>step.do</code> 包起来的代码会被重新执行；function 其余部分只是胶水。Restate 的 exactly-once handler journal 在寻常场景里直接绕过了这个问题——handler 跑一次，结果被缓存，重放就返回缓存值。实操上：Temporal 的代码库会长出 lint 规则去抓非确定性；Inngest 和 Cloudflare 的代码库只需要开发者记得把副作用包起来；Restate 的代码库对已记入 journal 的效果几乎不必去想这件事。</p>
+
+  <h3>计费形态</h3>
+  <p>四套引擎，四种计费单位。Temporal Cloud 按 action 计费（workflow 启动、activity 执行、signal、query）外加存储和活跃执行时间；开源 server 是免费的，但你要为 Cassandra / Postgres 集群、worker fleet 和 on-call 买单。Inngest Cloud 按 step 计费，附带相当宽松的免费额度；自托管则要为 server 的算力买单。Restate Cloud 按调用次数计费；自托管的单一 Rust 二进制是这四者里运维足迹最轻的——没有外部数据库。Cloudflare Workflows 折进了标准 Workers 付费计划：CPU 毫秒、requests 和存储，sleep 和等待事件的时间从 CPU 计费里排除。不太显眼的属性：一个大部分时间在 sleep 的 Cloudflare workflow 几乎不花钱，而一个有许多小 activity 的 Temporal workflow 在规模上可能贵得意外。</p>
+
+  <h3>运维足迹</h3>
+  <p>自托管成本相差超过一个数量级。Temporal 自托管最重：一套多组件 service，想要一个真正的数据库、一个选定的 shard 数量、一个 worker pool 和有分量的运维投入——在 OpenAI、Salesforce 和 DoorDash 都经过实战，但绝不是一个周末项目。Inngest 自托管中等：一个 server 二进制加上你应用的 worker。Restate 自托管是三个自托管选项里最轻的：一个单一 Rust 二进制就把 journal 存储捆在一起。Cloudflare Workflows 没有自托管选项——你付钱给 Cloudflare 替你运维，就这么个安排。对受监管的数据驻留或物理隔离环境，Cloudflare 直接出局，而 Restate 的单二进制足迹大概是最轻量、最站得住脚的选择。</p>
+</section>
+
+<section>
+  <h2>该选哪一个</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>使用场景</th>
+        <th>选 Temporal，当……</th>
+        <th>选 Inngest，当……</th>
+        <th>选 Restate，当……</th>
+        <th>选 CF Workflows，当……</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>长周期 LLM 工作流</td>
+        <td>你想要最大化掌控与多语言 SDK，把 durable timers、signals 和 queries 当作一等公民原语。</td>
+        <td>你想要 step 级重试，以及一个不必另接 APM 就能追踪每次模型与工具调用的 dashboard。</td>
+        <td>每个 LLM session 就是一个 virtual object，你想要 exactly-once 的 handler 语义，而不是"at-least-once 加幂等"。</td>
+        <td>你已经跑在 Cloudflare 上，想让 workflow 紧贴 <code>Workers AI</code>、<code>D1</code> 和 <code>Vectorize</code>。</td>
+      </tr>
+      <tr>
+        <td>agent 工具调用重试</td>
+        <td>activities 是天然契合，每个 activity 的重试策略和 workflow 的确定性外壳是分开的。</td>
+        <td>每次工具调用包进 <code>step.run</code>；Agent Kit 为 TypeScript 直接出货了这套框架。</td>
+        <td>每次工具调用是 agent 的 virtual object 上的一个 handler；journal 替你做去重，不必传 idempotency key。</td>
+        <td><code>step.do</code> 包住每次工具调用；毫秒级 cold-start 意味着短重试不必交容器启动税。</td>
+      </tr>
+      <tr>
+        <td>事件驱动的 SaaS</td>
+        <td>能用，但 workflow 即代码相对这个场景能拿到的回报来说太重了。</td>
+        <td>天然契合——事件触发 function，function sleep 到下一个事件，dashboard 展示整条漏斗。</td>
+        <td>如果按用户键的 virtual object 能映射到你的领域，就可用（每个用户一个 onboarding 对象）。</td>
+        <td>天然契合——<code>Queues</code> 或 webhook 的事件触发 workflow；<code>waitForEvent</code> 处理暂停。</td>
+      </tr>
+      <tr>
+        <td>边缘部署的 agent</td>
+        <td>自托管多区域可行但运维上不轻；不是天然契合。</td>
+        <td>可以贴近用户自托管，但平台不是围绕边缘原语建起来的。</td>
+        <td>单二进制模型可以部署到边缘；多区域协调是你自己的活。</td>
+        <td>天然契合——跑在响应这次请求的那个 Cloudflare PoP 上，不必额外配置。</td>
+      </tr>
+      <tr>
+        <td>受监管的数据驻留</td>
+        <td>自托管在你选定的数据库和区域上；Cloud 也提供按区域固定的部署。</td>
+        <td>在你的区域自托管 server；Cloud 提供按区域固定的套餐。</td>
+        <td>单二进制自托管，把数据完全留在你的环境里的足迹最轻。</td>
+        <td>出局——workflow 状态活在 Cloudflare 的基础设施上。</td>
+      </tr>
+      <tr>
+        <td>多语言技术栈</td>
+        <td>最契合——Go、Java、Python、TypeScript、.NET、Ruby 和 PHP 的 SDK 共享同一个 workflow service。</td>
+        <td>TypeScript、Python、Go 和 Kotlin/Java 的 SDK；语言面比 Temporal 小。</td>
+        <td>TypeScript、Java/Kotlin、Python、Go 和 Rust 的 SDK；在多数多语言工程团队里可用。</td>
+        <td><code>Workers</code> 运行时里只支持 TypeScript / JavaScript；Java / Python / Go 服务出局。</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+
+  <h3>durable execution 和 job queue 是两回事吗？</h3>
+  <p>是的，而且差得有分量。一个 job queue（Sidekiq、BullMQ、SQS-plus-workers）给你单个 job 的 at-least-once 执行，把多步协调、重试策略和崩溃后恢复都留给你。durable execution 增加的是：把一个多步过程写成单个函数——带 sleep、等待事件、并行分支、条件逻辑——并由运行时通过把每一步记入 journal 来保证它能挺过崩溃。你可以在 queue 之上自己搭出 durable execution（多年来人们就是这么做的），但这里的几个引擎是把它当作原语直接出货，而不是某种你要去拼装的东西。</p>
+
+  <h3>我已经用了 LangGraph checkpoint，还需要这个吗？</h3>
+  <p>有时候需要。<a href="/zh/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk"><code>LangGraph</code></a> 的 checkpointer 给的是 agent 图本身的状态持久性——图跑到一半崩了，从最后一个节点恢复。它覆盖的是单进程的恢复。它不给你 durable timers（sleep 24 小时并存活）、durable wait-for-event（暂停直到 webhook 到达）、跨重试的 exactly-once 副作用，也不给多区域恢复。如果你的 agent 是单进程内一分钟内跑完的端到端流程，LangGraph checkpoint 大概就够了。如果它会 sleep、等人、跨服务扇出，或者必须挺过部署，你就想要底下有一个 durable execution 引擎。</p>
+
+  <h3>AWS Step Functions / Durable Functions 怎么算？</h3>
+  <p>AWS Step Functions 自 2016 年 GA，带一套 JSON 状态机 DSL（ASL）和与 AWS 服务的紧密集成。Azure Durable Functions 自 2017 年 GA，通过 async/await 实现 workflow 即代码。如果你已经深扎 AWS 或 Azure，二者都很可信。我们把它们从正面对比里拿掉，是因为它们是各自超大规模云生态里的安全默认答案；本文这四者才是 2026 年这块设计空间正在活跃推进的地方。</p>
+
+  <h3>这四个我都能自托管吗？</h3>
+  <p>四里有三。Temporal 出货一个 MIT 许可证的 server（你来提供 Cassandra、PostgreSQL 或 MySQL）。Inngest 出货一个开源的自托管 server。Restate 以单一 Rust 二进制的形式出货。Cloudflare Workflows 没有自托管版——按设计就只跑在 Cloudflare 的平台上。</p>
+
+  <h3>cold-start 成本是多少？</h3>
+  <p>Cloudflare Workflows 在这条轴上完胜：<code>V8 isolate</code> 在个位数毫秒内启动，一个 sleep 中的 workflow 几乎不需要预热就能恢复。Inngest 和 Temporal 跑的是通常长连的 worker 进程，但一个新调度起来的 worker 要付几百毫秒到秒级的容器/进程启动成本。Restate 的运行时是一个通常处于热状态的 Rust 二进制；对常规状态体量，从 journal 里重新加载一个对象实例是很快的。对一个大部分时间在 sleep、偶尔醒来的 workflow，Cloudflare 的模型在挂钟延迟和计费时间上都是最便宜的。</p>
+
+  <h3>哪一个能挺过区域故障？</h3>
+  <p>四者都宣称多区域持久性；运维负担差别很大。Temporal Cloud 提供多区域复制；自托管 Temporal 可以做到，但 Cassandra / Postgres 的复制要你自己运维。Inngest Cloud 和 Restate Cloud 在付费套餐上默认多区域；自托管对应物是你的责任。Cloudflare Workflows 跑在全球网络上——状态在多个 PoP 之间复制，单区域故障对你的代码基本不可见，这在这条轴上是最强的姿态，也正是你最插不上手的姿态。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关内容：</h3>
+  <ul>
+    <li><a href="/zh/blogs/langgraph-vs-crewai-vs-claude-managed-agents-vs-openai-agents-sdk">LangGraph vs CrewAI vs Claude Managed Agents vs OpenAI Agents SDK</a>——与本文配套的编排框架对比。编排框架决定 agent 下一步做什么；durable execution 引擎让那个决定在进程死亡之间仍然活着。两层会组合：<code>LangGraph</code> 节点去调用 Temporal activities，Inngest 的 step 包住 CrewAI 的工具调用，OpenAI Agents SDK 的 runner 循环也可以坐在一个 Cloudflare Workflow 内部。</li>
+    <li><a href="/zh/concepts/the-agent-loop">智能体循环</a>——每个 agent 都在跑的感知-决策-行动循环。durable execution 就是让那个循环在朴素 <code>while True</code> 忽略的那些失败模式下仍可恢复的东西。</li>
+    <li><a href="/zh/concepts/planning-and-termination">规划与终止</a>——一个 agent 如何决定下一步做什么、又如何停下来。durable timers 和等待事件原语正是让规划者可以干净暂停而不占着一个 worker 的关键。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://temporal.io/" rel="noopener noreferrer">Temporal</a>——文档在 <a href="https://docs.temporal.io/" rel="noopener noreferrer">docs.temporal.io</a>，源码在 <a href="https://github.com/temporalio/temporal" rel="noopener noreferrer">github.com/temporalio/temporal</a>。</li>
+    <li><a href="https://www.inngest.com/" rel="noopener noreferrer">Inngest</a>——文档在 <a href="https://www.inngest.com/docs" rel="noopener noreferrer">inngest.com/docs</a>，源码在 <a href="https://github.com/inngest/inngest" rel="noopener noreferrer">github.com/inngest/inngest</a>。</li>
+    <li><a href="https://restate.dev/" rel="noopener noreferrer">Restate</a>——文档在 <a href="https://docs.restate.dev/" rel="noopener noreferrer">docs.restate.dev</a>，源码在 <a href="https://github.com/restatedev/restate" rel="noopener noreferrer">github.com/restatedev/restate</a>。</li>
+    <li><a href="https://developers.cloudflare.com/workflows/" rel="noopener noreferrer">Cloudflare Workflows</a>——开发者文档；GA 公告见 <a href="https://blog.cloudflare.com/" rel="noopener noreferrer">Cloudflare 博客</a>（2025 年 4 月 7 日）。</li>
+  </ul>
+</section>
