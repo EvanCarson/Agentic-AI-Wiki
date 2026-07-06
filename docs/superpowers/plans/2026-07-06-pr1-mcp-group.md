@@ -84,7 +84,12 @@ The `zh/` version uses `Deep Dive · MCP` → `深入解析 · MCP` for the `.we
 
 **`<pre>` block rule (from CLAUDE.md, mandatory).** `<pre>` blocks in en and zh must be byte-identical. Only prose translates. Where an essay's content spec provides a `<pre>` block below, reproduce it exactly in both locales.
 
-**Xref links.** Where an existing slug is mentioned in prose, wrap it as `<a href="/deep-dives/<slug>/" class="xref">…visible text…</a>` in en and `<a href="/zh/deep-dives/<slug>/" class="xref">…visible text…</a>` in zh. Do not link inside `<pre>` blocks or headings. First natural mention only.
+**Xref links.** Where an existing slug is mentioned in prose, wrap it as `<a href="/deep-dives/<group-key>/<slug>" class="xref">…visible text…</a>` in en and `<a href="/zh/deep-dives/<group-key>/<slug>" class="xref">…visible text…</a>` in zh. The `<group-key>` segment is mandatory — group keys are:
+- `architectures-and-patterns`, `protocols-and-interop`, `memory-and-context`, `retrieval-and-rag`, `training-agentic-models`, `multi-agent-systems`, `reasoning-and-test-time-compute`, `tool-capability-design`, and the new `mcp` (for MCP essays).
+
+For links to Concepts pages, use `/concepts/<slug>` (no group segment) — Concepts are ungrouped in URLs. For Operations pages, use `/operations/<slug>`. For Playbooks, `/playbooks/<slug>`. Verify each target URL by grepping the source (`grep "'<slug>'" src/content/`) before shipping.
+
+Do not link inside `<pre>` blocks or headings. First natural mention only. **Only link to slugs that already exist on `main` OR that a previously-committed task in this PR has added.** Do not forward-reference an essay whose task hasn't run yet — the internal-link check will fail. If a natural link point exists for a not-yet-drafted essay, leave the prose linkless and Task 12's back-pass adds the link later.
 
 ---
 
