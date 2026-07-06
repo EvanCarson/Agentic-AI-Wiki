@@ -1,0 +1,68 @@
+<section class="phase">
+  <div class="phase-num">C6</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>MCP 2025-11-25 规范的安全附录逐一点名了六种反模式——如果你不能在一段轨迹里看出每一种、并说清怎么修，那你现在还没做完鉴权。</h2>
+  <p class="goal">MCP 安全最佳实践附录基本是一份"具体失败模式"的购物清单——代理服务器中的 confused deputy、被规范点名禁止的令牌透传、两种变体的会话劫持、通过 OAuth 发现 URL 触发的 SSRF、经由客户端的 <code class="inline">javascript:</code> URL、以及本地服务器的启动命令执行。每一种都有真实案例；NSA/CISA 在 2026 年 6 月联合发布了 MCP 安全通告。下面挑出多数团队最容易漏的六种模式，并给出每种在一行日志里是什么样子。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>代理式 MCP 服务器中的 confused deputy。</h3>
+
+    <p>confused deputy 是这份清单里最老的攻击，也是 MCP 代理最常独立重新发明的一种——因为一台前置多个下游服务的代理，结构上就是一个 deputy。模式是这样：MCP 服务器接受了客户端 A 的一次请求，携带的是为 principal P 签发的令牌，而在路由这次请求的过程中，它用自己的环境权限去访问一个"信任这台代理、而不去校验 P"的下游服务。代理"被搞糊涂"是因为它带着调用者的意图、用的却是自己的凭证；下游服务"被搞糊涂"是因为它以为代理在为自己说话。这两种糊涂都不会被代理正确执行过的 JWT 签名校验抓到——那次校验回答的是"这枚令牌是不是真的"，而不是"这位 principal 是不是有资格通过我去访问这个资源"。</p>
+
+    <p>MCP 上具体的失败面出现在这里：代理服务器接受一个 AS 签发的令牌，且没有把令牌的 <code class="inline">aud</code> claim 与自身的规范 URL 比对，就把有效动作转给一个信任该代理的服务。这正是 <a href="/zh/operations/safety-and-security/agentic-threat-model" class="xref">agentic threat model</a> 运营那一篇点名过的"不做窄化的委托"失败形状。机械修法是两行强制。第一，校验令牌的 audience 与本服务器的规范 URL 是否完全一致——这就是 <a href="/zh/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 配置</a>所强制的 RFC 8707 资源指示检查。第二，一旦调用者所持令牌的 audience 不是本服务器，就拒绝以环境凭证代其行动；如果工具需要访问下游服务，请用 RFC 8693 的令牌交换、把 scope 窄化，交由 AS 判断这次交换是否被允许。两条修复都把"因为签名验得过就信任令牌"改成"因为令牌把本服务器命名为 audience 才信任它"。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>令牌透传（被禁止——却容易不小心做）。</h3>
+
+    <p>令牌透传是安全附录逐字点名禁止的反模式，而它"被不小心采用"的比例正是它值得被点名的原因。模式是这样：MCP 服务器手里握着调用者的合法 bearer 令牌，需要去访问下游服务时，把同一枚令牌转发给下游。读起来像有礼貌的中间人行为——用户已经认证过一次，就别再让他再来一次——但它把 RFC 8707 audience claim 想提供的一切保证全部打穿。下游服务此刻手里握着一枚为 MCP 服务器铸出来的令牌，scope 是为 MCP 工具授予的，<code class="inline">aud</code> claim 命名的是 MCP 服务器；下游服务自己的审计记录把这次动作归给了一位与它没有任何策略关系的 principal。</p>
+
+    <p>两种正确替代已经在 <a href="/zh/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 配置</a>那一篇里给过了：URL 模式的征询（把一个 URL 返回给客户端，让客户端带用户走完下游服务自己的 OAuth 流程，MCP 服务器从不接触下游令牌）或者 RFC 8693 的令牌交换（把收到的令牌递给 AS、请求一枚绑定到下游服务的窄化令牌、然后转发那枚新令牌）。规则很短：MCP 服务器不得把收到的令牌转发给任何除签发它者以外的服务。对每一次出站调用，只要其 <code class="inline">Authorization</code> header 等于入站那一份，就打一条"检测到透传"的安全事件；就这么一处比较，能抓住六个月后代码评审也会漏掉的每一次意外透传。不要为"同一个 AS 上的内部服务"开例外——AS 的信任边界不是 audience 的边界，RFC 8707 的全部意义就是"同 AS"与"同 audience"是两种不同的保证。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>会话劫持：两种变体（冒充、提示词注入）。</h3>
+
+    <p>Streamable HTTP 上的会话劫持有两种变体，它们共享同一种轨迹指纹、而修法各异。冒充变体是经典款：攻击者从客户端流量里偷到 <code class="inline">MCP-Session-Id</code> header（一条漏出去的日志、一个共用代理、一个权限过大的浏览器扩展），然后拿去重放给服务器。如果服务器把 <code class="inline">MCP-Session-Id</code> 当作后续请求上"足以授权"的凭据——传输规范的形状会诱惑你这么做，因为每一次请求上都带着 session id——攻击者就继承了受害者的会话。提示词注入变体较新，来自工具响应里包含"指示下游 agent 使用某个特定 session id"的文本；一条多 agent 流水线如果把工具输出灌进另一 agent 的上下文时没有剥掉 session 引用，那一台服务器的响应就能用与<a href="/zh/operations/safety-and-security/prompt-injection" class="xref">提示词注入</a>运营那一篇同一类攻击去劫持另一个 agent 的会话。</p>
+
+    <p>修法就是一个原则、用两次。会话在签发时就绑到令牌所指的 principal 上、每次请求都重新校验：一个 <code class="inline">MCP-Session-Id</code> 若没有一枚指向同一 principal 的 bearer 令牌配套，那就不是会话，只是一个 id。短会话 TTL（分钟到少量小时，而不是天）收窄重放窗口；权限变化时轮换会话，堵住"攻击者趁 scope 扩张钻进来"的接缝。对提示词注入变体，把看起来是 <code class="inline">MCP-Session-Id</code> 的子串从工具响应文本里剥掉或拒收，再进入另一 agent 的上下文；永远不要让服务端 agent 从任意工具输出中读取 session id。工具响应携带被注入指令的完整讨论属于另一篇文章，但会话劫持的角度收在同一条规则：会话是"principal + 令牌"，从来不是单独的不透明 id。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>通过 OAuth 发现 URL 的 SSRF。</h3>
+
+    <p>通过 OAuth 发现的 SSRF 是熟悉的服务端请求伪造在 MCP 上的一个变体，其触发原语是 Protected Resource Metadata 的解引用。一个天真实现在收到"请求里带有客户端提供的 PRM URL 或 Client ID Metadata Document URL"时，会去服务端拉那个 URL 来验证客户端。如果拉取不加限制，攻击者就把一份 PRM 形状的文档放在一个内部地址上——AWS 上的 <code class="inline">http://169.254.169.254/latest/meta-data/</code>、内网 <code class="inline">10.0.0.5</code> 上的管理面板、任何云的元数据端点——然后诱导服务器去拉。攻击者通过服务器暴露的某个副通道（错误信息、校验日志、下游调用）把响应带回来。</p>
+
+    <p>机械修法是"每一次与 AS 相关的抓取之前"做协议与目的地校验。把预期的 AS URL 加白名单（部署方知道自己信任哪几个授权服务器——通常不到五个），其他一律在请求时拒绝。凡是主机名解析到环回、链路本地或私有地址段——RFC 1918、RFC 4193、RFC 6890——一律拒绝解引用，重定向之后要重新检查解析。永远不要从请求里给的 URL 拉 PRM 文档；PRM 就住在本服务器 <code class="inline">/.well-known/oauth-protected-resource</code> 这个固定路径上，CIMD 才是客户端控制的 URL。<a href="/zh/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a> 那一篇为本地服务器覆盖了同一类校验——针对 Origin header 与 DNS rebinding——两种缓解属于同一件事：出站 URL 的 SSRF 检查与入站请求的 Origin 检查是"校验网络图"这一条纪律的两面。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3><code class="inline">javascript:</code> 与 <code class="inline">data:</code> URL 进入客户端。</h3>
+
+    <p>MCP 响应可以在多处形状里承载 URL——资源链接、工具响应文本、prompt 消息内容、带"另见"链接的错误信息。这些面里但凡有一处到达"不校验协议就渲染的客户端"，一条 <code class="inline">javascript:</code> URL 就会在客户端上下文里执行，一条 <code class="inline">data:</code> URL 也会送来任意内容、可能绕过客户端的正常内容类型预期。攻击形状不大，但爆炸半径可以很大：一台 MCP 服务器如果从不受信来源拉内容再原样转发给客户端，其"存储侧"就是那个内容源自的位置，本质是一条"存储型 XSS"流水线。</p>
+
+    <p>修法必须两端都做、不能只放一端。在服务端，只要 URL 的协议不在一份小白名单里——<code class="inline">https</code>、明确允许的本地开发用的 <code class="inline">http</code>、以及服务器真正会用的少数应用特定协议——在它进入工具响应、资源链接或 prompt 消息之前就剥掉或拒收。在客户端，渲染时应用同一份协议白名单；对待 MCP 响应里的 URL 要像对待来自不受信 API 的文本那样。之所以需要双端防御，是因为服务端可能信任自己上游、漏掉一种没料到的协议，而客户端也可能信任自家 MCP 服务器、漏掉服务器不小心放过的一种协议。两侧都校验同一份白名单，是"确保没有路径漏过来"最便宜的做法。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>本地服务器的启动命令执行。</h3>
+
+    <p>本地 MCP 服务器由宿主根据一份配置来启动，那份配置命名了一条命令与它的参数——<code class="inline">command: "python"</code>、<code class="inline">args: ["/path/to/server.py"]</code>，或者像 <code class="inline">npx some-mcp-server</code> 这样的包管理器调用。因此，一份被恶意改动或被篡改的宿主配置就是任意代码执行：MCP 一初始化，宿主便乖乖地按用户权限启动配置指向的任何二进制。攻击面并不冷门——改宿主配置的恶意软件、寄来一份"帮忙写好的"配置文件的钓鱼诱饵、npm 发布的服务器包上的供应链攻击——2025-11-25 附录当前把它列为本地传输一类里承重风险之一。</p>
+
+    <p>修法是"分发侧签名 + 宿主侧校验"。服务器发布者签署一份 manifest，命名预期的二进制、版本、以及允许的参数形状；宿主在执行命令之前校验签名，签名不匹配就拒绝启动，且首次遇到某个发布者的 key 时先向用户征询同意。在本地生态里还没有签名可用的地方，宿主如果在安装时锁定包哈希（带 lockfile 的 <code class="inline">npm ci</code>、包管理器的子资源完整性校验）、并拒绝没有用户显式动作就自动更新服务器，也能关掉大部分同样的面。<a href="/zh/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 配置</a>那一篇结尾写道：本配置在做那种没有捷径能替它做的事；本地执行反模式也以同样的方式收尾——"信任宿主配置"就是那条一次次让团队赔上整套系统的捷径。</p>
+
+<pre class="trace">[confused-deputy]      proxy-mcp | 200 | token.aud=other-mcp.example | downstream=internal-svc | ALLOWED (should be 401: audience mismatch)
+[token-passthrough]    mcp-1     | outbound=downstream-api | Authorization=Bearer eyJ... | matches inbound token | FORBIDDEN
+[session-hijack:imp]   mcp-1     | 200 | MCP-Session-Id=s_9x... | source_ip=203.0.113.42 | prev_ip=198.51.100.7 | NO REBIND
+[session-hijack:pi]    agent-2   | tool_result contains "MCP-Session-Id: s_9x..." | fed to agent-3 context | STRIP MISSING
+[ssrf-discovery]       mcp-1     | GET http://169.254.169.254/latest/meta-data/ | initiator=prm-fetch | ALLOWLIST BYPASS
+[js-url-injection]     mcp-1     | tool_result.link="javascript:fetch('/exfil?'+document.cookie)" | scheme not allowlisted
+[startup-exec]         host      | launch cmd="python" args=["/tmp/malicious.py"] | manifest_sig=MISSING | executed anyway</pre>
+  </div>
+</section>

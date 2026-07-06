@@ -1,0 +1,68 @@
+<section class="phase">
+  <div class="phase-num">C6</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>The MCP 2025-11-25 security appendix names six anti-patterns explicitly — if you can't spot each one in a trace and describe its fix, you don't yet ship auth.</h2>
+  <p class="goal">MCP's security best practices appendix is a shopping list of specific failure modes — confused deputy in proxy servers, token passthrough (forbidden by name), session hijacking with two variants, SSRF via OAuth discovery URLs, <code class="inline">javascript:</code> URLs surviving into a client, local-server startup-command execution. Every one has been observed in the wild; NSA/CISA published a joint MCP security advisory in June 2026. What follows isn't the whole appendix — it's the six patterns most teams miss and how each one shows up in a log line.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Confused deputy in proxy MCP servers.</h3>
+
+    <p>The confused deputy is the oldest attack in this list and the one MCP proxies rediscover most often, because a proxy that fronts several downstream services is structurally a deputy. The pattern: an MCP server accepts a request from client A carrying a token minted for principal P, and, in the course of routing that request, uses its own ambient authority to reach a downstream service that trusts the proxy rather than checking P. The proxy is confused because it acted with the caller's intent but its own credentials; the downstream service is confused because it thought the proxy was speaking for itself. Neither confusion is caught by the JWT signature check that the proxy performed correctly — the check answers "is this token real" not "should this principal reach this resource through me".</p>
+
+    <p>The concrete failure surface on MCP is where a proxy server accepts tokens issued for one AS and, without checking the token's <code class="inline">aud</code> claim against its own canonical URL, forwards the effective action to a service that trusts the proxy. This is the same shape the <a href="/operations/safety-and-security/agentic-threat-model" class="xref">agentic threat model</a> operations essay calls out as the "delegation without narrowing" failure. The mechanical fix is two lines of enforcement. First, verify the token's audience matches this exact server's canonical URL — the RFC 8707 resource indicator check the <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 profile</a> mandates. Second, refuse to act on ambient credentials on behalf of a caller whose token's audience is not this server; if the tool needs to reach a downstream service, use token exchange (RFC 8693) with narrowed scope and let the AS decide whether the exchange is allowed. Both fixes turn "trust the token because it verifies" into "trust the token because it names this server as its audience".</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Token passthrough (forbidden — and easy to do accidentally).</h3>
+
+    <p>Token passthrough is the anti-pattern the security appendix forbids by name, and its accidental-adoption rate is the reason it earned a name. The pattern: the MCP server holds a valid bearer token from the caller and, needing to reach a downstream service, forwards that same token to the downstream. It reads like polite intermediary behavior — the user authenticated once, don't make them do it again — and it defeats every guarantee the RFC 8707 audience claim was meant to provide. The downstream service now holds a token minted for the MCP server, in scopes granted for MCP tools, with an <code class="inline">aud</code> claim naming the MCP server; the downstream service's own audit trail attributes the action to a principal that has no policy relationship with it.</p>
+
+    <p>The two correct replacements come from the <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 profile</a> essay: URL-mode elicitation (return a URL and let the client take the user through the downstream service's own OAuth flow, so the MCP server never sees the downstream token) or RFC 8693 token exchange (present the incoming token to the AS, request a narrower one bound to the downstream service, forward that). The rule is short: an MCP server MUST NOT forward a received token to any service other than the one that issued it. Log a passthrough-detected security event on every outbound call whose <code class="inline">Authorization</code> header equals the inbound one; that one comparison catches every accidental passthrough that a code review would have missed six months later. Do not carve exceptions for internal services on the same AS — the AS trust boundary is not the audience boundary, and the whole point of RFC 8707 is that "same AS" and "same audience" are different guarantees.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Session hijacking: two variants (impersonation, prompt-injection).</h3>
+
+    <p>Session hijacking on Streamable HTTP has two variants that share a trace signature and diverge in fix. The impersonation variant is classic: an attacker steals the <code class="inline">MCP-Session-Id</code> header from a client's traffic (a leaked log, a shared proxy, a browser extension with too much scope) and replays it against the server. If the server treats <code class="inline">MCP-Session-Id</code> as sufficient authorization on subsequent requests — which is the shape the transport spec makes tempting because the session id is on every request — the attacker inherits the victim's session. The prompt-injection variant is newer and comes from tool responses containing text that instructs a downstream agent to use a specific session id; if a multi-agent pipeline pipes tool output into another agent's context without stripping session references, one server's response can hijack another agent's session with the same class of attack the <a href="/operations/safety-and-security/prompt-injection" class="xref">prompt injection</a> operations essay catalogues.</p>
+
+    <p>The fix is a single principle applied twice. Bind sessions to the token's principal at issuance and re-verify on every request: <code class="inline">MCP-Session-Id</code> without a matching bearer token identifying the same principal is not a session, it's an id. Short session TTLs (minutes to a low number of hours, not days) narrow the replay window; rotating the session on any privilege change closes the "attacker snuck in during a scope expansion" seam. For the prompt-injection variant, strip or reject <code class="inline">MCP-Session-Id</code>-looking substrings from tool response text before it enters another agent's context, and never let a server-side agent read session ids from arbitrary tool output. A prose treatment of tool responses that carry injected instructions belongs in a separate essay, but the session-hijacking angle closes with the same rule: sessions are principals + tokens, never opaque ids alone.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>SSRF via OAuth discovery URLs.</h3>
+
+    <p>SSRF through OAuth discovery is a MCP-specific variant of a familiar server-side request forgery, and its enabling primitive is the Protected Resource Metadata dereference. A naive server implementation, on receiving a request that includes a client-supplied URL for PRM or for a Client ID Metadata Document, fetches that URL server-side to validate the client. If the fetch is unrestricted, an attacker sets up a PRM-shaped document at an internal address — <code class="inline">http://169.254.169.254/latest/meta-data/</code> on AWS, an internal admin panel on <code class="inline">10.0.0.5</code>, a metadata endpoint on any cloud — and induces the server to fetch it. The attacker gets the response back via whatever side channel the server exposes (an error message, a validation log, a downstream call).</p>
+
+    <p>The mechanical fix is scheme and destination validation before every AS-related fetch. Allowlist expected AS URLs (the deployment knows which authorization servers it trusts; there are typically fewer than five) and reject anything else at request time. Refuse to dereference URLs whose host resolves to loopback, link-local, or private address ranges — RFC 1918, RFC 4193, RFC 6890 — and re-check the resolution after any redirect. Never fetch a PRM document from a URL supplied in the request; PRM lives at a fixed <code class="inline">/.well-known/oauth-protected-resource</code> path on this server, and CIMD is a client-side URL under the client's control. The <a href="/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a> essay covers the same class of validation for the Origin header and DNS rebinding on local servers, and both mitigations belong together: an SSRF check on outbound URLs and an Origin check on inbound requests are two sides of the same "validate the network graph" discipline.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3><code class="inline">javascript:</code> and <code class="inline">data:</code> URLs surviving into a client.</h3>
+
+    <p>MCP responses can carry URLs in several shapes — resource links, tool response text, prompt message content, error messages that include a "see also" link. If any of those surfaces reaches a client that renders it without validating the scheme, a <code class="inline">javascript:</code> URL executes in the client's context and a <code class="inline">data:</code> URL delivers arbitrary content that may bypass the client's normal content-type expectations. The attack shape is small but the blast radius is large: an MCP server that pulls content from an untrusted source and forwards it verbatim to a client is a stored-XSS pipeline whose stored side is whatever the source of the content was.</p>
+
+    <p>The fix belongs on both ends and cannot live on one. On the server, strip or reject any URL whose scheme is not in a small allowlist — <code class="inline">https</code>, <code class="inline">http</code> for explicitly-permitted local dev, and the few application-specific schemes the server actually uses — before the URL enters a tool response, resource link, or prompt message. On the client, apply the same scheme allowlist on render; treat a URL from an MCP response as untrusted content in the same way you'd treat text from an untrusted API. The dual defense matters because a server that trusts its own upstream might miss a scheme it never expected, and a client that trusts its MCP server might miss a scheme the server let through by accident. Both sides validating the same allowlist is the cheapest way to be sure that no path exists.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Startup-command execution in local servers.</h3>
+
+    <p>Local MCP servers are launched by the host from a config that names a command and its arguments — <code class="inline">command: "python"</code>, <code class="inline">args: ["/path/to/server.py"]</code>, or a package manager invocation like <code class="inline">npx some-mcp-server</code>. A malicious or tampered host config is therefore arbitrary code execution: the host obediently launches whatever binary the config points at, with the user's privileges, the moment MCP is initialised. The attack surface is not exotic — malware that edits a host config, a phishing lure that ships a "helpful" config file, a supply-chain compromise on an npm-published server package — and the current 2025-11-25 appendix treats it as one of the load-bearing risks in the local-transport class.</p>
+
+    <p>The fix is manifest signing on the distribution side and verification on the host side. A server publisher signs a manifest that names the expected binary, its version, and its allowed argument shape; the host verifies the signature before executing the command, refuses to launch on mismatch, and prompts the user before accepting a new publisher's key on first use. Where signing isn't yet available in the local ecosystem, a host that pins package hashes on install (<code class="inline">npm ci</code> with a lockfile, a package manager's integrity subresource check) and refuses to auto-update servers without an explicit user action closes most of the same surface. The <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 profile</a> essay ends with the observation that the profile does work no shortcut can replace; the local-execution anti-pattern ends the same way, and this is the one place where "trust the host config" is the shortcut that keeps costing teams the whole system.</p>
+
+<pre class="trace">[confused-deputy]      proxy-mcp | 200 | token.aud=other-mcp.example | downstream=internal-svc | ALLOWED (should be 401: audience mismatch)
+[token-passthrough]    mcp-1     | outbound=downstream-api | Authorization=Bearer eyJ... | matches inbound token | FORBIDDEN
+[session-hijack:imp]   mcp-1     | 200 | MCP-Session-Id=s_9x... | source_ip=203.0.113.42 | prev_ip=198.51.100.7 | NO REBIND
+[session-hijack:pi]    agent-2   | tool_result contains "MCP-Session-Id: s_9x..." | fed to agent-3 context | STRIP MISSING
+[ssrf-discovery]       mcp-1     | GET http://169.254.169.254/latest/meta-data/ | initiator=prm-fetch | ALLOWLIST BYPASS
+[js-url-injection]     mcp-1     | tool_result.link="javascript:fetch('/exfil?'+document.cookie)" | scheme not allowlisted
+[startup-exec]         host      | launch cmd="python" args=["/tmp/malicious.py"] | manifest_sig=MISSING | executed anyway</pre>
+  </div>
+</section>
