@@ -320,4 +320,168 @@ Between mid-2025 and mid-2026, the "protocol war" collapsed into a two-layer con
 
 ## 6. Gap synthesis
 
-(populated by Task 7)
+Cross-referenced §§2-5 landscape sub-topics against §1 inventory. All 51 raw candidates classified below; then filtered and assigned to a target surface per the design spec's three-track structure.
+
+### Classification (candidate | status | target surface)
+
+**From §2 MCP landscape (all 12 candidates are "missing" — no existing coverage beyond `mcp-architecture`):**
+
+| Candidate | Status | Target |
+|---|---|---|
+| mcp-building-servers-in-practice | missing | Track 1 (new mcp group) |
+| mcp-tool-design | missing | Track 1 |
+| mcp-testing | missing | Track 1 |
+| mcp-transport-choice | missing (partial overlap w/ mcp-architecture) | Track 1 — DROP, subsumed by streamable-http + building |
+| mcp-streamable-http-deep-dive | missing | Track 1 |
+| mcp-auth-oauth21 | missing | Track 1 |
+| mcp-security-anti-patterns | missing | Track 1 |
+| mcp-tool-poisoning | missing | Track 1 |
+| mcp-ops-in-production | missing | Track 1 |
+| mcp-sampling-and-elicitation | missing | Track 1 |
+| mcp-registry-and-distribution | missing | Track 1 |
+| mcp-remote-vs-local | missing | Track 1 — DROP, covered by transport + ops |
+
+**From §3 Frontier capabilities:**
+
+| Candidate | Status | Target |
+|---|---|---|
+| long-context-effective-vs-advertised | stale (context-windows) | Track 2 (memory-and-context) — reframed as deep-dive |
+| context-caching-economics | missing | Track 2 (architectures-and-patterns) |
+| adaptive-thinking-and-effort-budgets | missing | Track 2 (reasoning-and-test-time-compute) |
+| reasoning-mode-cross-vendor-api-surface | missing (concept-shaped) | SKIP — concepts out of scope |
+| when-to-turn-thinking-off | missing | Track 3 (Field Guide, Frontier Part) |
+| computer-use-in-production | stale (x2 chapter) | Track 3 (Field Guide, Frontier Part) |
+| browser-agent-failure-modes | missing | Track 2 (architectures-and-patterns) |
+| gui-agent-benchmarks-2026 | missing (concept-shaped) | Track 2 (new group `evaluating-agents`) |
+| rlvr-and-grpo-for-agents | missing | Track 2 (training-agentic-models) |
+| process-reward-models | stale (process-vs-outcome-rewards) | Track 2 (training-agentic-models) |
+| rl-fine-tuning-open-weights | missing | Track 2 (training-agentic-models) |
+| open-vs-closed-capability-delta-mid-2026 | stale (open-vs-closed-models) | SKIP — concept-shaped |
+
+**From §4 Agent engineering:**
+
+| Candidate | Status | Target |
+|---|---|---|
+| swe-bench-saturation-and-post-verified-benchmarks | missing | Track 2 (new group `evaluating-agents`) |
+| hal-holistic-agent-leaderboard | missing | Track 2 (new group `evaluating-agents`) |
+| gaia2-and-async-agent-eval | missing | Track 2 (new group `evaluating-agents`) — merge with above |
+| judge-calibration-and-meta-evaluation | missing | Track 2 (new group `evaluating-agents`) |
+| eval-score-drift-detection | missing (Operations-shaped) | SKIP — Operations out of scope |
+| evals-as-ci-gate-2026 | missing | Track 3 (Field Guide, Evaluate Part) |
+| memory-write-path-architectures | missing | Track 2 (memory-and-context) |
+| memory-poisoning-defenses | missing | Track 2 (memory-and-context) |
+| learned-retrievers-and-memrl | missing | Track 2 (memory-and-context) |
+| prompt-injection-layered-defense-2026 | missing (Operations-shaped) | SKIP — Operations out of scope |
+| policy-as-code-for-agents | missing (Operations-shaped) | SKIP — Operations out of scope |
+| durable-execution-langgraph-plus-temporal | missing | Track 2 (architectures-and-patterns) |
+| claude-managed-agents-architecture | missing | Track 2 (architectures-and-patterns) |
+| sub-agent-patterns-comparison | missing | Track 2 (multi-agent-systems) |
+| dspy-3-gepa-for-agent-optimization | missing | Track 2 (training-agentic-models) |
+
+**From §5 Protocols & standards:**
+
+| Candidate | Status | Target |
+|---|---|---|
+| a2a-v1-deep-dive | stale (a2a-communication) | Track 2 (protocols-and-interop) |
+| agent-cards-and-discovery | stale (capability-discovery) | Track 2 (protocols-and-interop) |
+| signed-agent-cards-and-identity | missing | Track 2 (protocols-and-interop) |
+| acp-and-what-happened | missing (post-mortem) | Track 2 (protocols-and-interop) |
+| tool-calling-vendor-matrix-2026 | stale (tool-calling-standards) | Track 2 (tool-capability-design) |
+| structured-outputs-vs-tool-calls | missing | Track 2 (tool-capability-design) |
+| json-schema-subsets-per-vendor | missing | Track 2 (tool-capability-design) |
+| advanced-tool-orchestration-patterns | missing | Track 2 (tool-capability-design) |
+| ap2-and-agent-commerce | missing | Track 2 (protocols-and-interop) |
+| the-two-layer-consensus | missing | Track 3 (Field Guide, Frontier Part) |
+| agents-json-and-openapi-for-agents | missing | Track 2 (protocols-and-interop) |
+| streaming-tool-calls-in-practice | missing | Track 2 (tool-capability-design) |
+
+### Design amendment flag
+
+**A second new Deep-Dive group is proposed: `evaluating-agents`.** The original design spec plans one new group (MCP). The evals candidates from §4 (judge-calibration, benchmark landscape, HAL/Gaia2) don't fit any existing Deep-Dive group cleanly — architectures-and-patterns is patterns; memory-and-context is memory; the closest fit is training-agentic-models but that's about training, not evaluating. Adding a small new group (~3 essays) is the cleanest home. Flagged in the slate for user decision at Checkpoint 1.
+
+### Filtered candidate list per track
+
+**Track 1 — MCP Deep-Dive group (target 6-10 entries):**
+
+- must (6): mcp-building-servers-in-practice, mcp-tool-design, mcp-testing, mcp-security-anti-patterns, mcp-streamable-http-deep-dive, mcp-auth-oauth21
+- should (2): mcp-sampling-and-elicitation, mcp-tool-poisoning
+- stretch (2): mcp-ops-in-production, mcp-registry-and-distribution
+
+Total: 10 (10 within 6-10 range).
+
+**Track 2 — Deep-Dive additions (target 8-12+ entries, distributed):**
+
+`architectures-and-patterns`:
+- must (1): durable-execution-langgraph-plus-temporal
+- should (2): context-caching-economics, browser-agent-failure-modes
+- stretch (1): claude-managed-agents-architecture
+
+`memory-and-context`:
+- must (1): memory-write-path-architectures
+- should (2): memory-poisoning-defenses, long-context-effective-vs-advertised
+- stretch (1): learned-retrievers-and-memrl
+
+`reasoning-and-test-time-compute`:
+- must (1): adaptive-thinking-and-effort-budgets
+
+`training-agentic-models`:
+- must (1): rlvr-and-grpo-for-agents
+- should (2): rl-fine-tuning-open-weights, process-reward-models
+- stretch (1): dspy-3-gepa-for-agent-optimization
+
+`multi-agent-systems`:
+- should (1): sub-agent-patterns-comparison
+
+`protocols-and-interop`:
+- must (1): a2a-v1-deep-dive
+- should (1): agent-cards-and-discovery
+- stretch (3): acp-and-what-happened, ap2-and-agent-commerce, agents-json-and-openapi-for-agents
+
+`tool-capability-design`:
+- must (2): tool-calling-vendor-matrix-2026, advanced-tool-orchestration-patterns
+- should (2): structured-outputs-vs-tool-calls, json-schema-subsets-per-vendor
+- stretch (1): streaming-tool-calls-in-practice
+
+`evaluating-agents` (NEW group — design amendment):
+- must (1): judge-calibration-and-meta-evaluation
+- should (1): benchmark-landscape-2026 (composite: swe-bench-saturation + post-Verified benchmarks)
+- stretch (1): hal-and-async-agent-eval (composite: HAL + Gaia2)
+
+**Track 2 totals:**
+- must: 8
+- should: 11
+- stretch: 8
+- Track 2 grand total: 27 (must+should = 19)
+
+**Track 3 — Field Guide chapters (target 2-4 chapters):**
+
+Frontier Part (currently only r1 What to Read — sparse):
+- must (1): computer-use-in-production (r2)
+- must (1): mcp-native-agent-building (r3) — ties MCP essays into a Field Guide narrative
+- should (1): the-two-layer-consensus (r4)
+- should (1): choosing-thinking-effort (r5)
+
+Evaluate Part:
+- should (1): evals-as-ci-gate (e5)
+
+**Track 3 totals:**
+- must: 2
+- should: 3
+- Track 3 grand total: 5
+
+### Grand totals (all three tracks)
+
+- must: 6 + 8 + 2 = **16**
+- should: 2 + 11 + 3 = **16**
+- stretch: 2 + 8 + 0 = **10**
+- **must + should combined: 32 pages (comfortably ≥ 20 target)**
+- **Total including stretch: 42 pages**
+
+### Field Guide dependency notes
+
+Field Guide chapters depend on Track 2 entries being merged first:
+- **r3 mcp-native-agent-building** depends on Track 1 (MCP group) merged.
+- **r4 the-two-layer-consensus** depends on `protocols-and-interop` a2a-v1-deep-dive and Track 1 MCP essays.
+- **r5 choosing-thinking-effort** depends on `reasoning-and-test-time-compute` adaptive-thinking essay.
+- **e5 evals-as-ci-gate** depends on new group `evaluating-agents` judge-calibration essay.
+- **r2 computer-use-in-production** — no hard dependency (self-contained; may link to browser-agent-failure-modes as Related).
