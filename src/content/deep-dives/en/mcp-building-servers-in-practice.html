@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">C1</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>Building an MCP server isn't hello-world plus tools — the decisions that matter are which capability becomes a tool vs a resource vs a prompt, and what the median server actually looks like.</h2>
+  <p class="goal">Every MCP tutorial teaches you to register two tools, echo back a string, and declare victory; production servers look nothing like that. The median MCP server in circulation ships five tools, zero resources, zero prompts, and no auth — a survey of 1,412 servers puts numbers on it — and the shape reflects a set of design choices most tutorials never mention. Get the tool-vs-resource-vs-prompt boundary wrong and every downstream problem — token bloat, brittle testing, unreadable agent traces — flows from it.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The stack you actually use: FastMCP (Python) or Standard Schema (TypeScript).</h3>
+
+    <p>Almost every Python MCP server shipped in 2026 is built with <strong>FastMCP</strong> (<code class="inline">pip install fastmcp</code>), not the reference <code class="inline">mcp</code> package it once wrapped. FastMCP is decorator-driven: you write a normal function, add <code class="inline">@server.tool</code>, and the library derives the JSON Schema from your type hints, negotiates the <a href="/deep-dives/protocols-and-interop/mcp-architecture" class="xref">participant model</a>'s <code class="inline">initialize</code> handshake, and hides the JSON-RPC layer entirely. The Bloomberry survey of 1,412 production servers found FastMCP has the largest SDK share among sampled Python servers, which is why most 2024-era tutorials that show a raw <code class="inline">Server</code> class and hand-registered handlers are already misleading — they're demonstrating the layer FastMCP was built to hide.</p>
+
+    <p>On the TypeScript side, the current SDK is <code class="inline">@modelcontextprotocol/sdk</code>, which exposes an <code class="inline">McpServer</code> class using a Standard Schema API — you can pass a Zod, Valibot, or ArkType schema and the SDK adapts it to MCP's inputSchema shape without you writing a JSON Schema by hand. The v2 line is in beta as of mid-2026, but v1 will remain supported for at least six more months, so a project starting today can pick either without rework in the near term. The lower-level Python <code class="inline">mcp</code> package still exists and is what you reach for when you need direct control over the message layer — implementing a novel transport, wrapping a non-standard host, or debugging protocol issues — but for shipping a normal server it is the wrong altitude.</p>
+
+    <p>A minimal FastMCP server is genuinely small: a decorator, a function, a run call. What tutorials usually stop there and treat as "done" is where the real decisions haven't started yet — the function signature you just wrote implies a whole set of choices about what belongs on the server at all.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The three-way choice: tool vs resource vs prompt.</h3>
+
+    <p>MCP gives you three primitives to expose a capability with, and the choice is not stylistic. <strong>Tools</strong> are model-controlled actions with side effects: if the model decides when to call something, and calling it can change state or perform a query on the model's behalf, it is a tool. <strong>Resources</strong> are application-controlled context: URI-addressable, read-only data the host reads and places into the model's context on its own schedule — a file, a database row, an API response frozen at a point in time. <strong>Prompts</strong> are user-controlled templates: workflow scaffolding a server exposes and the host surfaces as slash-commands or menu entries, expanded with the user's arguments.</p>
+
+    <p>The mnemonic that fits on a Post-it: <em>tool = model chooses, resource = host chooses, prompt = user chooses</em>. That is the entire test. If the answer is "the model decides at runtime whether to fetch it," that capability is a tool even if the underlying implementation reads a file. If the answer is "the host loads it before the model even sees the turn," it is a resource. If the answer is "the user picks it from a menu," it is a prompt.</p>
+
+    <p>The most common failure mode is exposing everything as a tool because tools are what every tutorial teaches. Bloomberry's survey found that most servers in the wild over-index on tools and under-use resources; the median server ships zero resources and zero prompts. Some of that is legitimate — many servers are wrapping an action API where the whole surface is side-effectful — but some of it is that authors never asked the question. A "get_user_profile" tool that the model must remember to call at the start of every session is usually a resource in disguise: the host could subscribe once, place the profile in context, and the model wouldn't need to spend a call on it.</p>
+
+    <div class="callout">
+      <p>Practical translation. If the answer to "when should this be loaded?" is "when the model asks," write it as a tool. If it is "always, at the start of the session," write it as a resource. If it is "when the user types <code class="inline">/summarise</code>," write it as a prompt. Building it the other way makes the model do work the protocol was designed to do for you.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What a server actually ships: shape of the median deployment.</h3>
+
+    <p>Bloomberry's February 2026 survey — 1,412 public MCP servers, the largest data set anyone has published — gives concrete numbers for what a real server looks like. The median: <strong>5 tools, 0 resources, 0 prompts, no auth</strong>. Not "hello-world plus a couple more"; five is genuinely what production servers converge on. The distribution has a long tail — some servers ship 30 or 40 tools — but the middle is small and side-effect-heavy.</p>
+
+    <p>That shape signals something important about how MCP is actually being used. Most servers are wrapping an API, a CLI, or a database with a small set of high-value operations; they are not document stores or knowledge bases, which is where resources would carry more weight. If your design has fifteen tools, the survey suggests either your capabilities really are unusually broad, or — more often — you have decomposed too finely and you would be better served by <a href="/deep-dives/tool-capability-design/tool-granularity" class="xref">coarser-grained tools</a> or by splitting the server in two.</p>
+
+    <p>The other pattern the numbers hint at is what practitioners have started calling the "eight-MCP production stack": rather than one big server that covers a whole domain, teams end up with several small servers, each focused on one system — a filesystem server, a database server, a monitoring server, a project-management server, and so on. This is a distribution decision as much as a design one, and it interacts with your host's tool-selection budget: when the host is running eight servers with five tools each, you are already at forty tools in the model's context, and the <a href="/deep-dives/tool-capability-design/tool-discovery-and-docs" class="xref">discoverability</a> problem starts biting. The right answer is usually to keep servers narrow and let the host mediate — not to fatten a single server until it does everything.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Concrete: registering a search-then-fetch tool pair.</h3>
+
+    <p>The canonical example is a content server — documentation, a knowledge base, a code index — where the naive design is one <code class="inline">search</code> tool that returns full matching documents. The problem is context bloat: a single call can dump megabytes of prose into the loop, and there is no way to recover from that inside the turn. The search-then-fetch pattern, named in Microsoft's post-mortem on the Microsoft Learn MCP server, splits the operation into two tools: <code class="inline">search</code> returns a list of <code class="inline">{id, summary}</code> pairs, and <code class="inline">fetch</code> takes an id and returns the full content of exactly one document. Two round-trips instead of one, but each is small and the model chooses which documents actually deserve the full read.</p>
+
+<pre class="standalone"><span class="c-cm"># server.py — FastMCP search-then-fetch pair</span>
+<span class="c-kw">from</span> fastmcp <span class="c-kw">import</span> FastMCP
+<span class="c-kw">from</span> pydantic <span class="c-kw">import</span> BaseModel
+
+mcp = FastMCP(<span class="c-st">"docs-server"</span>)
+
+<span class="c-kw">class</span> Hit(BaseModel):
+    id: str
+    title: str
+    summary: str
+
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> search(query: str, limit: int = <span class="c-st">10</span>) -&gt; list[Hit]:
+    <span class="c-st">"""Search docs for the top matches. Returns id + summary only;
+    call fetch(id) for the full document body."""</span>
+    <span class="c-kw">return</span> [Hit(id=r.id, title=r.title, summary=r.snippet)
+            <span class="c-kw">for</span> r <span class="c-kw">in</span> index.search(query, k=limit)]
+
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> fetch(id: str) -&gt; str:
+    <span class="c-st">"""Return the full body of one document by id.
+    Use after search() to pull only the documents you actually need."""</span>
+    <span class="c-kw">return</span> index.get(id).body
+
+<span class="c-kw">if</span> __name__ == <span class="c-st">"__main__"</span>:
+    mcp.run()</pre>
+
+    <p>A few things are doing work here. The docstrings are the tool descriptions the model reads — they are structurally the same as system-prompt text (see <a href="/deep-dives/tool-capability-design/tool-design-principles" class="xref">agent-facing docs</a>), and they explicitly cross-reference each other so the model knows <code class="inline">search</code> and <code class="inline">fetch</code> are two halves of one workflow. The <code class="inline">Hit</code> Pydantic model becomes a structured output schema on the tool response; a caller can rely on the shape. Type hints on the function signatures — including the default on <code class="inline">limit</code> — flow into the inputSchema that ships on <code class="inline">tools/list</code> and let the host validate arguments before the call.</p>
+
+    <p>What the client actually sees on <code class="inline">tools/list</code>:</p>
+
+<pre class="trace"><span class="c-out">{
+  "jsonrpc": "2.0", "id": 2, "result": {
+    "tools": [
+      { "name": "search",
+        "description": "Search docs for the top matches. Returns id + summary only; call fetch(id) for the full document body.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "default": 10}
+          },
+          "required": ["query"]
+        }
+      },
+      { "name": "fetch",
+        "description": "Return the full body of one document by id. Use after search() to pull only the documents you actually need.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {"id": {"type": "string"}},
+          "required": ["id"]
+        }
+      }
+    ]
+  }
+}</span></pre>
+
+    <p>That is the entire contract for two tools: two names, two descriptions written for the model to read, two schemas the host can validate. Everything else — session management, transport, framing — the SDK handles.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The things you'll get wrong on your first server.</h3>
+
+    <p>Every first server hits the same handful of mistakes, and they are consistent enough to itemise.</p>
+
+    <p><strong>Forgetting annotations.</strong> MCP tools carry an optional <code class="inline">annotations</code> object with fields like <code class="inline">destructiveHint</code>, <code class="inline">idempotentHint</code>, and <code class="inline">openWorldHint</code> that the host uses to shape consent UX — whether to ask before running, whether to allow silent retries, whether a call may reach the public internet. Servers that omit annotations force the host to fall back to conservative defaults, which usually means "always prompt the user," which usually means the user turns your server off.</p>
+
+    <p><strong>Descriptions written for humans.</strong> Free-text tool descriptions that read like docstrings — "Retrieves user information from the database" — are not what an agent needs. The description is text the model reads during tool selection, so it should be instruction-shaped: start with a verb, name the use case, and say when <em>not</em> to use it. "Get a user by id when you need their email, role, or account status. Do not use for listing users." reads awkwardly to a human and works vastly better in practice.</p>
+
+    <p><strong>Unversioned schemas.</strong> Silently renaming a parameter breaks every client that cached the schema. Microsoft's post-mortem on the Learn server named a specific number — 2–5% of clients broke on a single parameter rename — because clients had cached the pre-rename tool definition. If the schema changes in a way that isn't purely additive, the tool needs a new name or the server needs a version bump; a rename in place is a silent break.</p>
+
+    <p><strong>Shipping resources you never test.</strong> A common pattern is registering resources because "it feels right," then discovering your only client — the agent — never actually reads them because your host doesn't surface resources to the model. Either use them, plumb them into a real code path, and cover them in tests, or drop them. Dead capability is worse than absent capability because it looks like coverage in the manifest.</p>
+
+    <p><strong>The stdio-vs-HTTP assumption.</strong> A lot of first-server work assumes stdio is always the dev transport and Streamable HTTP is always the prod transport. Both directions are wrong. Local stdio servers are shipping in production — that's what most IDE-embedded servers are — and remote HTTP servers are perfectly reasonable for development against a shared team environment. Pick the transport based on where the server needs to run and how it will be authenticated, not on whether you consider the setup "dev" or "prod."</p>
+
+    <p>The through-line for every one of these: the parts that look like decoration — descriptions, annotations, versioning discipline, choosing the right primitive — are the parts that decide whether the server disappears from your debugging queue or lives there permanently. Get them right on the first five tools and everything downstream, from selection accuracy to trace readability to auth complexity, becomes cheaper.</p>
+  </div>
+</section>
