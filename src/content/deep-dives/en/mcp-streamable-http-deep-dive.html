@@ -1,0 +1,124 @@
+<section class="phase">
+  <div class="phase-num">C4</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>Streamable HTTP replaced the dual-endpoint HTTP+SSE transport in the 2025-11-25 spec — same JSON-RPC payload, but the operational profile is a distributed-systems problem in a trench coat.</h2>
+  <p class="goal">If your MCP tutorial mentions two endpoints and a POST-then-SSE dance, it's older than the current spec — the HTTP+SSE transport was deprecated in the 2025-11-25 revision and replaced by a single-endpoint Streamable HTTP mode with resumability via <code class="inline">Last-Event-ID</code> and sessions via a header. Bloomberry's survey says 93% of production servers have already migrated. The interesting content isn't the wire format; it's what changes when your MCP server becomes a distributed system — sticky routing, session storage, resumability semantics, and the DNS-rebinding foot-gun for local HTTP servers.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Deprecation timeline: HTTP+SSE gave way to Streamable HTTP.</h3>
+
+    <p>The MCP transport chapter has been rewritten twice in a year, and confusion about which version a tutorial is describing accounts for most of the "why doesn't my client talk to my server" tickets that reach the reference SDKs. The 2024-11-05 revision defined an HTTP+SSE transport with two endpoints — clients POSTed JSON-RPC requests to <code class="inline">/messages/</code> and held an open SSE stream at <code class="inline">/sse</code> to receive responses and server-initiated notifications. The 2025-11-25 revision deprecates that shape and defines <em>Streamable HTTP</em> as the current transport: a single MCP endpoint that accepts both POST and GET, that may return a plain JSON response or upgrade to <code class="inline">text/event-stream</code>, and that carries sessions and resumability in headers rather than in the URL structure. The <a href="/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP architecture</a> essay sketches the participant model at the JSON-RPC layer; what this essay adds is what the transport actually looks like on the wire in the 2025-11-25 shape.</p>
+
+    <p>The migration was fast. Bloomberry's 2026 survey of 1,412 production servers found 93% already on Streamable HTTP within six months of the spec bump, with the remaining fraction split between servers still on stdio (where the change did not apply) and a small number of long-tail HTTP+SSE deployments intended to preserve older Claude Desktop configurations. The reference SDKs (<code class="inline">fastmcp</code> for Python, <code class="inline">@modelcontextprotocol/sdk</code> for TypeScript) still ship the older transport as a backwards-compat shim, but both mark it deprecated and default new servers to Streamable HTTP. Practically: if you are reading a blog post that describes a POST-then-SSE two-endpoint dance, the post predates the current spec, and code from it will run against nothing new you build.</p>
+
+    <p>The wire format is not the interesting story. What is worth the essay is that Streamable HTTP took the transport from a thing you could conceptualize as "HTTP with server-push" to a thing whose operational profile is a distributed system with sticky routing, session storage, and a replay contract. The rest of this essay is about that operational profile.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The single endpoint: POST to send, GET to receive, upgrade to SSE.</h3>
+
+    <p>A Streamable HTTP MCP server exposes exactly one path — the spec calls it "the MCP endpoint" and lets the server pick the URL, but by convention it is <code class="inline">/mcp</code>. Clients POST JSON-RPC requests to that endpoint and inspect the response's <code class="inline">Content-Type</code>. If the header is <code class="inline">application/json</code>, the body is the JSON-RPC response and the exchange is over. If the header is <code class="inline">text/event-stream</code>, the server has chosen to stream — the same response is delivered as one or more SSE <code class="inline">data:</code> frames, followed by any interleaved progress or logging notifications, and the stream closes when the server has nothing more to say for that request. The client cannot tell in advance which mode the server will pick and the spec is explicit that both are valid; well-behaved clients handle both.</p>
+
+    <p>The GET half of the endpoint is what makes server-initiated messages possible. When a client opens a GET on the MCP endpoint with <code class="inline">Accept: text/event-stream</code>, the server holds the connection open as an SSE stream and uses it to push notifications, elicitations, and sampling requests that were not solicited by a specific POST. This is how the transport supports the bi-directional JSON-RPC that the protocol requires without needing WebSockets: the POST channel handles client-initiated requests, the GET channel handles server-initiated ones, and both share the same session context. Building an idiomatic server, in the sense the <a href="/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">building MCP servers in practice</a> essay uses that phrase, mostly means letting the SDK route these two halves for you; hand-writing the routing is rarely necessary and easy to get subtly wrong.</p>
+
+<pre class="standalone">POST /mcp HTTP/1.1
+Host: mcp.example.com
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2025-11-25
+
+{"jsonrpc":"2.0","id":1,"method":"initialize",
+ "params":{"protocolVersion":"2025-11-25",
+           "capabilities":{},
+           "clientInfo":{"name":"acme-client","version":"1.4.0"}}}
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+MCP-Session-Id: 3f9a2c81-0b6d-4e2a-9b71-8d5e2c0a4f11
+
+{"jsonrpc":"2.0","id":1,"result":
+ {"protocolVersion":"2025-11-25",
+  "capabilities":{"tools":{"listChanged":true}},
+  "serverInfo":{"name":"acme-mcp","version":"0.6.2"}}}</pre>
+
+    <p>Two headers in that exchange are load-bearing and easy to omit on a first server. <code class="inline">MCP-Protocol-Version</code> must be sent on every request after the initialize handshake — servers use it to reject clients that speak an incompatible revision, and a client that omits it is treated as legacy. <code class="inline">MCP-Session-Id</code> is issued by the server in the initialize response and must then be echoed by the client on every subsequent request; it is how the server-side state carrying tool subscriptions, elicitation replies, and resumability buffers is addressed. Miss either header and the server has a lawful reason to reject the request or, worse, to serve a fresh empty session that reproduces none of the state the client expected.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Sessions: MCP-Session-Id and the sticky-routing bill.</h3>
+
+    <p>The <code class="inline">MCP-Session-Id</code> header is where the transport's distributed-systems bill first comes due. The server generates the id in response to the first <code class="inline">initialize</code> POST, returns it as a response header, and expects to see it on every request the same client makes thereafter. What the id addresses depends on the server: any protocol-level state that persists across requests — subscription lists for <code class="inline">tools/listChanged</code>, elicitation callbacks awaiting a user reply, per-session sampling budgets, retained SSE event buffers used for resumability — is looked up by session id. A stateless server can decline to issue one, but a server that opts out of sessions loses the ability to correlate a resumed stream with the events that preceded it and cannot correctly serve elicitation or sampling flows, since those inherently span requests. The 2025-11-25 spec is explicit that session ids MUST be cryptographically secure, opaque to the client, and not encode any user data.</p>
+
+    <p>The moment a server has more than one replica, the session id becomes a routing problem. If replica A issued the session and holds the state it addresses, replica B cannot serve a request against that session unless the state is shared — usually meaning either the load balancer is configured to pin the session to a replica or a shared store (Redis, DynamoDB, an equivalent) holds the session state and every replica reads from it. Both patterns are common in production Streamable HTTP deployments; the pick is honest engineering rather than dogma, and the trade-off is between the tail-latency cost of hitting a shared store on every request and the failure-mode cost of pinning: if the pinned replica dies mid-session, a client with sticky routing sees its session evaporate and must reinitialize, whereas a client with shared state can be re-routed transparently.</p>
+
+    <p>Load balancers that hash on the client IP address are the pattern most teams reach for first and the one that fails most predictably: mobile clients change IPs, corporate NAT collapses many users onto a few addresses, and cloud-hosted clients rotate egress across a pool. Hashing on the <code class="inline">MCP-Session-Id</code> header directly — supported by every ingress controller worth using — is the correct primitive when the pin is what you want. Neither the spec nor the SDK will make this decision for you; production teams tend to learn it by watching cost graphs and reconnect rates rather than by reading the transport doc, which is why the operational side of running MCP servers deserves its own essay.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Resumability: Last-Event-ID and the SSE replay contract.</h3>
+
+    <p>Resumability is the feature that most obviously separates Streamable HTTP from a naive "HTTP with events" transport. When the server chooses to stream, each SSE frame carries an <code class="inline">id:</code> field — an opaque, server-assigned identifier that the client is expected to remember. If the connection drops before the stream completes, the client reconnects by opening a new GET on the MCP endpoint with the standard SSE <code class="inline">Last-Event-ID</code> header set to the id of the last frame it successfully received; the server is then obligated to replay every event issued after that id, in order, before continuing with fresh events. The client experience is a seamless stream even across TCP resets, load-balancer timeouts, or a browser tab suspend/resume.</p>
+
+<pre class="trace">GET /mcp HTTP/1.1
+Host: mcp.example.com
+Accept: text/event-stream
+MCP-Protocol-Version: 2025-11-25
+MCP-Session-Id: 3f9a2c81-0b6d-4e2a-9b71-8d5e2c0a4f11
+Last-Event-ID: evt-00047
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+
+id: evt-00048
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"pt-9","progress":0.7}}</pre>
+
+    <p>The contract has one number in it — the replay budget — and the number is not in the spec. Servers must retain post-id events long enough to make a reconnect succeed, but "long enough" is a policy choice: cover a browser tab switching for a few minutes and you spend little; cover an overnight suspend and you may need to persist stream state to disk or reject the reconnect. The pragmatic setting for most Streamable HTTP servers is a few minutes of in-memory retention per session, with the retained events dropped when they age past that window or when the session itself expires. Longer budgets are legal but shift the storage cost from the client (which must remember what it saw) to the server (which must remember what it emitted), and the boundary between the two is exactly the kind of decision that becomes an SRE conversation once the server has non-trivial traffic.</p>
+
+    <p>Two failure modes are worth naming. First, event ids that are not stable across restarts — assigning them from an in-process counter that resets on deploy — make resumability silently useless: the client reconnects with an id the new process doesn't recognize, the server has no basis to replay, and the missing events are simply lost. Use a monotonic counter that survives restarts, or a scheme derived from session id plus per-session sequence. Second, unbounded event retention: a session that stays open for a day while the client hardly reads from it accumulates every frame, and left unchecked will exhaust memory. A retention window measured in minutes plus an explicit cap on retained event count are both cheap and both necessary.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Horizontal scaling: what breaks when sessions are stateful.</h3>
+
+    <p>Once resumability is real, horizontal scaling stops being a matter of adding replicas and becomes a design problem. The load balancer has to route the same session's traffic to the same replica (sticky routing) or every replica has to be able to serve any session (shared state); the SSE reconnect that carries <code class="inline">Last-Event-ID</code> has to land on a process that either holds the referenced event or can read it from wherever the events were persisted; the session TTL has to be coordinated across replicas so that one replica doesn't garbage-collect a session another replica is still serving. Every one of these breaks under naive scaling patterns, and the failure symptoms — reconnects that get empty streams, elicitation replies that never resolve, sampling requests that hang — look like protocol bugs to a client author but are really deployment bugs.</p>
+
+    <p>Two shapes dominate in the field. The sticky-routing shape keeps session state in memory on the replica that owns the session, uses <code class="inline">MCP-Session-Id</code> as the load-balancer hash key, and accepts that a replica loss means every session on that replica must reinitialize. It is simple, has low tail latency, and scales linearly until a hot session becomes a replica-level hotspot. The shared-state shape stores session data in Redis or an equivalent, lets any replica serve any request, and pays a round-trip on every request in exchange for the freedom to move traffic around; replicas become interchangeable and rolling deploys stop dropping sessions. In practice, teams pick the sticky shape until an incident forces them to move to the shared shape, and the migration is a well-known milestone in the life of a Streamable HTTP server. The operational side of Streamable HTTP — retention policy, hash-key choices, session TTL, blast-radius sizing on replica loss — deserves its own treatment; this essay names the shape and leaves the SRE-facing detail for later.</p>
+
+    <p>What is worth pinning down here is that the phrase "remote MCP server" is doing more work than most tutorials admit. A local stdio MCP server is a subprocess your host launches; a remote Streamable HTTP MCP server is a distributed system with sessions, sticky routing, resumability buffers, and an operational tail that any team that has run production HTTP infrastructure will recognize instantly. The wire format is JSON-RPC; the deployment model is not. Teams that treat the two as equivalent — "we already run REST, this is the same problem" — reliably underestimate the amount of work between a working proof-of-concept and a Streamable HTTP server that stays up.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Local HTTP servers: Origin, DNS rebinding, and the localhost trap.</h3>
+
+    <p>Streamable HTTP is not only a remote-server concern. A common pattern for local MCP servers is to bind an HTTP listener to <code class="inline">127.0.0.1</code> instead of speaking stdio, because it is easier to reuse in browser-based clients or to develop against with <code class="inline">curl</code>. This pattern comes with a specific attack — DNS rebinding — that the 2025-11-25 security best-practices appendix calls out by name because it has been demonstrated in the wild against locally running dev tools. The mechanic is simple: an attacker gets the user's browser to load a page from an origin the attacker controls, that origin's DNS resolves to a public IP just long enough to serve the page, and then rebinds to <code class="inline">127.0.0.1</code>. From the browser's point of view the origin has not changed, same-origin checks succeed, and JavaScript in the attacker's page can now issue same-origin requests against the user's local MCP server, invoking any tool it exposes.</p>
+
+    <p>Two defenses stack, and the spec expects both. The first is to check the <code class="inline">Origin</code> header on every request and reject anything whose origin is not on an explicit allowlist — typically the host running the local UI. The second is to bind the listener to <code class="inline">127.0.0.1</code> or <code class="inline">::1</code> explicitly, not to <code class="inline">0.0.0.0</code> or an empty host string, so that even if the Origin check is misconfigured the socket is unreachable from any interface but loopback. Servers that skip either defense have historically been exploitable within the first week of shipping; the pattern is not theoretical.</p>
+
+<pre class="standalone">// Express-shaped Origin allowlist middleware for a local Streamable HTTP server.
+const ALLOWED_ORIGINS = new Set([
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://claude.ai',
+]);
+
+app.use('/mcp', (req, res, next) =&gt; {
+  const origin = req.headers.origin;
+  if (!origin || !ALLOWED_ORIGINS.has(origin)) {
+    return res.status(403).json({ error: 'origin_not_allowed' });
+  }
+  next();
+});
+
+app.listen(3945, '127.0.0.1'); // bind loopback explicitly, never 0.0.0.0</pre>
+
+    <p>Two footnotes on the snippet. First, an empty or missing <code class="inline">Origin</code> header is not a safe default to accept; browsers include the header on cross-origin requests, and the absence of it is either a non-browser client (which should be handled through auth, not through Origin) or a browser making a request the server shouldn't be serving in the first place. Second, the allowlist is not a stand-in for authentication — a local server that binds loopback and checks Origin still needs the same OAuth 2.1 story that a remote server does if the tools it exposes have any consequence. Origin checks defeat DNS rebinding; they do not defeat a compromised local process, a malicious host config, or the token-passthrough anti-pattern that the security best-practices appendix calls out separately. The transport-level defenses are one layer; the auth-level defenses are another; a production local server ships both.</p>
+
+    <p>Reading the six steps together, the Streamable HTTP transport is best understood as two documents in one. On the wire, it is a compact HTTP profile — one endpoint, two verbs, three headers, and an SSE upgrade — that any HTTP server can implement in an afternoon. In deployment, it is the point at which an MCP server becomes a distributed system, and every design decision that HTTP infrastructure has already made in the last decade (routing, session storage, replay, retention, origin, binding, TLS) now has to be made again with the JSON-RPC contract in mind. Teams that grasp the second half early ship boringly-reliable MCP servers; teams that stop reading after the wire format tend to relearn the second half from an incident.</p>
+  </div>
+</section>
