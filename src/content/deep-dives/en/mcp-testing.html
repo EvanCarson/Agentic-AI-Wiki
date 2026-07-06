@@ -1,0 +1,104 @@
+<section class="phase">
+  <div class="phase-num">C3</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>MCP testing gets stuck in two failure modes — subprocess-based end-to-end tests that flake, and vibe-testing through an agent loop that misses schema regressions — and both have concrete replacements.</h2>
+  <p class="goal">MCP servers have two testing populations: teams that spin up a real subprocess for every test and wonder why CI is flaky, and teams that ask Claude to "check if it still works" and ship regressions to production. Neither is what the SDK is designed for. FastMCP and the TypeScript SDK both ship an in-memory client-server transport that runs a full protocol handshake without a process boundary; contract tests against the schema catch what agent-loop tests can't. Skip both traps and MCP testing collapses to something that runs in milliseconds.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>In-memory client-server: the pattern the SDK is designed for.</h3>
+
+    <p>The single biggest lift in MCP testing comes from noticing that both official SDKs ship an in-memory transport, and that everyone's first instinct — spawn the server as a subprocess and talk to it over stdio — is the wrong one. FastMCP's Python API accepts a server object directly: <code class="inline">Client(server)</code> binds a client to the server in-process, runs the full initialize handshake, and dispatches tool calls through the same JSON-RPC layer a real client would use, without ever crossing a process boundary. The TypeScript SDK exposes the same idea more explicitly through <code class="inline">InMemoryTransport.createLinkedPair()</code>: you get two ends of a paired transport, hand one to <code class="inline">McpServer</code> and the other to <code class="inline">Client</code>, and the two sides talk over an in-memory channel. In both languages the contract is identical to the wire protocol; what disappears is the plumbing.</p>
+
+    <p>The cost saving is not marginal. Subprocess-based tests routinely take 200-500ms per test just to boot Python and negotiate the handshake before doing anything useful; the in-memory equivalents run in single-digit milliseconds. That difference compounds. A test file with fifty test cases that runs in three seconds gets touched during development; the same file that runs in ninety seconds gets skipped locally, only lands in CI, and starts flaking because the process boot occasionally races with a slow filesystem or a leftover port binding. Once the suite is slow, all the second-order testing problems (only running the changed test, only trusting the tests that "usually pass," disabling the flaky ones) follow mechanically. The <a href="/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">previous essay on server construction</a> ended with a list of first-server mistakes; "wrote subprocess-based tests before trying the in-memory transport" belongs on that list.</p>
+
+<pre class="standalone"><span class="c-cm"># tests/test_search_server.py</span>
+<span class="c-kw">import</span> pytest
+<span class="c-kw">from</span> fastmcp <span class="c-kw">import</span> Client
+<span class="c-kw">from</span> my_server <span class="c-kw">import</span> mcp  <span class="c-cm"># the FastMCP server object</span>
+
+<span class="c-at">@pytest.mark.asyncio</span>
+<span class="c-kw">async def</span> test_search_returns_expected_ids():
+    <span class="c-kw">async with</span> Client(mcp) <span class="c-kw">as</span> client:
+        tools = <span class="c-kw">await</span> client.list_tools()
+        <span class="c-kw">assert</span> {t.name <span class="c-kw">for</span> t <span class="c-kw">in</span> tools} == {<span class="c-st">"search"</span>, <span class="c-st">"fetch"</span>}
+
+        result = <span class="c-kw">await</span> client.call_tool(<span class="c-st">"search"</span>, {<span class="c-st">"query"</span>: <span class="c-st">"incidents 2026-01"</span>})
+        payload = result.structured_content
+        <span class="c-kw">assert</span> <span class="c-kw">isinstance</span>(payload[<span class="c-st">"results"</span>], list)
+        <span class="c-kw">assert</span> <span class="c-kw">all</span>(<span class="c-st">"id"</span> <span class="c-kw">in</span> r <span class="c-kw">and</span> <span class="c-st">"summary"</span> <span class="c-kw">in</span> r <span class="c-kw">for</span> r <span class="c-kw">in</span> payload[<span class="c-st">"results"</span>]])
+        <span class="c-kw">assert</span> payload[<span class="c-st">"done"</span>] <span class="c-kw">is</span> <span class="c-kw">False</span>  <span class="c-cm"># breadcrumb still points onward to fetch()</span></pre>
+
+    <p>Two properties of the snippet are worth naming, because they are what makes it work. First, the client is opened as an async context manager and the server object is passed in unchanged — no config file, no CLI invocation, no port. Everything the server needs to bind is already in the module the test imported. Second, the assertions are on the protocol-shaped return: <code class="inline">list_tools()</code> returns the same manifest a real client would see, and <code class="inline">call_tool()</code> returns the same result envelope. A test that passes against the in-memory transport passes against a real client for the same reasons, because the code under test is the same code the server ships. Nothing about the in-memory harness makes it lie for you.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Testing tools: schema tests separate from behavior tests.</h3>
+
+    <p>Once the transport question is out of the way, the interesting question is what to actually assert. The pattern that scales is to split every tool's coverage into two suites — a schema suite and a behavior suite — and to keep them in different files, because they fail for different reasons and belong to different review disciplines. Schema tests answer "does the tool still look like what its clients cached?" Behavior tests answer "does the tool still do the right thing on representative inputs?" A schema regression breaks every client at once, including ones you don't own; a behavior regression breaks specific use cases you can usually enumerate. The <a href="/deep-dives/tool-capability-design/tool-schemas-and-contracts" class="xref">tool schemas and contracts</a> deep-dive treats the underlying discipline in general; MCP makes it concrete because <code class="inline">tools/list</code> exposes the JSON Schema for every tool as protocol-visible data, which means "assert on the schema" is a five-line test, not an architecture project.</p>
+
+    <p>What belongs in the schema suite is short and mechanical. For every tool: the description is present and above some minimum length (a one-line description is a smell), required fields are actually marked required in <code class="inline">inputSchema.required</code>, no field has a free-form <code class="inline">object</code> type without properties, the destructive and idempotent annotations are set, and the response schema (if declared) matches the shape the behavior tests assume. Any of these can regress silently when someone edits a decorator argument or a Pydantic model, and none of them will fail a behavior test — the tool still runs — but every one of them changes what agents can trust about the tool. The five lines of schema assertions per tool are the cheapest insurance in an MCP repo.</p>
+
+<pre class="standalone"><span class="c-cm"># tests/test_schema_contract.py — one file, one suite, run before every merge.</span>
+<span class="c-at">@pytest.mark.asyncio</span>
+<span class="c-kw">async def</span> test_search_schema_is_stable():
+    <span class="c-kw">async with</span> Client(mcp) <span class="c-kw">as</span> client:
+        tools = {t.name: t <span class="c-kw">for</span> t <span class="c-kw">in</span> <span class="c-kw">await</span> client.list_tools()}
+        search = tools[<span class="c-st">"search"</span>]
+        <span class="c-kw">assert</span> <span class="c-kw">len</span>(search.description) &gt;= <span class="c-nb">80</span>, <span class="c-st">"description regressed to docstring length"</span>
+        <span class="c-kw">assert</span> search.inputSchema[<span class="c-st">"required"</span>] == [<span class="c-st">"query"</span>]
+        <span class="c-kw">assert</span> search.inputSchema[<span class="c-st">"properties"</span>][<span class="c-st">"query"</span>][<span class="c-st">"type"</span>] == <span class="c-st">"string"</span>
+        <span class="c-kw">assert</span> search.annotations.destructiveHint <span class="c-kw">is</span> <span class="c-kw">False</span></pre>
+
+    <p>The behavior suite lives alongside and uses the same in-memory client. Its shape is closer to conventional service tests: table-driven inputs, assertions on the return payload, one test per "notable case" (empty result, first-page result, error path, pagination). What is worth doing differently from a plain HTTP service is asserting on the breadcrumb fields — that a zero-result search still returns a hint, that a done state is marked <code class="inline">done: true</code>, that error responses include a next-step suggestion. Those are the fields that make the difference between a server the agent uses correctly and one it thrashes against. If you write behavior tests without asserting on them, you'll delete them by accident within a quarter, because they look like formatting details until you understand what they are for.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Testing resources and prompts: same shape, different assertions.</h3>
+
+    <p>Resources and prompts inherit the in-memory transport for free; the assertions change because the surface changes. A resource is URI-addressable read-only context, so the contract tests are <code class="inline">resources/list</code> returns the expected URI set, <code class="inline">resources/read</code> for a canonical URI returns the expected MIME type and non-empty content, and (if the server declares templates) the templates enumerate the parameters the host will fill in. The trap here is trusting <code class="inline">list</code> without checking <code class="inline">read</code>: URIs that appear in the manifest but fail to read are a common regression when a resource is renamed at the storage layer without updating the resolver, and no behavior test that only touches tools will catch it.</p>
+
+    <p>Prompts are more forgiving to test because they are pure functions of their arguments. <code class="inline">prompts/list</code> should return the expected names with their argument schemas, and <code class="inline">prompts/get</code> called with a representative argument set should return the expected message sequence. What is easy to miss is that prompts have their own version of the schema-vs-behavior split — the argument schema is what the host UI renders as a form, so a silent rename there breaks the slash-command UX in every client that consumes the prompt. Test the schema. The most common mistake across the whole non-tools surface is not testing it at all, because the median server ships no resources and no prompts (the same Bloomberry survey the previous essays cite) and teams inherit the pattern of "tools have tests, everything else is checked by staring at it." A five-line test per resource and per prompt inverts that default at almost zero cost.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The MCP Inspector is a debugger, not a test.</h3>
+
+    <p>The MCP Inspector is the browser-based tool the protocol team ships for interactive exploration: point it at a server, log in through OAuth if required, click through <code class="inline">tools/list</code>, fire off a call by filling in the input form, inspect the JSON-RPC frames. It is genuinely useful, and there is a well-worn confusion about what it is useful <em>for</em>. It is a debugger for humans exploring a running server — the MCP equivalent of a REST client like Postman or Insomnia. It is not a test runner. The interactions are not repeatable, the assertions are the human reading the response, and nothing captures a regression the next time someone opens the tool.</p>
+
+    <p>The correct role is to use it during development to poke at unfamiliar behavior, to write a failing in-memory test that reproduces what you saw, and to fix the code until the test passes. Anywhere it shows up in a CI pipeline, or is invoked as "the way we test the server before shipping," something has gone wrong upstream — usually the in-memory transport was skipped because the team assumed testing MCP required real HTTP. Reach for the Inspector the way you'd reach for <code class="inline">curl</code> against an HTTP service you were debugging; do not reach for it the way you'd reach for a test suite.</p>
+
+<pre class="trace"><span class="c-out">$ npx @modelcontextprotocol/inspector node ./build/server.js
+$ npx @modelcontextprotocol/inspector uv run my-server
+$ npx @modelcontextprotocol/inspector --config ./mcp.json --server my-server
+$ npx @modelcontextprotocol/inspector https://my-server.example.com/mcp
+$ npx @modelcontextprotocol/inspector --cli node ./build/server.js tools/list</span></pre>
+
+    <p>The invocation shapes matter for one reason: the <code class="inline">--cli</code> form at the bottom of the list is what teams sometimes try to press into service as a test harness, because it produces machine-readable output. It is still not a test — you'd be shelling out to a Node CLI to run a subprocess to run your server, when the in-memory transport does the same job in-process and in the same language your test suite is already written in. If you catch yourself piping Inspector output into <code class="inline">grep</code> from a CI script, delete the pipeline and write a Python or TypeScript test that talks to the server directly.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Vibe-testing through an agent loop: what it misses.</h3>
+
+    <p>The other end of the failure spectrum is vibe-testing: point a real agent (Claude Code, Cursor, an OpenAI Assistants-style loop) at the server, hand-write a prompt like "search for incidents from January and summarise the top three," watch it run, and if it produces something reasonable declare the change shipped. This is genuinely useful for exploration — nothing else surfaces "the agent doesn't understand what this tool is for" as fast — and it is emphatically not a test. FastMCP's author has a whole post on this failure mode titled "Stop vibe-testing MCP servers," and the reason it is worth naming as a specific anti-pattern is that the failure modes it hides are the ones that break in production.</p>
+
+    <p>The core problem is that a competent agent recovers from things a test needs to catch. A parameter renamed from <code class="inline">query</code> to <code class="inline">q</code> will fail the tool call once, and the agent — reading the tool description, seeing the error, retrying with the correct name — will succeed on the second try and produce an output that looks fine. The <a href="/deep-dives/tool-capability-design/tool-error-messages" class="xref">tool error message</a> discipline that makes agents robust in production is exactly what makes them useless as a test signal for schema drift. Silent schema regressions cost you nothing until a client that caches schemas — a Claude Desktop config, a Cursor MCP registration, an internal agent that snapshotted the manifest — starts calling with the old name and fails without the agent-loop recovery to save it.</p>
+
+    <p>Vibe-testing also misses everything the agent doesn't happen to try. Edge cases (empty query, malformed cursor, missing required argument, a permission error inside the tool) live in the tail of the input distribution, and one exploratory run rarely hits them. Race conditions in stateful tools — two tool calls in flight, concurrent writes to the same session — are effectively invisible to a single-agent run because the run is sequential by construction. And a class of prompt-injection-style bugs where a tool response contains text that alters the agent's next action is precisely what will not show up in a vibe test, because the agent's altered behavior looks like normal reasoning. Keep the exploratory agent runs; they are how you discover what to test. Do not let them replace the in-memory suite that runs on every commit.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>MCP Interviewer and other schema linters.</h3>
+
+    <p>The last piece of the testing puzzle is not a runtime harness at all, but static analysis over the schema. Microsoft's MCP Interviewer runs a linter over the tool manifest and flags anti-patterns that a behavior test cannot see because behavior tests only exercise inputs you thought to write: descriptions that read like docstrings ("Retrieves user information from the database"), missing annotations, kitchen-sink tools with an <code class="inline">object</code>-typed action parameter, response schemas that are just <code class="inline">object</code> with no properties, tools whose names collide with common language keywords. The rules encode the design principles the previous essay walked through, so running the linter on a fresh server usually catches the things the author knows in principle but forgot in practice.</p>
+
+    <p>A pragmatic minimum is one CI job per repo that starts the server, connects an in-memory client, dumps the tool manifest, and runs a hand-written rule set that matches the team's design vocabulary. Description length, required-field discipline, annotation presence, response schema shape — a hundred lines of Python or TypeScript captures the rules a team actually cares about, and it runs in the same second as the rest of the schema suite. Whichever linter you land on — MCP Interviewer, a Pydantic or zod validator on your own manifest, a hand-written check — the discipline is the same: the schema is a public contract, treat it like one, and let a machine tell you when the contract drifted before an agent client does.</p>
+
+    <p>Two axes emerge if you take the six sections as a whole. On the runtime axis, the good tests are in-memory and cheap, the bad tests are subprocess-based and slow. On the assertion axis, the strong assertions are schema-and-behavior contracts written against the SDK's return shapes, the weak assertions are a human reading the output of an Inspector session or the result of an agent-loop run. The two anti-patterns — subprocess plumbing and vibe-testing — sit at opposite corners of that grid and fail for opposite reasons: one is expensive without being informative, the other is informative without being repeatable. The in-memory transport plus a schema-and-behavior split plus one linter pass gives you the diagonal that dominates both.</p>
+  </div>
+</section>

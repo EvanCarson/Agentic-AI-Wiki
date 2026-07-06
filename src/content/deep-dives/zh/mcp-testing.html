@@ -1,0 +1,104 @@
+<section class="phase">
+  <div class="phase-num">C3</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>MCP 测试通常陷在两个失败模式里——基于子进程的端到端测试易碎，以及在 agent 循环里"凭感觉"测试漏掉 schema 回归——而两者都有具体的替代方案。</h2>
+  <p class="goal">MCP 服务器测试中常见两类做法：一种是每个测试都拉起一个真实的子进程、然后奇怪为什么 CI 老不稳定；另一种是让 Claude "看看还能不能用"、然后把回归发进了生产。这两种都不是 SDK 想让你做的方式。FastMCP 与 TypeScript SDK 都提供进程内的客户端/服务器传输，可以在无进程边界的情况下跑完完整的协议握手；针对 schema 的契约测试能抓到 agent 循环测试抓不到的东西。避开这两个坑，MCP 测试就会退化成毫秒级就能跑完的事。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>进程内客户端/服务器：SDK 本就为此设计的模式。</h3>
+
+    <p>MCP 测试上最大的一次提升，来自意识到两个官方 SDK 都提供了进程内传输，而多数人第一反应——把服务器作为子进程拉起、走 stdio 与它对话——恰恰是错的。FastMCP 的 Python 接口直接接受服务器对象：<code class="inline">Client(server)</code> 会把客户端与服务器绑定在同一进程里，跑完完整的 initialize 握手，并通过真实客户端会走的同一层 JSON-RPC 派发工具调用，全程不跨进程边界。TypeScript SDK 通过 <code class="inline">InMemoryTransport.createLinkedPair()</code> 把同一思路表达得更显式：你拿到成对传输的两端，一端交给 <code class="inline">McpServer</code>、另一端交给 <code class="inline">Client</code>，两侧通过进程内通道对话。两种语言里，这份契约与线上协议一模一样；消失的只是那堆管道。</p>
+
+    <p>省下来的成本远不是边际级别。子进程式测试仅仅为了把 Python 启动、把握手谈成，动辄花 200-500ms 才开始做正事；对应的进程内版本用的是个位数毫秒。这个差距会滚雪球。一个装了 50 个用例、总共 3 秒跑完的测试文件，开发过程中大家会顺手跑；同一个文件如果要 90 秒，本地就会被跳过，只在 CI 里露面，然后开始飘——进程启动偶尔与慢盘或残留端口占用赛跑。一旦套件慢下来，所有二阶测试问题（只跑改动过的那个用例、只信"通常能过"的那些用例、把老飘的用例先禁掉）就会机械地跟着来。<a href="/zh/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">上一篇讲服务器构建</a>的文章末尾列过一份"第一台服务器上会犯的错"清单；"没试过进程内传输就先写了子进程式测试"属于那份清单。</p>
+
+<pre class="standalone"><span class="c-cm"># tests/test_search_server.py</span>
+<span class="c-kw">import</span> pytest
+<span class="c-kw">from</span> fastmcp <span class="c-kw">import</span> Client
+<span class="c-kw">from</span> my_server <span class="c-kw">import</span> mcp  <span class="c-cm"># the FastMCP server object</span>
+
+<span class="c-at">@pytest.mark.asyncio</span>
+<span class="c-kw">async def</span> test_search_returns_expected_ids():
+    <span class="c-kw">async with</span> Client(mcp) <span class="c-kw">as</span> client:
+        tools = <span class="c-kw">await</span> client.list_tools()
+        <span class="c-kw">assert</span> {t.name <span class="c-kw">for</span> t <span class="c-kw">in</span> tools} == {<span class="c-st">"search"</span>, <span class="c-st">"fetch"</span>}
+
+        result = <span class="c-kw">await</span> client.call_tool(<span class="c-st">"search"</span>, {<span class="c-st">"query"</span>: <span class="c-st">"incidents 2026-01"</span>})
+        payload = result.structured_content
+        <span class="c-kw">assert</span> <span class="c-kw">isinstance</span>(payload[<span class="c-st">"results"</span>], list)
+        <span class="c-kw">assert</span> <span class="c-kw">all</span>(<span class="c-st">"id"</span> <span class="c-kw">in</span> r <span class="c-kw">and</span> <span class="c-st">"summary"</span> <span class="c-kw">in</span> r <span class="c-kw">for</span> r <span class="c-kw">in</span> payload[<span class="c-st">"results"</span>]])
+        <span class="c-kw">assert</span> payload[<span class="c-st">"done"</span>] <span class="c-kw">is</span> <span class="c-kw">False</span>  <span class="c-cm"># breadcrumb still points onward to fetch()</span></pre>
+
+    <p>这段片段里有两点值得点名，因为它们正是它能成立的原因。第一，客户端以异步上下文管理器方式打开、服务器对象原样传入——没有配置文件、没有 CLI 调用、没有端口。服务器要绑的东西，早在测试 import 的那个模块里都齐了。第二，断言都写在协议形状的返回上：<code class="inline">list_tools()</code> 返回的是真实客户端会看到的同一份清单，<code class="inline">call_tool()</code> 返回的是同一份 result 信封。一个用例在进程内传输下通过，用同样的理由也会在真实客户端下通过——因为被测代码就是服务器出厂的那份。这套进程内脚手架没有替你说谎的空间。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>工具测试：schema 测试与行为测试分离。</h3>
+
+    <p>把传输问题挪开之后，真正有趣的问题是"到底该断言什么"。可以扩展的模式，是把每个工具的覆盖拆成两套——schema 套件与行为套件——并且分别放在不同文件里，因为它们失败的原因不同、归属的评审纪律也不同。schema 测试回答"这个工具还长得像客户端缓存住的那个样子吗？"行为测试回答"它在代表性输入下还做对了事吗？"schema 回归会一次性打断每一个客户端、包括你不拥有的那些；行为回归打断的是具体用例，通常还能一条条列出来。<a href="/zh/deep-dives/tool-capability-design/tool-schemas-and-contracts" class="xref">工具 schema 与契约</a>那篇深入解析总体讲了这门纪律；MCP 让它变得具体，因为 <code class="inline">tools/list</code> 把每个工具的 JSON Schema 作为协议可见数据暴露出来，也就意味着"对 schema 做断言"是一个五行的测试，不是一个架构项目。</p>
+
+    <p>schema 套件里该有的东西短且机械。对每个工具而言：描述存在且长度不低于某个阈值（一行的描述就是坏味道）、必填字段确实在 <code class="inline">inputSchema.required</code> 里标了必填、没有哪个字段是没写 properties 的自由形 <code class="inline">object</code>、破坏性与幂等性两条 annotations 都设了、响应 schema（若声明了）与行为测试假设的形状对得上。这些每一条都可能在有人改一个装饰器参数或 Pydantic 模型时悄悄回归，而任何一条都不会让行为测试挂掉——工具还是能跑——但每一条都改变了 agent 关于这个工具还能相信什么。每个工具五行 schema 断言，是一个 MCP 仓库里最便宜的保险。</p>
+
+<pre class="standalone"><span class="c-cm"># tests/test_schema_contract.py — one file, one suite, run before every merge.</span>
+<span class="c-at">@pytest.mark.asyncio</span>
+<span class="c-kw">async def</span> test_search_schema_is_stable():
+    <span class="c-kw">async with</span> Client(mcp) <span class="c-kw">as</span> client:
+        tools = {t.name: t <span class="c-kw">for</span> t <span class="c-kw">in</span> <span class="c-kw">await</span> client.list_tools()}
+        search = tools[<span class="c-st">"search"</span>]
+        <span class="c-kw">assert</span> <span class="c-kw">len</span>(search.description) &gt;= <span class="c-nb">80</span>, <span class="c-st">"description regressed to docstring length"</span>
+        <span class="c-kw">assert</span> search.inputSchema[<span class="c-st">"required"</span>] == [<span class="c-st">"query"</span>]
+        <span class="c-kw">assert</span> search.inputSchema[<span class="c-st">"properties"</span>][<span class="c-st">"query"</span>][<span class="c-st">"type"</span>] == <span class="c-st">"string"</span>
+        <span class="c-kw">assert</span> search.annotations.destructiveHint <span class="c-kw">is</span> <span class="c-kw">False</span></pre>
+
+    <p>行为套件挨着放，用的是同一个进程内客户端。它的形状更接近常规的服务测试：表驱动的输入、对返回 payload 做断言、每个"值得点名的情形"一个用例（空结果、首页结果、错误路径、分页）。与一个普通 HTTP 服务不同、值得多做的一件事，是对面包屑字段做断言——一次零结果的 search 仍然带 hint、完成状态被标为 <code class="inline">done: true</code>、错误响应里带下一步建议。这些字段决定了"agent 会用对这台服务器"和"它在这台服务器面前来回撞墙"之间的差别。如果你写行为测试时不对它们做断言，你会在一个季度内不小心把它们删掉——因为在你还没搞清它们做什么之前，它们看上去只是格式细节。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>测试 resource 与 prompt：形状相同，断言不同。</h3>
+
+    <p>resource 与 prompt 免费继承了进程内传输；改变的是断言，因为表面变了。resource 是 URI 寻址的只读上下文，因此契约测试就是——<code class="inline">resources/list</code> 返回预期的 URI 集合，对某个规范 URI 调用 <code class="inline">resources/read</code> 返回预期的 MIME 类型与非空内容，如果服务器声明了模板，模板要能枚举出宿主将要填入的参数。这里的陷阱是只信 <code class="inline">list</code> 而不查 <code class="inline">read</code>：出现在清单里但读不出来的 URI，是一种常见回归——storage 层重命名了 resource、resolver 却没跟着更新——只碰工具的行为测试是抓不到的。</p>
+
+    <p>prompt 测起来更宽容，因为它就是参数的纯函数。<code class="inline">prompts/list</code> 应当返回预期的名字连同其参数 schema，用一组代表性参数调用 <code class="inline">prompts/get</code> 应当返回预期的消息序列。容易漏掉的是：prompt 也有它自己的 schema-与-行为分裂——参数 schema 正是宿主 UI 渲染成表单的那份东西，所以在这里的一次悄悄改名会把每个消费该 prompt 的客户端里的斜杠命令 UX 打断。请测 schema。整个"非 tools"表面上最常见的错误，就是根本不测——中位数的服务器不带 resource、不带 prompt（前几篇引用过的那份 Bloomberry 调查），团队于是继承了"工具有测试，其它靠盯着看"的模式。每个 resource、每个 prompt 五行测试，以近乎零成本把这个默认值反转过来。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>MCP Inspector 是调试器，不是测试。</h3>
+
+    <p>MCP Inspector 是协议团队官方提供的浏览器调试工具：把它指向一台服务器、需要就走一遍 OAuth、点开 <code class="inline">tools/list</code>、在输入表单里填一填就能触发调用、逐条查看 JSON-RPC 帧。它确实好用，而且长期以来一直有一个熟悉的混淆——它到底"对什么"好用。它是给人类探索运行中服务器的调试器，是 MCP 世界的 Postman/Insomnia。它不是测试运行器。这些交互不可复现、断言就是"人看了一眼觉得对"、下次有人开这个工具时也没有任何东西负责把回归抓回来。</p>
+
+    <p>它正确的角色，是在开发过程中拿它戳戳陌生的行为，写一个复现你所见的失败的进程内测试，然后改代码直到测试通过。凡是它出现在 CI 流水线里，或者被当作"我们发版前测服务器的方式"，都意味着上游哪儿出了问题——通常是有人以为"测 MCP 必须走真 HTTP"而略过了进程内传输。像对付一个正在调的 HTTP 服务时会顺手 <code class="inline">curl</code> 那样去用 Inspector；不要像对付一整套测试套件那样去用。</p>
+
+<pre class="trace"><span class="c-out">$ npx @modelcontextprotocol/inspector node ./build/server.js
+$ npx @modelcontextprotocol/inspector uv run my-server
+$ npx @modelcontextprotocol/inspector --config ./mcp.json --server my-server
+$ npx @modelcontextprotocol/inspector https://my-server.example.com/mcp
+$ npx @modelcontextprotocol/inspector --cli node ./build/server.js tools/list</span></pre>
+
+    <p>这些调用形状里有一件事需要挑出来说：清单最后那行 <code class="inline">--cli</code> 是团队偶尔会拿来当测试脚手架用的——因为它会打出机器可读的输出。它仍然不是测试——你在 shell 出去调一个 Node CLI、去起一个子进程、去跑你自己的服务器，而进程内传输能在同一进程、用你测试套件已经在用的同一门语言里完成同样的工作。如果你发现自己在 CI 脚本里把 Inspector 的输出往 <code class="inline">grep</code> 里管道，删掉这段流水线、改写一份 Python 或 TypeScript 测试直接跟服务器讲话。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>在 agent 循环里凭感觉测试：它漏了什么。</h3>
+
+    <p>失败谱系的另一端是 vibe-testing：把一个真实 agent（Claude Code、Cursor、OpenAI Assistants 式的循环）对准服务器，手写一句 prompt——"搜一月的事件、把前三条总结一下"——看它跑，产出看上去还行就宣告发版。这个做法对探索是有用的——没有别的手段能这么快地暴露"agent 根本没搞懂这个工具是干什么的"——但它明确不是测试。FastMCP 的作者专门写过一篇 "Stop vibe-testing MCP servers" 讨论这种失败模式，值得把它作为一个具体反模式点名，是因为它遮住的失败模式，恰恰是那些会在生产里坏掉的东西。</p>
+
+    <p>核心问题在于：一个够格的 agent 会从你本来该在测试里抓住的事情里恢复。把参数从 <code class="inline">query</code> 改名为 <code class="inline">q</code>，工具调用会失败一次，agent——读工具描述、看到错误、以正确的名字重试——第二次会成功，产出看起来没问题。<a href="/zh/deep-dives/tool-capability-design/tool-error-messages" class="xref">工具错误信息</a>那门在生产里让 agent 稳的纪律，恰恰就是使它作为 schema 漂移的测试信号毫无用处的原因。悄悄的 schema 回归不会让你付任何代价，直到某个会缓存 schema 的客户端——一份 Claude Desktop 配置、一条 Cursor 的 MCP 注册、某个把 manifest 快照过的内部 agent——开始用旧名字发起调用，而 agent 循环的自救机制不在场救它。</p>
+
+    <p>vibe-testing 也漏掉一切 agent 恰好没试到的东西。边缘情形（空 query、畸形 cursor、缺必填参数、工具内部的一次权限错误）住在输入分布的尾巴里，一次探索性运行很少能碰到。有状态工具中的竞态——两个调用在飞、对同一 session 并发写——对单 agent 运行几乎不可见，因为它按定义是顺序的。还有一类"响应里的文本改变了 agent 的下一步动作"式的、类提示词注入的 bug，正好是 vibe-test 不会显现的，因为 agent 被改变的行为看起来就像正常推理。请留下探索性的 agent 跑法；它们是你发现"该测什么"的方式。别让它们替代每次提交都跑的进程内套件。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>MCP Interviewer 与其它 schema linter。</h3>
+
+    <p>测试拼图的最后一块根本不是运行时脚手架，而是对 schema 的静态分析。微软的 MCP Interviewer 在工具清单上跑一遍 linter，能抓行为测试看不见的反模式——因为行为测试只覆盖你想到要写的那些输入：读起来像 docstring 的描述（"Retrieves user information from the database"）、缺 annotations、拿 <code class="inline">object</code> 型 action 参数打包的 kitchen-sink 工具、只写了 <code class="inline">object</code> 却没 properties 的响应 schema、名字撞上常见语言关键字的工具。这些规则把上一篇走过的设计原则编成了检查项，因此把 linter 放到一台新服务器上跑一遍，通常能抓住那些作者原则上懂、实操里忘了的事情。</p>
+
+    <p>务实的下限是每个仓库一个 CI 任务：起服务器、接一个进程内客户端、把工具清单 dump 出来、跑一份对得上团队设计词汇的手写规则集。描述长度、必填字段纪律、annotations 是否齐全、响应 schema 形状——一百行 Python 或 TypeScript 就足以捕捉团队真在意的规则，跟其余 schema 套件在同一秒内跑完。不管你最后落到哪一个 linter——MCP Interviewer、你自己 manifest 上跑的 Pydantic/zod 校验、还是手写的一组检查——纪律都一样：schema 是一份公开契约，就把它当契约对待，然后让机器在 agent 客户端替你发现之前告诉你契约漂了。</p>
+
+    <p>把六节合起来看，会浮出两根轴。运行时轴上，好的测试是进程内、便宜的，坏的测试是子进程、慢的。断言轴上，强的断言是针对 SDK 返回形状写的 schema-与-行为契约，弱的断言是人读 Inspector 会话的输出或 agent 循环运行的结果。两个反模式——子进程管道与 vibe-testing——分坐这张网格的两角，因相反的理由失败：一个昂贵却不给信息，一个给了信息却不可复现。进程内传输 + schema-与-行为分裂 + 一次 linter 扫描，共同给出压过两者的那条对角线。</p>
+  </div>
+</section>
