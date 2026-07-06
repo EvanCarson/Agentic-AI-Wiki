@@ -1,0 +1,133 @@
+<section class="phase">
+  <div class="phase-num">C5</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>MCP 的 OAuth 2.1 配置不是"OAuth 加几个 header"——RFC 8707 资源指示、Protected Resource Metadata、以及 Client ID Metadata Documents 才是承重件，做错这几处正是 39% 的生产服务器干脆放弃鉴权的原因。</h2>
+  <p class="goal">MCP 在 2025-11-25 规范里把 OAuth 2.1 定为鉴权的答案，但这里的"OAuth 2.1"是一个特定配置：PKCE 必选、令牌必须携带 RFC 8707 的资源指示以便被截获后不能拿去打别的服务、服务器通过 RFC 9728 的 Protected Resource Metadata 公布其授权服务器。Client ID Metadata Documents 让动态客户端可以跳过动态客户端注册。这确实是一套不小的仪式，而 39% 的生产服务器"根本没鉴权"（Bloomberry 调查）就是"多少团队干脆略过"最诚实的度量。把四块拼图讲清一遍，以后就不用再猜。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>威胁模型：MCP 鉴权到底保护什么。</h3>
+
+    <p>要让这套配置的四块拼图变得讲得通，先把"一次 MCP 请求上的一枚令牌到底买到了什么"钉住会有帮助。MCP 服务器暴露的具体资产其实就三样：通过其 resource 触达的个人或业务数据；通过其 tool 触发的副作用（一次写、一次下单、一次消息发送）；以及保证一个客户的数据不进入另一个客户上下文的租户边界。MCP 上的鉴权只保护这三件事，也只能保护这三件事。它不能——也不是任何 OAuth 配置能——挡住一段被提示词注入过的工具描述哄骗模型把一枚合法令牌递给敌对服务器；它也挡不住一台已经握有合法令牌的、被入侵的客户端；那两类是有单独缓解手段的单独威胁类别。<a href="/zh/operations/safety-and-security/agentic-threat-model" class="xref">agentic threat model</a> 这篇文章替运营者把这些类别理了一遍；本文覆盖的是"配置"能补上的那部分缺口。</p>
+
+    <p>这套配置背后的承重假设，是 MCP 服务器必须把每一个进来的请求都只信任到"所出示令牌指认的那个 principal"为止。失败模式看起来是这样：一枚为不同资源签发的令牌因为 JWT 签名过、发行者又在白名单上就被接受了；一次工具调用把调用者的令牌顺手拿去打下游服务；把"这次 HTTP 请求是哪个客户端发的"与"客户端问的是哪个用户的数据"两件事混为一谈。每一样都是 2025-11-25 安全附录明确点名的反模式，而每一样都能靠"把配置的四块承重件之一做对"来关掉。</p>
+
+    <p><a href="/zh/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP 架构</a>那一篇在 JSON-RPC 层面描述了 host/client/server 参与者三角；鉴权配置在它下面一层，讲的是客户端如何为服务器取到 bearer 令牌，以及服务器如何校验它。下文按团队实际遇到的顺序把四块拼图走一遍：负责重定向的 PKCE、负责令牌的资源指示、负责发现的 Protected Resource Metadata、负责客户端身份的 CIMD。最小权限与令牌透传反模式收尾，因为即便这套配置就位后，生产团队仍最容易在这两处投入不足。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>强制 PKCE、无客户端密钥。</h3>
+
+    <p>整个流程的重定向那一半用 OAuth 2.0 的 Authorization Code 授权 + PKCE，而"+ PKCE"这个条件在 MCP 配置里不可选——它对所有客户端都是必选的，即便理论上能藏住共享密钥的那种也一样。PKCE 关掉的是一类老攻击：一枚在重定向那一段被截到的授权码，任何在传输途中或浏览器日志里逮到它的人都可以拿去换令牌；有了 PKCE，令牌端点会拒绝完成交换，除非调用者能出示先前那个哈希的原像。机制很短：客户端生成一段随机的 verifier，用 SHA-256 哈希后把哈希（"code challenge"）发到 authorize 请求上，之后在 token 请求里把 verifier 本身出示出来，AS 重算哈希、验证它与保留下来的 challenge 一致。</p>
+
+<pre class="standalone">import base64, hashlib, secrets
+
+# 1. Client generates a random verifier (43-128 chars, URL-safe).
+verifier = secrets.token_urlsafe(64)
+
+# 2. SHA-256 hash of the verifier, base64url without padding.
+digest = hashlib.sha256(verifier.encode("ascii")).digest()
+challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+# 3. Send challenge on /authorize (method=S256), keep verifier locally.
+authorize_params = {"code_challenge": challenge, "code_challenge_method": "S256"}
+
+# 4. On /token, present verifier; AS re-hashes and checks match.
+token_params = {"code_verifier": verifier}</pre>
+
+    <p>有两条实现注解比这段代码本身更重。第一，在令牌回来之前，verifier 一直是敏感数据；把它放到"页面内脚本能读到"的地方（URL 片段、localStorage）等于打穿整套机制，客户端只把它放在内存里才是唯一正确的目标。第二，AS 必须在 MCP 配置里拒绝 <code class="inline">code_challenge_method=plain</code>——只有 <code class="inline">S256</code> 合规——一个还敢发 <code class="inline">plain</code> 的客户端，要么是在跑早于本配置的老 AS，要么就是 Bloomberry 调查里被标记为"看似 OAuth 但并不是规定配置"的那批服务器之一。其余是标准的 authorization code：AS 把授权码回重定向，客户端把这段码与自己的 verifier 一起 POST 到 <code class="inline">/token</code>，AS 校验哈希并返回访问令牌。</p>
+
+    <p>MCP 的公有客户端没有客户端密钥。这套配置本来就绕开了一个事实：MCP 客户端往往是浏览器扩展、原生 App、CLI 工具，这些东西没法有效保管密钥；code 交换只由 PKCE verifier 认证，别无其他。要求公有客户端提供 <code class="inline">client_secret</code> 的服务器，是没按本配置配好的；那些带着自认为可以认证的密钥的客户端，通常把这个密钥早就泄在打包出去的公开二进制里了——而这与令牌端点是否检查它无关。服务器实现最容易做错的一处，是从"到处都是机密客户端"的企业 OAuth 流程照搬过来、在上面加了 PKCE，却没有回头看密钥是不是还需要。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>RFC 8707 资源指示：令牌绑定到你的服务器。</h3>
+
+    <p>RFC 8707 解掉了 OAuth 2.0 存在了十年却大多没有点名的一类攻击：一枚为服务 A 签发的令牌，拿到服务 B 去出示，B 因为信任同一个授权服务器、JWT 签名也验得过就接受了。资源指示是 authorize 与 token 请求上的一个参数，它命名"令牌被铸出来是为了哪个具体资源"，最后落到 JWT 的 <code class="inline">aud</code> claim 上，或者落到 introspection 响应上的等价绑定里。MCP 配置施加的规则是：服务器必须在每一次进来的令牌上把 <code class="inline">aud</code> claim 与自身的规范 URL 逐一比对，audience 不匹配的令牌一律按签名不对来拒绝。</p>
+
+<pre class="standalone">POST /oauth/token HTTP/1.1
+Host: as.example.com
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&code=SplxlOBeZQQYbYS6WxSbIA
+&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+&client_id=s6BhdRkqt3
+&resource=https%3A%2F%2Fmcp.example.com%2Fmcp</pre>
+
+    <p>线上格式里有两处细节要紧。<code class="inline">resource</code> 参数是一个 URI，不是取自共享注册表的某个标识；它的值就是 MCP 服务器的规范 URL，服务器按"字符串完全一致"来强制匹配。尾斜杠、同一台服务器的两种主机名（CNAME 与后面的主机）、为公开 URL 签发的令牌拿去打内部 URL——都是团队常常花掉一小时在"签名合法为什么还 403"工单上的典型原因。MCP 配置为每台服务器选一个规范 URL，要求客户端在 <code class="inline">resource</code> 参数里指名的就是那一个 URL、不接受别名；服务器在令牌校验时拒绝其余一切，且不做前缀规则拼凑出的匹配。</p>
+
+    <p>好处很具体，且以"爆炸半径"来度量。没有 <code class="inline">resource</code>：一枚为同一 AS 上的低价值 MCP 服务器——比如一个只读状态服务器——签发的令牌，可以被拿去打同样信任那个 AS 的高价值 MCP 服务器；后者没有依据拒绝。有 <code class="inline">resource</code>：第一枚令牌的 audience 就是低价值那台，后者会拒绝它。2025-11-25 配置把这条视作不可谈判，并要求服务器把 audience 不匹配当作安全事件、而不是普通 401 来打日志，因为不匹配这个信号本身就说明：要么某个客户端配错了，要么这枚令牌正在被重放。请在每一次请求上加这个检查；不要因为"列表无害"就在 <code class="inline">tools/list</code> 上省掉它——攻击者一旦发现你在任何端点跳过它，"跳过"本身就是他要的全部让步。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Protected Resource Metadata：通过 /.well-known 发现 AS。</h3>
+
+    <p>第一次访问某个 MCP 服务器的客户端，需要知道该把用户重定向到哪一个授权服务器去。在 RFC 9728 之前，多数实现的做法是把 AS URL 硬编码进每一个客户端；这样每一次 MCP 服务器换 AS 都要发一版客户端。Protected Resource Metadata（PRM）把 AS URL 抬到服务器自己身上：MCP 服务器在 <code class="inline">/.well-known/oauth-protected-resource</code> 下发布一份 JSON 文档，声明它接受的授权服务器、它支持的 scope、以及客户端在令牌端点上该用的鉴权方法。客户端把这份文档取一次，就知道要把用户送去哪儿做重定向，代码里的 AS URL 硬编码彻底可以扔掉。</p>
+
+<pre class="trace">GET /.well-known/oauth-protected-resource HTTP/1.1
+Host: mcp.example.com
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "resource": "https://mcp.example.com/mcp",
+  "authorization_servers": ["https://as.example.com"],
+  "scopes_supported": ["mcp:tools:search", "mcp:tools:fetch"],
+  "bearer_methods_supported": ["header"],
+  "resource_documentation": "https://mcp.example.com/docs"
+}</pre>
+
+    <p><code class="inline">resource</code> 字段就是客户端之后要放进 token 请求 <code class="inline">resource</code> 参数里的那个规范 URL——它把发现与 RFC 8707 的检查串成一个闭环。<code class="inline">authorization_servers</code> 数组可以列超过一个 AS——一处企业部署同时接受公司 IdP 与合作方 IdP 的令牌是合法的——客户端挑自己能认证得过的那一个。因为客户端会作为流程的一部分去解引用 URL，PRM 也是一个小小的 SSRF 面：一台 MCP 服务器如果把"取 PRM 时的 URL"改成"客户端提供、由自己解引用"的形态，就是安全附录另立一条点名的常见反模式。直白的实现从固定路径或常量 handler 里把这份文档服务出去，永远不去解引用请求里给的 URL。</p>
+
+    <p>被保护资源的 401 响应在同一个"发现"故事里同样承重。当 MCP 服务器拒掉一个未鉴权请求时，2025-11-25 配置要求响应里的 <code class="inline">WWW-Authenticate</code> header 携带一个 <code class="inline">resource_metadata</code> 参数、指向同一个 <code class="inline">/.well-known/oauth-protected-resource</code> URL，好让没带令牌摸到端点的客户端马上有一根通往发现文档的面包屑。实践里客户端就顺着 PRM 拿到 AS、对着 AS 做 PKCE 舞步、拿到带正确 <code class="inline">resource</code> 参数的令牌，然后重试原始请求；整个循环里没有人碰过配置文件。发布了 PRM 却漏了 <code class="inline">WWW-Authenticate</code> 提示的团队，会看到"第一次请求总失败"的支持工单模式——只要把那个 header 补上，症状立刻消散。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Client ID Metadata Documents 与动态客户端注册。</h3>
+
+    <p>客户端身份是四块承重件里的最后一块。历史上 OAuth 用"带外预注册"来处理它——有人把表填一填，AS 存下客户端的 redirect URI 与公钥，客户端拿一个 ID 从此使用。Dynamic Client Registration（RFC 7591，"DCR"）把"填表"这一步自动化了：一个陌生客户端把注册文档 POST 给 AS，AS 合成一个 ID 并存下元数据，客户端在后续流程里用那个 ID。DCR 是可用的，需要它的 MCP 客户端还可以用它。问题在于规模：一个支持 DCR 的 AS 必须为每一个曾经注册过的客户端持久化状态、必须按计划撤销这些状态、必须先决定允许谁来注册——每一步都是企业 AS 会抗拒这个模式的地方。</p>
+
+    <p>Client ID Metadata Documents（CIMD）把持久化的方向反了过来。不是 AS 为每个客户端存元数据，而是客户端在它自己控制的 URL 上发布一份 JSON 文档——常见形状是 <code class="inline">https://client.example/.well-known/oauth-client</code>——并把那个 URL 当自己的 client ID 用。AS 一旦看到 authorize 请求里的 client ID 是一个 URL，就把 URL 解引用、验证返回的元数据、并把那份文档视作这次请求下该客户端的权威声明。请求之间 AS 上什么都不留；客户端的身份由"谁控制这个 URL"决定。撤销退化成"把文档删了"；轮换退化成"就地更新"；"AS 里躺着四万条死掉的客户端注册"那种企业疼痛也就随之蒸发。</p>
+
+<pre class="standalone">{
+  "client_id": "https://client.example/.well-known/oauth-client",
+  "client_name": "Acme MCP Client",
+  "redirect_uris": ["https://client.example/oauth/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none",
+  "code_challenge_methods_supported": ["S256"],
+  "jwks_uri": "https://client.example/.well-known/jwks.json"
+}</pre>
+
+    <p>对 CIMD 的支持比 DCR 新，且 AS 覆盖参差；想要可移植的客户端会写降级逻辑：先试 CIMD、抓到"unrecognized client_id"响应就回落到对要求 DCR 的 AS 用 DCR。因为 client-id 那个 URL 会被 AS 解引用，同样的 SSRF 提醒也适用：AS 应当拒绝解引用内部或环回 URL、应当以合理的 TTL 缓存这份文档、并应当校验返回的文档里 <code class="inline">client_id</code> 字段命名的就是它自己的 URL。做到这几点，这个模式的运维成本几乎为零——这也是为什么本配置把它写成推荐形状，把 DCR 当作 AS 可能仍需服务的历史路径。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>最小权限：团队仍投入不足的字段。</h3>
+
+    <p>四块承重件把"令牌的来源故事"闭环了：PKCE 把授权码绑到请求它的客户端上、资源指示把令牌绑到消费它的服务器上、PRM 告诉客户端该找哪个 AS、CIMD 在无长期 AS 状态的前提下识别客户端。剩下的问题是"令牌到手之后到底授权了什么"——那是 scope 的问题。默认的 MCP 配置并不带一个规范 scope 分类；每台服务器自定义 scope 名，值得决策的地方是粒度。只发一个 scope 的服务器——叫 <code class="inline">mcp:full</code>、或者更糟直接没 scope——等于把同一把开所有工具的钥匙塞给每一个客户端，每一个同意屏都塌陷成一个用户没法认真判断的"允许访问"。</p>
+
+    <p><a href="/zh/operations/safety-and-security/scoped-credentials-for-agents" class="xref">scoped credentials for agents</a> 运营那一篇讲的那套惯用法在这里直接落地。scope 名应该是"逐工具"或"逐能力"的形状：<code class="inline">acme-mcp:tools:search</code>、<code class="inline">acme-mcp:tools:send_email</code>、<code class="inline">acme-mcp:resources:read</code>——每个 scope 对应一个具体动作，好让同意屏呈现真正的权限、也让被入侵的令牌无法越过其持有者被授权的工具。从"一个 scope 打天下"重构到"一 scope 一工具"，代价主要是服务端多加几处注解；MCP 工具本来就有名字，tools/list 响应可以把每个工具所需的 scope 一并公布，客户端就能用与服务器强制的同一份数据去构建同意屏。</p>
+
+    <p>要让这个分类在实践里真正有用，还有两条副控制。刷新令牌应当短寿并轮换；一个能活一年的刷新令牌，等于一枚不管 scope 名多细都会带着它被铸时全部 scope 一起漏出去的令牌。scope 扩张时要重新征询同意——一个今天有 <code class="inline">acme-mcp:tools:search</code>、明天又想要 <code class="inline">acme-mcp:tools:send_email</code> 的客户端，不该能靠已有刷新令牌把扩张 bootstrap 出来；它应当触发一次新的 authorize 跳转、拿新的 scope，用户应当能看到。两种模式在本配置里都合法，也都是 Bloomberry 调查里"本配置作为当前规范六个月后，生产服务器投入最不足"的字段。配置里"工具的一半"更容易上线；"纪律的一半"——scope 收窄、刷新短寿、扩张时重征询——正是"过安全评审的服务器"与"过不了"之间合规差距被拉开的地方。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>反模式：令牌透传（规范明确禁止）。</h3>
+
+    <p>最后一件事，是 2025-11-25 安全附录逐字点名禁止的反模式——之所以要点名，是因为生产服务器一次又一次地独立发明它。模式是这样：MCP 服务器接受了一枚 bearer 令牌，判定被调用的工具需要以用户身份去打下游服务，就把同一枚 bearer 令牌直接转发给下游。它很方便——"用户都已经认证过了何必再来一次"——它也是灾难。下游服务此刻手里握着一枚为 MCP 服务器铸出来的令牌，其 <code class="inline">resource</code> claim 命名的是 MCP 服务器，其 scope 是为 MCP 工具授予的；令牌的 audience 里没有关于下游服务的任何东西，整个 RFC 8707 的故事都被这个把令牌顺手往下传的中间人打穿了。</p>
+
+    <p>规范的规则很短：MCP 服务器不得把收到的令牌传给下游服务。取而代之有两种正确模式。第一种是 URL 模式的征询：MCP 服务器需要用户直接去下游服务授权时，把一个 URL 返回给客户端，客户端带用户走完下游服务自己的 OAuth 流程；MCP 服务器从不接触下游令牌——这正是重点。第二种是 RFC 8693 的令牌交换：MCP 服务器把自己收到的令牌递给 AS、请求换一枚"面向下游服务且窄化到工具真正所需 scope"的新令牌，然后转发这枚新令牌。令牌交换保住"单一 OAuth 流程"的运维简洁，同时把 audience 变更明明白白地摆出来；AS 强制哪一类交换合法、下游服务看到的是一枚为它铸的令牌，而不是别处飘来的陌生人。</p>
+
+    <p>URL 模式征询的形状会在本组下一篇里单独处理——它就是 2025-11-25 规范里被低估的特性之一——而令牌交换主要住在 OAuth 规范里、并非 MCP 配置的一部分。本文的承重观察是：透传反模式不是一个隐晦失败，而是让 MCP 服务器最后落得这么一条审计记录的方式之一——凌晨三点，一个本没有资格握有该凭证的服务，看起来用某个用户的下游凭证发了一封邮件。把配置的四块承重件放在一起读——PKCE 管重定向、RFC 8707 管 audience、PRM 管发现、CIMD 管身份——再加最小权限与拒绝透传，本文开头那 39% 就不再让人惊讶：仪式一显得"可略过"团队就会略过，而这六道控制里的每一道都是配置在做那种没有捷径能替它做的事。</p>
+  </div>
+</section>
