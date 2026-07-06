@@ -163,6 +163,7 @@
 - **agent-cards-and-discovery** | protocols-and-interop | M | should | `/.well-known/agent.json`; capability declaration; extended cards; signing; caching. Contrast with MCP registry-based discovery.
   Gap: `capability-discovery` covers the concept; the A2A v1.0 Agent Card format and `/.well-known/` convention are newer specifics.
   Links: capability-discovery, a2a-v1-deep-dive, mcp-registry-and-distribution
+  ⚠ spec-dep
 
 - **acp-and-what-happened** | protocols-and-interop | S | stretch | Short post-mortem: ACP existed, was REST-native, contributed to Linux Foundation in July 2025 and folded into A2A. Useful because searches still surface stale "ACP vs A2A" content.
   Gap: no essay explains the ACP disappearance; readers arriving from older content will be confused.
@@ -182,22 +183,27 @@
 - **tool-calling-vendor-matrix-2026** | tool-capability-design | L | must | Side-by-side of OpenAI (Chat Completions vs Responses API, `parallel_tool_calls`, custom tools w/ Lark/regex grammar), Anthropic (Programmatic Tool Calling, Tool Search Tool, Tool Use Examples), Gemini (OpenAPI subset, `tool_choice: any`, multimodal function responses). Skeptical framing: schemas differ enough that "portable" tool defs are still fiction.
   Gap: `tool-calling-standards` covers the universal contract at a high level and predates all three vendors' 2026 additions. This is the 2026 vendor-matrix update.
   Links: tool-calling-standards, tool-calling-explained, structured-tool-io
+  ⚠ spec-dep
 
 - **advanced-tool-orchestration-patterns** | tool-capability-design | L | must | Anthropic Tool Search Tool (85% token reduction); Programmatic Tool Calling (Claude writes Python in a sandbox that calls tools, only final outputs enter context); Tool Use Examples. New primitives that changed the design space in late 2025.
   Gap: no essay covers these primitives. Programmatic Tool Calling foreshadows "code-as-orchestration" across vendors, worth naming early.
   Links: tool-calling-standards, tool-granularity, pattern-landscape
+  ⚠ spec-dep
 
 - **structured-outputs-vs-tool-calls** | tool-capability-design | M | should | When to use each; why they're mechanically similar (both constrained decoding under the hood); Anthropic's late arrival to native structured outputs (GA in 2026 with `output_config.format`); the 20-strict-tools / 24-optional-params cap.
   Gap: `structured-outputs` (concept) covers the mechanism; `tool-calling-explained` covers tool calls; the *choice between them* isn't addressed anywhere.
   Links: structured-outputs, tool-calling-explained, structured-tool-io
+  ⚠ spec-dep
 
 - **json-schema-subsets-per-vendor** | tool-capability-design | M | should | What's actually enforceable: no `minLength`/`maxLength`/`minimum`/`maximum` on Anthropic; OpenAPI subset only on Gemini; strict mode requires `additionalProperties:false` + all fields required on OpenAI.
   Gap: `tool-schemas-and-contracts` covers schema design; the *vendor-by-vendor enforceable subset* isn't documented anywhere. Practitioners hit this the moment they try to port a schema.
   Links: tool-schemas-and-contracts, structured-tool-io, tool-calling-vendor-matrix-2026
+  ⚠ spec-dep
 
 - **streaming-tool-calls-in-practice** | tool-capability-design | M | stretch | Vendor-by-vendor: how to accumulate deltas; gotchas (OpenAI GPT-4.1-nano duplicate tool calls, Gemini aggregatable `arguments`, Anthropic streaming with parallel calls).
   Gap: no essay covers streaming tool calls. Small but practical.
   Links: tool-calling-vendor-matrix-2026, tool-error-recovery
+  ⚠ spec-dep
 
 ### `evaluating-agents` (NEW group — design amendment)
 
