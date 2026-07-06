@@ -88,12 +88,14 @@ The `zh/` version uses `Deep Dive · MCP` → `深入解析 · MCP` for the `.we
 
 ---
 
-## Task 1: Create the MCP group scaffold
+## Task 1: Prepare the MCP group scaffold (not committed on its own)
 
 **Files:**
-- Create: `src/content/deep-dives/groups/mcp.ts`
+- Create: `src/content/deep-dives/groups/mcp.ts` — kept in the working directory but NOT committed independently. Task 2 (essay C1) commits it together with the first essay HTML.
 
-- [ ] **Step 1: Create the group file with empty `entries` array.**
+**Why not a standalone commit:** `deep-dives-manifest.test.mjs` enforces `entries must be non-empty array`. Committing an empty group makes the test fail. The group file must go in with at least one essay's registration.
+
+- [ ] **Step 1: Create the group file with empty `entries` array (temporary state, not committed).**
 
 Write to `src/content/deep-dives/groups/mcp.ts`:
 
@@ -113,22 +115,7 @@ const group: Group = {
 export default group;
 ```
 
-- [ ] **Step 2: Run tests.**
-
-Run: `npm test`
-Expected: PASS. An empty `entries` array is a valid group; the deep-dives-manifest test only checks that registered slugs have fragments — no registration, nothing to check.
-
-- [ ] **Step 3: Run build.**
-
-Run: `npm run build`
-Expected: PASS. The new group appears on the Deep-Dives index with 0 entries (interim state — subsequent tasks add entries).
-
-- [ ] **Step 4: Commit.**
-
-```bash
-git add src/content/deep-dives/groups/mcp.ts
-git commit -m "MCP group: scaffold groups/mcp.ts (order 25, no entries yet)"
-```
+- [ ] **Step 2: Do NOT commit.** Leave the file in the working directory. Task 2's Step 8 commits it together with the C1 HTML fragments and the first entry line.
 
 ---
 
@@ -231,11 +218,11 @@ Open `src/content/deep-dives/groups/mcp.ts`, change `entries: []` to `entries: [
 - [ ] **Step 5: Run `npm test`** — expect PASS.
 - [ ] **Step 6: Run `npm run verify`** — expect PASS.
 - [ ] **Step 7: Run `npm run build`** — expect PASS with no new warnings.
-- [ ] **Step 8: Commit.**
+- [ ] **Step 8: Commit — includes the group scaffold from Task 1.**
 
 ```bash
 git add src/content/deep-dives/groups/mcp.ts src/content/deep-dives/en/mcp-building-servers-in-practice.html src/content/deep-dives/zh/mcp-building-servers-in-practice.html
-git commit -m "MCP group: essay C1 — Building MCP servers in practice"
+git commit -m "MCP group: scaffold groups/mcp.ts + essay C1 — Building MCP servers in practice"
 ```
 
 ---
