@@ -1,0 +1,91 @@
+<section class="phase">
+  <div class="phase-num">C2</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>面向 agent 工作流（而非 REST 客户端）设计 MCP 工具，是决定"5 个工具的服务器能用"与"15 个工具的服务器被 agent 无视"之间最大的杠杆。</h2>
+  <p class="goal">工具描述就是 agent 能看到的全部提示词；如果它读起来像一段 OpenAPI 注释，agent 会去挑别的工具。工具选择准确率不是模型问题——有据可查是工具爆炸带来 24 个百分点的下滑——而是设计问题，且描述措辞对"agent 选哪个工具"的影响，超过模型本身。前五个工具做对了，这台服务器就会从你的调试队列里消失。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>描述是提示词，不是 docstring。</h3>
+
+    <p>对 MCP 最常见的误读，就是把工具描述当成文档。它不是。描述是模型在选工具时会读的文本，与其它所有工具的描述并列出现，抢夺模型的注意力。它在结构上与系统提示词里的一条指令没有区别：同样的 token、同样的注意力预算、对模型下一步做什么有同样的影响力。"Retrieves user information from the database" 这样一行只是写给未来维护者看的 docstring；它几乎没告诉模型"什么时候该伸手去用"，更糟的是也没告诉模型"什么时候<em>不要</em>用"。只要另一个工具的描述读起来更像指令，那另一个每次都会赢下选择。</p>
+
+    <p>行得通的形状是短、动词化、指令化。以动词开头。用读者的语言而非 API 的语言说清用途。写明"何时用、何时不用"，好让模型有一条明确规则可套。以一个模型可以照猫画虎的用法例子收尾。<a href="/zh/deep-dives/tool-capability-design/tool-design-principles" class="xref">通用工具设计原则</a>那篇深入解析讲了"把工具元数据视为提示词界面"背后的根据；MCP 这边的具体做法归结为：为将要读这段文字的 agent 而写，且要显式点出多数作者留白的负向情形——<a href="/zh/deep-dives/tool-capability-design/tool-discovery-and-docs" class="xref">面向 agent 的工具文档</a>那篇总体地展开了这门纪律，而在 MCP 里，<code class="inline">tools/list</code> 的表面让它成了承重件。</p>
+
+    <p>改写这件事，感受比争论要容易得多。"Retrieves user information from the database" 变成 "Get a user by id when you need their email, role, or account status. Do NOT use for listing users (use <code class="inline">list_users</code>). Example: <code class="inline">get_user(id='u_123')</code>." 后者在生产里胜出，因为它同时给了模型正向触发和负向排除。凡是两条描述可能被搞混的地方，就在原地做区分：描述里的相互引用是这套协议允许的最便宜的提示词工程，能把互为近邻、彼此竞争的工具变成协调的工作流。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>粒度：细工具税与粗工具爆炸半径。</h3>
+
+    <p>每台服务器都会撞上粒度问题，两个极端各自以相反方式失败。细工具增加往返、并把每一轮都要塞进模型上下文的工具列表撑大。粗工具把决策藏进服务器内部，模型再也无法在这些被隐藏的行为之间选择，而一次失败调用的爆炸半径也更大——毕竟服务器本打算原子性地做好几件事。</p>
+
+    <p>反对过细粒度的信号是"工具选择准确率曲线"。Anthropic 的 Tool Search Tool 动机部分记录了：工具数量攀升到成百时，选择准确率下滑约 24 个百分点——列表越长，模型挑对工具的能力就越差，而且比列表本身增长得更快。<a href="/zh/deep-dives/tool-capability-design/tool-granularity" class="xref">工具粒度</a>那篇深入解析把总体权衡展开了；MCP 特有的经验法则——从前一篇引用过的同一份 Bloomberry 调查里来——是每台服务器 5 到 8 个工具为宜。如果你有 15 个，多半是两台服务器在假装一台。</p>
+
+    <p>反对过粗的信号更隐蔽，会在轨迹里现形。当一个工具把多种概念操作打包在一起——比如一个接受"动作名 + payload"的 <code class="inline">execute</code> 工具——你就失去了从轨迹里读出"到底跑了哪个操作"的能力。你也失去了 annotations 体系：<code class="inline">destructiveHint</code> 是每工具一个的字段，因此一个有时写、有时读的工具必须永远标为破坏性，也就意味着每次调用都会弹同意提示，读取用例的宿主 UX 就跟着降级。先沿"破坏性 vs 幂等"边界拆，再沿"领域对象"边界拆——每个（对象、动作）对一个工具，动作要粗到足以像一个用户会亲口念出的任务。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>search-then-fetch 及其它经受住实战的模式。</h3>
+
+    <p>MCP 里后果最大的一个工具模式是 search-then-fetch，其道理值得说清楚，因为多数教程把权衡讲反了。朴素的内容工具接受一个 query、直接返回完整的匹配文档。一次调用模型就拿到了材料；看起来很高效。失败模式是模型没有办法"退回"它其实不需要的那些材料。一次调用可能把几万乃至十几万 token 推进循环，而这一轮里没有任何原语能让模型把其中一部分交回去。上下文已经花掉了，之后每次工具调用都更贵，因为输入长度变大了。</p>
+
+    <p>把同一操作拆成两个工具——<code class="inline">search(query) → [{id, summary}]</code> 与 <code class="inline">fetch(id) → full_content</code>——模型就能自己挑哪几篇文档值得完整读。多一次往返成本不高；上下文节省却很惊人；而且轨迹变得可读，因为这种两步分解正好契合人类如何解释"发生了什么"。这个模式在微软 Learn MCP 服务器的复盘里被点名，如今在内容型服务器上几乎通用，但其底层原则可以推广：任何<em>可能</em>返回大 payload 的工具，都应该拆成"摘要+id 形式"和"完整 payload 形式"两个独立工具，而不是一个带 <code class="inline">verbose</code> 开关的多态工具。</p>
+
+    <p>两个相邻模式随之而来。分页读取：一个可能返回未知数量结果的工具应当接受 cursor、返回一页加下一 cursor，让模型自己控制每次让多少结果进入上下文。结构化过滤工具与 fetch 工具保持分离：一个返回 id + 一行摘要的 <code class="inline">list_incidents(status, since)</code> 应当与返回一切的 <code class="inline">get_incident(id)</code> 分开。把二者合并成一个带"详细度"参数的 <code class="inline">query_incidents</code>，就把当初拆开时想赶走的多态性又请了回来。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>面包屑：设计让 agent 会收敛的工具。</h3>
+
+    <p>只报事实的工具让 agent 自己去想"下一步做什么"；既报事实<em>又</em>建议下一步的工具，能让 agent 用更少的轮次收敛。一个 <code class="inline">search</code> 工具返回 <code class="inline">[]</code>，逼着模型自己编下一步——换个 query、放弃、问用户。一个 <code class="inline">search</code> 工具返回 <code class="inline">{ "results": [], "hint": "No matches. Try broadening the query, or add a category filter with list_categories()." }</code>，就明确告诉模型下一步该试什么，轨迹从三四轮探索性调用压缩成一轮。</p>
+
+    <p>每次工具响应都应当以"下一步动作提示"或明确的"你已完成"信号结尾。二者之间的模糊地带正是 agent 循环变长的地方：模型不停调用，指望在工具本就没设计要发的地方等到一个停止信号。显式的终止符——一个 <code class="inline">done: true</code> 字段，或以 "This is the final result" 开头的 hint——能极大缩短本会一直循环下去的对话。同一规则的另一面是：工具<em>描述</em>之间也应互相引用——<code class="inline">search</code> 的描述提及 <code class="inline">fetch</code> 是自然的下一步；<code class="inline">list_incidents</code> 的描述提及 <code class="inline">get_incident</code>。这样一份扁平的清单就变成模型可以走的有向图。从业者的说法——"留下面包屑，让 agent 会收敛"——正是这个意思：一台面包屑铺得好的服务器，其轨迹读起来像一个故事；没有面包屑的那种，读起来像一场随机漫步。</p>
+
+<pre class="trace"><span class="c-out">{
+  "results": [],
+  "hint": "No matches for 'quarterly-report-q4'. Try: (a) broaden the query,\n  or (b) call list_categories() to see valid filter values,\n  or (c) confirm with the user that the report exists.",
+  "done": false
+}</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>具体做法：把 REST 映射服务器重写成 agent 形状。</h3>
+
+    <p>那些通过封装现有 API 造出来的服务器，其失败模式就是一比一地照搬 REST 界面。如果 API 有 <code class="inline">GET /users</code>、<code class="inline">GET /users/{id}</code>、<code class="inline">PUT /users/{id}</code>，朴素的 MCP 服务器就暴露三个工具，名字大概叫 <code class="inline">list_users</code>、<code class="inline">get_user</code>、<code class="inline">update_user</code>，参数原封不动照搬 REST。这些工具能用。它们对 agent 也无甚帮助，因为 agent 的任务很少是"按顺序调这几个 REST 端点"——而是"找到对的那位用户并把他的角色改掉"，这件事碰的是同一批端点，想要的却是不同的形状。</p>
+
+<pre class="standalone"><span class="c-cm"># Before: REST-mirroring — five tools, each shaped like an HTTP verb.</span>
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> list_users(limit: int, offset: int) -&gt; list[User]: ...
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> get_user(id: str) -&gt; User: ...
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> update_user(id: str, user: User) -&gt; User: ...
+
+<span class="c-cm"># After: agent-shaped — three tools, each named for the task, each returning</span>
+<span class="c-cm"># the shape the next step of the workflow actually needs.</span>
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> find_user(query: str) -&gt; list[UserMatch]:
+    <span class="c-st">"""Find users by name, email, or id. Returns id + one-line summary.
+    Call get_user_details(id) for the full record before updating."""</span>
+    ...
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> get_user_details(id: str) -&gt; UserDetails:
+    <span class="c-st">"""Return the full user record (profile, roles, recent activity).
+    Use after find_user() when you have the id and need everything."""</span>
+    ...
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> update_user(id: str, changes: UserChanges) -&gt; UserDiff:
+    <span class="c-st">"""Apply a partial update. Pass only fields that change.
+    Returns a before/after diff so the caller can verify the write."""</span>
+    ...</pre>
+
+    <p>有四件事同时改变。名字描述的是 agent 的任务——"find"、"get details"、"update"——而不是 REST 动词。每条描述都点出工作流上的邻居，好让模型顺藤摸瓜。<code class="inline">update_user</code> 的输入变成 <code class="inline">UserChanges</code>——只是增量——而不是整份记录，这让意图变得显式，也避免了那种"模型来回一趟拉一份、改一个字段、再把其余原样写回"的隐式覆盖模式。<code class="inline">update_user</code> 的返回不是新记录而是 diff，把"我刚改了什么"这条要紧信息摆到了模型下一轮上下文的最前面。</p>
+
+    <p>回到<a href="/zh/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">前一篇</a>的主线：那台"中位数 5 个工具"的服务器之所以能用，是因为那 5 个工具是围着 agent 的任务选出来的。一台照抄 REST 界面的 15 工具服务器，底层能做的操作完全一样，反而更差劲，因为工具的形状根本对不上工作的形状。先按 agent 的工作流设计，再翻译到底层 API，工具数量通常自动落在 5 到 8 个，用不着谁去强推规则。</p>
+  </div>
+</section>
