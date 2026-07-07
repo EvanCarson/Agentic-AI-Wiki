@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">C9</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>Production MCP ops are not "web-service ops with MCP words on top" — the traffic shape is agent-shaped, and four ops disciplines change with it.</h2>
+  <p class="goal">The four things that separate a hobby MCP server from a production one are per-tool kill switches (because one bad tool shouldn't take down the server), audit logs that record argument <em>shapes</em> not values (because tool arguments contain PII you don't want in your log store), tenant isolation from <em>verified</em> token claims not request bodies (because clients lie about their tenant), and rate-limits sized for agent traffic (which spikes to 10x human traffic in seconds). Web-service ops instincts get three of these wrong.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Per-tool kill switches: feature flags for tools.</h3>
+
+    <p>The unit of failure inside an MCP server is a tool, not the process. A misbehaving tool — one that started throwing 500s after an upstream schema change, one that turned out to leak PII in its result, one that a client is calling in a loop because a prompt regression made it look like a good idea — should be disable-able without redeploying the server. That means every tool needs to be individually toggleable, and the toggle needs to be readable at call time rather than at process start; a flag that only takes effect on restart is not a kill switch, it is a config parameter with a lag. The pattern is the same one that applies to <a href="/operations/agentops/feature-flags-for-agents" class="xref">feature flags for agents</a> generally — the flag store (Unleash, LaunchDarkly, or a Redis key you own) is checked inside the tool dispatcher, and the answer determines whether the tool executes, whether it returns a "temporarily disabled" reply, or whether it is hidden from <code class="inline">tools/list</code> entirely. Which of those three responses is correct depends on the failure mode; hiding a tool that a client's plan already committed to calling produces a different error than returning a soft-refuse, and both are different from executing and failing.</p>
+
+    <p>A kill switch used only in emergencies rots. The operational discipline that keeps it honest is periodic exercise: an on-call runbook item that flips a canary tool off, watches the client-visible behavior for a minute, and flips it back. If that exercise breaks in staging, the switch is not real. The other discipline is scope granularity — a switch that disables an entire server is a blunt instrument, while a switch that disables one specific argument pattern of one tool ("all calls to <code class="inline">db_query</code> where <code class="inline">table</code> equals <code class="inline">users</code>") is where the actual save happens during an incident. This is the pattern documented in the operations catalog under <a href="/operations/agentops/kill-switches" class="xref">kill switches</a>: what a switch actually stops is not "the server" but "the specific broken thing," and getting that granularity right is what separates a switch you use from a switch you write about and never touch.</p>
+
+<pre class="standalone"># Per-tool dispatcher — kill switch consulted on every call
+async def dispatch(name: str, args: dict, ctx: Ctx) -> Result:
+    flag = await flags.get(f"tool:{name}", tenant=ctx.tenant_id)
+    if flag == "off":
+        raise ToolDisabled(f"{name} temporarily disabled by operator")
+    if flag == "shadow":
+        asyncio.create_task(shadow_call(name, args, ctx))
+        return CANNED_OK
+    audit.log_shape(name, args, ctx)   # shape, not values — see STEP 2
+    return await TOOLS[name](args, ctx)</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Audit logs: shapes, not values.</h3>
+
+    <p>The reflex from web-service ops is to log the full request body for debuggability. In MCP that reflex is wrong twice over. First, tool arguments carry PII the way form submissions do — a <code class="inline">send_email</code> tool's arguments are addresses and free-text bodies, a <code class="inline">db_query</code> tool's arguments are literal customer identifiers, an <code class="inline">upload_file</code> tool's arguments include the file contents — and putting all of that in the general log store makes the log store a PII system that inherits every retention, encryption, and access-control constraint the source data had, which no team wants to discover after the fact. Second, agent traffic is repetitive; the same tool gets called with variations of the same arguments across a session, and logging every value turns the log store into a duplicate copy of the input source. Neither problem exists if you log the <em>shape</em>: tool name, argument names, argument types, argument size buckets (small/medium/large), and a content hash if you need to correlate two identical calls.</p>
+
+    <p>Shape logging is not the absence of forensics, it is a different forensics. When a real incident hits and someone needs the exact value that was passed, the answer comes from a separate, higher-restriction "values" store that only a named on-call role can read and that has its own retention clock — hours or days, not the log store's months. Route the values there at the dispatcher, tag them with the same request id as the shape entry, and the correlation across the two stores is one query away. The <a href="/operations/governance-compliance/audit-trails" class="xref">audit trails</a> page frames this as a general provenance discipline; the MCP-specific twist is that the tool-call payload structure is regular enough that shape logging is unusually cheap — you already know the schema from <code class="inline">tools/list</code>, so extracting a shape record is a schema walk, not a heuristic.</p>
+
+<pre class="trace">{
+  "ts": "2026-07-06T14:22:03Z",
+  "request_id": "r_9f2a",
+  "session_id": "s_71c4",
+  "tenant_id": "t_acme",
+  "tool": "send_email",
+  "args_shape": {
+    "to": {"type": "email", "count": 1},
+    "subject": {"type": "text", "bucket": "small"},
+    "body": {"type": "text", "bucket": "medium", "hash": "sha256:8a…"}
+  },
+  "outcome": "ok",
+  "latency_ms": 412
+}</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Tenant isolation from verified token claims.</h3>
+
+    <p>The wrong pattern is short enough to describe in one sentence: the client sends a request whose body includes a <code class="inline">tenant_id</code> field, and the server trusts it. Every subsequent access-control decision — which database rows to scope the query to, which storage bucket to write into, which per-tenant kill switch to consult — flows from that value. The problem is that the value is under the client's control, and any client that lies about its tenant walks straight into the next tenant's data. This is the same confused-deputy shape called out in the <a href="/deep-dives/mcp/mcp-security-anti-patterns" class="xref">security anti-patterns</a> catalog, and the fix is boringly mechanical: the tenant identity comes from the token, not the body. The <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 profile</a> gives you a verified <code class="inline">sub</code> (user), a <code class="inline">tid</code> or equivalent claim (tenant, sometimes carried as a resource indicator scope), and a <code class="inline">scope</code> list (capability). The dispatcher reads those, and treats anything the request body says about identity as untrusted metadata that must round-trip through a check against the claim before it influences a decision.</p>
+
+    <p>Two guardrails make the discipline enforceable rather than aspirational. The first is a middleware layer that rejects any request whose body carries a <code class="inline">tenant_id</code>, <code class="inline">user_id</code>, or similar identity field that disagrees with the corresponding token claim — not a warning, a hard 4xx — so misconfigured clients fail loudly, not silently. The second is that verified identity propagates into every downstream call the tool makes; if the tool queries a database with tenant-scoped rows, the connection or query must carry the verified tenant, not the argument. Storing per-request identity in a context-local (Python's <code class="inline">contextvars</code>, JavaScript's <code class="inline">AsyncLocalStorage</code>) rather than passing it as an argument keeps the discipline honest, because downstream code cannot accidentally reach for a value that came from the wire. The <a href="/operations/safety-and-security/scoped-credentials-for-agents" class="xref">scoped credentials</a> page has the wider picture; the ops-level rule is short: any tenant decision reads from the claim, never from the body.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Rate-limits sized for agent traffic.</h3>
+
+    <p>Human traffic and agent traffic have different shapes, and a rate-limit tuned for one starves or fails to protect against the other. A human clicks a button, waits, reads, clicks again; peak QPS for a single user is bounded by human reaction time and the burstiness comes from many independent users overlapping. An agent, once it decides a tool is worth calling, calls it in a loop — the loop body runs at whatever cadence the model, the tool latency, and the sampling temperature allow, and the natural upper bound is not human reaction but the token budget. Under an incident like a prompt regression that convinces every agent session to hit the same tool, aggregate QPS can climb by an order of magnitude in seconds while the human load looks unchanged. A rate-limit written for humans absorbs that spike silently until the backend behind the tool falls over; a rate-limit sized for agent traffic pushes back at the tool boundary and keeps the shared backend up.</p>
+
+    <p>Three layered limits do most of the work. Per-session limits, small, catch the "one runaway loop" case — a single session should not be able to consume more than a few dozen calls to any one tool per minute, because a healthy session doesn't need to. Per-tenant limits, larger, catch the "many sessions from one tenant misbehaving in the same way" case, which is the pattern a prompt regression produces at a customer that just rolled out a new prompt template. Per-tool limits, sometimes smallest, protect expensive tools that are cheap to call but do real work behind them — a tool that runs a background job or triggers a paid API. Token-bucket is the right primitive for all three because it lets bursts through when the average rate is low, which matches the pattern where a legitimate session occasionally batches calls; leaky-bucket is fine when the goal is smoothing rather than admission control. The response when a limit fires should be a specific MCP-shape error — a JSON-RPC error with a retry-after hint — rather than an HTTP 429 the model has to guess how to parse.</p>
+
+<pre class="standalone"># limits.yaml — three layered token buckets, agent-sized
+default:
+  per_session: { rate: 30/min,  burst: 60  }
+  per_tenant:  { rate: 600/min, burst: 1200 }
+tools:
+  db_query:    { per_tool: { rate: 120/min, burst: 200 } }
+  send_email:  { per_tool: { rate: 20/min,  burst: 20  } }
+  run_job:     { per_tool: { rate: 6/min,   burst: 6   } }
+overrides:
+  tenant:t_pilot: { per_tenant: { rate: 60/min, burst: 100 } }</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Observability: MCP-specific signals to trace.</h3>
+
+    <p>Web-service observability treats a request as the unit of a trace. MCP has three units worth tracing separately: the session (from <code class="inline">initialize</code> through disconnect, carrying the negotiated protocol version and capability set), the tool call (from dispatch through result, carrying the shape record from STEP 2), and — when the server initiates them — the sampling call and the elicitation call. Every one of those spans should carry a small, consistent set of tags: session id, tool name, tenant id (redacted or hashed as appropriate for the store), spec version, and the outcome bucket (ok, tool-error, rate-limited, killed, tenant-mismatch). Rolling those up gives you the four dashboards that answer the questions actually asked during an incident: "which tool is failing," "which tenant is being throttled," "which session is looping," and "which spec version is talking to us." A trace that only records the outermost HTTP request cannot answer any of those, which is why the <a href="/operations/evaluation-and-observability/tracing-and-observability" class="xref">tracing and observability</a> discipline for agents is different from tracing for a REST API — the interesting unit is not the request, it is the loop.</p>
+
+    <p>The last thing to instrument is the boundary between the MCP server and whatever it wraps. A server that proxies to a downstream API benefits enormously from tagging every downstream call with the originating tool name, session id, and tenant id, because the moment something breaks the question is never "did the MCP layer break" but "did the tool break because the downstream is broken," and answering that in one query rather than three separate log-store hunts is what makes on-call sustainable. Emit the tags as OpenTelemetry attributes so a standard collector picks them up; keep the vocabulary stable across servers so the dashboards written for one work for the next. None of this is MCP-specific technology — it is OpenTelemetry, structured logs, and boring middleware — but the choice of what to attribute is MCP-specific, and getting it right is the difference between an MCP fleet you can operate and one you can only redeploy.</p>
+  </div>
+</section>
