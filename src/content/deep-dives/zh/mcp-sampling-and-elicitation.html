@@ -1,0 +1,95 @@
+<section class="phase">
+  <div class="phase-num">C7</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>采样和征询把 MCP 请求流反了过来——服务器向客户端的模型或用户提要求——这两个特性在教程里被严重低估，尽管它们分别是两个常见设计问题的正解。</h2>
+  <p class="goal">2025-11-25 规范里有两个特性在教程里不常见，是因为它们把常规请求流反了过来：采样让服务器请求客户端的模型帮它生成文本（嵌套循环中甚至可以调用服务器自己的工具），征询则让服务器在工具调用中途向用户要输入。二者看起来很另类；却分别是两个具体设计问题的正解——"我的服务器怎么在不自持 API key 的情况下调用 LLM"，以及"我怎么在不掉进规范禁止的令牌透传陷阱的前提下拿到第三方凭证"。讲清一次，它们就不再另类。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>采样：服务器向客户端的模型提问。</h3>
+
+    <p>默认的 MCP 请求流是从客户端到服务器：客户端发问、服务器作答。采样把这个箭头反了过来。在一次工具调用中——或经客户端允许后，在调用之间自发地——服务器沿同一条会话反向发出 <code class="inline">sampling/createMessage</code> 请求，其中包含一组消息、模型偏好提示（比如"偏好一个快的模型"或"偏好一个大的模型"），以及一个可选的 system prompt。持有 API key 或本地模型运行时的一方是客户端的宿主；由它跑完补全并返回结果。服务器永远看不到模型提供方，客户端宿主也从不把凭证暴露出去。<a href="/zh/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP 参与者模型</a>让这个形状讲得通——采样就是服务器"往栈上打电话"，借用宿主已有的模型关系，而不是自己再去建一段。</p>
+
+    <p>使用场景就是那些"服务器作者一到需要 LLM 就想着去够、但又不想变成 LLM 运维方"的时刻。返回资源前先做摘要。从一条搜索结果里生成追问。把用户提供的一段 blob 按工具理解的分类法归类。把一份 diff 改写成一句 commit message，让调用它的 agent 再决定要不要采纳。这些问题都不难；但只要把它们放到服务器侧解决，服务器作者就得开个模型提供方账号、要一枚 API key、承一份账单，如果碰上合规还要多一场对话。采样把整套装置压缩成一次 JSON-RPC 往返，其中的凭证归"本来就有凭证"的宿主所有。代价是控制力：服务器不选模型、无法保证延迟，还要指望客户端诚实地尊重"模型偏好"提示。实践中提示通常会被尊重；实践中客户端也必须在真正跑这次采样调用之前向用户征询同意，所以服务器也不能把"采样可用"当既定条件来依赖。</p>
+
+<pre class="standalone">// server -> client (over the same session)
+{
+  "jsonrpc": "2.0",
+  "id": 42,
+  "method": "sampling/createMessage",
+  "params": {
+    "messages": [
+      { "role": "user", "content": { "type": "text", "text": "Summarize: <resource>" } }
+    ],
+    "modelPreferences": { "hints": [{ "name": "fast" }], "intelligencePriority": 0.3 },
+    "systemPrompt": "You are a concise summarizer. Answer in one sentence.",
+    "maxTokens": 200
+  }
+}
+// client -> server
+{ "jsonrpc": "2.0", "id": 42, "result": { "role": "assistant", "content": { "type": "text", "text": "..." }, "model": "claude-...-haiku", "stopReason": "endTurn" } }</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>带工具的采样：不占用服务器 API key 的嵌套循环。</h3>
+
+    <p>2025-11-25 规范在朴素采样之上加进来的这一项，正是让"借用模型"升级为"借用整个 agent 循环"的那一步。一次采样请求可以声明：在嵌套补全过程中，服务器自己的工具是可用的。客户端宿主跑模型、模型决定要调用其中某个工具、宿主把这次工具调用代理回同一台服务器、服务器执行工具、工具结果回流进嵌套对话、模型继续。服务器由此在跑一段完整的 agent 循环——计划、行动、观察、重复——却既不用握 API key、也不用起推理栈，因为每一次模型 turn 都是客户端宿主在自己账号上跑的一条消息。<a href="/zh/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">构建 MCP 服务器</a>那一篇把服务器当作被动应答者来讲；带工具的采样则是"当工作流需要时，让服务器成为一等 agent 编排者"的那个原语。</p>
+
+    <p>这种模式对"服务器有领域知识、有工具，却没有推理预算"的任务恰到好处。一个走遍代码仓库的重构服务器，调用自家的 <code class="inline">read_file</code> 与 <code class="inline">apply_patch</code>、再让宿主的模型决定下一步做什么，是最典型的例子。一个不停在 <code class="inline">search</code> 与 <code class="inline">fetch</code> 之间迭代直到得到某个结构化答案的研究服务器，是另一个。会崩的地方在哪：成本记账（服务器编排出去的 token 是宿主用户在付账，所以同意 UX 必须对此说明白）、终止保证（服务器决定何时停下；一段跑飞的嵌套循环会把宿主账单打穿）、可观测性（采样消息发生在客户端里、不在服务器进程里，服务器的追踪只看得到工具调用及其间的空档，看不到完整对话）。设计时要给一个硬的 token 预算、一个硬的步数预算，还要输出一个外层 agent 界面可以据以行动的 "stop reason: budget exhausted" 信号。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>征询表单模式：调用中途的结构化用户输入。</h3>
+
+    <p>征询是第二个"服务器主导"的原语，回答的是另一个问题：当服务器需要用户再给它一条信息、而且"通过模型转达"会让征询意图被有损压缩时，它该怎么办？工具调用正在进行；服务器发出 <code class="inline">elicitation/create</code>，带一份 JSON Schema 描述想要的字段、一句人类可读的信息解释为什么要问、以及一个 request id。客户端宿主渲染一份表单——小对话框、slash-command 形状的行内卡片、任何宿主 UX 词汇里的东西——用户填好，响应作为符合该 schema 的结构化 JSON 回来。然后工具调用才恢复。这个原语替换掉了长期存在的两种绕行方式：一是"返回一段错误信息、让模型去问用户"，答案在这一场传话游戏里丢掉；二是"在工具调用之前先问用户"，问出的信息有 60% 的时候后来根本用不上。</p>
+
+    <p>只要"缺的那条信息是结构化的"，表单模式就是正解：一个要打开的项目 id、一个破坏性动作前的确认、在三个含糊匹配中做一次挑选。schema 就是一份平实的 JSON Schema draft，列出服务器需要的字段；宿主可以自由地为布尔渲染 checkbox、为枚举渲染下拉、为字符串渲染文本框。message 字段是用户会看到的提问语（"你要搜索哪个 repo？"），不是系统指令。两条设计规则经受住了实战。第一：把 schema 保持得扁平且小——不要嵌套对象，字段不多于三四个——因为一个有十五个输入框的对话框比多做一次工具调用更能把工作流顶死。第二：给每一个可选字段在 schema 里定一个合理的默认值，好让用户直接接受、往下走，不必再敲键盘。</p>
+
+<pre class="standalone">// server -> client, mid tool call
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "elicitation/create",
+  "params": {
+    "message": "Which repository do you want to open?",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "repo": { "type": "string", "enum": ["web", "api", "infra"], "description": "Repository key" },
+        "branch": { "type": "string", "default": "main" }
+      },
+      "required": ["repo"]
+    }
+  }
+}
+// client -> server
+{ "jsonrpc": "2.0", "id": 7, "result": { "action": "accept", "content": { "repo": "api", "branch": "main" } } }</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>征询 URL 模式：无令牌透传的 OAuth。</h3>
+
+    <p>URL 模式征询是较新的一种变体，也是 <a href="/zh/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 配置</a>那一篇每次讲"该用什么替换令牌透传"时都会指向的答案。这次工具调用需要作用在第三方服务上——一处 GitHub 仓库、一个 Notion 工作区、一份 Stripe 面板——而服务器并不持有该服务的凭证。服务器发出一次征询请求，其中带的 payload 是一个 URL 而不是 schema；客户端宿主在用户浏览器里打开这个 URL；用户走完 URL 那头的流程（OAuth 授权码交换、设备流、应用安装页）；第三方服务把它的令牌直接返回给由<em>客户端</em>掌控的 callback；服务器收到"恢复"信号，但从来没看到过第三方令牌。规范逐字点名禁止的令牌透传之所以被禁止，正是因为按天真方式做——服务器手里握着调用者的令牌、把它转发给下游服务——会把 RFC 8707 的 audience 保证全部打穿，还逼下游服务去信任错误的 principal。URL 模式征询正是那种"每一份凭证都留在拥有该关系的一方手里"的形状。</p>
+
+    <p>值得留意的轨迹指纹很短。服务器打上一条"等待征询"状态；等待期间，服务器进程没有任何朝第三方服务的出站 HTTP 调用；客户端发回的恢复消息带着服务器识别"这次流程成功了"所需的把手（一枚绑定到服务器自身 audience 的窄化内部令牌、一条关于"哪一个下游账号现已链接"的 claim、或一枚服务器可用于恢复该工具调用的不透明游标）。这段窗口里但凡有一行日志显示：服务器带着"来自调用者"的 bearer 令牌去打第三方服务，那就是伪装成征询的透传，正确的动作是把那次出站调用去掉、把流程围绕客户端重建。规范不容商量的一条是：第三方令牌绝不能碰服务器；只要端到端把这条规则贯彻到底，工具会变得更安全、而不是更慢。</p>
+
+<pre class="trace">t=0.00  server  | tool_call=connect_github     | need external creds
+t=0.01  server  | elicitation/create           | mode=url  url=https://github.com/login/oauth/authorize?...&state=abc123
+t=0.02  client  | open in user's browser       | user completes OAuth
+t=8.31  client  | callback lands on client     | code -> exchange -> access_token STORED IN CLIENT
+t=8.33  client  | elicitation resume           | { action=accept, linked_account_id=gh_u_9x }
+t=8.34  server  | tool_call resumes            | operates via linked_account_id  | server never sees gh access_token</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>HITL 设计：两者的用户同意 UX。</h3>
+
+    <p>采样与征询共享一处设计属性，把它们当"干净利落的协议特性"来讲的教程往往一带而过：它们让服务器在"发生的当下"驱动一段用户没主动发起的体验，因此把同意从"每次连接问一次"推到了"每次交互都要问"的层面。<a href="/zh/operations/safety-and-security/human-in-the-loop" class="xref">HITL</a>运营那一篇把同意当作一门运维纪律来讲；采样与征询正是 MCP 宿主真正把这门纪律活出来的地方。对采样，每一次同意面都必须显示四件事：哪台服务器在发问、为什么（服务器提供的一句简短理由）、模型将看到什么（那份消息 payload，若过长则给出摘要）、以及服务器在嵌套循环中开放了哪些工具。对征询，同意面必须显示：哪台服务器在发问、哪些字段（表单模式）或哪个 URL（URL 模式）——对 URL 模式，还要显示该 URL 的来源、以及"在用户浏览器打开"的相关告警。</p>
+
+    <p>两条运维模式可以让同意 UX 保持诚实。第一，按会话对"服务器主导的调用"限流——一台服务器一分钟里发十次征询要么是坏了、要么是敌意，客户端应当以明确的错误拒绝更多请求，以便服务器把它记进自家 bug tracker。第二，把"这次调用授一次"、"本会话授一段"、"永久授给这台服务器"三档明确分开；用户对一次"帮我总结一份资源"的采样点了"是"，不代表他把本会话余下时间的"嵌套带工具采样循环"都点了"是"。让服务器得以借用宿主的模型与宿主的用户的那两个原语，也正是让同意 UX 成为客户端承重面的那两个原语。两者都跟"客户端把它渲染成什么样"完全同水平；两者也都会像任何被客户端敷衍渲染的浏览器权限对话框那样一样地崩掉。</p>
+  </div>
+</section>

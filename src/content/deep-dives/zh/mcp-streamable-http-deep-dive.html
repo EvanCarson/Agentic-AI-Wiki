@@ -1,0 +1,124 @@
+<section class="phase">
+  <div class="phase-num">C4</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>Streamable HTTP 在 2025-11-25 规范中取代了双端点的 HTTP+SSE 传输——JSON-RPC 负载相同，但运维形态换汤不换药地就是一个分布式系统问题。</h2>
+  <p class="goal">如果你的 MCP 教程提到两个端点、以及 POST-再-SSE 的接力舞步，那这份教程比当前规范旧——HTTP+SSE 传输在 2025-11-25 版本被弃用，取而代之的是单端点的 Streamable HTTP，配合 <code class="inline">Last-Event-ID</code> 的可恢复性和一个 header 传递会话。Bloomberry 的调查显示 93% 的生产服务器已经完成迁移。真正值得讨论的不是线上格式，而是当你的 MCP 服务器变成一个分布式系统之后有什么改变——粘性路由、会话存储、可恢复性语义，以及本地 HTTP 服务器的 DNS rebinding 陷阱。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>弃用时间线：HTTP+SSE 让位给 Streamable HTTP。</h3>
+
+    <p>MCP 的传输章节一年里被改写了两次，一份教程到底在讲哪一版所引起的困惑，占了到达官方 SDK 的"我的客户端为什么连不上我的服务器"工单的大头。2024-11-05 版本定义的 HTTP+SSE 传输带两个端点——客户端把 JSON-RPC 请求 POST 到 <code class="inline">/messages/</code>，并保持一条到 <code class="inline">/sse</code> 的 SSE 长连接以接收响应与服务器主动通知。2025-11-25 版本弃用了那种形状，把 <em>Streamable HTTP</em> 定义为当前传输：一个 MCP 端点同时接受 POST 与 GET，服务器可以返回普通 JSON 响应、也可以升级为 <code class="inline">text/event-stream</code>，会话与可恢复性由 header 承载而不再靠 URL 结构。<a href="/zh/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP 架构</a>那一篇勾勒了 JSON-RPC 层面的参与者模型；本文补的是——在 2025-11-25 形状下，这套传输在线上到底长什么样。</p>
+
+    <p>迁移速度很快。Bloomberry 2026 年对 1,412 台生产服务器的调查显示，规范发布六个月内已有 93% 迁到 Streamable HTTP，剩下的那一小片分成两拨：仍在用 stdio（本次变更不适用）的，与刻意保留一小段 HTTP+SSE 部署以兼容较早 Claude Desktop 配置的。官方 SDK（Python 的 <code class="inline">fastmcp</code>、TypeScript 的 <code class="inline">@modelcontextprotocol/sdk</code>）依然把老传输作为向后兼容 shim 保留，但都标了弃用，新起服务器默认走 Streamable HTTP。落到实处：如果你正在读的博客描述 POST-再-SSE 的双端点接力，那篇文章早于当前规范，里面的代码放到你新写的东西上跑不出结果。</p>
+
+    <p>线上格式并不是有趣的部分。真正值得展开的，是 Streamable HTTP 把传输从"HTTP 加服务器推送"这种可以在脑子里一次装下的东西，拽成了运维形态就是"带粘性路由、会话存储、回放契约的分布式系统"的东西。后面几节都在讲这套运维形态。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>单端点：POST 用于发送、GET 用于接收、可升级为 SSE。</h3>
+
+    <p>一台 Streamable HTTP MCP 服务器只暴露一个路径——规范里叫"MCP 端点"，具体 URL 由服务器决定，惯例上是 <code class="inline">/mcp</code>。客户端把 JSON-RPC 请求 POST 到这个端点，然后看响应的 <code class="inline">Content-Type</code>。若头是 <code class="inline">application/json</code>，body 就是 JSON-RPC 响应，交换到此结束。若头是 <code class="inline">text/event-stream</code>，服务器选择了流式——同一份响应作为一条或多条 SSE <code class="inline">data:</code> 帧递交，其间可能夹带进度或日志通知，服务器对这次请求无话可说时流就关闭。客户端事先无法预知服务器会走哪一路，规范明确说两路都合法；行为得体的客户端两路都会处理。</p>
+
+    <p>端点的 GET 那一半，是让服务器主动消息成为可能的关键。当客户端以 <code class="inline">Accept: text/event-stream</code> 打开一次 GET 到 MCP 端点时，服务器把连接作为 SSE 流保留下来，用它推送并非由某次特定 POST 触发的通知、征询与采样请求。这就是这套传输在不需要 WebSockets 的情况下承载协议所要求的双向 JSON-RPC 的方式：POST 通道处理客户端发起的请求，GET 通道处理服务器发起的请求，二者共享同一份会话上下文。按<a href="/zh/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">实操构建 MCP 服务器</a>那篇文章的意义把服务器写得地道，大多意味着让 SDK 替你路由这两半；手写路由很少必要，且很容易在细节上错。</p>
+
+<pre class="standalone">POST /mcp HTTP/1.1
+Host: mcp.example.com
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2025-11-25
+
+{"jsonrpc":"2.0","id":1,"method":"initialize",
+ "params":{"protocolVersion":"2025-11-25",
+           "capabilities":{},
+           "clientInfo":{"name":"acme-client","version":"1.4.0"}}}
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+MCP-Session-Id: 3f9a2c81-0b6d-4e2a-9b71-8d5e2c0a4f11
+
+{"jsonrpc":"2.0","id":1,"result":
+ {"protocolVersion":"2025-11-25",
+  "capabilities":{"tools":{"listChanged":true}},
+  "serverInfo":{"name":"acme-mcp","version":"0.6.2"}}}</pre>
+
+    <p>这段交换里两个 header 是承重件，且都容易在第一台服务器上被漏掉。<code class="inline">MCP-Protocol-Version</code> 必须在 initialize 握手之后的每一次请求里带上——服务器用它拒绝说不同版本的客户端，漏掉这个 header 的客户端会被当作老版本对待。<code class="inline">MCP-Session-Id</code> 由服务器在 initialize 响应里签发，此后客户端必须在每次请求里回带；它是访问服务器侧那份状态的地址——工具订阅、待回复的征询回调、可恢复性缓冲全都挂在它上面。少任何一个，服务器都有合法理由拒绝请求，或者更糟——发一份空空如也的新会话，把客户端原本以为还在的状态一并抹掉。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>会话：MCP-Session-Id 与粘性路由的账单。</h3>
+
+    <p>就是从 <code class="inline">MCP-Session-Id</code> 这个 header 开始，传输层的"分布式系统账单"才第一次被端上桌。服务器在第一次 <code class="inline">initialize</code> POST 时生成 id，作为响应 header 返回，并期待此后该客户端每次请求都带上它。id 到底寻址什么，取决于服务器：任何跨请求存在的协议级状态——<code class="inline">tools/listChanged</code> 的订阅表、等待用户回复的征询回调、每会话采样预算、为可恢复性保留的 SSE 事件缓冲——都以会话 id 查找。无状态服务器可以选择不签发；但一台放弃会话的服务器也就失去了把可恢复重连关联到之前事件的能力，也无法正确承载征询与采样流程，因为这些流程本质上跨请求。2025-11-25 规范明确要求：会话 id 必须密码学安全、对客户端不透明、不携带任何用户数据。</p>
+
+    <p>一旦服务器不止一份副本，会话 id 立刻变成路由问题。副本 A 签发的会话所指向的状态挂在 A 上，副本 B 就没法响应针对这份会话的请求——除非状态被共享——通常意味着要么在负载均衡上把会话固定到某个副本，要么在某个共享存储（Redis、DynamoDB 之类）里放会话状态、每个副本都从那儿读。两种模式在生产 Streamable HTTP 部署里都常见；这不是教条问题，是诚实的工程取舍：一边是每次请求都要打共享存储的尾延迟成本，另一边是把会话钉在副本上的失败模式——如果被钉的那份副本半路挂了，粘性路由的客户端就会看到自己的会话蒸发、必须重新 initialize，而共享状态的客户端可以被透明改路。</p>
+
+    <p>用客户端 IP 做哈希的负载均衡是很多团队的第一反应，也是最可预测地会失败的那个：移动客户端会换 IP、公司 NAT 把很多用户折叠到少数几个地址上、云端客户端会把出口在一批地址间轮换。直接用 <code class="inline">MCP-Session-Id</code> header 做哈希——只要是像样点的 ingress 控制器都支持——才是"想要钉住时"该用的原语。规范和 SDK 都不会替你做这个决定；生产团队通常是看着成本图与重连率反倒回去补的，而不是从传输规范里读来的——这也正是"MCP 服务器的运维那一面"值得单开一篇的原因。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>可恢复性：Last-Event-ID 与 SSE 回放契约。</h3>
+
+    <p>可恢复性是让 Streamable HTTP 与朴素的"HTTP 加事件"传输最明显拉开距离的特性。当服务器选择流式响应时，每条 SSE 帧都带一个 <code class="inline">id:</code> 字段——一个由服务器分配、对客户端不透明的标识，客户端应当记住它。若连接在流结束前断了，客户端的重连办法是：在 MCP 端点上打开一次新的 GET，把标准 SSE 的 <code class="inline">Last-Event-ID</code> header 设成最后一次成功收到的那条帧的 id；服务器就有义务把此后签发过的每一条事件按顺序重放一遍，再接着推新事件。客户端的体验，是即便碰到 TCP 重置、负载均衡超时、浏览器标签暂停/恢复，也是一条无缝的流。</p>
+
+<pre class="trace">GET /mcp HTTP/1.1
+Host: mcp.example.com
+Accept: text/event-stream
+MCP-Protocol-Version: 2025-11-25
+MCP-Session-Id: 3f9a2c81-0b6d-4e2a-9b71-8d5e2c0a4f11
+Last-Event-ID: evt-00047
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+
+id: evt-00048
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"pt-9","progress":0.7}}</pre>
+
+    <p>这个契约里只有一个数字——回放预算——而这个数字规范并不给你。服务器必须把 id 之后的事件保留到足够让重连成功的时长，但"足够"是一个策略选择：覆盖用户切几分钟标签，成本很低；覆盖一整夜挂机，可能要把流状态落到磁盘，或者干脆拒绝这次重连。多数 Streamable HTTP 服务器务实的设置，是每会话在内存里保留几分钟事件，事件超龄或者会话本身过期时把它们丢掉。更长的预算不违规，但会把存储成本从客户端（要记住它看过什么）挪到服务器（要记住它发过什么），而这两者之间的边界，正是那种服务器一有点像样流量就会变成 SRE 讨论的决定。</p>
+
+    <p>有两种失败模式值得点名。第一，事件 id 在重启后不稳定——比如从进程内计数器里取号，一次发版就归零——会让可恢复性悄悄失效：客户端拿一个新进程不认识的 id 重连，服务器没有依据回放，缺失的事件就这么丢了。请用能扛住重启的单调计数器，或者用"会话 id + 会话内序号"的方案。第二，无上限的事件保留：一个客户端几乎不读、却挂着一整天的会话会把每一帧都攒下来，不加节制的话会耗光内存。以分钟计的保留窗口加上对保留事件数的显式上限，都不贵，且都必要。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>横向扩容：会话有状态时会坏掉什么。</h3>
+
+    <p>可恢复性一旦真的做起来，横向扩容就不再是"加几份副本"的事，而变成一个设计问题。负载均衡必须把同一会话的流量路由到同一份副本（粘性路由），或者每份副本都要能响应任何会话（共享状态）；带 <code class="inline">Last-Event-ID</code> 的 SSE 重连必须落到那份要么手里就有对应事件、要么能从事件持久化的地方读出来的进程；会话 TTL 必须在副本间对齐，免得一份副本把另一份副本还在服务的会话回收了。这些里的每一件在朴素扩容模式下都会坏，而失败症状——重连拿到空流、征询回复永不结算、采样请求挂住——在客户端作者看来像协议 bug，实际是部署 bug。</p>
+
+    <p>现场里主要有两种形状。粘性路由形状把会话状态放在拥有该会话的那份副本的内存里，用 <code class="inline">MCP-Session-Id</code> 作为负载均衡的哈希键，并接受"一份副本挂了就意味着挂在它上面的每个会话都得重新 initialize"。它简单、尾延迟低、可以近乎线性地扩容——直到某个热门会话变成副本级热点。共享状态形状把会话数据放到 Redis 或等价的东西里，任何一份副本都能响应任意请求，每次请求付一个 round-trip，换来把流量自由挪动的能力；副本变得可互换，滚动发版不再丢会话。实际中，团队一般先用粘性形状，直到某次事故把他们推向共享形状——这个迁移是 Streamable HTTP 服务器生命周期里一个众所周知的里程碑。Streamable HTTP 的运维那一面——保留策略、哈希键的选择、会话 TTL、副本挂掉时的爆炸半径——值得独立成篇；这一节只把形状点出来，SRE 相关的细节留给后文。</p>
+
+    <p>这里值得钉住的是——"远程 MCP 服务器"这个词做的活比多数教程承认的要多。一台本地 stdio MCP 服务器是宿主拉起的一个子进程；一台远程 Streamable HTTP MCP 服务器是一个带会话、粘性路由、可恢复性缓冲以及运维长尾的分布式系统——任何跑过生产 HTTP 基础设施的团队一眼就认得出来。线上格式是 JSON-RPC；部署模型不是。把两者当同一件事看待——"我们本来就跑 REST，这不就同一个问题"——的团队，总是稳稳低估从"能跑的原型"到"稳得住的 Streamable HTTP 服务器"之间的活儿。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>本地 HTTP 服务器：Origin、DNS rebinding 与 localhost 陷阱。</h3>
+
+    <p>Streamable HTTP 不只是远程服务器的事。本地 MCP 服务器常见的一种模式是给 HTTP listener 绑到 <code class="inline">127.0.0.1</code> 而不是走 stdio，因为这样在浏览器客户端里更容易复用、或者用 <code class="inline">curl</code> 调试更方便。这个模式有一个具体攻击——DNS rebinding——2025-11-25 版本的安全最佳实践附录点名了它，因为它已经在真实世界里被拿来打过本地跑着的开发工具。机制很简单：攻击者让用户浏览器加载一个自己控制域名的页面，那个域名的 DNS 先解析到公网 IP 只为把页面发下去，然后改绑到 <code class="inline">127.0.0.1</code>。在浏览器看来源没变，同源检查通过，攻击者页面里的 JavaScript 就可以对着用户的本地 MCP 服务器发同源请求，触发它暴露的任意工具。</p>
+
+    <p>两道防线要叠加使用，规范也期待两个都做。第一道，是对每一个请求都检查 <code class="inline">Origin</code> header，把不在显式白名单上的（一般就是本地跑 UI 的那台 host）通通拒掉。第二道，是把 listener 显式绑到 <code class="inline">127.0.0.1</code> 或 <code class="inline">::1</code>，而不是绑 <code class="inline">0.0.0.0</code> 或者空字符串，这样即便 Origin 检查配错了，socket 从环回以外的任何接口都碰不到。历史上任何一道都省掉的服务器，往往在上线一周之内被利用；这不是纸上谈兵的模式。</p>
+
+<pre class="standalone">// Express-shaped Origin allowlist middleware for a local Streamable HTTP server.
+const ALLOWED_ORIGINS = new Set([
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://claude.ai',
+]);
+
+app.use('/mcp', (req, res, next) =&gt; {
+  const origin = req.headers.origin;
+  if (!origin || !ALLOWED_ORIGINS.has(origin)) {
+    return res.status(403).json({ error: 'origin_not_allowed' });
+  }
+  next();
+});
+
+app.listen(3945, '127.0.0.1'); // bind loopback explicitly, never 0.0.0.0</pre>
+
+    <p>这段片段有两条脚注。第一，把空的或者缺失的 <code class="inline">Origin</code> header 当作安全默认放过去不对；浏览器在跨源请求上会带这个 header，缺席要么是非浏览器客户端（那应当靠鉴权而不是靠 Origin 处理），要么是一个服务器本就不该服务的浏览器请求。第二，白名单不是鉴权的替代——一台绑环回并做了 Origin 检查的本地服务器，只要它暴露的工具有任何后果，就依然需要跟远程服务器一样的 OAuth 2.1 故事。Origin 检查能挡住 DNS rebinding；它挡不住被入侵的本地进程、恶意的宿主配置、或者安全最佳实践附录另外点名的令牌透传反模式。传输层的防线是一层；鉴权层的防线是另一层；一台上线的本地服务器两层都要有。</p>
+
+    <p>把六节合起来看，Streamable HTTP 传输最好被理解成两份文档合一。在线上，它是一份紧凑的 HTTP 配置——一个端点、两种动词、三个 header，以及一次 SSE 升级——任何 HTTP 服务器都能在一下午写出来。在部署上，它是一台 MCP 服务器变成分布式系统的那一刻，过去十年里 HTTP 基础设施积攒下来的每一个设计决定（路由、会话存储、回放、保留、Origin、绑定、TLS）都要在 JSON-RPC 契约的语境下重新做一遍。早早把第二半也读进去的团队，做出来的 MCP 服务器无聊地稳；只把线上格式读完就收工的团队，第二半通常是从一次事故里补回来的。</p>
+  </div>
+</section>

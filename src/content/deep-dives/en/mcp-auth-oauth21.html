@@ -1,0 +1,133 @@
+<section class="phase">
+  <div class="phase-num">C5</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>MCP's OAuth 2.1 profile is not "OAuth with extra headers" — the resource indicator, Protected Resource Metadata, and Client ID Metadata Documents are the load-bearing pieces, and getting them wrong is why 39% of production servers shipped with no auth at all.</h2>
+  <p class="goal">MCP made OAuth 2.1 the auth story in the 2025-11-25 spec, but "OAuth 2.1" here is a specific profile: PKCE is mandatory, tokens must carry an RFC 8707 resource indicator so an intercepted token can't be replayed against a different service, and the server publishes its authorization server via RFC 9728 Protected Resource Metadata. Client ID Metadata Documents let dynamic clients skip Dynamic Client Registration entirely. This is a real amount of ceremony, and the 39% of production servers with no auth at all (Bloomberry survey) is the honest measure of how much of it teams skipped. Cover the four pieces once and you never guess again.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The threat model: what MCP auth actually protects against.</h3>
+
+    <p>Before any of the four pieces of the profile make sense, it helps to fix what a token on an MCP request is buying. The concrete assets an MCP server exposes are three: personal or business data reachable through its resources, the side effects triggerable through its tools (a write, a purchase, a message sent), and the tenant boundary that keeps one customer's data out of another customer's context. Auth on MCP protects those three and only those three. It does not — and no OAuth profile can — protect against a prompt-injected tool description that convinces the model to hand a legitimate token to a hostile server, and it does not protect against a compromised client that already holds a valid token; those are separate threat classes with separate mitigations. The <a href="/operations/safety-and-security/agentic-threat-model" class="xref">agentic threat model</a> essay sorts these classes for the operator; what this essay covers is the profile that closes the auth-shaped part of the gap.</p>
+
+    <p>The load-bearing assumption behind the profile is that an MCP server MUST treat every incoming request as trustworthy only up to whatever principal the presented token identifies. The failure modes look like: accepting a token issued for a different resource because the JWT signature verifies and the issuer is on the allowlist; letting one tool call reuse the caller's token to reach a downstream service on the caller's behalf; conflating "the client that made this HTTP request" with "the user whose data the client is asking about". Each of those is a specific anti-pattern the 2025-11-25 security appendix names, and each is closed by getting one of the four load-bearing pieces of the profile right.</p>
+
+    <p>The <a href="/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP architecture</a> essay describes the host/client/server participant triangle at the JSON-RPC layer; the auth profile sits one layer down, describing how the client obtains a bearer token and how the server verifies it. What follows walks the four pieces in the order teams meet them: PKCE for the redirect, resource indicators for the token, Protected Resource Metadata for discovery, and CIMD for client identity. Scope minimization and the token-passthrough anti-pattern close the essay because both are the places production teams under-invest even after the profile is in place.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>PKCE mandatory, no client secret.</h3>
+
+    <p>The redirect half of the flow uses the OAuth 2.0 Authorization Code grant with PKCE, and the "with PKCE" clause is not optional in the MCP profile — it is required for every client, including the ones that could in principle hold a shared secret. PKCE closes an old attack in which an authorization code intercepted on the redirect leg can be exchanged for a token by anyone who catches it in transit or in a browser log; with PKCE, the token endpoint refuses to complete the exchange unless the caller can present the pre-image of a hash it saw before. The mechanic is short: the client generates a random verifier, hashes it with SHA-256, sends the hash (the "code challenge") on the authorize request, and later presents the verifier itself on the token request, where the AS checks that its hash matches the challenge it stored.</p>
+
+<pre class="standalone">import base64, hashlib, secrets
+
+# 1. Client generates a random verifier (43-128 chars, URL-safe).
+verifier = secrets.token_urlsafe(64)
+
+# 2. SHA-256 hash of the verifier, base64url without padding.
+digest = hashlib.sha256(verifier.encode("ascii")).digest()
+challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+# 3. Send challenge on /authorize (method=S256), keep verifier locally.
+authorize_params = {"code_challenge": challenge, "code_challenge_method": "S256"}
+
+# 4. On /token, present verifier; AS re-hashes and checks match.
+token_params = {"code_verifier": verifier}</pre>
+
+    <p>Two implementation notes carry more weight than the code itself. First, the verifier is a secret in scope until the token comes back; storing it in a place a page-scoped script can read (URL fragment, localStorage) is a defeat of the whole mechanism, and in-memory-only storage on the client is the only correct target. Second, the AS MUST reject <code class="inline">code_challenge_method=plain</code> in the MCP profile — only <code class="inline">S256</code> is compliant — and a client that offers <code class="inline">plain</code> is either running against an old AS that predates the profile or is one of the servers Bloomberry's survey flagged as shipping "OAuth-ish" auth that isn't actually the mandated profile. The rest of the flow is standard authorization code: the AS redirects back with a code, the client POSTs that code plus its verifier to <code class="inline">/token</code>, the AS verifies the hash and returns an access token.</p>
+
+    <p>There is no client secret for public MCP clients. The profile designs around the fact that MCP clients are frequently browser extensions, native apps, or CLI tools, none of which can hold a secret meaningfully; the code exchange is authenticated by the PKCE verifier and by nothing else. Servers that require <code class="inline">client_secret</code> from public clients are misconfigured for the profile, and clients carrying a secret they think authenticates them are typically shipping one that leaked into a public binary long before the token endpoint checked it. The place server implementations most often get this wrong is by porting an existing enterprise OAuth flow with confidential clients everywhere and adding PKCE on top without rechecking whether the secret is still required.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>RFC 8707 resource indicators: tokens tied to your server.</h3>
+
+    <p>RFC 8707 solves an attack that OAuth 2.0 had for a decade and mostly did not name: a token issued for service A, presented to service B, being accepted by B because B trusts the same authorization server and the JWT signature checks. The resource indicator is a request parameter on both the authorize and token requests naming the specific resource the token is being minted for, and it lands as either an <code class="inline">aud</code> claim on the resulting JWT or an equivalent binding on the introspection response. The rule the MCP profile applies is that the server MUST verify the <code class="inline">aud</code> claim on every incoming token against its own canonical URL, and any token whose audience does not match is rejected as if it had a bad signature.</p>
+
+<pre class="standalone">POST /oauth/token HTTP/1.1
+Host: as.example.com
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&code=SplxlOBeZQQYbYS6WxSbIA
+&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+&client_id=s6BhdRkqt3
+&resource=https%3A%2F%2Fmcp.example.com%2Fmcp</pre>
+
+    <p>Two subtleties matter in the wire shape. The <code class="inline">resource</code> parameter is a URI, not an identifier from a shared registry; the value is the MCP server's canonical URL and the server enforces the match by comparing exactly that string. Mismatches from trailing slashes, differing hostnames for the same server (a CNAME vs the underlying host), or a token minted for the public URL being presented at an internal URL are all common ways teams lose an hour to a "the signature is valid why is it 403" ticket. The MCP profile picks a single canonical URL per server and requires that clients name that one URL in the <code class="inline">resource</code> parameter, no aliases; the server rejects everything else at token verification time and refuses to synthesize a match from prefix rules.</p>
+
+    <p>The benefit is concrete and measured in blast radius. Without <code class="inline">resource</code>, a token minted for a low-value MCP server on the same AS — say, a read-only status server — can be replayed against a high-value MCP server that trusts the same AS. With <code class="inline">resource</code>, the first token's audience is the low-value server and the second server rejects it. The 2025-11-25 profile treats this as non-negotiable and instructs servers to log audience mismatches as security events rather than normal 401s, because the mismatch is a signal that either a client is misconfigured or a token is being replayed. Add the check on every request; do not skip it on <code class="inline">tools/list</code> because "listing is harmless" — the moment an attacker learns you skip it on any endpoint, the concession is the whole point.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Protected Resource Metadata: AS discovery via /.well-known.</h3>
+
+    <p>A client that reaches an MCP server for the first time needs to know which authorization server to redirect the user to. Hardcoding the AS URL in every client is what most implementations did before RFC 9728; it turns every MCP server change into a client-side release. Protected Resource Metadata (PRM) lifts the AS URL onto the server itself: the MCP server publishes a JSON document at <code class="inline">/.well-known/oauth-protected-resource</code> that names the authorization servers it accepts, the scopes it supports, and the token endpoint auth methods clients should use. A client fetches that document once, learns where to send the user for the redirect, and drops the hardcoded AS URL from its code entirely.</p>
+
+<pre class="trace">GET /.well-known/oauth-protected-resource HTTP/1.1
+Host: mcp.example.com
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "resource": "https://mcp.example.com/mcp",
+  "authorization_servers": ["https://as.example.com"],
+  "scopes_supported": ["mcp:tools:search", "mcp:tools:fetch"],
+  "bearer_methods_supported": ["header"],
+  "resource_documentation": "https://mcp.example.com/docs"
+}</pre>
+
+    <p>The <code class="inline">resource</code> field is the same canonical URL that clients will later put into the <code class="inline">resource</code> parameter on token requests, which closes the loop between discovery and the RFC 8707 check. The <code class="inline">authorization_servers</code> array can name more than one AS — an enterprise deployment that accepts tokens from either a corporate IdP or a partner IdP is legal — and clients pick whichever one they can authenticate against. Because clients dereference the URL as part of the flow, PRM is also a small SSRF surface: an MCP server that fetches a client-supplied URL as part of dereferencing PRM instead of serving it from a fixed path is a common enough anti-pattern that the security appendix names it separately. The straightforward implementation serves the document from a static file or a constant handler and never derefences a URL from the request.</p>
+
+    <p>The 401 response from a Protected Resource is also load-bearing in the same discovery story. When an MCP server rejects an unauthenticated request, the 2025-11-25 profile requires the <code class="inline">WWW-Authenticate</code> header on the response to include a <code class="inline">resource_metadata</code> parameter pointing at the same <code class="inline">/.well-known/oauth-protected-resource</code> URL, giving a client that stumbles into the endpoint without a token an immediate breadcrumb to the discovery document. In practice the client fetches PRM, sees the AS, does the PKCE dance against that AS, gets a token with the correct <code class="inline">resource</code> parameter, and retries the original request; the whole loop happens without a human touching a config file. Teams that publish PRM but forget the <code class="inline">WWW-Authenticate</code> hint see a support-ticket pattern of "the first request always fails" that dissolves the moment the header is added.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Client ID Metadata Documents vs Dynamic Client Registration.</h3>
+
+    <p>The client identity problem is the last of the four load-bearing pieces. Historically OAuth handled it by pre-registering every client out-of-band — a human filled out a form, the AS stored the client's redirect URI and public keys, and the client got an ID it used forever after. Dynamic Client Registration (RFC 7591, "DCR") automated the human step: an unknown client POSTs a registration document to the AS, the AS synthesizes an ID and stores the metadata, and the client uses that ID on subsequent flows. DCR works, and MCP clients that need it can still use it. The problem is scale: an AS supporting DCR must persist per-client state for every client that ever registered, must revoke that state on schedule, and must decide which clients to allow to register — every step a place enterprise ASes push back on the pattern.</p>
+
+    <p>Client ID Metadata Documents (CIMD) invert the persistence direction. Instead of the AS storing metadata for every client, the client publishes a JSON document at a URL under its own control — <code class="inline">https://client.example/.well-known/oauth-client</code> is a common shape — and uses that URL as its client ID. When the AS sees an authorize request with a URL-shaped client ID, it dereferences the URL, verifies the returned metadata, and treats the document as authoritative for that request. Nothing persists on the AS between requests; the client is identified by whoever controls the URL. Revocation collapses to "delete the document"; rotation to "update it in place"; and the enterprise pain of "our AS has 40,000 rows of dead client registrations" evaporates.</p>
+
+<pre class="standalone">{
+  "client_id": "https://client.example/.well-known/oauth-client",
+  "client_name": "Acme MCP Client",
+  "redirect_uris": ["https://client.example/oauth/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none",
+  "code_challenge_methods_supported": ["S256"],
+  "jwks_uri": "https://client.example/.well-known/jwks.json"
+}</pre>
+
+    <p>Support for CIMD is newer than DCR and AS coverage is uneven; a portable client ships fallback logic that tries CIMD first, catches the "unrecognized client_id" response, and falls back to DCR against ASes that require it. Because the client-id URL is dereferenced by the AS, the same SSRF caveat applies as with PRM: the AS should refuse to dereference internal or loopback URLs, cache the document with a reasonable TTL, and verify that the returned document names the same URL as its own <code class="inline">client_id</code> field. When those checks are in place the pattern's operational cost is close to zero, which is why the profile documents it as the preferred shape and treats DCR as the legacy path an AS may still choose to serve.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Scope minimization: the field where teams still under-invest.</h3>
+
+    <p>The four load-bearing pieces close the token's provenance story: PKCE binds the code to the client that requested it, resource indicators bind the token to the server that will consume it, PRM tells the client which AS to talk to, and CIMD identifies the client without long-lived AS state. What remains is what the token authorizes once it arrives, and that is a scope question. The default MCP profile does not ship a canonical scope taxonomy; each server picks its own scope names, and the interesting decision is granularity. Servers that ship one scope — call it <code class="inline">mcp:full</code> or, worse, no scope at all — hand every client the same key to every tool, and every consent screen collapses to a single "grant access" that a user cannot meaningfully reason about.</p>
+
+    <p>The idiom the <a href="/operations/safety-and-security/scoped-credentials-for-agents" class="xref">scoped credentials for agents</a> operations essay describes lands here directly. Scope names should follow a per-tool or per-capability shape: <code class="inline">acme-mcp:tools:search</code>, <code class="inline">acme-mcp:tools:send_email</code>, <code class="inline">acme-mcp:resources:read</code> — one concrete action per scope, so that consent surfaces the actual permission and so that a compromised token cannot exceed the tools its holder was authorized for. The refactor cost from "one scope, everything" to "one scope per tool" is mostly annotation on the server side; MCP tools already carry names, and the tools/list response can advertise the required scope for each tool so that clients build the consent screen from the same data the server enforces against.</p>
+
+    <p>Two secondary controls make the taxonomy useful in practice. Refresh tokens should be short-lived and rotated; a refresh token that lives for a year is a token that leaks with every scope it was minted for. Consent should be re-prompted on scope expansion — a client that today has <code class="inline">acme-mcp:tools:search</code> and tomorrow wants <code class="inline">acme-mcp:tools:send_email</code> should not bootstrap that expansion from the existing refresh token; it should trigger a new authorize hop with the new scope, and the user should see it. Both patterns are legal in the profile and both are where Bloomberry's survey found production servers under-invested most, six months after the profile was current. The tools half of the profile is easier to ship; the discipline half — scopes narrow, refresh short, re-consent on expansion — is where the compliance gap widens between servers that pass a security review and servers that do not.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>Anti-pattern: token passthrough (explicitly forbidden).</h3>
+
+    <p>The last piece is the anti-pattern the 2025-11-25 security appendix forbids by name, because production servers keep discovering it independently. The pattern: an MCP server accepts a bearer token, decides the tool being called needs to reach a downstream service on the user's behalf, and forwards that same bearer token to the downstream service. It is convenient — the user has already authenticated, why authenticate again — and it is catastrophic. The downstream service now holds a token minted for the MCP server, whose <code class="inline">resource</code> claim names the MCP server, and whose scope was granted for MCP tools; nothing about the downstream service is in the token's audience, and the whole RFC 8707 story is defeated by the intermediary that passed the token along.</p>
+
+    <p>The spec's rule is short: an MCP server MUST NOT pass a received token to a downstream service. Two correct patterns replace it. The first is elicitation in URL mode, where the MCP server, needing the user to authorize the downstream service directly, returns a URL to the client and the client takes the user through the downstream service's own OAuth flow; the MCP server never sees the downstream token, which is the whole point. The second is RFC 8693 token exchange, where the MCP server presents its incoming token to the AS, requests a new token narrowed to the downstream service and scoped to just what the tool needs, and forwards that new token instead. Token exchange keeps the operational simplicity of a single flow while making the audience change explicit; the AS enforces which exchanges are legal and the downstream service sees a token minted for it, not for a stranger.</p>
+
+    <p>The URL-mode elicitation shape gets its own treatment in the next essay in this group — it is one of the under-covered features of the 2025-11-25 spec — and token exchange mostly lives in the OAuth spec rather than in the MCP profile. The load-bearing observation for this essay is that the passthrough anti-pattern is not a subtle failure; it is one of the ways an MCP server ends up with an audit trail in which a user's downstream credential appears to have been used to send email at 3 a.m. by a service that had no business holding it. Read the four load-bearing pieces of the profile together — PKCE for the redirect, RFC 8707 for the audience, PRM for discovery, CIMD for identity — plus scope minimization and passthrough avoidance, and the 39% number that opened this essay stops being surprising: teams skip the ceremony when it feels optional, and every one of the six controls is a place where the profile is doing work no shortcut can do for them.</p>
+  </div>
+</section>

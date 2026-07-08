@@ -1,0 +1,57 @@
+<section class="phase">
+  <div class="phase-num">C10</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>交付一台 MCP 服务器本质是分发问题——Registry 给你一个发现入口，而包类型选择（npm、PyPI 还是 OCI）决定了谁真的能装上它。</h2>
+  <p class="goal">造好服务器是一件事，让用户看到它是另一件事。MCP Registry——目前最接近 MCP 包索引的东西——让你把服务器登记进去；包类型（npm、PyPI 或者 OCI 镜像）决定了谁能装以及怎么装；2026 路线图加入 <code class="inline">.well-known</code> 能力发现，让宿主在运行时无需查询 Registry 也能找到兼容的服务器。这篇文章短，因为话题本身就小；跳过它，用户就找不到你的服务器。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>MCP Registry：它现在是什么。</h3>
+
+    <p>MCP Registry 是已发布服务器的中心索引——名称、描述、支持的传输、包类型、许可证、能力标签，以及一个指向底层包的指针。宿主想让用户"添加一个 MCP 服务器"时，就查询 Registry、按能力过滤、把得到的 <code class="inline">command + args</code> 或 HTTP 端点交给自己的传输层。发布是一份 JSON manifest，通过 Registry 的 CLI 提交；目前的审核门槛更接近 npm，而不是 App Store。失败模式也和 npm 一样——没登记的服务器对"只翻 Registry"的宿主完全隐身，而登记了但元数据陈旧的服务器则会因为错误的原因被挑上。</p>
+
+    <p>Registry 不是运行时——它不代理工具调用、不承担传输、不签名响应。它只做两件事：发现和元数据。<a href="/zh/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">实操构建 MCP 服务器</a>教的一切——工具粒度、resource 与 prompt 之分、annotations——对 Registry 都是不可见的，只留下你写进描述字段里的那些字。所以描述字段才是"选择"真正发生的地方，把它当作营销 slogan 而不是能力句子，是"发布一台没人装的服务器"最快的方法。</p>
+
+<pre class="standalone">{
+  "name": "acme-search",
+  "description": "Search Acme's docs, then fetch full articles by id.",
+  "version": "1.4.2",
+  "protocolVersions": [">=2025-11-25"],
+  "transports": ["stdio", "streamable-http"],
+  "package": { "type": "npm", "name": "@acme/mcp-search" },
+  "capabilities": ["tools", "resources"],
+  "license": "MIT",
+  "homepage": "https://acme.dev/mcp"
+}</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>包类型：npm、PyPI、OCI。</h3>
+
+    <p>三种包类型覆盖了三种现实的交付路径。npm 包（JS/TS 服务器）用 <code class="inline">npx</code> 一次性运行，或者 <code class="inline">npm i -g</code> 常驻；宿主把它作为子进程拉起来，这条路径默认走 stdio。PyPI 包（Python 服务器）用 <code class="inline">pip</code>、<code class="inline">pipx</code> 或者 <code class="inline">uv</code> 安装；<code class="inline">uvx</code> 已经成为 FastMCP 惯用的一次性启动器，扮演的角色相当于 Node 世界里的 <code class="inline">npx</code>。OCI 镜像更重，但对运行时无依赖——宿主把它拉下来、跑起来，然后走 <a href="/zh/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a>（而不是 stdio）与之对话，因为把一个容器的 stdio 绑进宿主的工具循环，摩擦比一个网络端点要大得多。取舍并不隐晦：npm 与 PyPI 依赖宿主已经装好可用的 Node 或 Python 运行时；OCI 交付的是一个到处跑法都一致的自包含物件。按受众选——爱好者与小团队吃 npm/PyPI 的亏，企业部署吃 OCI 的亏。</p>
+
+<pre class="trace"># npm — one-shot, Node runtime
+npx -y @acme/mcp-search --stdio
+
+# PyPI — one-shot, Python runtime
+uvx acme-mcp-search --stdio
+
+# OCI — self-contained image, Streamable HTTP
+docker run -p 3333:3333 ghcr.io/acme/mcp-search:1.4.2</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>版本：SemVer 加规范版本钉住。</h3>
+
+    <p>两个版本号一起走动，把它们混起来正是兼容性 bug 的来源。服务器自身的版本走 SemVer——<code class="inline">1.4.2</code>——遵循常规契约：patch 修 bug、minor 加新工具、major 做破坏性 schema 变更。另一个版本号是 MCP 的 <code class="inline">protocolVersion</code>，在 <code class="inline">initialize</code> 握手时交换，用来标识规范的版本（当前是 <code class="inline">2025-11-25</code>）。服务器把自己支持的规范版本作为一个范围登记出去；宿主挑其中自己也支持的最高一个；两边都必须能处理"宿主比服务器新"和"服务器比宿主新"这两种情况而不至于崩溃。一台把自己钉死在某一个规范版本上的服务器，会让每一次规范升级都变成对客户端的强制升级——从 HTTP+SSE 迁到 Streamable HTTP 拖了几个月，就是因为服务器钉得太窄。Registry manifest 把两个版本号都列出来，宿主装之前可以按规范兼容性先过滤一遍。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>2026 路线图：.well-known 能力发现。</h3>
+
+    <p>2026 MCP 路线图新增了一条运行时发现路径，与 Registry 并存而非替代。已经知道服务器 URL 的宿主——因为是企业自托、本地、或是被收藏过的——去请求 <code class="inline">/.well-known/mcp</code>，就能拿到一份能力描述，全程不必与中心索引对话。这与授权流程里已经用上的 OAuth Protected Resource Metadata 文档同形，也解决同一类问题：为公共 Registry 不能也不该收录的服务器提供发现——VPN 背后的企业服务器、开发者笔记本上的本地服务器、一次性的内部工具。这个通用模式在 <a href="/zh/deep-dives/protocols-and-interop/capability-discovery" class="xref">能力发现</a>一文里已有交代；MCP 相关的加持是：这份描述文档的字段——能力、传输、规范版本——与 Registry 的 manifest 对齐，让宿主用一条代码路径就能同时消费两种来源。路线图把它安排在 2026 稳定窗口；它还未进入当前规范，因此对待方式是"值得把你的服务器元数据设计得可复用，等它落地就能直接用"，而不是"今天就照它落地"。</p>
+  </div>
+</section>

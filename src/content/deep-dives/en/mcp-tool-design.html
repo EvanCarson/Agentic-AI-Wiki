@@ -1,0 +1,91 @@
+<section class="phase">
+  <div class="phase-num">C2</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>Designing MCP tools for the agent workflow (not for a REST client) is the biggest lever between a five-tool server that works and a fifteen-tool server the agent ignores.</h2>
+  <p class="goal">The tool description is the entire prompt the agent sees; if it reads like an OpenAPI note, the agent will pick a different tool. Tool-selection accuracy is not a model problem — a documented 24-percentage-point drop with tool explosion — but a design problem, and description phrasing changes which tool an agent picks more than model choice does. Get this right on the first five tools and the server disappears from your debugging queue.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Descriptions are prompts, not docstrings.</h3>
+
+    <p>The single most common misread of MCP is treating the tool description as documentation. It is not. The description is text the model reads during selection, alongside every other tool's description, competing for the model's attention. Structurally it is indistinguishable from an instruction in a system prompt: same tokens, same attention budget, same influence on what the model does next. A "Retrieves user information from the database" line is a docstring aimed at a future maintainer; it tells the model almost nothing about when to reach for the tool and, worse, tells it nothing about when <em>not</em> to. If a sibling tool has a description that reads like an instruction, the sibling wins the selection every time.</p>
+
+    <p>The shape that works is short, verbal, and instructional. Start with a verb. Name the use case in the reader's terms, not the API's. State a when-and-when-not so the model has an explicit rule to apply. End with one usage example the model can pattern-match against. The <a href="/deep-dives/tool-capability-design/tool-design-principles" class="xref">general tool-design principles</a> deep-dive covers the underlying rationale for treating tool metadata as prompt surface; the MCP specifics come down to writing for the agent that will read the text, and being explicit about the negative cases most authors leave implicit — a discipline the <a href="/deep-dives/tool-capability-design/tool-discovery-and-docs" class="xref">agent-facing tool docs</a> deep-dive develops in general and MCP's <code class="inline">tools/list</code> surface makes load-bearing.</p>
+
+    <p>The rewrite is easier to feel than argue about. "Retrieves user information from the database" becomes "Get a user by id when you need their email, role, or account status. Do NOT use for listing users (use <code class="inline">list_users</code>). Example: <code class="inline">get_user(id='u_123')</code>." The second version wins in production because it gives the model both a positive trigger and a negative one. Any place two descriptions could be confused with each other, disambiguate in place: cross-references inside descriptions are the cheapest prompt engineering the protocol supports, and they turn near-neighbour tools from competing candidates into a coordinated workflow.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Granularity: the fine-tool tax and the coarse-tool blast radius.</h3>
+
+    <p>Every server converges on a granularity question, and both extremes fail in opposite ways. Fine tools multiply round-trips and inflate the tool list every host has to render into the model's context on every turn. Coarse tools bundle decisions inside the server, hiding behaviours the model can no longer choose between, and a single failed call has a larger blast radius because the server was going to do several things atomically.</p>
+
+    <p>The signal against very fine granularity is the tool-selection accuracy curve. Anthropic's Tool Search Tool motivation documented a roughly 24-percentage-point drop in selection accuracy as tool counts grew into the hundreds — the model's ability to pick the right tool degrades as the list length grows, and it degrades faster than the list. The <a href="/deep-dives/tool-capability-design/tool-granularity" class="xref">tool granularity</a> deep-dive works the trade-offs in general; the MCP-specific rule of thumb, drawn from the same Bloomberry survey the previous essay cites, is to prefer five to eight tools per server. If you have fifteen, you probably have two servers pretending to be one.</p>
+
+    <p>The against-coarse signal is subtler and shows up in traces. When one tool packs several conceptual operations together — an <code class="inline">execute</code> tool that takes an action name plus a payload — you lose the ability to read the trace and know which operation ran. You also lose the annotation system: <code class="inline">destructiveHint</code> is a per-tool flag, so a tool that sometimes writes and sometimes reads has to be marked destructive always, which means every call gets a consent prompt, which means the host UX degrades for the read cases. Split along the destructive-vs-idempotent boundary first, then along the domain-object boundary — one tool per (object, action) pair, where the action is coarse enough to feel like a task the user would name aloud.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Search-then-fetch, and other patterns that survived first contact.</h3>
+
+    <p>The single most consequential MCP tool pattern is search-then-fetch, and its rationale is worth stating cleanly because most tutorials get the trade-off backwards. A naive content tool takes a query and returns matching documents in full. In one call the model has the material it needs; this looks efficient. The failure mode is that the model has no way to decline the material it did not need. A single call can push tens or hundreds of thousands of tokens into the loop, and no primitive inside the turn lets the model give any of it back. The context is spent, and every subsequent tool call is more expensive because the input length has grown.</p>
+
+    <p>Split the same operation into two tools — <code class="inline">search(query) → [{id, summary}]</code> and <code class="inline">fetch(id) → full_content</code> — and the model chooses which documents actually deserve the full read. The extra round-trip is cheap; the context savings are enormous; and the trace becomes readable because the two-step decomposition matches how a human would explain what happened. The pattern was named in Microsoft's Learn MCP post-mortem and is now near-universal for content servers, but the underlying principle generalises: any tool that <em>might</em> return a large payload should have a summary-and-id form and a full-payload form as two separate tools, not one polymorphic tool with a <code class="inline">verbose</code> flag.</p>
+
+    <p>Two adjacent patterns follow. Paginated reads: a tool that could return an unknown number of results should take a cursor and return a page plus a next-cursor, so the model controls how much of the result set enters context one page at a time. Structured filter tools kept separate from fetch tools: a <code class="inline">list_incidents(status, since)</code> that returns id + one-line summary belongs distinct from a <code class="inline">get_incident(id)</code> that returns everything. Merging them into a <code class="inline">query_incidents</code> with a "detail level" argument reintroduces the polymorphism the split was meant to remove.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Breadcrumbs: designing tools that let the agent converge.</h3>
+
+    <p>Tools that only report facts leave the agent to figure out what to do next; tools that report facts <em>and</em> suggest the next move let the agent converge in fewer turns. A <code class="inline">search</code> tool that returns <code class="inline">[]</code> forces the model to invent a next step — try a different query, give up, ask the user. A <code class="inline">search</code> tool that returns <code class="inline">{ "results": [], "hint": "No matches. Try broadening the query, or add a category filter with list_categories()." }</code> tells the model what to try next, and the trace collapses from three-or-four exploratory turns into one.</p>
+
+    <p>Every tool response should end with a next-action hint or an explicit "you're done" signal. Ambiguity between the two is where agent loops go long: the model keeps calling, hoping for a stopping signal the tools were never designed to emit. Explicit terminators — a field like <code class="inline">done: true</code>, or a hint that begins "This is the final result" — dramatically shorten conversations that would otherwise loop. The other side of the same rule is that tool <em>descriptions</em> should reference each other: <code class="inline">search</code>'s description mentions <code class="inline">fetch</code> as the natural follow-up; <code class="inline">list_incidents</code>'s mentions <code class="inline">get_incident</code>. This turns a flat manifest into a directed graph the model can traverse. The practitioner phrase — leave breadcrumbs so agents converge — is exactly right: a trace of a well-breadcrumbed server reads like a story; a trace of a breadcrumbless one reads like a random walk.</p>
+
+<pre class="trace"><span class="c-out">{
+  "results": [],
+  "hint": "No matches for 'quarterly-report-q4'. Try: (a) broaden the query,\n  or (b) call list_categories() to see valid filter values,\n  or (c) confirm with the user that the report exists.",
+  "done": false
+}</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Concrete: rewriting a REST-mirroring server into an agent-shaped one.</h3>
+
+    <p>The failure mode of servers built by wrapping an existing API is that they mirror the REST surface one-for-one. If the API has <code class="inline">GET /users</code>, <code class="inline">GET /users/{id}</code>, and <code class="inline">PUT /users/{id}</code>, the naive MCP server exposes three tools with names like <code class="inline">list_users</code>, <code class="inline">get_user</code>, and <code class="inline">update_user</code> that take the REST parameters verbatim. The tools work. They also do not help the agent, because the agent's task is rarely "call the REST endpoints in order" — it is "find the right user and update their role," which touches the same endpoints but wants a different shape.</p>
+
+<pre class="standalone"><span class="c-cm"># Before: REST-mirroring — five tools, each shaped like an HTTP verb.</span>
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> list_users(limit: int, offset: int) -&gt; list[User]: ...
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> get_user(id: str) -&gt; User: ...
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> update_user(id: str, user: User) -&gt; User: ...
+
+<span class="c-cm"># After: agent-shaped — three tools, each named for the task, each returning</span>
+<span class="c-cm"># the shape the next step of the workflow actually needs.</span>
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> find_user(query: str) -&gt; list[UserMatch]:
+    <span class="c-st">"""Find users by name, email, or id. Returns id + one-line summary.
+    Call get_user_details(id) for the full record before updating."""</span>
+    ...
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> get_user_details(id: str) -&gt; UserDetails:
+    <span class="c-st">"""Return the full user record (profile, roles, recent activity).
+    Use after find_user() when you have the id and need everything."""</span>
+    ...
+<span class="c-at">@mcp.tool</span>
+<span class="c-kw">def</span> update_user(id: str, changes: UserChanges) -&gt; UserDiff:
+    <span class="c-st">"""Apply a partial update. Pass only fields that change.
+    Returns a before/after diff so the caller can verify the write."""</span>
+    ...</pre>
+
+    <p>Four things change together. The names describe agent tasks — "find," "get details," "update" — rather than REST verbs. Each description names the workflow neighbour so the model can traverse. The <code class="inline">update_user</code> input is <code class="inline">UserChanges</code> — the delta — not the whole record, which makes intent explicit and prevents the accidental clobbering pattern where the model round-trips a fetch, mutates one field, and writes back everything else unchanged. And <code class="inline">update_user</code>'s return is a diff, not the new record, which puts the important information — what did I just change — at the front of the model's next-turn context.</p>
+
+    <p>The through-line back to <a href="/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">the previous essay</a>: the five-tool median server works because those five tools were chosen for the agent's tasks. A fifteen-tool server that mirrors a REST surface has the same underlying operations available and works worse, because the tools do not match the shape of the work. Design for the agent's workflow first, translate to the underlying API second, and the tool count usually falls out at five to eight without anyone having to enforce a rule.</p>
+  </div>
+</section>

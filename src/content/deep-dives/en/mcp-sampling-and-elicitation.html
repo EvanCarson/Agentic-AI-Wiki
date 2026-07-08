@@ -1,0 +1,95 @@
+<section class="phase">
+  <div class="phase-num">C7</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>Sampling and elicitation invert the MCP request flow — the server asks the client's model or user for something — and both features are under-covered in tutorials despite being the correct answer to two common design problems.</h2>
+  <p class="goal">Two features from the 2025-11-25 spec don't show up in tutorials because they invert the normal request flow: sampling lets a server ask the client's model to generate text (potentially with the server's tools available in the nested loop), and elicitation lets a server ask the user for input during a tool call. Both look exotic; both are the answer to concrete design problems — "how does my server call an LLM without holding an API key" and "how do I capture a third-party credential without falling into the token-passthrough trap the spec forbids". Cover them once and they stop looking exotic.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Sampling: the server asks the client's model.</h3>
+
+    <p>The default MCP request flow moves from client to server: the client asks, the server answers. Sampling reverses that arrow. During a tool call — or unprompted between calls, if the client permits it — the server issues a <code class="inline">sampling/createMessage</code> request back through the same session, containing a set of messages, model preferences (hints like "prefer a fast model" or "prefer a large one"), and an optional system prompt. The client's host, which is the participant holding an API key or a local model runtime, runs the completion and returns it. The server never sees the model provider; the client's host never exposes credentials. The <a href="/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP participant model</a> makes this shape make sense — sampling is a server calling <em>up</em> the stack, using the host's existing model relationship rather than establishing its own.</p>
+
+    <p>The use cases are the ones a server author reaches for the moment they need an LLM but don't want to become an LLM operator. Summarize a resource before returning it. Generate a follow-up query from a search result. Classify a user-supplied blob against a taxonomy the tool understands. Rewrite a diff into a commit message the calling agent will then decide whether to apply. None of these are hard problems; all of them cost the server author a model provider account, an API key, a bill, and a compliance conversation if they're solved server-side. Sampling collapses the whole apparatus into one JSON-RPC round trip whose credentials belong to the host that already has them. The tradeoff is control: the server does not choose the model, cannot guarantee latency, and depends on the client to honor the model-preference hints in good faith. In practice hints are honored; in practice the client MUST prompt the user for consent before running the sampling call at all, so the server also cannot rely on sampling being available.</p>
+
+<pre class="standalone">// server -> client (over the same session)
+{
+  "jsonrpc": "2.0",
+  "id": 42,
+  "method": "sampling/createMessage",
+  "params": {
+    "messages": [
+      { "role": "user", "content": { "type": "text", "text": "Summarize: <resource>" } }
+    ],
+    "modelPreferences": { "hints": [{ "name": "fast" }], "intelligencePriority": 0.3 },
+    "systemPrompt": "You are a concise summarizer. Answer in one sentence.",
+    "maxTokens": 200
+  }
+}
+// client -> server
+{ "jsonrpc": "2.0", "id": 42, "result": { "role": "assistant", "content": { "type": "text", "text": "..." }, "model": "claude-...-haiku", "stopReason": "endTurn" } }</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Sampling with tools: nested loops without a server-side model key.</h3>
+
+    <p>The feature the 2025-11-25 spec added on top of plain sampling is the one that turns "borrow the model" into "borrow the whole agent loop". A sampling request may declare that the server's own tools are available inside the nested completion. The client's host runs the model, the model decides to call one of the tools, the host proxies the tool call back to the same server, the server executes the tool, the tool result flows back into the nested conversation, the model keeps going. The server is running a full agent loop — plan, act, observe, repeat — without holding an API key and without spinning up an inference stack, because every model turn is a message the client's host runs on its own account. The <a href="/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">building MCP servers</a> essay treats the server as a passive respondent to the model; sampling-with-tools is the primitive that lets a server be a first-class agent orchestrator when the workflow calls for it.</p>
+
+    <p>The pattern is exactly right for jobs where the server has the domain knowledge and the tools but not the reasoning budget. A refactor server that walks a repository, calls its own <code class="inline">read_file</code> and <code class="inline">apply_patch</code> tools, and asks the host's model to decide the next step is a canonical example. A research server that iterates on <code class="inline">search</code> and <code class="inline">fetch</code> until a specific structured answer is reached is another. What breaks: cost accounting (the host's user pays for tokens the server orchestrates, so consent UX has to be explicit about it), termination guarantees (the server chooses when to stop; a runaway nested loop bills the host), and observability (the sampling messages happen inside the client, not the server's process, so the server's tracing shows tool calls and gaps between them rather than a complete transcript). Design for a hard token budget, a hard step budget, and a "stop reason: budget exhausted" signal that the outer agent surface can act on.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Elicitation form mode: structured user input mid-call.</h3>
+
+    <p>Elicitation is the second server-initiated primitive and answers a different question: what does the server do when it needs one more piece of information from the user, and asking through the model would be indirection with lossy consent? The tool call is in progress; the server issues <code class="inline">elicitation/create</code> with a JSON Schema describing the fields it wants, a human-readable message explaining why, and a request id. The client's host renders a form — a small dialog, a slash-command-shaped inline card, whatever the host's UX vocabulary is — the user fills it, the response returns as structured JSON matching the schema. Only then does the tool call resume. The primitive replaces two long-standing workarounds: the "return an error message that instructs the model to ask the user" pattern, which loses the user's answer through a game of telephone, and the "prompt the user before the tool call" pattern, which asks for information that turns out not to be needed 60% of the time.</p>
+
+    <p>Form mode is the right choice whenever the missing information is structured: a project id to open, a confirmation before a destructive action, a choice between three ambiguous matches. The schema is a plain JSON Schema draft with the fields the server needs; the host is free to render checkboxes for booleans, dropdowns for enums, and text inputs for strings. The message field is the prompt the user sees ("Which repository do you want to search?"), not a system instruction. Two design rules survive contact with practice. First: keep the schema flat and small — no nested objects, no more than three or four fields — because a dialog with fifteen inputs stops the workflow harder than an extra tool call would. Second: give every optional field a sensible default in the schema, so the user can accept and move on without having to type.</p>
+
+<pre class="standalone">// server -> client, mid tool call
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "elicitation/create",
+  "params": {
+    "message": "Which repository do you want to open?",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "repo": { "type": "string", "enum": ["web", "api", "infra"], "description": "Repository key" },
+        "branch": { "type": "string", "default": "main" }
+      },
+      "required": ["repo"]
+    }
+  }
+}
+// client -> server
+{ "jsonrpc": "2.0", "id": 7, "result": { "action": "accept", "content": { "repo": "api", "branch": "main" } } }</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Elicitation URL mode: OAuth without token passthrough.</h3>
+
+    <p>URL-mode elicitation is the newer variant and the one the <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 profile</a> essay points at every time it explains what to do <em>instead</em> of token passthrough. The tool call needs to act on a third-party service — a GitHub repository, a Notion workspace, a Stripe dashboard — and the server does not hold that service's credentials. The server issues an elicitation request whose payload is a URL rather than a schema; the client's host opens that URL in the user's browser; the user completes whatever flow lives at the URL (an OAuth authorization code exchange, a device flow, an app install page); the third-party service returns its token directly to a callback the <em>client</em> controls; the server receives a resume signal but never sees the third-party token. The token-passthrough anti-pattern the spec forbids by name is forbidden precisely because doing it the naive way — the server holds the caller's token, the server forwards it to the downstream service — collapses the RFC 8707 audience guarantee and forces the downstream service to trust the wrong principal. URL-mode elicitation is the shape that keeps every credential in the hands of the party that owns the relationship.</p>
+
+    <p>The trace signature to look for is short. The server logs a "waiting for elicitation" state; there is no outbound HTTP call from the server's process to the third-party service during the wait; the resume message from the client carries whatever handle the server needs to identify that the flow succeeded (a scoped internal token bound to the server's own audience, a claim about which downstream account is now linked, an opaque cursor the server can use to resume the tool call). If any log line during that window shows the server making a request to the third-party service using a bearer token that came from the caller, that is passthrough dressed up as elicitation, and the correct action is to remove the outbound call and rebuild the flow around the client. The spec's non-negotiable is that the third-party token never touches the server; the tool becomes safer, not slower, when that rule is enforced end to end.</p>
+
+<pre class="trace">t=0.00  server  | tool_call=connect_github     | need external creds
+t=0.01  server  | elicitation/create           | mode=url  url=https://github.com/login/oauth/authorize?...&state=abc123
+t=0.02  client  | open in user's browser       | user completes OAuth
+t=8.31  client  | callback lands on client     | code -> exchange -> access_token STORED IN CLIENT
+t=8.33  client  | elicitation resume           | { action=accept, linked_account_id=gh_u_9x }
+t=8.34  server  | tool_call resumes            | operates via linked_account_id  | server never sees gh access_token</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Human-in-the-loop design: consent UX for both.</h3>
+
+    <p>Sampling and elicitation share a design property that the tutorials treating them as neat protocol features tend to elide: they let the server drive an experience the user did not ask for at the moment it happens, and that shifts consent from a per-connection question to a per-interaction one. The <a href="/operations/safety-and-security/human-in-the-loop" class="xref">human-in-the-loop</a> operations essay treats consent as an ops discipline; the sampling and elicitation cases are where an MCP host actually lives out that discipline. For sampling, the consent surface must show four things every time: which server is asking, why (a short reason string the server supplies), what the model will be shown (the messages payload, or a summary of it if the payload is long), and what tools the server has made available in the nested loop. For elicitation, the surface must show which server is asking, what fields (form mode) or what URL (URL mode) — and for URL mode, the origin of the URL and any warnings about opening it in the user's browser.</p>
+
+    <p>Two operational patterns keep the consent UX honest. First, rate-limit server-initiated calls per session — a server that fires ten elicitation requests in a minute is either malfunctioning or hostile, and the client should refuse further requests with an explicit error the server can log against its own bug tracker. Second, distinguish "grant once for this call" from "grant for the session" from "grant for this server forever"; a user who says yes to a sampling call to summarize one resource should not be considered as having said yes to nested-tool sampling loops for the rest of the session. The two primitives that let a server borrow the host's model and the host's user are the same two primitives that make consent UX the load-bearing surface of the client. Both work exactly as well as the client that renders them; both fall over as hard as any web permission dialog when the client renders them lazily.</p>
+  </div>
+</section>

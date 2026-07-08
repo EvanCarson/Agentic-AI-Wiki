@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">C9</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>MCP 的生产运维不是"套上 MCP 术语的普通 Web 服务运维"——流量形状是 agent 形状，四项运维纪律也随之改变。</h2>
+  <p class="goal">把玩具级 MCP 服务器与生产 MCP 服务器分开的是四件事：逐工具的 kill switch（因为一个坏工具不应把整台服务器拖下水）、按参数"<em>形状</em>"而非"<em>值</em>"记录的审计日志（因为工具参数里有你不想入日志库的 PII）、从"<em>被验证的令牌 claim</em>"而非"请求体"得到的租户隔离（因为客户端会谎报租户），以及按 agent 流量做的限流（agent 流量能在数秒内飙到人类流量的 10 倍）。Web 服务运维直觉会把其中三件搞错。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>逐工具 kill switch：工具的 feature flag。</h3>
+
+    <p>MCP 服务器内部的失败单元是一个工具，不是整个进程。一个行为异常的工具——上游 schema 一变就开始返 500 的、结果里被发现漏了 PII 的、因为 prompt 回归而被客户端反复循环调用的——都应当能在不重启服务器的前提下被禁用。这意味着每个工具都需要能单独开关，而且这个开关必须在调用时读取，而不是在进程启动时读取；一个只有重启才生效的开关不是 kill switch，是带滞后的配置项。这个模式和 <a href="/zh/operations/agentops/feature-flags-for-agents" class="xref">面向 agent 的 feature flag</a> 通用做法一致——开关存储（Unleash、LaunchDarkly，或是你自己拥有的一个 Redis key）在工具 dispatcher 内被查询，返回值决定这次调用是执行、返回一条"暂时停用"的软拒绝、还是干脆从 <code class="inline">tools/list</code> 里隐藏。这三种响应哪种正确取决于故障模式；隐藏一个客户端计划已经承诺要调用的工具，与返回软拒绝产生的错误不同，两者又都不同于"执行然后失败"。</p>
+
+    <p>只在紧急时才用的 kill switch 会腐化。让它保持诚实的运维纪律是定期演练：on-call 手册里加一条——把一个金丝雀工具关掉、看一分钟客户端可见行为、再打开。如果这套演练在预发环境就出问题，那这个开关就不算真开关。另一条纪律是作用域粒度——一个能停掉整台服务器的开关是钝器，而一个能停掉某个工具的某种参数模式的开关（"所有 <code class="inline">db_query</code> 且 <code class="inline">table</code> 等于 <code class="inline">users</code> 的调用"）才是事故里真正救命的东西。这就是运维目录里 <a href="/zh/operations/agentops/kill-switches" class="xref">kill switch</a> 记录的模式：一个开关真正停下的从来不是"这台服务器"，而是"那件具体坏了的事"，把这一层粒度做对，才把"你真会用"的开关和"你写了但从没碰过"的开关区分开来。</p>
+
+<pre class="standalone"># Per-tool dispatcher — kill switch consulted on every call
+async def dispatch(name: str, args: dict, ctx: Ctx) -> Result:
+    flag = await flags.get(f"tool:{name}", tenant=ctx.tenant_id)
+    if flag == "off":
+        raise ToolDisabled(f"{name} temporarily disabled by operator")
+    if flag == "shadow":
+        asyncio.create_task(shadow_call(name, args, ctx))
+        return CANNED_OK
+    audit.log_shape(name, args, ctx)   # shape, not values — see STEP 2
+    return await TOOLS[name](args, ctx)</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>审计日志：记形状，不记值。</h3>
+
+    <p>Web 服务运维的本能反应是"为了好调试，把整个请求体记下来"。在 MCP 这里，这个反应错了两次。第一，工具参数带 PII 的方式和表单提交一样——一个 <code class="inline">send_email</code> 工具的参数是收件地址加自由文本正文，一个 <code class="inline">db_query</code> 工具的参数是直白的客户 ID，一个 <code class="inline">upload_file</code> 工具的参数里带着文件内容——把这些全塞进通用日志库，日志库就成了一套 PII 系统，继承源数据本来带着的每一条保留、加密、访问控制约束，没有哪个团队愿意"事后"才发现这一点。第二，agent 流量是重复的；同一个工具会在一个会话里被以相同参数的各种变体反复调用，把每一个值都记下来会让日志库沦为输入源的副本。只要你记"<em>形状</em>"这两个问题都不存在：工具名、参数名、参数类型、参数大小分桶（小/中/大），以及当你需要把两次相同调用对应起来时的一个内容哈希。</p>
+
+    <p>记形状不是没有取证能力，而是另一种取证能力。真正出事故、有人要具体到"传进去的那个值"时，答案来自一个单独的、更高受限级别的"值"存储——只有指定的 on-call 角色能读，保留时钟按自己的节奏走：以小时或天为单位，而不是日志库的以月为单位。在 dispatcher 那里把值分流到那边、用与形状条目相同的 request id 打上标签，事故来时跨这两个库的关联只需要一次查询。<a href="/zh/operations/governance-compliance/audit-trails" class="xref">审计轨迹</a>那页把这个当作通用溯源纪律来讲；MCP 里独有的一层是工具调用负载的结构够规整，因此记形状的成本异常低——你已经从 <code class="inline">tools/list</code> 拿到 schema 了，提取一条形状记录只是按 schema 走一遍，不是启发式猜测。</p>
+
+<pre class="trace">{
+  "ts": "2026-07-06T14:22:03Z",
+  "request_id": "r_9f2a",
+  "session_id": "s_71c4",
+  "tenant_id": "t_acme",
+  "tool": "send_email",
+  "args_shape": {
+    "to": {"type": "email", "count": 1},
+    "subject": {"type": "text", "bucket": "small"},
+    "body": {"type": "text", "bucket": "medium", "hash": "sha256:8a…"}
+  },
+  "outcome": "ok",
+  "latency_ms": 412
+}</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>从被验证的令牌 claim 得到租户隔离。</h3>
+
+    <p>错误做法一句话讲得完：客户端发来的请求体里带一个 <code class="inline">tenant_id</code> 字段，服务器就信了。之后的每一个访问控制决策——查询限定在哪些数据库行、写入哪个存储桶、查哪个逐租户的 kill switch——全都从这个值往下流。问题在于这个值受客户端控制，任何一个谎报租户的客户端会直接走进邻居租户的数据。这就是 <a href="/zh/deep-dives/mcp/mcp-security-anti-patterns" class="xref">安全反模式</a> 目录里点名的 confused-deputy 形状，修法机械且乏味：租户身份取自令牌，而非请求体。<a href="/zh/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 配置</a> 给你一个被验证过的 <code class="inline">sub</code>（用户）、一个 <code class="inline">tid</code> 或等价的 claim（租户，有时以资源指示器 scope 的形式承载）、以及一个 <code class="inline">scope</code> 列表（能力）。dispatcher 只读这些，把请求体里关于身份的任何说法都当作"不受信元数据"，必须先与 claim 核对一遍，才允许它影响任何决策。</p>
+
+    <p>两条护栏让这条纪律"能被执行"而不是"仅是理想"。第一条是中间件层：拒绝任何"请求体里带 <code class="inline">tenant_id</code>、<code class="inline">user_id</code> 或类似身份字段却与对应令牌 claim 不一致"的请求——不是警告，是硬 4xx——让配置错误的客户端"响亮地失败"，而不是悄悄失败。第二条是被验证的身份要顺着往下传：如果工具要查一个按租户切分行的数据库，连接或查询必须携带被验证的租户，而不是参数。把每次请求的身份放进一个 context-local（Python 的 <code class="inline">contextvars</code>、JavaScript 的 <code class="inline">AsyncLocalStorage</code>），而不是当作参数往下传，能让这条纪律保持诚实，因为下游代码无从"顺手"去够到那个"从线上进来的"值。<a href="/zh/operations/safety-and-security/scoped-credentials-for-agents" class="xref">范围受限凭证</a>那页给出更宽的视角；运维层面的规则很短：任何租户决策都从 claim 读，永远不从请求体读。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>为 agent 流量而设的限流。</h3>
+
+    <p>人类流量和 agent 流量形状不同，为一种调好的限流对另一种要么"憋死"要么"防不住"。人点一下按钮、等一等、读一读、再点一下；单个用户的峰值 QPS 被人类反应时间封顶，突发性来自许多互相独立的用户在同一时刻叠加。而 agent 一旦决定某个工具值得调用，就会在循环里连着调用——循环体的节奏由模型、工具延迟、采样温度共同决定，自然上限不是人类反应而是 token 预算。碰上"一次 prompt 回归把每个 agent 会话都指向同一个工具"这样的事故，聚合 QPS 能在数秒内跃升一个数量级，而人类负载看起来毫无变化。为人类写的限流会把这波峰吸得悄无声息，直到工具背后的后端垮掉；为 agent 流量设计的限流会在工具边界推回去，把共享后端保住。</p>
+
+    <p>三层叠加的限额做掉多数活。逐会话限额，小，兜住"一路狂奔的循环"这种情况——一个健康的会话不需要一分钟内对同一个工具打上几十次，所以就不允许它这样。逐租户限额，大一些，兜住"某个租户的很多会话以同一种坏方式在跑"的情况，这正是刚上线了新 prompt 模板的客户会产生的形态。逐工具限额，有时是最小的，用来保护那些"调用轻但背后干真活"的昂贵工具——比如触发后台任务或调用付费 API 的工具。三层都适合用 token-bucket 作为原语，因为它在平均速率低时允许突发，恰好匹配"合法会话偶尔把多次调用打包在一起"的模式；leaky-bucket 用在目标是平滑而非准入控制时也可以。触发限额时的响应应当是一个 MCP 形状的错误——一个带 retry-after 提示的 JSON-RPC 错误——而不是让模型自己猜怎么解析一个 HTTP 429。</p>
+
+<pre class="standalone"># limits.yaml — three layered token buckets, agent-sized
+default:
+  per_session: { rate: 30/min,  burst: 60  }
+  per_tenant:  { rate: 600/min, burst: 1200 }
+tools:
+  db_query:    { per_tool: { rate: 120/min, burst: 200 } }
+  send_email:  { per_tool: { rate: 20/min,  burst: 20  } }
+  run_job:     { per_tool: { rate: 6/min,   burst: 6   } }
+overrides:
+  tenant:t_pilot: { per_tenant: { rate: 60/min, burst: 100 } }</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>可观测：需要追踪的 MCP 专有信号。</h3>
+
+    <p>Web 服务可观测把"一次请求"当作 trace 的单元。MCP 有三种单元值得分别追踪：会话（从 <code class="inline">initialize</code> 到断开，携带协商出的协议版本与能力集）、工具调用（从 dispatch 到结果，携带 STEP 2 的形状记录），以及——当服务器主动发起时——采样调用与征询调用。每一种 span 都应带上一小组一致的标签：session id、工具名、tenant id（按存储的合适方式做脱敏或哈希）、规范版本，以及结果分桶（ok、工具错误、被限流、被 kill、租户不匹配）。把这些卷起来就有了事故里真正被问到的四张仪表盘："哪个工具在挂"、"哪个租户被限"、"哪个会话在打转"、"哪个规范版本在和我们说话"。只记录最外层 HTTP 请求的 trace 一个都答不上，这也是为什么 agent 的 <a href="/zh/operations/evaluation-and-observability/tracing-and-observability" class="xref">追踪与可观测性</a> 纪律与 REST API 的追踪不同——真正有意思的单元不是请求，是循环。</p>
+
+    <p>最后要仪表化的是 MCP 服务器与它所包装的东西之间的边界。一个把流量代理到下游 API 的服务器，若把每一次下游调用都打上"发起它的工具名、session id、tenant id"的标签，收益极大，因为一旦出问题，问题从来不是"MCP 层坏了没"，而是"工具是不是因为下游坏了才坏"，能在一次查询里回答这个问题、而不是要在三个日志库里各刨一次，才是让 on-call 可持续的关键。把这些标签作为 OpenTelemetry 属性发出去，让标准 collector 直接收；跨服务器保持词汇一致，一个服务器写好的仪表盘换个服务器也能用。这些技术本身没一样是 MCP 独有——是 OpenTelemetry、结构化日志、乏味的中间件——但"要给什么打标签"是 MCP 特有的，把这一点做对，才是"你运维得动一支 MCP 舰队"与"你只会重新部署它"之间的区别。</p>
+  </div>
+</section>
