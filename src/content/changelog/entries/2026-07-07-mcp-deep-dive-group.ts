@@ -1,7 +1,7 @@
 import { L, type ChangelogEntry } from '../types.ts';
 
 const entry: ChangelogEntry = {
-  date: '2026-07-06',
+  date: '2026-07-07',
   title: L(
     'New Deep-Dive group: MCP — building, testing, securing, and operating Model Context Protocol servers',
     '新增深入解析分组：MCP——构建、测试、保护与运维模型上下文协议服务器',
