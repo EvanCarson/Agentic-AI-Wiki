@@ -11,6 +11,7 @@ const group: Group = {
   entries: [
     { page: 'judge-calibration-and-meta-evaluation', slug: 'judge-calibration-and-meta-evaluation', title: L('Judge Calibration & Meta-Evaluation','评判器校准与元评测'), summary: L('Prometheus 2, JudgeBench, RubricEval; meta-evaluation collapse; the 85-90% human-agreement floor; monthly recalibration cadence.','Prometheus 2、JudgeBench、RubricEval；元评测坍缩；85–90% 的人机一致底线；月度重校准节奏。') },
     { page: 'benchmark-landscape-2026', slug: 'benchmark-landscape-2026', title: L('Benchmark Landscape (2026)','2026 年基准全景'), summary: L('SWE-bench Verified saturation (five models within 0.7 pts); SWE-bench Pro; contamination as legal deterrent; why Verified is now an audit signal, not a ranking.','SWE-bench Verified 已饱和（前五仅相差 0.7 分）；SWE-bench Pro；把污染当法律威慑；为何 Verified 如今是审计信号，而非排名。') },
+    { page: 'hal-and-async-agent-eval', slug: 'hal-and-async-agent-eval', title: L('HAL & Asynchronous Agent Eval','HAL 与异步智能体评测'), summary: L("Princeton HAL (cost-per-solve + 5-dim reliability dashboard); Gaia2 (async environments, write-action verifiers, temporal constraints); why static benchmarks miss real deployment.",'Princeton HAL（每解一题的成本 + 5 维可靠性面板）；Gaia2（异步环境、写动作核验器、时间约束）；为何静态基准漏掉真实部署。') },
   ],
 };
 export default group;
