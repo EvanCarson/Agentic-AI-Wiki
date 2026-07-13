@@ -1,0 +1,90 @@
+<section class="phase">
+  <div class="phase-num">K8</div>
+  <div class="week">Deep Dive · Tool &amp; Capability Design</div>
+  <h2>Programmatic Tool Calling — model writes code, code calls tools in a sandbox, only the final result enters context — is not a Claude feature, it's a preview of "code as orchestration" across vendors.</h2>
+  <p class="goal">Anthropic's Tool Search Tool cuts about 85% of the token cost of exposing many tools to a model. Their Programmatic Tool Calling, shipped November 2025, changes the loop shape entirely — the model writes a small Python program that runs in a sandbox, calls tools from inside it, and only the final output crosses back into context. Tool Use Examples add few-shot semantics at the tool level. Read as Anthropic-specific curiosities, these are three product bullets. Read as the shape the next generation of vendors will converge on, they are the first draft of "code as orchestration": the tool loop stops being a message-passing dance in the model's context and becomes a program the model composes and a sandbox executes. This essay is what each primitive does, when to reach for it, the failure modes teams hit in production, and where the pattern is heading across the matrix.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Tool Search Tool: the many-tool context tax and the retrieval fix.</h3>
+
+    <p>Every serious agent eventually accumulates more tools than it can afford to expose. The <a href="/deep-dives/tool-capability-design/tool-granularity" class="xref">tool-granularity</a> essay works the measured 24-point selection-accuracy loss the field sees as tool counts climb past a few dozen; the <a href="/deep-dives/tool-capability-design/tool-discovery-and-docs" class="xref">tool docs &amp; discoverability</a> essay covers the naming and namespacing side of the same problem. What neither addresses is the raw token cost of the tool list itself: every tool def has a name, description, and JSON Schema, and at 200 tools the tool list alone can be 40–60k tokens carried on every turn — money spent whether the model uses those tools or not. Anthropic's Tool Search Tool is a built-in whose only job is to solve that: instead of shipping 200 defs in the prompt, you upload the corpus once, expose a single Tool Search Tool, and the model queries it to retrieve the three or four defs it actually needs for the current step. Anthropic's own benchmark reports about an 85% token reduction on tool-rich prompts, with tool-selection accuracy holding or improving because the model sees fewer distractors.</p>
+
+    <p>The mechanic under the hood is embarrassingly simple. The tool corpus lives on Anthropic's side, indexed by semantic embedding. The Tool Search Tool takes a natural-language query and returns a ranked list of tool defs — name, description, schema — that the model then treats as if you had put them in the prompt directly. The first turn's model output is typically a call to Tool Search Tool with a query drawn from the user's message; the second turn's model output uses the retrieved tools normally. The extra hop costs one round trip on the first turn and is amortized across every subsequent one, and on any prompt where the model would have needed fewer than a quarter of the tools available, the trade is straightforwardly positive.</p>
+
+<pre class="standalone"><span class="c-cm"># Tool Search Tool — enable, then let the model pull only what it needs</span>
+resp = client.messages.create(
+    model=<span class="c-st">"claude-opus-4-7"</span>,
+    tools=[{<span class="c-st">"type"</span>: <span class="c-st">"tool_search_20250924"</span>, <span class="c-st">"name"</span>: <span class="c-st">"tool_search"</span>}],
+    tool_choice={<span class="c-st">"type"</span>: <span class="c-st">"auto"</span>},
+    messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: <span class="c-st">"Refund order 42 for the customer who called about the defective batch."</span>}],
+)
+<span class="c-cm"># First turn: model emits tool_use for tool_search with query='refund order'</span>
+<span class="c-cm"># Second turn: model uses the refund_order def that tool_search returned</span></pre>
+
+    <p>Two failure modes are worth naming up front. First, the tool corpus is only as good as its descriptions — the same discipline that <a href="/deep-dives/mcp/mcp-tool-design" class="xref">MCP tool design</a> preaches (verb-first, when-and-when-not, one example) becomes load-bearing for retrieval, because the model's query has to match against text you wrote, and a description written for a human maintainer will retrieve poorly against a model's paraphrase of the user's intent. Second, the extra round trip costs latency on the first turn — a few hundred milliseconds — and on latency-sensitive workflows (voice, IDE-inline) that budget is often already spoken for. Tool Search earns its keep in agents that make multi-turn plans and can absorb the round trip; it is a bad fit for single-turn "one tool, one call" flows where the answer is one shot.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Programmatic Tool Calling: the sandbox is the loop.</h3>
+
+    <p>Programmatic Tool Calling (PTC) is the more radical primitive and the one worth reading carefully even if you never use Claude. The classical tool loop passes results back into the model's context as messages: the model calls <code class="inline">list_files</code>, the harness runs it, the JSON result becomes a <code class="inline">tool_result</code> block the model reads on the next turn. Ten tools deep, the context is now carrying every intermediate result, most of which the model needed only to feed the next call and doesn't need to reason about at the end. PTC breaks that pattern: instead of emitting a single tool call, the model writes a small Python program (in a sandbox Anthropic runs on its side), the program calls tools inside the sandbox, and only the program's final return value crosses back into the model's context. The intermediate tool results — potentially hundreds of them — never enter the context window at all.</p>
+
+    <p>Two consequences are worth pinning. First, on multi-tool chains the context savings dominate the cost line. A workflow that hits ten tools per turn goes from carrying ten result payloads back to carrying one, and the "which tool result was that again?" reasoning tax the model pays on long chains disappears — the model wrote the code, so it already knows what shape the data has. Second, PTC generalizes what MapReduce-style tool-fanout looks like: a program can call the same tool a hundred times in a loop, filter, aggregate, and hand the model one summary; the context window sees a summary of a hundred calls, not a hundred calls. That is the shape "code as orchestration" points at, and it is the shape that makes many-tool servers newly practical.</p>
+
+<pre class="standalone"><span class="c-cm"># Programmatic Tool Calling — model writes this, sandbox runs it, only</span>
+<span class="c-cm"># the return value crosses back into the model's context.</span>
+<span class="c-kw">from</span> tools <span class="c-kw">import</span> list_orders, refund_order, notify_customer
+
+candidates = list_orders(status=<span class="c-st">"defective"</span>, batch_id=<span class="c-st">"B-9137"</span>)
+refunded = []
+<span class="c-kw">for</span> o <span class="c-kw">in</span> candidates:
+    <span class="c-kw">if</span> o.amount &lt;= <span class="c-nu">500</span>:
+        result = refund_order(order_id=o.id, reason=<span class="c-st">"defective"</span>)
+        notify_customer(order_id=o.id)
+        refunded.append(result.confirmation)
+<span class="c-kw">return</span> {<span class="c-st">"refunded_count"</span>: <span class="c-fn">len</span>(refunded), <span class="c-st">"confirmations"</span>: refunded}
+<span class="c-cm"># The model's context sees only this final dict, not the N tool results.</span></pre>
+
+    <p>The costs are real and worth budgeting. PTC requires an Anthropic-managed sandbox — you cannot run the model's code inside your own process, which means the tools have to be reachable from that sandbox (either published as MCP servers or wrapped in HTTP endpoints the sandbox can call). That constraint is not a mistake: letting model-authored code execute inside your own process is the security posture the <a href="/deep-dives/mcp/mcp-security-anti-patterns" class="xref">MCP security anti-patterns</a> essay would take a section to warn against, and Anthropic's sandbox is the correct isolation. But it does mean PTC is not a drop-in for local tools; it earns its complexity on server-hosted tool surfaces where the sandbox can already reach them. The other cost is the model has to be able to write correct Python — early PTC deployments hit "the code has a syntax error" recovery loops more often than teams expected, and the harness needs a retry pass that returns the traceback as context so the model can fix it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Tool Use Examples: few-shot at the tool level.</h3>
+
+    <p>Tool Use Examples add a <code class="inline">tool_use_examples</code> field to a tool definition, listing example calls that the model reads only when it is considering that tool. Same idea as few-shot in the system prompt — worked examples of the desired output shape — but scoped so the examples don't consume attention when the model is picking a different tool. The unlock is that a tool with a fiddly argument shape (say, a query DSL with three optional filters and a specific ordering of keys) can carry its own examples inline; the model doesn't have to infer the correct call from the schema alone, it can pattern-match against the examples the tool author supplied.</p>
+
+    <p>The practical effect is largest on tools whose "right shape" is ambiguous from the schema. A <code class="inline">search</code> tool that accepts a query string, a filter object, and a sort spec has a huge space of legal calls, only a small fraction of which are useful; three good examples in the tool def narrow the model's usage almost entirely. Anthropic's guidance is to keep the examples brief (two to five, one per common shape), and the same principles that govern few-shot in a system prompt apply — pick examples that cover the failure modes you actually see, not the ones that look good in a demo. The <a href="/deep-dives/tool-capability-design/tool-error-messages" class="xref">error-messages-as-prompts</a> discipline (echo the bad value, prescribe the corrected call) is a good source of counter-examples the tool-use-example slot can absorb.</p>
+
+<pre class="standalone"><span class="c-cm"># Tool Use Examples — inline few-shot on the tool definition itself.</span>
+tools = [{
+    <span class="c-st">"name"</span>: <span class="c-st">"search_orders"</span>,
+    <span class="c-st">"description"</span>: <span class="c-st">"Search orders. Use for filtering by customer, date range, or status."</span>,
+    <span class="c-st">"input_schema"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"object"</span>, <span class="c-st">"properties"</span>: {...}},
+    <span class="c-st">"tool_use_examples"</span>: [
+        {<span class="c-st">"query"</span>: <span class="c-st">"defective batch B-9137"</span>,
+         <span class="c-st">"filters"</span>: {<span class="c-st">"status"</span>: <span class="c-st">"defective"</span>, <span class="c-st">"batch_id"</span>: <span class="c-st">"B-9137"</span>},
+         <span class="c-st">"sort"</span>: [{<span class="c-st">"field"</span>: <span class="c-st">"created_at"</span>, <span class="c-st">"dir"</span>: <span class="c-st">"desc"</span>}]},
+        {<span class="c-st">"query"</span>: <span class="c-st">"customer alice orders last week"</span>,
+         <span class="c-st">"filters"</span>: {<span class="c-st">"customer"</span>: <span class="c-st">"alice"</span>, <span class="c-st">"since"</span>: <span class="c-st">"2026-07-06"</span>}},
+    ],
+}]</pre>
+
+    <p>One caveat is worth reading loud. Tool Use Examples are a Claude-specific field; a tool def with a <code class="inline">tool_use_examples</code> key sent to OpenAI or Gemini is either ignored (if the vendor tolerates unknown properties) or rejected (if strict mode is on). The intermediate-representation pattern the K7 essay recommends is where you handle this: keep the examples in your internal spec and let per-vendor emitters drop or transform them. Vendors without a native few-shot-at-tool primitive can still emulate the effect by concatenating an example line into the description — worse ergonomically, comparable in behaviour on the models where it matters.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Where the pattern generalizes: code as orchestration.</h3>
+
+    <p>Read the three primitives together and a shape emerges. Tool Search Tool solves the "many tools, few used per turn" problem with retrieval. Programmatic Tool Calling solves the "many calls per turn, most intermediate" problem with a sandbox. Tool Use Examples solve the "correct call is ambiguous from schema" problem with few-shot. Different problems, one unifying instinct: <em>move orchestration off the model's context and into a substrate designed to hold it</em>. The context window is precious; the tool list is expensive; the intermediate results are boring for the model to reason about. Every one of these primitives moves the boring bits off the model and keeps the interesting bits on it.</p>
+
+    <p>The generalization to watch is code-as-orchestration across vendors. OpenAI's custom-tool grammar (see K7) is a first step in the same direction — let the model emit constrained text that the harness interprets, rather than a natural-language plan the harness has to parse. Gemini's function-calling <code class="inline">ANY</code> mode plus an increasingly rich set of built-in tools (code interpreter, retrieval) points at the same shape from a different angle: the sandbox is your model provider's, and the tools inside it are named. The <a href="/deep-dives/architectures-and-patterns/pattern-landscape" class="xref">pattern-landscape</a> essay pins ReAct and Plan-and-Execute as the two dominant loop shapes; PTC is the third, and its pitch is that on multi-tool chains it dominates both on both cost and latency.</p>
+
+    <p>Two moves make sense for teams that don't yet have a Claude-anchored stack. First, treat the tool-def surface as an <em>intermediate representation</em>, not a wire format. If your internal spec captures name, description, schema, examples, and side-effect flags, the per-vendor emitter can drop what a target vendor doesn't understand. Second, budget context as if PTC were coming to your vendor next year. Design tools that would compose well inside a sandbox — small, deterministic, idempotent — and your existing loop keeps working while the primitives around it get better. The teams that will move fastest to code-as-orchestration are the ones whose tools were already sandbox-shaped before the sandbox arrived.</p>
+
+    <p>Read the four steps together and the surface tension resolves. These are not three isolated Claude features to memorize; they are three moves in the same design direction, and the direction is clear enough that a team can bet on it without waiting for the other two vendors to catch up. The bet costs little today — an intermediate representation, tool designs that would sandbox well, descriptions written with retrieval in mind — and buys you the option to adopt PTC-shaped primitives the moment they land elsewhere. Teams that treat the current tool loop as the endpoint tend to build harnesses that will need reshaping; teams that read Anthropic's 2025-2026 moves as a preview build harnesses that age gracefully into the shape everyone will eventually converge on.</p>
+  </div>
+</section>
