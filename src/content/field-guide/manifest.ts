@@ -41,6 +41,7 @@ export const PARTS: Part[] = [
     { page: 'e2', slug: 'three-layers',     num: '02', title: L('Three Layers', '三个层次') },
     { page: 'e3', slug: 'llm-as-judge',     num: '03', title: L('LLM-as-Judge', 'LLM 作为评判者') },
     { page: 'e4', slug: 'benchmarks-and-ci',num: '04', title: L('Benchmarks & CI', '基准与 CI') },
+    { page: 'e5', slug: 'evals-as-ci-gate', num: '05', title: L('Evals as CI Gate', '把评测做成 CI 门禁') },
   ]},
   { key: 'x', roman: 'IV', name: L('Specialize', '专精'), chapters: [
     { page: 'x1', slug: 'code-agents',      num: '01', title: L('Code Agents', '代码智能体') },
