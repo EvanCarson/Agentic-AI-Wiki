@@ -1,0 +1,71 @@
+<section class="phase">
+  <div class="phase-num">M9</div>
+  <div class="week">Deep Dive · Memory &amp; Context</div>
+  <h2>Memory poisoning is a real class of attack — AgentPoison hits 80% success at 0.1% poison — and the defenses live at four lifecycle stages, not at one "detect malicious input" checkpoint.</h2>
+  <p class="goal">AgentPoison achieves an 80% attack success rate against agent memory systems with under 0.1% poisoned entries. MemoryGraft, SpAIware, and the Morris-II worm each attack different layers. The naive defense — "sanitize input at write time" — fails because the input often looks benign; the exploit is in how the memory gets recalled later. The defense is a four-stage lifecycle: gate at ingestion, provenance at storage, quorum at retrieval, drift at monitoring.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The threat catalog: what actually attacks agent memory in 2026.</h3>
+
+    <p>Memory poisoning is not a single technique. AgentPoison (originally in the RAG literature, extended to agent stores in 2025) shows that under 0.1% of poisoned entries in a retrieval-augmented memory can drive attack success rates north of 80% on downstream agent tasks — the mechanism is a trigger phrase embedded in a memory that gets retrieved on a matching query, and steers the agent's next action toward a malicious tool call. MemoryGraft is a lateral-move variant: poison a shared memory in a multi-agent system so that a downstream agent inherits the payload without ever seeing the attacker's traffic. SpAIware targets long-lived personal assistants: writes look like preferences, retrieval turns them into instructions ("the user prefers to have the transfer confirmation email deleted"). Morris-II is the worm case — a poisoned memory whose recall causes the agent to propagate the poison to another memory store it has write access to.</p>
+
+    <p>The through-line is that none of these attacks require a compromised model or a broken tool schema. They exploit the fact that the memory system treats retrieved content as trustworthy context, and the LLM treats retrieved context as authoritative unless something in the surrounding pipeline says otherwise. The <a href="/operations/safety-and-security/prompt-injection" class="xref">prompt-injection</a> literature covers the read-time surface of that trust; the <a href="/operations/safety-and-security/agentic-threat-model" class="xref">agentic threat model</a> essay names memory as one of the highest-leverage exfiltration channels. What this essay adds is the write-side surface — how a poisoned entry gets in in the first place, and where the four cheap defensive stages actually sit. The <a href="/deep-dives/memory-and-context/evaluating-memory" class="xref">evaluating-memory</a> essay's poisoning metrics are the observability layer; the defenses below are what the metrics detect.</p>
+
+<pre class="trace">Attack     | Vector                       | Payload survives via
+-----------|------------------------------|-------------------------------
+AgentPoison| write-time inject to store   | trigger phrase in recall
+MemoryGraft| lateral via shared memory    | cross-agent inheritance
+SpAIware   | preference-shaped write      | preference → instruction slide
+Morris-II  | poisoned recall + write tool | self-propagation, worm-style
+
+Four attacks, one common failure: retrieval treats stored content as trusted.</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Ingestion-stage defense: rate-limit and quarantine before the write lands.</h3>
+
+    <p>The first cheap lever is at ingestion. Every write into the memory store gets a source tag (the tool call, user turn, or upstream agent that produced it) and a rate-limit budget by source. A single user session writing 300 semantic entries in a minute is not a legitimate use of memory; a single tool that has never previously produced a semantic write suddenly producing dozens is not either. The gate is not "is this content malicious?" (a question the ingestion stage cannot answer well) but "does the write shape look like the historical shape of writes from this source?". Anomalous shape earns quarantine — the write lands in a separate partition, not visible to retrieval, until a human or a secondary check confirms it.</p>
+
+    <p>Quarantine is the load-bearing part. Teams that skip it and instead try to classify content at write time run into a well-known asymmetry: benign preferences and adversarial preferences look identical to a text classifier, and the classifier's false-negative rate is the attack's success rate. Quarantine defers the decision from "is this malicious?" (hard) to "did this source subsequently do other suspicious things?" (easier, because behavior accumulates). The <a href="/deep-dives/memory-and-context/memory-write-path-architectures" class="xref">write-path essay</a> named write-visibility as the fourth axis; ingestion-stage quarantine is where that axis earns its cost.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Storage-stage: provenance and version every entry, never mutate in place.</h3>
+
+    <p>Provenance is not a nice-to-have; it is the primitive that makes every downstream defense possible. Every memory entry stores its source (which tool or user or upstream agent produced it), its write timestamp, its confidence, and the trajectory ID that produced it. Entries are immutable — an "update" is a new row that supersedes the old one, and the old one stays queryable for audit. The reason for immutability is that mutating in place makes the poisoning attack strictly harder to detect: if an attacker can overwrite a fact, the audit trail loses the "before" state that would have surfaced the anomaly. Storage that supports quorum reasoning (below) needs multiple concurrent versions, not a single overwritten row.</p>
+
+    <p>The <a href="/deep-dives/memory-and-context/memory-stores" class="xref">memory-stores essay</a> covered backend fit; the poisoning-defense addition is that whatever backend you chose (vector, KV, graph, hybrid), the schema needs provenance columns as first-class fields, not sidecar metadata. When retrieval later filters by source-trust, the filter runs on indexed columns, not on a JSON blob that has to be parsed per row. Provenance you cannot query at scale is provenance you will not use in the hot path, and the defense that never runs is not a defense.</p>
+
+<pre class="standalone"><span class="c-cm"># Quorum retrieval: pull k candidates, require agreement or drop outliers.</span>
+<span class="c-kw">def</span> quorum_retrieve(store, query, k=<span class="c-nb">5</span>, agree_min=<span class="c-nb">3</span>):
+    hits = store.top_k(query, k=k)                 <span class="c-cm"># diverse-source retrieval</span>
+    clusters = cluster_by_meaning(hits)             <span class="c-cm"># normalize + group</span>
+    top = <span class="c-kw">max</span>(clusters, key=<span class="c-kw">lambda</span> c: <span class="c-kw">len</span>(c.entries))
+    <span class="c-kw">if</span> <span class="c-kw">len</span>(top.entries) &lt; agree_min:              <span class="c-cm"># no quorum → do not answer from memory</span>
+        <span class="c-kw">return</span> <span class="c-kw">None</span>
+    <span class="c-kw">if</span> single_source(top.entries):                  <span class="c-cm"># quorum but from one source → suspicious</span>
+        flag_for_review(top); <span class="c-kw">return</span> <span class="c-kw">None</span>
+    <span class="c-kw">return</span> top.canonical()</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Retrieval-stage: quorum, voting, and diverse-source top-k.</h3>
+
+    <p>Retrieval is where the AgentPoison-style attack pays off — the trigger fires because the poisoned entry is what the embedder ranked first. The defense is quorum: pull k candidates instead of one, require agreement across a minimum number of them (say three of five), and require the agreeing entries to come from more than one source. The single-source-quorum case is the important refinement — a poisoning attack that lands ten near-identical entries from one source will trivially win a naive top-k, but a source-diverse quorum treats those ten as a single vote. If no quorum forms, the correct answer is to <em>not</em> answer from memory; fall back to fresh retrieval, ask the user, or say "I don't remember" — anything except letting a single unverified entry drive the next action.</p>
+
+    <p>Voting is more than a defense against poisoning; it is also a hedge against staleness. When two clusters disagree because one is fresh and one is old, the timestamps decide, and the retrieval returns the fresher cluster with an "invalidates" annotation on the older one. Teams sometimes push back on quorum because it costs an extra k-vector query; the honest cost is a low double-digit percentage of retrieval time in exchange for making a whole attack class quantitatively harder. If your latency budget cannot spare it, the workload is one where memory should not be steering critical actions unassisted anyway.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Monitoring: drift detection turns memory into an observable system.</h3>
+
+    <p>The last stage is monitoring, and it is the stage that turns memory from "a store the agent writes to" into an observable system. Three signals matter. First, retrieval-source distribution over time: when the fraction of retrievals dominated by a specific source shifts materially — a source that used to account for 5% of retrievals now accounts for 40% — the change surfaces poisoning or a benign but worth-knowing shift in usage. Second, action-outcome correlation with retrieved memories: when an unusually high fraction of failed tool calls follows a specific memory being retrieved, that memory is either wrong or being weaponized. Third, cross-store propagation: when the same textual pattern appears in multiple memory stores in close temporal succession, Morris-II-style propagation is the leading hypothesis until ruled out.</p>
+
+    <p>Drift monitoring plugs into the same telemetry a well-instrumented agent already emits: retrieval events, tool-call outcomes, session boundaries. The dashboards are boring by design — histograms of retrieval-source share, per-memory success rates, and inter-store text similarity between recent writes. The point is not that the monitoring will catch every attack; it is that a poisoning campaign persistent enough to move the numbers on any of these three signals is a campaign the defender can respond to before the payload has done irreversible harm. Combined with the ingestion quarantine, storage provenance, and retrieval quorum, the four stages take AgentPoison's 80% success rate at 0.1% poison down to the kind of numbers where the attack is no longer economically interesting to run.</p>
+  </div>
+</section>

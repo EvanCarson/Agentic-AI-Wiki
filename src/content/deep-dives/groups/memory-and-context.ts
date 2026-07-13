@@ -14,6 +14,7 @@ const group: Group = {
     { page: 'memory-stores', slug: 'memory-stores', title: L('Memory Stores: Vector, KV, Graph & Eviction','记忆存储：向量、键值、图与驱逐'), summary: L('Match backend to memory kind, a unified interface, why unbounded stores rot retrieval, and decay/eviction policies.','把后端匹配到记忆类型、统一接口、无界存储为何腐蚀检索，以及衰减／驱逐策略。') },
     { page: 'evaluating-memory', slug: 'evaluating-memory', title: L('Evaluating Memory Quality','评估记忆质量'), summary: L('Memory-specific metrics (recall@k, staleness, constraint survival, write precision) and the pitfalls they catch: poisoning, staleness, drift, compaction amnesia.','记忆特有指标（recall@k、过期率、约束存活、写入精度）及其捕获的陷阱：毒化、过期、漂移、压缩失忆。') },
     { page: 'memory-write-path-architectures', slug: 'memory-write-path-architectures', title: L('Memory Write-Path Architectures','记忆的写入路径架构'), summary: L('RAG-only is dead for stateful agents — the write path (what earns a slot, when to write, when to update) is the 2026 focus, and the four memory kinds (episodic, semantic, procedural, relational) each want a different policy.','对有状态智能体来说 RAG-only 已死——写入路径（谁配占位、何时写、何时更新）才是 2026 年的焦点，而四类记忆（情景、语义、程序、关系）各要各的策略。') },
+    { page: 'memory-poisoning-defenses', slug: 'memory-poisoning-defenses', title: L('Memory Poisoning Defenses','记忆毒化防御'), summary: L('AgentPoison at 80% ASR with <0.1% poison; MemoryGraft, SpAIware, Morris-II — lifecycle defenses at ingestion, storage, retrieval, and monitoring.','AgentPoison 在毒化率 <0.1% 时达 80% ASR；MemoryGraft、SpAIware、Morris-II——在摄取、存储、检索、监控四段做生命周期防御。') },
   ],
 };
 export default group;
