@@ -1,0 +1,148 @@
+<section class="phase">
+    <div class="phase-num">5.3</div>
+    <div class="week">第五部分 · 前沿 · 端到端把智能体接到 MCP</div>
+    <h2>MCP 优先地构建智能体——工具做成服务器、宿主运行客户端、把循环接通——是 2026 年多数生产级智能体最终收敛到的形态，也是给 MCP 深入解析分组的自然收束章。</h2>
+    <p class="goal">到 2026 年年中，中位数的生产级智能体不再自建工具层——它消费 MCP 服务器。Anthropic 自家文档以这种方式定框；Bloomberry 对 1,412 台生产服务器的调查解释了为什么。本章端到端走一遍真正的 MCP 原生智能体：把工具做成 MCP 服务器暴露出去、在宿主侧接客户端、处理包含 sampling 与 elicitation 的循环、进程内测试它、以及以 MCP 深入解析分组覆盖的运维纪律把它上线。读完之后你会造好一台小型智能体，通过带鉴权和审计的 MCP 服务器读写文件系统，并且清楚生产上撞到每个面时该翻到哪一篇 MCP 篇章。</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>为什么 2026 年"MCP 原生"是一个真正的类别。</h3>
+
+      <p>工具层曾经是每个智能体团队都要从零写一遍的东西。每个项目重新发明一遍函数模式的格式、参数校验器、重试策略、审计日志。这份活儿每个项目要吃掉数周，产出的工具层还无法跨团队复用——你想在两个智能体之间共用一个"从 S3 读取"或"查询 Snowflake"的工具，等于把同一段接线又写了两遍。</p>
+
+      <p>MCP 结束了那一阶段。Model Context Protocol 给这个领域定下了模型如何寻址工具的公共形状——一次 JSON-RPC 握手、一份 <code class="inline">tools/list</code> 清单、一次 <code class="inline">tools/call</code> 调用，以及一个挂鉴权的标准位置。到 2026 年，这个形状被采纳得足够广，中位数的生产级智能体已不再自建工具层。它消费别人写好的 MCP 服务器——有时是官方厂商的服务器，有时是同一家公司里另一个团队已经立起来的内部服务器。</p>
+
+      <p>数据是具体的。Bloomberry 2026 年 2 月对 1,412 台公开 MCP 服务器的调查发现，中位数服务器出厂 5 个 tool、0 个 resource、0 个 prompt。这些数字不是猎奇——就是这个生态的形状。所有带 MCP 支持的宿主（Claude Desktop、Cursor、Anthropic 与 OpenAI API 内建的 MCP 客户端面、Windsurf、Continue）都能不加改造地接入同一台服务器，而你消费的服务器则小而单一职责。所谓"八台 MCP 的生产栈"——一台文件系统服务器、一台数据库服务器、一台监控服务器、一台项目管理服务器，再加另外四台——如今已是常见形态。这就是"MCP 原生"的含义：你智能体的工具层不是你写的代码，而是宿主要连接的一组 MCP 端点。</p>
+
+      <p>本章是给 MCP 深入解析分组做的 Field Guide 收束章。如果 <a href="/zh/field-guide/tool-use" class="xref">工具调用</a> 是"模型如何调函数"的入门章，那么这一章就是"2026 年智能体如何真正把这些调用接起来"的运维章：把你拥有的工具暴露成 MCP 服务器、在宿主里跑一个 MCP 客户端、每个面咬到什么就翻对应的深入解析。</p>
+    </div>
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>选择哪些能力做成 tool、resource 还是 prompt。</h3>
+
+      <p>MCP 给服务器三种原语来暴露能力。Tool 是模型主导的动作——模型在运行时决定是否调用一个 tool，一次调用可以为模型执行副作用或代它做一次查询。Resource 是宿主主导的上下文——按 URI 寻址的只读数据，宿主按自己的节奏读取并放进模型的上下文。Prompt 是用户主导的模板——服务器暴露的工作流骨架，宿主把它呈现为斜杠命令。</p>
+
+      <p>顺口的记法：<em>tool = 模型选、resource = 宿主选、prompt = 用户选</em>。<a href="/zh/deep-dives/mcp/mcp-tool-design" class="xref">MCP 工具设计</a>深入解析细讲这个选择；把 Field Guide 版本套用到本章的实做例子——一台文件系统服务器，允许智能体在沙箱根目录下读、写、枚举文件——大致是这样。</p>
+
+      <p><code class="inline">read_file(path)</code> 与 <code class="inline">write_file(path, content)</code> 是 tool。模型必须在某一轮中决定它要打开某个特定文件、或持久化某次特定编辑。这两次调用都不吻合"会话开始时预加载"的形态；两者都是模型在循环中某个具体点上请求的操作。</p>
+
+      <p><code class="inline">list_directory(path)</code> 是那个含糊的：答案取决于用例。如果智能体需要在任意时刻拿到实时目录清单——比如一个编辑器智能体在代码库里游走——它是 tool。如果你的宿主想在会话开始时预加载一棵固定的树，好让模型永远知道项目布局，那它就是一个键在类似 <code class="inline">fs://project/tree</code> 的 URI 上的 resource。多数 2026 年的智能体出厂只带 tool 版本，仅当宿主真的会呈现 resource 时才补上 resource 版本；中位数服务器出厂 0 个 resource，就是这个原因。</p>
+
+      <p>这台服务器上的一个 prompt 也许是 <code class="inline">/refactor {file}</code>——一份模板，展开成用户可以按斜杠命令触发的具体指令。Prompt 是用得最少的面；多数文件系统服务器一个都不出厂。仅当它能在宿主的斜杠命令 UX 里挣到自己的位子时才出厂。</p>
+    </div>
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>把 MCP 客户端接进你的宿主循环。</h3>
+
+      <p>宿主侧是"MCP 原生"智能体被缝合起来的地方。客户端与它被配置为可达的每台服务器建立会话，调用 <code class="inline">tools/list</code> 学习可用工具，把这些工具折进模型本就看到的那份工具数组里，模型选中某个 tool 时再派发 <code class="inline">tools/call</code>。<a href="/zh/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP 架构</a>深入解析走一遍 JSON-RPC 生命周期与参与者模型；<a href="/zh/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">实操构建 MCP 服务器</a>一篇覆盖 FastMCP 服务器侧。下面是接进一段朴素智能体循环的最小客户端。</p>
+
+<pre class="standalone"><span class="c-cm"># host.py — minimal MCP-native agent loop (Python + fastmcp Client + Anthropic SDK)</span>
+<span class="c-kw">import</span> anthropic
+<span class="c-kw">from</span> fastmcp <span class="c-kw">import</span> Client
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_msg: str, servers: list[str]) -&gt; str:
+    llm = anthropic.AsyncAnthropic()
+    <span class="c-kw">async with</span> Client(servers[<span class="c-st">0</span>]) <span class="c-kw">as</span> mcp:
+        tools = [{<span class="c-st">"name"</span>: t.name,
+                  <span class="c-st">"description"</span>: t.description,
+                  <span class="c-st">"input_schema"</span>: t.inputSchema}
+                 <span class="c-kw">for</span> t <span class="c-kw">in</span> <span class="c-kw">await</span> mcp.list_tools()]
+        messages = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_msg}]
+        <span class="c-kw">while</span> <span class="c-kw">True</span>:
+            resp = <span class="c-kw">await</span> llm.messages.create(
+                model=<span class="c-st">"claude-mythos-preview"</span>,
+                tools=tools, messages=messages, max_tokens=<span class="c-st">2048</span>)
+            messages.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>, <span class="c-st">"content"</span>: resp.content})
+            <span class="c-kw">if</span> resp.stop_reason != <span class="c-st">"tool_use"</span>:
+                <span class="c-kw">return</span> resp.content[<span class="c-st">0</span>].text
+            <span class="c-kw">for</span> block <span class="c-kw">in</span> resp.content:
+                <span class="c-kw">if</span> block.type == <span class="c-st">"tool_use"</span>:
+                    result = <span class="c-kw">await</span> mcp.call_tool(block.name, block.input)
+                    messages.append({<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: [
+                        {<span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                         <span class="c-st">"tool_use_id"</span>: block.id,
+                         <span class="c-st">"content"</span>: result.structured_content <span class="c-kw">or</span> result.text}]})</pre>
+
+      <p>这段里有三处在做真正的活。<code class="inline">Client(servers[0])</code> 上下文管理器跑完整的 initialize 握手——客户端与服务器在别的动作之前先协商协议版本与能力。工具清单的翻译把 MCP 的 <code class="inline">inputSchema</code> 形状适配到厂商 SDK 的 <code class="inline">input_schema</code> 字段；两者是同一份 JSON Schema，但住在不同的属性名下，MCP 原生的宿主学会在边界处一次性归一化。循环在 <code class="inline">stop_reason != "tool_use"</code> 时终止，意味着任何一轮不请求 tool 的即是最终答复。其余的一切——会话管理、分帧、错误信封——SDK 自己处理。</p>
+
+      <p>在协议线上，宿主从服务器收到的第一次交换就是一份类似下面的 <code class="inline">tools/list</code> 响应。</p>
+
+<pre class="trace">{"jsonrpc":"2.0","id":1,"result":{"tools":[
+  {"name":"read_file",
+   "description":"Read a file under the sandbox root. Returns text or a binary marker.",
+   "inputSchema":{"type":"object","required":["path"],
+     "properties":{"path":{"type":"string"}}}},
+  {"name":"write_file",
+   "description":"Write text to a file under the sandbox root. Creates parents.",
+   "inputSchema":{"type":"object","required":["path","content"],
+     "properties":{"path":{"type":"string"},"content":{"type":"string"}}}},
+  {"name":"list_directory",
+   "description":"List names under a directory. Non-recursive.",
+   "inputSchema":{"type":"object","required":["path"],
+     "properties":{"path":{"type":"string"}}}}]}}</pre>
+
+      <p>三个 tool、三段写给模型看的描述、三份宿主可校验的模式。这就是文件系统服务器面向智能体的全部合约，无需另加一行胶水就流进上面的循环。</p>
+    </div>
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>完整循环，含 sampling 与 elicitation。</h3>
+
+      <p>上面的循环是九成情形：模型请求 tool、服务器执行、结果回喂。剩下的一成正是 MCP 被公认为"不易一眼看透"的地方，也是 <a href="/zh/deep-dives/mcp/mcp-sampling-and-elicitation" class="xref">采样与征询</a>深入解析完整覆盖的部分。两种机制都反转方向——服务器主动向宿主发起一次调用——两者在生产上都比多数教程承认的重要。</p>
+
+      <p><strong>Sampling。</strong>服务器为了干活需要 LLM 帮忙——总结一份文件、给一段内容分类、在两份 schema 之间抉择——但服务器不持有 API 密钥。在 MCP 之前的世界里，每台服务器都要自带模型凭据，每一次凭据轮换都是又一个运维面。Sampling 把它翻过来：服务器通过客户端回发一次 <code class="inline">sampling/createMessage</code> 请求，客户端用宿主的模型和宿主的密钥完成生成并返回结果。宿主控制跑哪个模型、适用什么成本预算、以及用户是否要批准这次调用。服务器借智能而不借密钥。</p>
+
+      <p><strong>Elicitation。</strong>调用途中，服务器发现它需要来自用户的某个值——一次确认、一段 PII、几个选项中的一个——那不在原始工具参数里。服务器不是失败也不是猜，而是发出一次 <code class="inline">elicitation/create</code> 请求，宿主向用户渲染一份表单再把回答返回。这一面让"删除这五份文件"这样的 tool 可以问一句"你确定吗？"，而不必让模型在自己的推理里假造一条确认流。</p>
+
+      <p>两项特性都在 initialize 握手中作为客户端能力声明，都可选。要求 sampling 的服务器面对没有声明它的客户端会拒绝启动；提供 elicitation 的服务器在宿主无法渲染表单时会优雅降级。在我们的文件系统例子中，elicitation 就是破坏性路径的正确原语：<code class="inline">delete_file</code> 在动手前先发一次 elicitation，用户的回答成为事实源，而不是模型对"用户大概想要什么"的推断。</p>
+    </div>
+
+    <!-- ============ STEP 5 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 5</div>
+      <h3>在进程内测试整体。</h3>
+
+      <p>默认的直觉——把 MCP 服务器起成子进程、通过 stdio 与之通话、断言 JSON-RPC 帧——是错的，<a href="/zh/deep-dives/mcp/mcp-testing" class="xref">测试 MCP 服务器</a>深入解析就是你 CI 一开始抖动就要翻到的那一篇。两份官方 SDK 都出厂了一种进程内传输，能完整跑一遍协议握手而不用跨越进程边界。FastMCP 的 Python <code class="inline">Client</code> 直接接收一个服务器对象；TypeScript SDK 暴露 <code class="inline">InMemoryTransport.createLinkedPair()</code>。任一种方式下，原本要 200–500 毫秒子进程启动的测试都会塌缩到个位数毫秒。</p>
+
+<pre class="standalone"><span class="c-cm"># tests/test_agent_loop.py — in-memory end-to-end for the loop above</span>
+<span class="c-kw">import</span> pytest
+<span class="c-kw">from</span> fastmcp <span class="c-kw">import</span> Client
+<span class="c-kw">from</span> fs_server <span class="c-kw">import</span> mcp  <span class="c-cm"># the FastMCP filesystem server object</span>
+
+<span class="c-at">@pytest.mark.asyncio</span>
+<span class="c-kw">async def</span> test_read_after_write_round_trip(tmp_path):
+    <span class="c-kw">async with</span> Client(mcp) <span class="c-kw">as</span> client:
+        <span class="c-kw">await</span> client.call_tool(<span class="c-st">"write_file"</span>,
+            {<span class="c-st">"path"</span>: str(tmp_path / <span class="c-st">"note.md"</span>), <span class="c-st">"content"</span>: <span class="c-st">"hello"</span>})
+        result = <span class="c-kw">await</span> client.call_tool(<span class="c-st">"read_file"</span>,
+            {<span class="c-st">"path"</span>: str(tmp_path / <span class="c-st">"note.md"</span>)})
+        <span class="c-kw">assert</span> result.structured_content[<span class="c-st">"text"</span>] == <span class="c-st">"hello"</span></pre>
+
+      <p>这种形状要紧的是：没有配置文件、没有 CLI 调用、没有端口。<code class="inline">mcp</code> 这个服务器对象从生产入口所导入的同一个包中导入，因此通过进程内传输通过的测试，也会因为同样的原因通过一个真实客户端。Schema 测试——断言 <code class="inline">tools/list</code> 仍然返回你客户端缓存过的那些工具、描述和 required 字段——住在另一个文件里、并先运行，因为一次 schema 回归会同时打掉所有下游客户端。上面那种行为测试覆盖具体用例；深入解析走完这条拆分并展示什么该放进哪一套。</p>
+    </div>
+
+    <!-- ============ STEP 6 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 6</div>
+      <h3>上线清单。</h3>
+
+      <p>剩下的都是运维纪律。四个面各值得在你按下开关之前咬一口，每一个都有一篇比本节走得更深的深入解析。</p>
+
+      <p><strong>鉴权。</strong>任何能通过网络到达的东西都需要 MCP OAuth 2.1 配置：强制 PKCE、按 RFC 8707 的资源指示、用于授权服务器发现的 Protected Resource Metadata。Bloomberry 调查发现 39% 的生产服务器一个都不用。别成为那 39%。<a href="/zh/deep-dives/mcp/mcp-auth-oauth21" class="xref">MCP 鉴权</a>深入解析是参考。</p>
+
+      <p><strong>审计日志。</strong>记录参数的<em>形状</em>——工具名、按 schema 呈现的参数（去掉值）——而不是参数的值。这才让你能回答"这次会话碰过哪些工具？"而不必把用户 PII 倾泻到日志存储里。逐工具的 kill switch、从被验证的令牌 claim 取得的租户隔离、按智能体流量规模化的限流，都住在同一顶运维伞下；<a href="/zh/deep-dives/mcp/mcp-ops-in-production" class="xref">MCP 生产运维</a>走一遍这套模式。</p>
+
+      <p><strong>传输。</strong>本地 stdio 用于与宿主一起出厂的服务器（Claude Desktop 打包了一台文件系统服务器、IDE 打包了一台代码搜索服务器）。<a href="/zh/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a> 用于跑在网络上的服务器——那是对已弃用 HTTP+SSE 传输的单端点替代方案，带 MCP-Session-Id 和基于 Last-Event-ID 的可恢复性。按服务器要跑在哪里选传输，而不是按你把这次配置视作"开发"还是"生产"来选。</p>
+
+      <p><strong>失败信封。</strong>客户端看得到三种失败模式：服务器返回一次工具错误（结构化、可行动）、服务器返回一次协议错误（initialize 失败、传输掉链）、或者服务器不可达。宿主循环对每种都需要一条策略。工具错误以带 <code class="inline">isError: true</code> 标记的 tool_result 回喂模型，让模型决定重试还是改道。协议错误上浮给运维。不可达的服务器不应在跑到一半时从工具清单里静默消失——要么循环暂停并重连，要么大声失败。此处含糊，就是 MCP 原生智能体在生产上抖动的地方。</p>
+
+      <p>贯穿全章的主线：MCP 原生不是重写，而是重构"责任住在哪里"。工具从你智能体的代码库里挪进宿主要连接的一些服务器。鉴权挪进这个领域已经达成一致的协议的一份配置。测试挪进一种毫秒级运行的进程内传输。留在你智能体代码里的，是循环、宿主，以及产品逻辑——比过去更小、更好推理，因为每一段可复用的部分都有它该住的地方。</p>
+    </div>
+
+  </section>

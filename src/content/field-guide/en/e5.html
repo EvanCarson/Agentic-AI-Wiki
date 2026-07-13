@@ -1,0 +1,100 @@
+<section class="phase">
+    <div class="phase-num">3.5</div>
+    <div class="week">Part III / Evaluate · Turn your eval suite into a merge gate</div>
+    <h2>An eval suite that runs but doesn't block merges is a lie — the tiered pattern (cheap graders in pre-commit, LLM judges in preview, judge calibration in monthly cadence) is the 2026 discipline that survives production.</h2>
+    <p class="goal">Every team ships an eval suite; most teams don't block merges on it. The result is the "eval report" nobody reads until a regression makes it into production. The 2026 discipline that survives is tiered: cheap code-graders (~ms) run in pre-commit hooks, LLM judges (~s) run on preview deploys, and judge calibration runs monthly against a versioned human gold set. This chapter is the operational build — what to run where, how to configure the merge gate, and how to keep the gold set alive. By the end you'll have an eval-CI pipeline that actually blocks bad merges, and you'll know the two failure modes (judge drift and gold-set rot) that undo it.</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>The three tiers.</h3>
+
+      <p>The <a href="/field-guide/eval-driven-dev" class="xref">eval-driven-dev chapter</a> taught the rhythm; the <a href="/field-guide/benchmarks-and-ci" class="xref">benchmarks-and-ci chapter</a> taught the runtime substrate that carries the rhythm through CI. This chapter is the last piece — the merge-gate policy that turns a passing eval report into an enforced contract. A team that runs evals but never blocks on them has a report, not a gate; a team that blocks on every eval failure has a gate but no throughput. The pattern that shipped through 2026 in production without either failure mode is tiered, and the tiers are defined by cost-per-run rather than by what they measure.</p>
+
+      <p>Tier one is the pre-commit tier: deterministic code graders that finish in milliseconds. Regex over the model output, JSON schema validation, unit tests on generated code, contract checks against a fixed tool spec. These run in a git pre-commit hook and again on the first CI job of every push. They are always blocking, and the block is uncontroversial — a schema failure is not a taste judgment. Tier two is the preview tier: LLM judges running against a small representative slice on the preview deploy of the pull request. These take seconds to minutes, cost cents to dollars per run, and are the tier where regressions actually get caught before merge. Tier three is the monthly tier: judge calibration against a versioned human gold set. This tier never blocks a merge directly — it blocks the <em>judge</em> from being trusted for the next month, which is a stronger kind of gate.</p>
+
+      <p>The cost gradient is the whole point. Pre-commit graders are free enough to run on every keystroke; preview judges are cheap enough to run on every PR; calibration is expensive enough that you run it once a month and treat the result as a signed contract. Any team that inverts the gradient — LLM judges in pre-commit, code graders in monthly cadence — ends up either paying too much or catching too little. The tiers exist because the eval budget is finite and the failure modes are stratified.</p>
+    </div>
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Pre-commit: cheap code graders.</h3>
+
+      <p>The pre-commit tier answers one question: does this change violate a contract that a machine can check without asking a model? Every yes here is a hard block. The check runs locally under a git hook and again in the first CI job so the local hook can be bypassed without silently escaping the gate. Typical checks: the agent's structured output still parses as JSON; every tool call names a registered tool; every message has the required fields; the code the agent generated compiles; the golden trajectories replay without an exception. These are cheap, deterministic, and boring — three properties that make them ideal blocking gates.</p>
+
+      <p>The specific rule that separates a working pre-commit tier from a broken one is that it must finish in under a minute for a typical change. Above that threshold, engineers learn to bypass it, and a bypassed hook is a hook that isn't there. The way you hit the budget is aggressive scoping: run the pre-commit graders only against the changed files and their direct dependents, save the full sweep for CI. The CI variant of the same job then runs across the whole tree with no scoping and posts a hard failure back to the PR when it disagrees with the local hook's verdict — that disagreement is a signal that someone bypassed the local check and needs the CI to catch what the hook missed.</p>
+
+      <p>Concretely, this tier is a YAML job with a few dozen lines of assertions. It is the CI equivalent of the type checker: it doesn't decide whether your code is good, it decides whether your code is well-formed. That framing is worth defending against creep. Every quarter someone will propose adding an LLM judge to this tier because "it would only add a few seconds." Refuse. The moment tier one holds a network call, its uptime becomes coupled to a vendor's uptime, and the contract that "pre-commit always passes locally" breaks.</p>
+    </div>
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Preview: LLM judges.</h3>
+
+      <p>Tier two is where quality regressions actually get caught. The mechanics are simple in shape and unforgiving in detail: on every pull request, the preview deploy runs the agent against a fixed sampled slice of the eval suite; an LLM judge scores each response along the rubric axes; the aggregate score is compared to the main-branch baseline; the merge gate blocks if the aggregate drops below a threshold or if any individual axis regresses by more than the noise floor. The <a href="/operations/evaluation-and-observability/llm-as-judge-for-agents" class="xref">LLM-as-judge for agents</a> operations page walks the rubric design that makes this tier trustworthy; the point of the merge gate is that the trust is enforced, not aspirational.</p>
+
+      <p>Three implementation decisions decide whether this tier works or theatrically fails. First, the sampled slice must be fixed by seed and versioned in the repo — a floating slice makes the baseline meaningless. Second, the noise floor must be measured, not assumed. Run the same slice against the same code five times, take the standard deviation of the aggregate, and set the block threshold at two of those. Anything tighter produces false blocks; anything looser misses real regressions. Third, the block must be enforceable at the branch protection level. A failing check a maintainer can override with a click will get overridden, and the gate becomes advisory theater.</p>
+
+      <p>The escape hatch — a labeled override for the rare legitimate case where the judge is wrong — is a hard requirement, not an admission of weakness. With it, every override creates a paper trail that feeds the tier-three calibration pass. If the same override reason shows up three months in a row, the judge rubric needs a fix.</p>
+    </div>
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>Monthly: judge calibration + gold-set upkeep.</h3>
+
+      <p>Tier three is the tier most teams skip and most production incidents trace back to. Once a month, the judge model runs against a versioned human gold set — a few hundred hand-labeled examples that represent the distribution the agent actually sees in production. The judge's verdicts are compared to the human labels; agreement below a threshold (85-90% is the ceiling most published rubrics hit, and the <a href="/deep-dives/evaluating-agents/judge-calibration-and-meta-evaluation" class="xref">judge calibration and meta-evaluation</a> deep-dive walks why higher targets are self-defeating) sends the judge back to prompt engineering. The <a href="/operations/evaluation-and-observability/eval-driven-agent-development" class="xref">eval-driven agent development</a> ops page has the runbook for the calibration pass itself; this chapter's contribution is naming it as a merge-gate dependency rather than a nice-to-have.</p>
+
+      <p>The gold set grows by an additive rule: every month, add a handful of examples drawn from production traces flagged by escape-hatch overrides in tier two, and rotate an equal number of the oldest examples out. A gold set that never rotates scores the judge against a distribution the agent no longer serves; one replaced wholesale loses continuity with prior months. The flywheel: production traces feed the escape hatch, escape-hatch cases feed the gold set, the gold set calibrates the judge, the judge gates the merges, and the merges shape the traces. Break any link and the tier degrades.</p>
+    </div>
+
+    <!-- ============ STEP 5 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 5</div>
+      <h3>Failure modes: judge drift and gold-set rot.</h3>
+
+      <p>Two failure modes undo this pipeline, and they show up together often enough to be worth naming as a pair. Judge drift is when the same judge prompt, run against the same input, produces a different score distribution over time — usually because the vendor silently updated the underlying model. The tell is that baseline aggregate scores creep up or down over a few weeks with no corresponding code change. Fix: pin the judge model to a dated snapshot the same way you pin production models, and alert on any monthly calibration run whose aggregate shifts by more than the noise floor from the prior month.</p>
+
+      <p>Gold-set rot is the slower failure. Labels that were unambiguous six months ago become ambiguous as the agent's capabilities shift — the "borderline pass" that used to be rare becomes common, and the rubric no longer separates borderline from clear. The tell is that inter-annotator agreement (if you keep two labelers on a sample) declines, or the gap between judge and human verdicts widens on specific rubric axes. Fix: when an axis shows widening disagreement, rewrite that axis's rubric text and re-label the affected slice against the new definition. The gold set is not immutable, but every change to it must be logged, versioned, and dated so that the calibration history remains interpretable.</p>
+
+<pre class="standalone"><span class="c-cm"># .github/workflows/eval-gate.yml — the three-tier gate</span>
+name: eval-gate
+on: [pull_request]
+
+jobs:
+  tier1-precommit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make eval-precommit   <span class="c-cm"># regex, schema, unit — ~ms, blocking</span>
+
+  tier2-preview:
+    needs: tier1-precommit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make eval-preview     <span class="c-cm"># LLM judges on fixed slice — ~s, blocking</span>
+        env:
+          JUDGE_MODEL: claude-opus-4-7-20260201   <span class="c-cm"># pinned; drift guard</span>
+          EVAL_SLICE_SEED: 42                     <span class="c-cm"># fixed; baseline guard</span>
+
+  tier3-monthly:
+    <span class="c-cm"># separate scheduled workflow — not shown; gates the judge, not the merge</span>
+</pre>
+
+<pre class="trace">$ gh pr checks 4171
+tier1-precommit    pass    0m12s
+tier2-preview      FAIL    3m41s
+  aggregate: 0.847 → 0.821  (Δ -0.026, noise floor 0.014)
+  axis: instruction_following   0.91 → 0.87   (Δ -0.04, blocking)
+  axis: tool_selection          0.83 → 0.82   (Δ -0.01, within noise)
+  axis: response_quality        0.80 → 0.78   (Δ -0.02, within noise)
+verdict: BLOCKED  — instruction_following axis exceeds noise floor
+override: use label `eval-override` with justification comment
+</pre>
+
+      <p>The trace above is what a working gate looks like from the PR author's side: one axis dropped past the noise floor, the merge is blocked, and the override path is documented rather than hidden. That is the whole shape of the discipline — the pipeline is boring, the failure is loud, and the escape hatch is auditable. Everything else is upkeep.</p>
+    </div>
+  </section>
