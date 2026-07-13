@@ -52,6 +52,7 @@ export const PARTS: Part[] = [
     { page: 'r1', slug: 'what-to-read',     num: '01', title: L('What to Read', '延伸阅读') },
     { page: 'r2', slug: 'computer-use-in-production', num: '02', title: L('Computer Use in Production', '生产中的计算机操作') },
     { page: 'r3', slug: 'mcp-native-agent-building',  num: '03', title: L('MCP-Native Agent Building', 'MCP 原生的智能体构建') },
+    { page: 'r4', slug: 'the-two-layer-consensus',    num: '04', title: L('The Two-Layer Consensus', '两层共识') },
   ]},
 ];
 
