@@ -1,0 +1,148 @@
+<section class="phase">
+    <div class="phase-num">5.3</div>
+    <div class="week">Part V / Frontier · Wire an agent through MCP end-to-end</div>
+    <h2>Building an agent MCP-first — server for tools, client on the host, wire the loop — is the shape that most 2026 production agents converge on, and the field guide chapter for that shape is the natural capstone for the MCP deep-dive group.</h2>
+    <p class="goal">By mid-2026 the median production agent doesn't build its own tool layer — it consumes MCP servers. Anthropic's own docs frame it that way; Bloomberry's survey of 1,412 production servers shows why. This chapter walks a real MCP-native agent end-to-end: pick tools by exposing them as an MCP server, wire the client on the host side, handle the loop including sampling and elicitation, test it in-process, and ship it with the operational disciplines the MCP deep-dive group covers. By the end you'll have built a small agent that reads and writes to a filesystem via an MCP server with proper auth and audit, and you'll know exactly which MCP essays to reach for when your production build hits each surface.</p>
+
+    <!-- ============ STEP 1 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 1</div>
+      <h3>Why "MCP-native" is a real category in 2026.</h3>
+
+      <p>The tool layer used to be something every agent team wrote from scratch. Each project reinvented the function-schema format, the argument validator, the retry policy, the audit log. That work absorbed weeks per project and produced tool layers that didn't compose across teams, so the moment you wanted to share a "read from S3" or "query Snowflake" tool between two agents you were rewriting the same wiring twice.</p>
+
+      <p>MCP finished that phase. The Model Context Protocol gave the field a common shape for how a model addresses a tool — a JSON-RPC handshake, a <code class="inline">tools/list</code> manifest, a <code class="inline">tools/call</code> invocation, and a standard place to hang auth. By 2026 that shape had been widely enough adopted that the median production agent no longer builds a tool layer at all. It consumes MCP servers written by someone else — sometimes an official vendor server, sometimes an internal server another team on the same company already stood up.</p>
+
+      <p>The data is concrete. Bloomberry's February 2026 survey of 1,412 public MCP servers found that the median server ships five tools, zero resources, zero prompts. Those numbers aren't a curiosity — they're the shape of the ecosystem. Every host with MCP support (Claude Desktop, Cursor, the Anthropic and OpenAI APIs' native MCP client surfaces, Windsurf, Continue) can wire the same server without adaptation, and the servers you consume are small and single-purpose. The eight-MCP production stack — a filesystem server, a database server, a monitoring server, a project-management server, and four more like them — is now a common shape. That is what "MCP-native" means: your agent's tool layer isn't code you wrote, it's a set of MCP endpoints your host connects to.</p>
+
+      <p>This chapter is the field-guide capstone for the MCP deep-dive group. If <a href="/field-guide/tool-use" class="xref">tool use</a> was the introductory chapter for how models call functions, this is the operational chapter for how a 2026 agent actually wires those calls: expose the tools you own as an MCP server, run an MCP client in your host, and let the deep-dive essays supply the details as each surface bites.</p>
+    </div>
+
+    <!-- ============ STEP 2 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 2</div>
+      <h3>Choosing which capabilities to expose as tools vs resources vs prompts.</h3>
+
+      <p>MCP gives a server three primitives to expose a capability with. Tools are model-controlled actions — the model decides at runtime whether to invoke one, and the call may perform a side effect or a query on the model's behalf. Resources are host-controlled context — URI-addressable, read-only data the host reads and places into the model's context on its own schedule. Prompts are user-controlled templates — workflow scaffolding the server exposes and the host surfaces as slash-commands.</p>
+
+      <p>The mnemonic that sticks: <em>tool = model chooses, resource = host chooses, prompt = user chooses</em>. The <a href="/deep-dives/mcp/mcp-tool-design" class="xref">MCP tool design</a> deep-dive walks the choice in depth; the field-guide version applied to our worked example — a filesystem server that lets an agent read, write, and enumerate files under a sandboxed root — comes out like this.</p>
+
+      <p><code class="inline">read_file(path)</code> and <code class="inline">write_file(path, content)</code> are tools. The model has to decide, mid-turn, that it needs to open a specific file or persist a specific edit. Neither call fits a "load at session start" pattern; both perform an operation the model requested at a specific point in the loop.</p>
+
+      <p><code class="inline">list_directory(path)</code> is the ambiguous one, and the answer changes with the use case. If the agent needs a live directory listing at arbitrary times — say, an editor agent walking a codebase — it's a tool. If your host wants to pre-load a fixed tree at session start so the model always knows the project layout, it's a resource keyed off a URI like <code class="inline">fs://project/tree</code>. Most 2026 agents ship the tool version and add the resource only if the host actually surfaces resources; the median server ships zero resources for exactly this reason.</p>
+
+      <p>A prompt on this server might be <code class="inline">/refactor {file}</code> — a template that expands to a specific instruction the user can invoke as a slash-command. Prompts are the least-used surface; most filesystem servers don't ship any. Ship one only when it earns its keep in the host's slash-command UX.</p>
+    </div>
+
+    <!-- ============ STEP 3 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 3</div>
+      <h3>Wiring the MCP client into your host loop.</h3>
+
+      <p>The host side is where an "MCP-native" agent gets stitched together. The client establishes a session with each server it's configured to reach, calls <code class="inline">tools/list</code> to learn what's available, folds those tools into the same tool array the model already sees, and dispatches <code class="inline">tools/call</code> when the model picks one. The <a href="/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP architecture</a> deep-dive walks the JSON-RPC lifecycle and the participant model; the <a href="/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">building servers in practice</a> essay covers the FastMCP server side. Here's the minimal client wired into a plain agent loop.</p>
+
+<pre class="standalone"><span class="c-cm"># host.py — minimal MCP-native agent loop (Python + fastmcp Client + Anthropic SDK)</span>
+<span class="c-kw">import</span> anthropic
+<span class="c-kw">from</span> fastmcp <span class="c-kw">import</span> Client
+
+<span class="c-kw">async def</span> <span class="c-fn">run_agent</span>(user_msg: str, servers: list[str]) -&gt; str:
+    llm = anthropic.AsyncAnthropic()
+    <span class="c-kw">async with</span> Client(servers[<span class="c-st">0</span>]) <span class="c-kw">as</span> mcp:
+        tools = [{<span class="c-st">"name"</span>: t.name,
+                  <span class="c-st">"description"</span>: t.description,
+                  <span class="c-st">"input_schema"</span>: t.inputSchema}
+                 <span class="c-kw">for</span> t <span class="c-kw">in</span> <span class="c-kw">await</span> mcp.list_tools()]
+        messages = [{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_msg}]
+        <span class="c-kw">while</span> <span class="c-kw">True</span>:
+            resp = <span class="c-kw">await</span> llm.messages.create(
+                model=<span class="c-st">"claude-mythos-preview"</span>,
+                tools=tools, messages=messages, max_tokens=<span class="c-st">2048</span>)
+            messages.append({<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>, <span class="c-st">"content"</span>: resp.content})
+            <span class="c-kw">if</span> resp.stop_reason != <span class="c-st">"tool_use"</span>:
+                <span class="c-kw">return</span> resp.content[<span class="c-st">0</span>].text
+            <span class="c-kw">for</span> block <span class="c-kw">in</span> resp.content:
+                <span class="c-kw">if</span> block.type == <span class="c-st">"tool_use"</span>:
+                    result = <span class="c-kw">await</span> mcp.call_tool(block.name, block.input)
+                    messages.append({<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: [
+                        {<span class="c-st">"type"</span>: <span class="c-st">"tool_result"</span>,
+                         <span class="c-st">"tool_use_id"</span>: block.id,
+                         <span class="c-st">"content"</span>: result.structured_content <span class="c-kw">or</span> result.text}]})</pre>
+
+      <p>Three things are doing real work in that snippet. The <code class="inline">Client(servers[0])</code> context manager runs the full initialize handshake — the client and server negotiate protocol version and capabilities before anything else happens. The tool-manifest translation adapts MCP's <code class="inline">inputSchema</code> shape into the vendor SDK's <code class="inline">input_schema</code> field; the two are the same JSON Schema but live under different property names, and MCP-native hosts learn to normalize once at the boundary. And the loop terminates on <code class="inline">stop_reason != "tool_use"</code>, meaning any turn that doesn't request a tool is the final answer. Everything else — session management, framing, error envelopes — the SDK handles.</p>
+
+      <p>On the wire, the first exchange the host sees back from the server is a <code class="inline">tools/list</code> response like this one.</p>
+
+<pre class="trace">{"jsonrpc":"2.0","id":1,"result":{"tools":[
+  {"name":"read_file",
+   "description":"Read a file under the sandbox root. Returns text or a binary marker.",
+   "inputSchema":{"type":"object","required":["path"],
+     "properties":{"path":{"type":"string"}}}},
+  {"name":"write_file",
+   "description":"Write text to a file under the sandbox root. Creates parents.",
+   "inputSchema":{"type":"object","required":["path","content"],
+     "properties":{"path":{"type":"string"},"content":{"type":"string"}}}},
+  {"name":"list_directory",
+   "description":"List names under a directory. Non-recursive.",
+   "inputSchema":{"type":"object","required":["path"],
+     "properties":{"path":{"type":"string"}}}}]}}</pre>
+
+      <p>Three tools, three descriptions written for the model to read, three schemas the host can validate. That is the entire agent-facing contract of the filesystem server, and it flows into the loop above without another line of glue.</p>
+    </div>
+
+    <!-- ============ STEP 4 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 4</div>
+      <h3>The full loop, including sampling and elicitation.</h3>
+
+      <p>The loop above is the ninety-percent case: model asks for a tool, server runs it, result feeds back. The other ten percent is where MCP earned its reputation for being subtle, and it's what the <a href="/deep-dives/mcp/mcp-sampling-and-elicitation" class="xref">sampling and elicitation</a> deep-dive covers in full. Both mechanisms invert the direction — the server initiates a call back into the host — and both matter more in production than most tutorials admit.</p>
+
+      <p><strong>Sampling.</strong> The server needs an LLM to help it do its job — summarize a file, classify a piece of content, decide between two schemas — but the server doesn't hold an API key. In the pre-MCP world every server carried its own model credentials and every credential rotation was another operational surface. Sampling flips it: the server issues a <code class="inline">sampling/createMessage</code> request back through the client, the client uses the host's model with the host's key, and returns the completion. The host controls what model runs, what cost budget applies, and whether the user gets to approve the call. The server borrows intelligence without borrowing a key.</p>
+
+      <p><strong>Elicitation.</strong> Mid-call, the server discovers it needs a value from the user — a confirmation, a piece of PII, a choice between options — that wasn't in the original tool arguments. Instead of failing or guessing, the server issues an <code class="inline">elicitation/create</code> request and the host renders a form to the user, then returns the response. This is the surface that lets a "delete these five files" tool ask "are you sure?" without the model having to fake a confirmation flow in its own reasoning.</p>
+
+      <p>Both features are declared as client capabilities during the initialize handshake, and both are optional. A server that requires sampling will refuse to start against a client that didn't advertise it; a server that offers elicitation gracefully degrades if the host can't render a form. In our filesystem example, elicitation is the correct primitive for the destructive path: <code class="inline">delete_file</code> issues an elicitation before it acts, and the user's answer becomes the ground truth, not the model's inference of what the user probably wants.</p>
+    </div>
+
+    <!-- ============ STEP 5 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 5</div>
+      <h3>Testing the whole thing in-process.</h3>
+
+      <p>The default instinct — spawn the MCP server as a subprocess, talk to it over stdio, assert on the JSON-RPC frames — is the wrong one, and the <a href="/deep-dives/mcp/mcp-testing" class="xref">MCP testing</a> deep-dive is the essay you reach for the moment your CI starts flaking. Both official SDKs ship an in-memory transport that runs a full protocol handshake without a process boundary. FastMCP's Python <code class="inline">Client</code> takes a server object directly; the TypeScript SDK exposes <code class="inline">InMemoryTransport.createLinkedPair()</code>. Either way, tests that used to take 200-500ms of subprocess boot collapse to single-digit milliseconds.</p>
+
+<pre class="standalone"><span class="c-cm"># tests/test_agent_loop.py — in-memory end-to-end for the loop above</span>
+<span class="c-kw">import</span> pytest
+<span class="c-kw">from</span> fastmcp <span class="c-kw">import</span> Client
+<span class="c-kw">from</span> fs_server <span class="c-kw">import</span> mcp  <span class="c-cm"># the FastMCP filesystem server object</span>
+
+<span class="c-at">@pytest.mark.asyncio</span>
+<span class="c-kw">async def</span> test_read_after_write_round_trip(tmp_path):
+    <span class="c-kw">async with</span> Client(mcp) <span class="c-kw">as</span> client:
+        <span class="c-kw">await</span> client.call_tool(<span class="c-st">"write_file"</span>,
+            {<span class="c-st">"path"</span>: str(tmp_path / <span class="c-st">"note.md"</span>), <span class="c-st">"content"</span>: <span class="c-st">"hello"</span>})
+        result = <span class="c-kw">await</span> client.call_tool(<span class="c-st">"read_file"</span>,
+            {<span class="c-st">"path"</span>: str(tmp_path / <span class="c-st">"note.md"</span>)})
+        <span class="c-kw">assert</span> result.structured_content[<span class="c-st">"text"</span>] == <span class="c-st">"hello"</span></pre>
+
+      <p>What matters about the shape: no config file, no CLI invocation, no port. The <code class="inline">mcp</code> server object is imported from the same package the production entrypoint imports, so a test that passes against the in-memory transport passes against a real client for the same reasons. Schema tests — assertions that <code class="inline">tools/list</code> still returns the tools with the descriptions and required fields your clients cached — live in a separate file and run first, because a schema regression breaks every downstream client at once. Behavior tests like the one above cover the specific cases; the deep-dive walks the split and shows what belongs in each suite.</p>
+    </div>
+
+    <!-- ============ STEP 6 ============ -->
+    <div class="step">
+      <div class="step-num">STEP 6</div>
+      <h3>Ship checklist.</h3>
+
+      <p>The rest of a production MCP-native agent is operational discipline. Four surfaces each deserve one bite of attention before you flip the switch, and each has a deep-dive that goes deeper than this section will.</p>
+
+      <p><strong>Auth.</strong> Anything reachable over a network needs the MCP OAuth 2.1 profile: mandatory PKCE, resource indicators per RFC 8707, Protected Resource Metadata for authorization-server discovery. The Bloomberry survey found 39% of production servers ship none of that. Don't be in that 39%. The <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">MCP auth</a> deep-dive is the reference.</p>
+
+      <p><strong>Audit logging.</strong> Log the argument <em>shape</em> — the tool name, the schema-shaped arguments minus their values — not the argument values. That's what lets you answer "which tools did this session touch?" without dumping user PII into the log store. Per-tool kill switches, tenant isolation from verified token claims, and rate-limits sized for agent traffic all live under the same operational umbrella; <a href="/deep-dives/mcp/mcp-ops-in-production" class="xref">MCP ops in production</a> walks the pattern.</p>
+
+      <p><strong>Transport.</strong> Local stdio for a server that ships with the host (Claude Desktop bundling a filesystem server, an IDE bundling a code-search server). <a href="/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a> for a server that lives on a network — the single-endpoint replacement for the deprecated HTTP+SSE transport, with MCP-Session-Id and Last-Event-ID resumability. Pick per server based on where it needs to run, not by whether you consider the setup dev or prod.</p>
+
+      <p><strong>Failure envelope.</strong> The client sees three failure modes: the server returns a tool error (structured, actionable), the server returns a protocol error (initialize failed, transport dropped), or the server is unreachable. The host loop needs a policy for each. Tool errors flow back to the model as tool results with an <code class="inline">isError: true</code> marker so the model can decide whether to retry or reroute. Protocol errors surface to the operator. Unreachable servers should not silently disappear from the tool manifest mid-run — either the loop pauses and reconnects, or it fails loudly. Ambiguity here is where MCP-native agents get flaky in production.</p>
+
+      <p>The through-line: MCP-native isn't a rewrite, it's a refactor of where responsibility lives. Tools move out of your agent's codebase into servers your host connects to. Auth moves into a profile of a protocol the field already agreed on. Testing moves into an in-process transport that runs in milliseconds. What's left in your agent code is the loop, the host, and the product logic — smaller than it used to be, and easier to reason about, because every reusable piece has a place it lives.</p>
+    </div>
+
+  </section>

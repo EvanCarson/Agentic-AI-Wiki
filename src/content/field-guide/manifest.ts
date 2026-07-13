@@ -51,6 +51,7 @@ export const PARTS: Part[] = [
   { key: 'r', roman: 'V', name: L('Frontier', '前沿'), chapters: [
     { page: 'r1', slug: 'what-to-read',     num: '01', title: L('What to Read', '延伸阅读') },
     { page: 'r2', slug: 'computer-use-in-production', num: '02', title: L('Computer Use in Production', '生产中的计算机操作') },
+    { page: 'r3', slug: 'mcp-native-agent-building',  num: '03', title: L('MCP-Native Agent Building', 'MCP 原生的智能体构建') },
   ]},
 ];
 
