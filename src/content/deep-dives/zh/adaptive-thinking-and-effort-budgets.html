@@ -1,0 +1,157 @@
+<section class="phase">
+  <div class="phase-num">N7</div>
+  <div class="week">深入解析 · 推理与测试时计算</div>
+  <h2>2026 年厂商从"令牌预算旋钮"转到自适应 <code class="inline">effort</code> 档位——Anthropic 已弃用 <code class="inline">budget_tokens</code>——三家的写法足够接近可对比，但足够不同能坑到你。</h2>
+  <p class="goal">2024–2025 年间"给思考预算令牌"的每一份示例都过期了。Anthropic 在 Opus 4.6 / Sonnet 4.6 上把 <code class="inline">budget_tokens</code> 标为弃用，在 4.7+ 直接删除；替代品是 <code class="inline">thinking.type: adaptive</code> 配 <code class="inline">effort: low|medium|high</code>。Gemini 用 <code class="inline">thinking_level</code>。OpenAI 用 <code class="inline">reasoning_effort</code>。思路相同，三套词汇，一个陷阱——当模型自己的梯度告诉它"需要更多"时，会覆盖你的预算。这篇讲 API 表面、覆盖行为，以及逐厂商的成本账。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>令牌预算为何被替换。</h3>
+
+    <p>第一代推理 API——Claude 3.7 的 extended thinking、o1 最初 GA 时的形状、Gemini 2.5 Flash Thinking——共享同一个控制面：一个数值上限，规定模型在必须给出答案之前，允许花掉的私有思考令牌数。名字各家有异（<code class="inline">budget_tokens</code>、<code class="inline">max_reasoning_tokens</code>、<code class="inline">thinking_budget</code>），默认值也不同，但形状一样。你挑一个数，模型至多花这么多，若撞到上限就停止思考、按被截断的轨迹产出答案。它易懂，且能顺畅接入已有的令牌预算代码路径；它错的方式与本组上一篇里"固定的测试时算力预算"错的方式相同——一刀切的上限在容易的多数查询上浪费预算，却把本该多花的困难长尾饿死。</p>
+
+    <p>失效模式很好复现。在混合负载上把 <code class="inline">budget_tokens=8000</code> 设上，记录每次实际消耗的思考令牌。查表类问题模型花 200 就返回；直白推导花 1500；二十次里那一道难题它想花 12000，却被 8000 掐掉，给出的部分答案往往比"根本不思考、一次通过"还差。把上限提到 16000，你就在每个原本用不到那么多的查询上多付一倍。混合负载没有一个"正确的数"——本组 <a href="/zh/deep-dives/reasoning-and-test-time-compute/inference-time-scaling" class="xref">推理时扩展</a>一文里的算力最优测试时策略说的是：预算应当是"按查询估计的难度"的函数，而数值上限无法编码这个函数。</p>
+
+    <p>2026 年厂商的动作是把难度估计器搬到模型内部。不再暴露"令牌旋钮"，而暴露一个粗粒度的<em>意图</em>——模型该多用力尝试——让模型自己把这份意图翻译成"逐查询"的实际令牌花销，按它即将回答的那道查询做校准。Anthropic 先定了形状（<code class="inline">effort: low|medium|high</code>），Gemini 与 OpenAI 用各自的词跟上同一思路。结果是一个在一维上更不可控（你不能再强制正好 N 个令牌）、在另一维上高效得多的 API（低档在易题上花几百个令牌，高档在难题上从同一档设置里花五位数）。<a href="/zh/deep-dives/reasoning-and-test-time-compute/when-reasoning-helps" class="xref">推理何时有用</a>一文在策略层已描述了同一转变——"给 Y 类查询把思考预算设为 X"本就是对的建议；API 如今才追上来，把 X 变成努力度档位，而不是令牌数。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Anthropic 的 <code class="inline">effort</code> API。</h3>
+
+    <p>Anthropic 在 Claude Opus 4.7 与 Sonnet 5 上的形状是请求里的 <code class="inline">thinking</code> 对象，含 <code class="inline">type: "adaptive"</code> 与一个 <code class="inline">effort</code> 枚举。较老的 <code class="inline">type: "enabled"</code> 加 <code class="inline">budget_tokens</code> 形状在 4.6 类模型上仍接受、附弃用警告；4.7+ 上直接返回 400。迁移是一个字段改名加去掉数字，2026 年 5 月底之后的每一次 SDK 发布，新代码都默认走 adaptive 形状。</p>
+
+<pre class="standalone">POST /v1/messages HTTP/1.1
+Host: api.anthropic.com
+anthropic-version: 2026-05-01
+content-type: application/json
+
+{
+  "model": "claude-opus-4-7",
+  "max_tokens": 4096,
+  "thinking": {
+    "type": "adaptive",
+    "effort": "high"
+  },
+  "messages": [
+    {"role": "user", "content": "Prove that sqrt(2) is irrational."}
+  ]
+}</pre>
+
+    <p>三档努力度是校准过的目标，不是固定预算。<code class="inline">low</code> 在易题上瞄准几百个思考令牌、在较难题上至多几千；<code class="inline">medium</code> 是推理模式请求的默认，大致对应 Claude 3.7 中段的 extended-thinking 花销；<code class="inline">high</code> 在难题上能花掉数万思考令牌，也乐意在查表题上花零。模型逐查询决定。<code class="inline">effort</code> 的取值把整条分布往上或往下推——同一道查询在 <code class="inline">high</code> 比 <code class="inline">low</code> 花得多——但"易题 vs 难题"在任一档下的比值由模型定，而非你定。</p>
+
+    <p>比字段改名更重要的是两个迁移点。第一，响应里现在带一个 <code class="inline">actual_effort</code> 字段，与流式思考块一起返回，报告模型实际选择的花销档位——取值仍是那三个枚举之一，可以低于你请求的（模型认为这道查询不配升级），但不会高于。每次请求都把这个字段记下来；没有它，自适应思考的可观测性就无从谈起。第二，system 提示与工具上的 cache-control 未变，但思考块本身从不被缓存——花了 12000 思考令牌的查询，每次跑都要付这份钱，即便提示的 90% 是缓存命中。<a href="/zh/deep-dives/architectures-and-patterns/context-caching-economics" class="xref">上下文缓存经济学</a>一文讲了它如何与写入溢价交互；一句话：自适应思考与缓存是加法杠杆，不是乘法。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Gemini 的 <code class="inline">thinking_level</code>。</h3>
+
+    <p>Gemini 3.1 Pro 与 3.5 Pro 在生成配置里用 <code class="inline">thinking_level</code> 字段，取值与 Anthropic 同为三档、但词汇稍异：<code class="inline">off</code>、<code class="inline">low</code>、<code class="inline">medium</code>、<code class="inline">high</code>。<code class="inline">off</code> 是重要的新增——Gemini 在 Flash 类模型上的默认是"较低档思考"而非"零思考"；如果你想要严格的零思考行为（与非推理模型对齐），就得显式点名。Pro 类模型默认 <code class="inline">medium</code>。老的 <code class="inline">thinking_budget</code> 整数字段仍在、仍能用，但文档标为 legacy，未来版本会删。</p>
+
+<pre class="standalone">POST /v1/models/gemini-3.5-pro:generateContent HTTP/1.1
+Host: generativelanguage.googleapis.com
+content-type: application/json
+
+{
+  "contents": [
+    {"role": "user", "parts": [{"text": "Prove that sqrt(2) is irrational."}]}
+  ],
+  "generation_config": {
+    "max_output_tokens": 4096,
+    "thinking_level": "high"
+  }
+}</pre>
+
+    <p>Gemini 的语义与 Anthropic 在两处岔开，值得钉一下。第一，响应把思考令牌拆到 usage 里的 <code class="inline">thoughts_token_count</code>，与 <code class="inline">output_token_count</code> 分开，两者都按标准输出令牌费率计费——与 Anthropic 和 OpenAI 一致。第二，Gemini 暴露了一个 <code class="inline">thinking_summary</code> 开关，返回一份被压缩、人类可读的推理轨迹摘要，而不是原始轨迹本身；这对 UI 展示与基于评判者的评估有用，但当你要调试某个具体失败时，摘要不能替代原始轨迹。<a href="/zh/concepts/reasoning-models" class="xref">推理模型</a>概念页对"原始 vs 摘要"的取舍讲得更详。</p>
+
+    <p>Gemini 独有的一个陷阱是：思考档位与工具调用的交互方式与其他两家不同。在 <code class="inline">high</code> 档下，Gemini 会在同一次请求里乐意发出多轮"思考+工具调用"的交错——想-调-想-调-答——所有轮次的思考总预算可能大于任何单轮预算。这对智能体形状的负载是特性（模型能在下一次调用前对工具结果先做推理），对按"每次请求一个思考块"来预算的团队则是成本惊喜。若你把 Gemini 接入 agent loop，令牌成本要按"N 轮工具 × 每轮思考花销"来建模，而不是一个固定的 per-request 数字。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>OpenAI 的 <code class="inline">reasoning_effort</code>。</h3>
+
+    <p>OpenAI 在 o3 与 o4-mini 上的形状是请求里的 <code class="inline">reasoning</code> 对象含 <code class="inline">effort</code> 字段，三档取值为 <code class="inline">low</code>、<code class="inline">medium</code>、<code class="inline">high</code>——与 Anthropic 的枚举名一致。相似性是有意为之；从老的顶层 <code class="inline">reasoning_effort</code> 字段迁到嵌套 <code class="inline">reasoning.effort</code>，在 SDK 变更记录里被标注为"与厂商约定对齐"的说明。老的扁平字段在 o1 与 o3-mini 上仍能用，但 o4-mini 与 GPT-5.5 不接受。没有 <code class="inline">off</code> 值——推理模型总归会做点推理；若你需要零推理，请换非推理模型。</p>
+
+<pre class="standalone">POST /v1/responses HTTP/1.1
+Host: api.openai.com
+content-type: application/json
+
+{
+  "model": "o4-mini",
+  "max_output_tokens": 4096,
+  "reasoning": {
+    "effort": "high"
+  },
+  "input": [
+    {"role": "user", "content": "Prove that sqrt(2) is irrational."}
+  ]
+}</pre>
+
+    <p>OpenAI 的语义与 Anthropic 有一处重要分歧：推理轨迹默认不返回给客户端。响应里包含一个 <code class="inline">reasoning</code> 块，含 <code class="inline">summary</code>（对模型推理内容的简短自然语言描述）与 <code class="inline">encrypted_content</code>（对你不透明，可在后续请求里回传以在多轮之间保持推理连续），但没有原始思考令牌本身。你为这些令牌付费——usage 块报告 <code class="inline">reasoning_tokens</code>——却看不到它们。调试时你手头只有摘要。做评估时，这比 Claude 的原始轨迹或 Gemini 的可选摘要都更受限；<a href="/zh/deep-dives/reasoning-and-test-time-compute/chain-of-thought" class="xref">正确理解思维链</a>里的忠实性讨论，在你读不到链子时就更难套用。</p>
+
+    <p><code class="inline">encrypted_content</code> 机制值得理解，因为它改变了多轮推理会话的计费方式。在跟随轮里，你把上一轮的 <code class="inline">encrypted_content</code> 回传给 OpenAI，OpenAI 解密并将先前推理前置到新一轮的上下文里。这保留推理连续性（模型不必重新推导已想通的部分），代价是"较早的推理令牌"在跟随轮里作为输入令牌被再次计费。对"模型在先前推理之上继续构建"的智能体形状负载，这交易通常划得来；对无状态的一次性查询则是浪费。请盯紧成本报表——一个每轮都开高档推理的多轮长对话，账单里可能是"回传的加密推理"而非"新的生成"占大头。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>模型何时覆盖你的预算。</h3>
+
+    <p>横跨三家最容易被漏掉的细节，是你请求的努力度档位是一个提示、而不是硬上限。模型可以判定该查询确实难，从而花掉比该档位通常产出的更多思考令牌；反过来（更常见），模型可以判定该查询容易，从而花得比该档位建议的少得多。Anthropic 通过 STEP 2 提到的 <code class="inline">actual_effort</code> 响应字段显式说明这一点。Gemini 通过观察"任一档位下 <code class="inline">thoughts_token_count</code> 分布带长尾"隐式说明。OpenAI 通过承认"<code class="inline">high</code> 档下的 <code class="inline">reasoning_tokens</code> 可以超过老 API 允许你设置的固定思考预算"来说明。</p>
+
+    <p>低、中两档下这种覆盖行为很少，高档下才是常态。低档下实际思考花销紧贴请求档位；模型几乎不会认定一道易题需要"比 low 更多的思考"。高档下模型愿意升级——一段特别棘手的推导，或一道后来发现需要多步规划的查询，可能花掉普通"high"查询两三倍的量。厂商的解释是：这正是自适应思考存在的意义——固定预算在难长尾上花得不够，自适应旋钮把那份花销找回来，且不必你去猜什么时候该批准。</p>
+
+<pre class="trace"># Actual thinking tokens on a mixed workload of 1000 queries
+# claude-opus-4-7, thinking.effort = "medium"
+
+percentile   thinking_tokens   actual_effort
+p10                    180     low
+p50                   1450     medium
+p90                   4200     medium
+p95                   7800     medium
+p99                  18400     high      &lt;- model escalated
+p99.9                42100     high      &lt;- model escalated
+
+# Total spend: 1.9M thinking tokens across 1000 queries
+# Naive equivalent (budget_tokens=8000): 8.0M tokens billed
+# Adaptive savings: ~76% on this workload shape</pre>
+
+    <p>成本核算随之带来两个后果。第一，思考令牌花销不可从请求预测；必须去测。在提交某档位到生产之前，先在你自己的查询上跑出一份 <code class="inline">actual_effort</code> 与思考令牌数的分布——账单由"模型在你的查询上如何行为"决定，而不是由档位字符串决定。第二，高档升级是 p99 成本尾巴所在——一份大多数时候按中档花销、偶尔在 p99 升级的负载，账单由那条尾巴主导，限流或封顶策略（若上一次查询花了超过 N 个令牌，则回退到中档）是把账单压在承诺预算里的运维手段。可观测性的问题不是"我请求了什么"，而是"模型选择花了多少"；两者都要埋点。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>跨厂商对照表。</h3>
+
+    <p>把三种形状放到一起读，接缝一目了然。名字不同、枚举略异、默认行为不同、轨迹可见性差得最多。下面是一份逐字段映射，可移植客户端必须把它编码进来；每一份多厂商栈最后都会留出一小层适配层，把内部单一的"努力度"概念翻成下方三种形状。</p>
+
+<pre class="standalone">| Field              | Anthropic                     | Gemini                        | OpenAI                        |
+|--------------------|-------------------------------|-------------------------------|-------------------------------|
+| Container          | thinking: {}                  | generation_config.thinking_*  | reasoning: {}                 |
+| Enable adaptive    | type: "adaptive"              | (implicit; set thinking_level)| (implicit; set effort)        |
+| Effort field       | effort                        | thinking_level                | effort                        |
+| Values             | low | medium | high            | off | low | medium | high      | low | medium | high            |
+| Zero-thinking      | (use non-reasoning model)     | thinking_level: "off"         | (use non-reasoning model)     |
+| Deprecated         | budget_tokens (removed 4.7+)  | thinking_budget (legacy)      | reasoning_effort top-level    |
+| Actual spend field | usage.thinking_tokens         | usage.thoughts_token_count    | usage.reasoning_tokens        |
+| Actual effort      | response.actual_effort        | (inferred from token count)   | (inferred from token count)   |
+| Trace visibility   | raw thinking blocks           | opt-in summary                | summary + encrypted opaque    |
+| Multi-turn replay  | resend full trace or drop     | resend summary or drop        | resend encrypted_content      |
+| Interleaved tools  | one thinking block per turn   | multiple rounds per request   | one reasoning block per turn  |
+| Billing            | output-token rate             | output-token rate             | output-token rate             |</pre>
+
+    <p>三条横切说明。计费费率统一：三家的思考令牌都按输出令牌费率计费，且当前都不给它单独打折（批处理折扣仍适用；缓存折扣不适用于思考块本身）。多轮故事在运维层分歧最大——Anthropic 的"回传全文或丢弃"最容易实现，Gemini 的"摘要"在线上最省字节，OpenAI 的"encrypted_content"在持续推理时最无缝，也最不透明。要把"交错工具"那一行内化：Gemini 的"每次请求多轮"形状意味着单次 API 调用可能产出若干思考块，被工具调用分隔，你的令牌预算要照此建模。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>成本影响。</h3>
+
+    <p>自适应思考在三个方面改变了成本模型，这是固定预算世代不具备的。第一，每查询成本现在是随机的——模型自己决定花多少，你的单位经济性得按分布建模，而不是点估计。一份平均 1500 思考令牌/查询的负载，p99 可能是 20000，账单由"你的流量落在分布哪一侧"主导。第二，努力度旋钮才是该花优化时间的地方——把一份"模型很少升级"的负载从 <code class="inline">high</code> 降到 <code class="inline">medium</code>，均值花销可降 50–70%，准确度差异勉强能测——这个杠杆比多数缓存或批处理优化都大。第三，思考令牌不与提示缓存复合——被缓存的提示削减了输入令牌账单，但思考令牌每次都是新鲜生成的，按完整输出费率付。</p>
+
+    <p>生产里能落地的具体模式：默认把负载跑在 <code class="inline">medium</code>；对一小撮被难度估计器标为"真正难"的查询（启发式：长依赖链、工具重、或被一个轻量分类器判为难），升到 <code class="inline">high</code>；对被估计器标为琐碎的查询（短查表、单事实检索），降到 <code class="inline">low</code>。这与 <a href="/zh/deep-dives/reasoning-and-test-time-compute/inference-time-scaling" class="xref">推理时扩展</a>一文所描述的"外部算力的难度自适应策略"是同一路数，被套用到内部推理旋钮上。在大致 70% 易 / 25% 中 / 5% 难切分的混合负载上，此策略相对于统一 <code class="inline">medium</code> 通常能减 40–50% 成本，准确度差异在标准基准上低于 1 分——数字与负载相关，但胜利的形状在三家上一致。</p>
+
+    <p>使这一切可操作的可观测性纪律很小。在每次请求上记下你请求的努力度、实际的思考令牌数、以及（若可得）响应里报告的 actual-effort 字段。按工作负载类别与输入长度带做分桶。为每类画出 p50 / p95 / p99 的思考令牌，你就能看到"模型选择多花"的升级事件；那些查询正是要逐一检视的——那份多花是否值得，还是同一答案在更低档位下也能得到。三家的 API 都让这份埋点很好写——请求日志多两三个字段——回报是：你对每份负载都清楚，自适应思考究竟是在为你买准确度，还是只是在多收你钱。<code class="inline">budget_tokens</code> 的弃用把这份纪律推进了每个团队的路线图；三家收敛到的形状，奖励那些把努力度档位当作"逐查询决策"而非"全局设置"的团队。</p>
+  </div>
+</section>

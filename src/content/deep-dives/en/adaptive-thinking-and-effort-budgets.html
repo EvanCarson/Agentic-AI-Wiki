@@ -1,0 +1,157 @@
+<section class="phase">
+  <div class="phase-num">N7</div>
+  <div class="week">Deep Dive · Reasoning &amp; Test-Time Compute</div>
+  <h2>Vendors moved from token-budget dials to adaptive <code class="inline">effort</code> levels in 2026 — Anthropic deprecated <code class="inline">budget_tokens</code> — and the three vendor idioms are close enough to compare but different enough to trip you up.</h2>
+  <p class="goal">Every "budget your thinking tokens" example from 2024-2025 is stale. Anthropic deprecated <code class="inline">budget_tokens</code> on Opus 4.6 / Sonnet 4.6 and removed it on 4.7+; the replacement is <code class="inline">thinking.type: adaptive</code> with <code class="inline">effort: low|medium|high</code>. Gemini uses <code class="inline">thinking_level</code>. OpenAI uses <code class="inline">reasoning_effort</code>. Same idea, three vocabularies, one gotcha — the model can override your budget when its own gradient says it needs more. This essay is the API surface, the override behavior, and the cost math per vendor.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why token budgets got replaced.</h3>
+
+    <p>The first generation of reasoning APIs — Claude 3.7 extended thinking, o1 in its initial GA shape, Gemini 2.5 Flash Thinking — all shared one control surface: a numeric ceiling on the private thinking tokens the model was allowed to spend before it had to emit an answer. The names varied (<code class="inline">budget_tokens</code>, <code class="inline">max_reasoning_tokens</code>, <code class="inline">thinking_budget</code>) and the defaults varied, but the shape was the same. You picked a number, the model spent up to that number, and if it hit the ceiling it stopped thinking and produced whatever answer the truncated trace supported. This was legible and it composed well with existing token-budgeting code paths, and it was wrong in the same way a fixed test-time compute budget was wrong in the previous essay of this group — a uniform ceiling wastes budget on the easy majority of queries and starves the hard tail that would actually earn the spend.</p>
+
+    <p>The specific failure mode is easy to reproduce. Set <code class="inline">budget_tokens=8000</code> on a mixed workload and log the actual thinking tokens consumed per query. On lookup-shaped questions the model spends 200 tokens and returns; on straightforward derivations it spends 1500; on the one hard problem in twenty it wants 12000 tokens and gets cut off at 8000, delivering a partial answer that's often worse than a single-pass no-thinking response would have been. Raise the ceiling to 16000 and you pay 2x on every query that never needed it. There is no single number that is right for the mixed workload — the compute-optimal test-time policy from the <a href="/deep-dives/reasoning-and-test-time-compute/inference-time-scaling" class="xref">inference-time scaling</a> essay says the budget should be a function of estimated per-query difficulty, and a numeric ceiling can't encode that function.</p>
+
+    <p>The vendor move in 2026 is to shift the difficulty estimator inside the model. Instead of exposing a token dial, expose a coarse <em>intent</em> — how hard should the model try — and let the model translate that intent into an actual token spend per query, calibrated to the query it's about to answer. Anthropic named the shape first (<code class="inline">effort: low|medium|high</code>), Gemini and OpenAI followed with their own words for the same idea. The resulting API is less controllable in one dimension (you can no longer force exactly N tokens) and much more efficient in another (the low-effort dial spends a couple hundred tokens on easy queries and the high-effort dial spends five figures on hard ones, from the same setting). The <a href="/deep-dives/reasoning-and-test-time-compute/when-reasoning-helps" class="xref">when reasoning helps</a> essay describes the same shift at the policy layer — "set the thinking budget to X for query class Y" was already the right advice; the API is now catching up to make X mean an effort level instead of a token count.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The Anthropic <code class="inline">effort</code> API.</h3>
+
+    <p>Anthropic's shape on Claude Opus 4.7 and Sonnet 5 is a <code class="inline">thinking</code> object on the request, with <code class="inline">type: "adaptive"</code> and an <code class="inline">effort</code> enum. The older <code class="inline">type: "enabled"</code> shape with <code class="inline">budget_tokens</code> is still accepted on 4.6-class models with a deprecation warning; on 4.7+ it returns a 400. The migration is one field rename plus dropping the number, and every SDK release from late-May 2026 onward defaults new code to the adaptive shape.</p>
+
+<pre class="standalone">POST /v1/messages HTTP/1.1
+Host: api.anthropic.com
+anthropic-version: 2026-05-01
+content-type: application/json
+
+{
+  "model": "claude-opus-4-7",
+  "max_tokens": 4096,
+  "thinking": {
+    "type": "adaptive",
+    "effort": "high"
+  },
+  "messages": [
+    {"role": "user", "content": "Prove that sqrt(2) is irrational."}
+  ]
+}</pre>
+
+    <p>The three effort levels are calibrated targets, not fixed budgets. <code class="inline">low</code> aims at a few hundred thinking tokens on easy queries and up to a couple of thousand on harder ones; <code class="inline">medium</code> is the default for reasoning-mode requests and roughly matches Claude 3.7's midrange extended-thinking spend; <code class="inline">high</code> can consume tens of thousands of thinking tokens on a hard problem and will happily spend zero on a lookup. The model chooses per-query. The <code class="inline">effort</code> value shifts the entire distribution up or down, so the same query will spend more thinking tokens at <code class="inline">high</code> than at <code class="inline">low</code>, but the ratio between an easy and a hard query at any given effort level is set by the model rather than by you.</p>
+
+    <p>Two migration notes matter more than the field rename. First, the response now carries an <code class="inline">actual_effort</code> field alongside the streaming thinking blocks that reports what the model actually chose to spend — the value is one of the same three enums, and it can be lower than what you requested (the model decided the query didn't earn the escalation) but not higher. Log this field on every request; the observability story for adaptive thinking is impossible without it. Second, cache-control on system prompts and tools is unchanged, but the thinking block itself is never cached — a query that spends 12000 thinking tokens pays for those tokens every time it runs, even if 90% of the prompt was cache-hit. The <a href="/deep-dives/architectures-and-patterns/context-caching-economics" class="xref">context caching economics</a> essay walks through how this interacts with the write premium; the short version is that adaptive thinking and caching are additive levers, not multiplicative ones.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Gemini <code class="inline">thinking_level</code>.</h3>
+
+    <p>Gemini 3.1 Pro and 3.5 Pro use a <code class="inline">thinking_level</code> field on the generation config, with the same three values in a slightly different vocabulary: <code class="inline">off</code>, <code class="inline">low</code>, <code class="inline">medium</code>, <code class="inline">high</code>. The <code class="inline">off</code> value is the important addition — Gemini's default on Flash-class models is a low level of thinking rather than none, and if you want strict zero-thinking behavior (parity with a non-reasoning model) you have to name it explicitly. The Pro-class models default to <code class="inline">medium</code>. The older <code class="inline">thinking_budget</code> integer field is still on the API and still works, but the docs mark it as legacy and future model versions drop it.</p>
+
+<pre class="standalone">POST /v1/models/gemini-3.5-pro:generateContent HTTP/1.1
+Host: generativelanguage.googleapis.com
+content-type: application/json
+
+{
+  "contents": [
+    {"role": "user", "parts": [{"text": "Prove that sqrt(2) is irrational."}]}
+  ],
+  "generation_config": {
+    "max_output_tokens": 4096,
+    "thinking_level": "high"
+  }
+}</pre>
+
+    <p>Gemini's semantics diverge from Anthropic's in two ways worth pinning down. First, the response separates thinking tokens into <code class="inline">thoughts_token_count</code> on the usage block, distinct from <code class="inline">output_token_count</code>, and both bill at the standard output-token rate — the same as Anthropic and OpenAI. Second, Gemini exposes a <code class="inline">thinking_summary</code> flag that returns a compressed, human-readable summary of the reasoning trace in the response rather than the raw trace itself; this is useful for UI surfacing and for judge-based evaluation but is not a replacement for the raw trace when you need to debug a specific failure. The <a href="/concepts/reasoning-models" class="xref">reasoning models</a> concept covers the raw-vs-summary trade-off in more depth.</p>
+
+    <p>The one gotcha specific to Gemini is that the thinking level interacts with tool calling in a way the other vendors' don't. At <code class="inline">high</code>, Gemini will happily emit multiple rounds of thinking interleaved with tool calls on the same request — think-call-think-call-answer — and the total thinking budget across all rounds can be larger than any single-round budget would be. This is a feature for agent-shaped workloads (the model gets to reason about tool results before the next call) and a cost surprise for teams that budgeted assuming one thinking block per request. If you're wiring Gemini into an agent loop, model your token cost as "N tool rounds × per-round thinking spend" rather than a fixed per-request number.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>OpenAI <code class="inline">reasoning_effort</code>.</h3>
+
+    <p>The OpenAI shape on o3 and o4-mini uses a <code class="inline">reasoning</code> object on the request with an <code class="inline">effort</code> field, and the three values are <code class="inline">low</code>, <code class="inline">medium</code>, <code class="inline">high</code> — the same enum names Anthropic uses. The similarity is deliberate; the shift from the older <code class="inline">reasoning_effort</code> top-level field to a nested <code class="inline">reasoning.effort</code> was published as an "align with vendor conventions" note in the SDK changelog. The older flat field still works on o1 and o3-mini but is not accepted on o4-mini or GPT-5.5. There is no <code class="inline">off</code> value — reasoning models always reason to some degree; if you need zero reasoning you use a non-reasoning model.</p>
+
+<pre class="standalone">POST /v1/responses HTTP/1.1
+Host: api.openai.com
+content-type: application/json
+
+{
+  "model": "o4-mini",
+  "max_output_tokens": 4096,
+  "reasoning": {
+    "effort": "high"
+  },
+  "input": [
+    {"role": "user", "content": "Prove that sqrt(2) is irrational."}
+  ]
+}</pre>
+
+    <p>OpenAI's semantics diverge from Anthropic's in one important place: the reasoning trace is not returned to the client by default. The response contains a <code class="inline">reasoning</code> block with a <code class="inline">summary</code> (short natural-language description of what the model reasoned about) and a <code class="inline">encrypted_content</code> field (opaque to you, replayable on subsequent requests to preserve reasoning continuity across turns), but not the raw thinking tokens themselves. You are billed for those tokens — the usage block reports <code class="inline">reasoning_tokens</code> — but you cannot inspect them. For debugging, the summary is what you have. For evaluation, this is a real limitation compared to Claude's raw traces and Gemini's opt-in summaries; the <a href="/deep-dives/reasoning-and-test-time-compute/chain-of-thought" class="xref">chain-of-thought</a> faithfulness discussion is harder to apply when you can't read the chain.</p>
+
+    <p>The <code class="inline">encrypted_content</code> mechanism is worth understanding because it changes how multi-turn reasoning conversations bill. On a follow-up turn, you send back the previous turn's <code class="inline">encrypted_content</code> and OpenAI decrypts and prepends the earlier reasoning to the new turn's context. This preserves reasoning continuity (the model doesn't re-derive what it already worked out) at the cost of the earlier reasoning tokens being billed again as input tokens on the follow-up. The trade is usually worth it for agent-shaped workloads where the model builds on prior reasoning; it's a waste for stateless one-shot queries. Watch this on cost reports — a chatty multi-turn conversation with high-effort reasoning on every turn can produce a bill that is dominated by re-sent encrypted reasoning rather than by fresh generation.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When the model overrides your budget.</h3>
+
+    <p>The single most-missed detail across all three vendors is that the effort level you request is a hint, not a hard cap. The model can decide the query is genuinely hard and spend more thinking tokens than the level would typically produce; conversely (more commonly), the model can decide the query is easy and spend far less than the level suggests. Anthropic documents this explicitly with the <code class="inline">actual_effort</code> response field mentioned in STEP 2. Gemini documents it implicitly through the observation that <code class="inline">thoughts_token_count</code> distributions at any given level have a long tail. OpenAI documents it by acknowledging that <code class="inline">reasoning_tokens</code> at <code class="inline">high</code> effort can exceed the fixed thinking budgets that the older API let you set.</p>
+
+    <p>The override behavior is rare in the low-and-medium range and real at high. On low-effort settings the actual thinking spend hugs the requested level tightly; the model almost never decides an easy query needs more thought than "low" indicates. On high-effort settings the model is willing to escalate — an especially gnarly derivation or a query that turns out to require multi-step planning can spend two or three times what a typical "high" query does. The vendors' framing is that this is the whole point of adaptive thinking: fixed budgets underspent on the hard tail, and the adaptive dial recovers that spend without asking you to guess when to grant it.</p>
+
+<pre class="trace"># Actual thinking tokens on a mixed workload of 1000 queries
+# claude-opus-4-7, thinking.effort = "medium"
+
+percentile   thinking_tokens   actual_effort
+p10                    180     low
+p50                   1450     medium
+p90                   4200     medium
+p95                   7800     medium
+p99                  18400     high      &lt;- model escalated
+p99.9                42100     high      &lt;- model escalated
+
+# Total spend: 1.9M thinking tokens across 1000 queries
+# Naive equivalent (budget_tokens=8000): 8.0M tokens billed
+# Adaptive savings: ~76% on this workload shape</pre>
+
+    <p>Two consequences for cost accounting follow. First, thinking-token spend is not predictable from the request; you have to measure it. Build a per-workload distribution of <code class="inline">actual_effort</code> and thinking-token counts before you commit to an effort level in production, because the model's behavior on your queries is what determines the bill, not the level string. Second, high-effort escalation is where the p99 cost tail sits — a workload that mostly runs at medium spend but occasionally escalates at p99 has a bill dominated by that tail, and rate-limiting or capping strategies (fall back to medium if the last query cost more than N tokens) are the operational mitigations that keep the bill within a budget you can commit to. The observability question is not "what did I request" but "what did the model choose to spend"; instrument both.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Cross-vendor comparison table.</h3>
+
+    <p>Read the three shapes together and the seams are obvious. The names differ, the enums differ slightly, the default behavior differs, and the trace visibility differs the most. What follows is the field-by-field mapping a portable client has to encode; every multi-vendor stack ends up with a small adapter layer that translates a single internal "effort" concept into the three shapes below.</p>
+
+<pre class="standalone">| Field              | Anthropic                     | Gemini                        | OpenAI                        |
+|--------------------|-------------------------------|-------------------------------|-------------------------------|
+| Container          | thinking: {}                  | generation_config.thinking_*  | reasoning: {}                 |
+| Enable adaptive    | type: "adaptive"              | (implicit; set thinking_level)| (implicit; set effort)        |
+| Effort field       | effort                        | thinking_level                | effort                        |
+| Values             | low | medium | high            | off | low | medium | high      | low | medium | high            |
+| Zero-thinking      | (use non-reasoning model)     | thinking_level: "off"         | (use non-reasoning model)     |
+| Deprecated         | budget_tokens (removed 4.7+)  | thinking_budget (legacy)      | reasoning_effort top-level    |
+| Actual spend field | usage.thinking_tokens         | usage.thoughts_token_count    | usage.reasoning_tokens        |
+| Actual effort      | response.actual_effort        | (inferred from token count)   | (inferred from token count)   |
+| Trace visibility   | raw thinking blocks           | opt-in summary                | summary + encrypted opaque    |
+| Multi-turn replay  | resend full trace or drop     | resend summary or drop        | resend encrypted_content      |
+| Interleaved tools  | one thinking block per turn   | multiple rounds per request   | one reasoning block per turn  |
+| Billing            | output-token rate             | output-token rate             | output-token rate             |</pre>
+
+    <p>Three cross-cutting notes. The billing rate is uniform: thinking tokens bill at the same rate as output tokens on all three vendors, and none of the three currently discounts them (batch discounts still apply, cache discounts do not apply to the thinking block itself). The multi-turn story is where the three diverge most operationally — Anthropic's replay-or-drop is simplest to implement, Gemini's summary is cheapest on the wire, OpenAI's encrypted-content is the most seamless for continuous reasoning but the least transparent. The interleaved-tools row is the one to internalize: Gemini's multi-round-per-request shape means a single API call can produce several thinking blocks separated by tool calls, and your token budgeting has to reflect that.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>Cost implications.</h3>
+
+    <p>Adaptive thinking changes the cost model in three ways that the fixed-budget generation did not. First, the per-query cost is now stochastic — the model decides how much to spend, so your unit economics have to be modeled as a distribution rather than a point estimate. A workload with a mean of 1500 thinking tokens per query might have a p99 of 20000, and the bill is dominated by which side of that distribution your traffic sits on. Second, the effort dial is where you should be spending your optimization time — moving from <code class="inline">high</code> to <code class="inline">medium</code> on a workload where the model was rarely escalating anyway drops the mean spend by 50-70% with a barely-measurable accuracy delta, which is a bigger lever than most caching or batch-optimization work. Third, thinking tokens do not compose with prompt caching — the cached prompt cuts the input-token bill, but the thinking tokens are always freshly generated and pay full output-rate on every query.</p>
+
+    <p>A concrete pattern that ships in production: run the workload at <code class="inline">medium</code> as the default; for the small subset of queries that a difficulty estimator flags as "genuinely hard" (heuristics: long chain of dependencies, tool-heavy, or classified as such by a lightweight classifier), promote to <code class="inline">high</code>; for the queries the estimator flags as trivial (short lookup, single-fact retrieval), demote to <code class="inline">low</code>. This is the same difficulty-adaptive policy the <a href="/deep-dives/reasoning-and-test-time-compute/inference-time-scaling" class="xref">inference-time scaling</a> essay described for external compute, applied to the internal reasoning dial. On mixed workloads that split roughly 70% easy / 25% medium / 5% hard, this policy typically produces a 40-50% cost reduction versus a uniform <code class="inline">medium</code> setting with an accuracy delta below 1 point on standard benchmarks — the numbers are workload-dependent, but the shape of the win is consistent across the three vendors.</p>
+
+    <p>The observability discipline that makes this tractable is small. Log the requested effort, the actual thinking-token count, and (where available) the reported actual-effort field on every request. Bucket the results by workload class and by input-length band. Chart p50 / p95 / p99 thinking tokens per class, and you will see the escalation events where the model chose to spend more; those are the queries to inspect for whether the spend was earned or whether a lower effort level would have produced the same answer. The three vendors' APIs make this instrumentation easy — a couple of extra fields in the request log — and the payoff is that you know, per workload, whether adaptive thinking is buying you accuracy or just billing you more. The deprecation of <code class="inline">budget_tokens</code> forced this discipline into everyone's roadmap; the shape the three vendors converged on rewards teams that treat the effort level as a per-query decision rather than a global setting.</p>
+  </div>
+</section>
