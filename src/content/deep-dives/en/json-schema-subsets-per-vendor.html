@@ -1,0 +1,97 @@
+<section class="phase">
+  <div class="phase-num">K10</div>
+  <div class="week">Deep Dive · Tool &amp; Capability Design</div>
+  <h2>JSON Schema is not one thing — Anthropic, OpenAI, and Gemini enforce different subsets, and the moment you port a schema you meet the mismatch.</h2>
+  <p class="goal">Anthropic ignores <code class="inline">minLength</code>, <code class="inline">maxLength</code>, <code class="inline">minimum</code>, <code class="inline">maximum</code> at validation time. Gemini enforces the OpenAPI 3.0 subset only. OpenAI's strict mode requires <code class="inline">additionalProperties: false</code> and marks all fields required. Each is documented, none of them is JSON Schema draft-2020-12, and none of them fails loudly when you send a keyword they do not enforce — the schema is accepted, the constraint quietly disappears, and the model happily produces output the schema was supposed to forbid. This essay is the table you need next to your editor when you port a schema between vendors — what each enforces, what silently drops, and the portable subset that survives all three.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The three subsets, at altitude.</h3>
+
+    <p>Anthropic, OpenAI, and Gemini all take a JSON Schema in the same syntactic slot — <code class="inline">input_schema</code>, <code class="inline">parameters</code>, <code class="inline">parameters</code> respectively — and all three call it "JSON Schema." What that means differs enough that a schema written for one vendor is a candidate bug on the other two. The <a href="/deep-dives/tool-capability-design/tool-calling-vendor-matrix-2026" class="xref">K7 vendor matrix</a> covers the outer wrapper differences; this essay is one layer inside, on the schema-keyword enforcement.</p>
+
+    <p>Three shapes are worth pinning first. Anthropic uses "JSON Schema" as a rough description of a very permissive subset — the schema documents intent, and the model's constrained decoder honours some keywords and treats others as documentation. OpenAI has two modes: non-strict (schema is a hint the model tries to follow) and strict (schema is enforced by the constrained decoder). Gemini uses the OpenAPI 3.0 <code class="inline">Schema</code> object — a well-defined subset of JSON Schema draft-04, missing a lot of what draft-2020-12 added, with uppercase type names as one visible surface difference.</p>
+
+    <p>The <a href="/deep-dives/tool-capability-design/tool-schemas-and-contracts" class="xref">schemas &amp; contracts</a> essay covers the design principle — make illegal states unrepresentable, make safety-relevant fields required — which is where the K10 discipline matters most: a keyword that silently drops on your target vendor is a load-bearing constraint the model is no longer honouring. The <a href="/deep-dives/protocols-and-interop/structured-tool-io" class="xref">structured tool I/O</a> essay covers the return-side of the same story. Here we zoom into the exact keyword table you need when porting.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Anthropic subset: strings and numbers open at the edges.</h3>
+
+    <p>Anthropic's <code class="inline">input_schema</code> honours the structural keywords — <code class="inline">type</code>, <code class="inline">properties</code>, <code class="inline">required</code>, <code class="inline">enum</code>, <code class="inline">items</code>, <code class="inline">description</code> — and drops the range keywords: <code class="inline">minLength</code> and <code class="inline">maxLength</code> for strings, <code class="inline">minimum</code>, <code class="inline">maximum</code>, <code class="inline">exclusiveMinimum</code>, <code class="inline">exclusiveMaximum</code> for numbers. It also does not enforce <code class="inline">pattern</code> or <code class="inline">format</code> constraints at the constrained-decoder level. The model is told about them in the schema text and often obeys, but there is no hard mask against violations — the constraint is advisory. Similarly, <code class="inline">const</code> is not enforced; use a single-element <code class="inline">enum</code> if the constraint is load-bearing.</p>
+
+    <p>The practical consequence is that a schema which visibly caps a string at 200 characters on OpenAI strict mode will silently accept 5000 characters on Anthropic. If the cap matters — because your downstream stores it in a bounded column, or because you are paying per output token — the schema is not the enforcement point on Anthropic; you have to validate the model's output in application code, or express the constraint as an enum of allowed values. The same applies to number ranges: a <code class="inline">quantity</code> field with <code class="inline">minimum: 1</code> and <code class="inline">maximum: 100</code> is documentation on Anthropic, not enforcement, and a negative quantity is a bug you will catch at your database rather than at the model.</p>
+
+    <p>What Anthropic does enforce well: enum membership, required fields, top-level type, and object shape (property names, no extras when you set <code class="inline">additionalProperties: false</code>). Design your Anthropic schemas around those; treat everything else as prose in the description and validate at the harness edge.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>OpenAI strict mode: additionalProperties everywhere, all required.</h3>
+
+    <p>OpenAI's strict mode is the tightest of the three by design — the schema is compiled into a real grammar, and the model's output is guaranteed to match. The cost of that guarantee is two rules that catch teams by surprise. First, every object in the schema must set <code class="inline">additionalProperties: false</code>, including nested ones — omit it and the strict validator rejects the schema. Second, every property listed in <code class="inline">properties</code> must also appear in <code class="inline">required</code>; strict mode does not distinguish "optional field" the way JSON Schema does elsewhere. The workaround for a genuinely optional field is a union type: <code class="inline">"type": ["string", "null"]</code>, and the caller decides null means "not present."</p>
+
+    <p>Two derived rules follow. Strict mode does not support <code class="inline">oneOf</code>, <code class="inline">allOf</code>, <code class="inline">anyOf</code> in most positions (as of the 2026 docs; check the compatibility matrix — it evolves). Deeply nested schemas hit an implementation depth cap around a handful of levels; the fix is usually to flatten. String keywords work — <code class="inline">minLength</code>, <code class="inline">maxLength</code>, <code class="inline">pattern</code>, <code class="inline">enum</code>, <code class="inline">format</code> — and number keywords work. <code class="inline">strict: true</code> flag is what turns enforcement on; without it, the schema is a hint and the model may produce output that violates it.</p>
+
+    <p>The failure mode you will see is subtle: your schema was drafted for Anthropic (permissive, no <code class="inline">additionalProperties</code> discipline, some optionals), you turn on OpenAI strict mode, and the SDK refuses to register the tool. That is the good failure — it stops before running. The bad one is you drafted for OpenAI strict, sent it to Anthropic, and now the string-length cap silently disappears because Anthropic ignores those keywords. Both directions bite; the K7 essay's intermediate-representation pattern is the mechanical fix.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Gemini's OpenAPI 3.0 subset: uppercase types and no draft-2020-12 tricks.</h3>
+
+    <p>Gemini's schema is drawn from OpenAPI 3.0's <code class="inline">Schema</code> object, which is essentially JSON Schema draft-04 with OpenAPI's specific keywords. The type names are UPPERCASE strings (<code class="inline">OBJECT</code>, <code class="inline">STRING</code>, <code class="inline">INTEGER</code>, <code class="inline">NUMBER</code>, <code class="inline">BOOLEAN</code>, <code class="inline">ARRAY</code>) rather than lowercase, which is the first thing a copy-paste port trips on. Beyond that, constructs that don't exist in OpenAPI 3.0 are rejected: <code class="inline">const</code>, <code class="inline">$defs</code>, <code class="inline">$ref</code> across files, and the more exotic draft-2020-12 additions all fail validation.</p>
+
+    <p>What Gemini enforces reliably: <code class="inline">type</code>, <code class="inline">properties</code>, <code class="inline">required</code>, <code class="inline">enum</code>, <code class="inline">items</code>, <code class="inline">description</code>, string <code class="inline">minLength</code> / <code class="inline">maxLength</code>, number <code class="inline">minimum</code> / <code class="inline">maximum</code>, <code class="inline">format</code> for well-known formats. What it does not: <code class="inline">const</code>, <code class="inline">oneOf</code> with heterogeneous types, <code class="inline">patternProperties</code>. <code class="inline">nullable: true</code> is an OpenAPI-style knob rather than the JSON Schema <code class="inline">"type": ["string", "null"]</code> union; getting this wrong is a common port bug.</p>
+
+<pre class="trace">| keyword                | Anthropic  | OpenAI strict | Gemini (OpenAPI) |
+|------------------------|------------|---------------|------------------|
+| type / properties      | enforced   | enforced      | enforced (UPPER) |
+| required               | enforced   | enforced (all)| enforced         |
+| enum                   | enforced   | enforced      | enforced         |
+| additionalProperties   | honoured   | REQUIRED false| honoured         |
+| minLength / maxLength  | ignored    | enforced      | enforced         |
+| minimum / maximum      | ignored    | enforced      | enforced         |
+| pattern                | advisory   | enforced      | partial          |
+| format                 | advisory   | enforced      | well-known only  |
+| const                  | ignored    | enforced      | rejected         |
+| oneOf / anyOf / allOf  | partial    | limited       | not supported    |
+| $defs / $ref           | supported  | limited       | not supported    |
+| type: ["x", "null"]    | supported  | required opt  | use nullable     |</pre>
+
+    <p>Read the row for a keyword and you know its portability. Anything with three different behaviours across the columns is a keyword you either avoid in your portable spec or gate behind a per-vendor emitter. Anything that says "ignored" is silent-drop territory: it will not error, and it will not enforce, and your test suite has to catch the constraint at the application boundary rather than at the schema.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The portable subset: what actually ports intact.</h3>
+
+    <p>Draw the intersection of the three enforcement columns and the result is the portable subset. Top-level <code class="inline">"type": "object"</code>. A <code class="inline">properties</code> map of primitives — <code class="inline">string</code>, <code class="inline">integer</code>, <code class="inline">number</code>, <code class="inline">boolean</code> — plus <code class="inline">array</code> of primitives with <code class="inline">items</code>. A <code class="inline">required</code> array. <code class="inline">enum</code> on strings. <code class="inline">description</code> everywhere. That is it. Ports across all three vendors intact, enforces on all three, and covers the majority of real tool schemas without ceremony.</p>
+
+<pre class="standalone"><span class="c-cm"># The portable subset — enforces the same way on all three vendors.</span>
+{
+  <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+  <span class="c-st">"properties"</span>: {
+    <span class="c-st">"order_id"</span>: {
+      <span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+      <span class="c-st">"description"</span>: <span class="c-st">"The order identifier, e.g. 'o_42'."</span>
+    },
+    <span class="c-st">"reason"</span>: {
+      <span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+      <span class="c-st">"enum"</span>: [<span class="c-st">"defective"</span>, <span class="c-st">"wrong_item"</span>, <span class="c-st">"other"</span>],
+      <span class="c-st">"description"</span>: <span class="c-st">"The reason for the refund."</span>
+    },
+    <span class="c-st">"amount_cents"</span>: {
+      <span class="c-st">"type"</span>: <span class="c-st">"integer"</span>,
+      <span class="c-st">"description"</span>: <span class="c-st">"Refund amount in cents (must be positive)."</span>
+    }
+  },
+  <span class="c-st">"required"</span>: [<span class="c-st">"order_id"</span>, <span class="c-st">"reason"</span>, <span class="c-st">"amount_cents"</span>]
+}</pre>
+
+    <p>What is missing from that schema is deliberate. There is no <code class="inline">minimum: 1</code> on <code class="inline">amount_cents</code> because Anthropic will not enforce it and a portable schema cannot silently lose a constraint on one vendor. The description says "must be positive" — that is advisory prose the model will usually honour, and application-level validation catches the case where it doesn't. There is no <code class="inline">additionalProperties: false</code> at the top because that would break Anthropic's tolerant validator on some patterns and force OpenAI strict mode to be on for the schema to be legal. Add both back at the per-vendor emitter step, not in the shared spec.</p>
+
+    <p>Read the five steps together and JSON Schema stops being one thing. Three vendors, three subsets, one narrow intersection you can rely on, and per-vendor extensions gated behind emitters. The teams that keep their schema portability healthy do two things — they never author schemas directly for a single vendor, and they run a per-vendor CI validator pass every commit — and both practices cost hours to set up and save weeks of "why did the enum stop working" debugging over the life of a codebase.</p>
+  </div>
+</section>

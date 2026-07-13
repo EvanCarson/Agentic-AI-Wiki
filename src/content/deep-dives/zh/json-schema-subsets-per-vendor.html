@@ -1,0 +1,97 @@
+<section class="phase">
+  <div class="phase-num">K10</div>
+  <div class="week">深入解析 · 工具与能力设计</div>
+  <h2>JSON Schema 不是同一件东西——Anthropic、OpenAI、Gemini 强制的是不同子集，一移植 schema，就会撞上这个不匹配。</h2>
+  <p class="goal">Anthropic 在校验时会忽略 <code class="inline">minLength</code>、<code class="inline">maxLength</code>、<code class="inline">minimum</code>、<code class="inline">maximum</code>。Gemini 只强制 OpenAPI 3.0 子集。OpenAI 的 strict 模式要求 <code class="inline">additionalProperties: false</code>，并把所有字段标为 required。每家都有文档，都不是 JSON Schema draft-2020-12，且当你发一个它不强制的关键字时，都没有一家会大声报错——schema 被接收、约束悄悄消失、模型愉快地产出 schema 本应禁止的输出。这篇是你跨厂商移植 schema 时放在编辑器旁边的那张表——各家强制什么、会静默丢什么，以及三家都能扛住的可移植子集。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>三个子集的鸟瞰。</h3>
+
+    <p>Anthropic、OpenAI、Gemini 都把 JSON Schema 塞进同一个语法槽——分别叫 <code class="inline">input_schema</code>、<code class="inline">parameters</code>、<code class="inline">parameters</code>——三家都称之为 "JSON Schema"。含义的差别足以让"为一家写的 schema"到另外两家都成为候选 bug。<a href="/zh/deep-dives/tool-capability-design/tool-calling-vendor-matrix-2026" class="xref">K7 厂商矩阵</a>覆盖外层包装差异；本文往里再一层，聚焦 schema 关键字的强制。</p>
+
+    <p>三种形状先钉。Anthropic 把 "JSON Schema" 当作一份很宽松子集的粗略描述——schema 记录意图，模型的受限解码器兑现某些关键字、把另一些视作文档。OpenAI 有两种模式：非 strict（schema 是模型尽量遵循的提示）与 strict（schema 由受限解码器强制）。Gemini 用 OpenAPI 3.0 的 <code class="inline">Schema</code> 对象——一个定义良好的 JSON Schema draft-04 子集，缺少 draft-2020-12 新增的很多东西，一个可见的表面差异是类型名大写。</p>
+
+    <p><a href="/zh/deep-dives/tool-capability-design/tool-schemas-and-contracts" class="xref">模式与契约</a>一文覆盖设计原则——让非法状态无法表示、让安全相关字段必填——这正是 K10 纪律最要紧的地方：一个在目标厂商上静默丢失的关键字，就是一条模型不再兑现的承重约束。<a href="/zh/deep-dives/protocols-and-interop/structured-tool-io" class="xref">结构化工具 I/O</a>一文覆盖同一故事的返回侧。这里我们把镜头拉近到你移植时需要的关键字表。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Anthropic 子集：字符串与数字在边界开放。</h3>
+
+    <p>Anthropic 的 <code class="inline">input_schema</code> 兑现结构性关键字——<code class="inline">type</code>、<code class="inline">properties</code>、<code class="inline">required</code>、<code class="inline">enum</code>、<code class="inline">items</code>、<code class="inline">description</code>——并丢弃范围类关键字：字符串的 <code class="inline">minLength</code>、<code class="inline">maxLength</code>，数字的 <code class="inline">minimum</code>、<code class="inline">maximum</code>、<code class="inline">exclusiveMinimum</code>、<code class="inline">exclusiveMaximum</code>。它也不在受限解码器层强制 <code class="inline">pattern</code> 或 <code class="inline">format</code>。schema 文本里模型会读到它们、通常会遵守，但没有硬 mask 反违反——约束只是劝告。同理，<code class="inline">const</code> 不被强制；若约束是承重件，请使用只有一个元素的 <code class="inline">enum</code>。</p>
+
+    <p>实操结果是：一份在 OpenAI strict 模式下明显把字符串封顶到 200 字符的 schema，在 Anthropic 上会静默接收 5000 字符。若上限重要——因为下游要存进一个有界列，或者你按输出令牌付费——schema 就不是 Anthropic 上的强制点；你要在应用代码里校验模型输出，或者把约束表达成允许值的 enum。数字范围同理：带 <code class="inline">minimum: 1</code> 与 <code class="inline">maximum: 100</code> 的 <code class="inline">quantity</code> 字段在 Anthropic 上是文档而非强制，负数量将是你在数据库而非模型那里抓到的 bug。</p>
+
+    <p>Anthropic 会好好强制的：enum 成员资格、required 字段、顶层 type、对象形状（属性名，设 <code class="inline">additionalProperties: false</code> 时不允许多余）。围绕这些设计你的 Anthropic schema；其他一切当作 description 里的散文，并在外壳边缘做校验。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>OpenAI 的 strict 模式：处处 additionalProperties、全部 required。</h3>
+
+    <p>OpenAI 的 strict 模式按设计是三家里最紧的——schema 被编译成真正的语法，模型输出保证匹配。为这份保证付出的代价是两条常让团队意外的规则。第一，schema 里的每个对象都必须设 <code class="inline">additionalProperties: false</code>，包括嵌套的——省略它，strict 校验器就拒绝该 schema。第二，<code class="inline">properties</code> 里列的每个属性也必须出现在 <code class="inline">required</code> 里；strict 模式不像 JSON Schema 别处那样区分"可选字段"。真正可选字段的绕开法是并集类型：<code class="inline">"type": ["string", "null"]</code>，由调用方决定 null 表示"未提供"。</p>
+
+    <p>由此派生出两条规则。strict 模式在大多数位置上不支持 <code class="inline">oneOf</code>、<code class="inline">allOf</code>、<code class="inline">anyOf</code>（截至 2026 年文档；请核对兼容性矩阵，它在演化）。深嵌套 schema 会撞到实现层的深度上限，通常在几层左右；修法通常是展平。字符串关键字都可用——<code class="inline">minLength</code>、<code class="inline">maxLength</code>、<code class="inline">pattern</code>、<code class="inline">enum</code>、<code class="inline">format</code>——数字关键字也可用。开启强制的开关是 <code class="inline">strict: true</code>；不开，schema 只是提示，模型可能产出违反它的输出。</p>
+
+    <p>你会看到的失效模式很隐微：你的 schema 起草时对准 Anthropic（宽松、无 <code class="inline">additionalProperties</code> 纪律、有些可选），打开 OpenAI strict 模式，SDK 拒绝注册工具。这是好失败——跑之前就停。坏失败是你按 OpenAI strict 起草、发给 Anthropic，字符串长度上限静默消失，因为 Anthropic 忽略这些关键字。两向都咬人；K7 一文的"中间表示"模式是机械修法。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Gemini 的 OpenAPI 3.0 子集：大写类型与"没 draft-2020-12 花招"。</h3>
+
+    <p>Gemini 的 schema 取自 OpenAPI 3.0 的 <code class="inline">Schema</code> 对象，本质上是 JSON Schema draft-04 加 OpenAPI 特定关键字。类型名是大写字符串（<code class="inline">OBJECT</code>、<code class="inline">STRING</code>、<code class="inline">INTEGER</code>、<code class="inline">NUMBER</code>、<code class="inline">BOOLEAN</code>、<code class="inline">ARRAY</code>），不是小写，这是复制粘贴移植时第一件绊倒你的事。此外，OpenAPI 3.0 里不存在的构造会被拒绝：<code class="inline">const</code>、<code class="inline">$defs</code>、跨文件 <code class="inline">$ref</code>，以及更奇异的 draft-2020-12 新增内容都过不了校验。</p>
+
+    <p>Gemini 可靠强制的：<code class="inline">type</code>、<code class="inline">properties</code>、<code class="inline">required</code>、<code class="inline">enum</code>、<code class="inline">items</code>、<code class="inline">description</code>、字符串的 <code class="inline">minLength</code> / <code class="inline">maxLength</code>、数字的 <code class="inline">minimum</code> / <code class="inline">maximum</code>、常见 <code class="inline">format</code>。不可靠的：<code class="inline">const</code>、异类型的 <code class="inline">oneOf</code>、<code class="inline">patternProperties</code>。<code class="inline">nullable: true</code> 是一个 OpenAPI 风格旋钮，而非 JSON Schema 的 <code class="inline">"type": ["string", "null"]</code> 并集；把它搞错是常见移植 bug。</p>
+
+<pre class="trace">| keyword                | Anthropic  | OpenAI strict | Gemini (OpenAPI) |
+|------------------------|------------|---------------|------------------|
+| type / properties      | enforced   | enforced      | enforced (UPPER) |
+| required               | enforced   | enforced (all)| enforced         |
+| enum                   | enforced   | enforced      | enforced         |
+| additionalProperties   | honoured   | REQUIRED false| honoured         |
+| minLength / maxLength  | ignored    | enforced      | enforced         |
+| minimum / maximum      | ignored    | enforced      | enforced         |
+| pattern                | advisory   | enforced      | partial          |
+| format                 | advisory   | enforced      | well-known only  |
+| const                  | ignored    | enforced      | rejected         |
+| oneOf / anyOf / allOf  | partial    | limited       | not supported    |
+| $defs / $ref           | supported  | limited       | not supported    |
+| type: ["x", "null"]    | supported  | required opt  | use nullable     |</pre>
+
+    <p>读某关键字对应的一行，就能知道它的可移植性。三列行为都不同的关键字，就是你要么在可移植规格里避开、要么放到"逐厂商 emitter"后面的关键字。写着"ignored"的部分是"静默丢弃"地带：既不报错、也不强制，你的测试套件必须在应用边界而非 schema 处抓到约束。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>可移植子集：真的能不改就搬的部分。</h3>
+
+    <p>把三列强制取交集，结果就是可移植子集。顶层 <code class="inline">"type": "object"</code>。一份含原语——<code class="inline">string</code>、<code class="inline">integer</code>、<code class="inline">number</code>、<code class="inline">boolean</code>——的 <code class="inline">properties</code> 映射，加上带 <code class="inline">items</code> 的原语数组。一个 <code class="inline">required</code> 数组。字符串上的 <code class="inline">enum</code>。到处 <code class="inline">description</code>。就这些。跨三家完好移植、三家都强制，涵盖真实工具 schema 的大部分而无需仪式。</p>
+
+<pre class="standalone"><span class="c-cm"># The portable subset — enforces the same way on all three vendors.</span>
+{
+  <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+  <span class="c-st">"properties"</span>: {
+    <span class="c-st">"order_id"</span>: {
+      <span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+      <span class="c-st">"description"</span>: <span class="c-st">"The order identifier, e.g. 'o_42'."</span>
+    },
+    <span class="c-st">"reason"</span>: {
+      <span class="c-st">"type"</span>: <span class="c-st">"string"</span>,
+      <span class="c-st">"enum"</span>: [<span class="c-st">"defective"</span>, <span class="c-st">"wrong_item"</span>, <span class="c-st">"other"</span>],
+      <span class="c-st">"description"</span>: <span class="c-st">"The reason for the refund."</span>
+    },
+    <span class="c-st">"amount_cents"</span>: {
+      <span class="c-st">"type"</span>: <span class="c-st">"integer"</span>,
+      <span class="c-st">"description"</span>: <span class="c-st">"Refund amount in cents (must be positive)."</span>
+    }
+  },
+  <span class="c-st">"required"</span>: [<span class="c-st">"order_id"</span>, <span class="c-st">"reason"</span>, <span class="c-st">"amount_cents"</span>]
+}</pre>
+
+    <p>该 schema 里缺席的内容是刻意的。<code class="inline">amount_cents</code> 上没有 <code class="inline">minimum: 1</code>，因为 Anthropic 不会强制它，而一份可移植 schema 不能在某家静默丢约束。描述里说了"必须为正"——这是模型通常会遵守的劝告性散文，应用层校验兜底。顶层没有 <code class="inline">additionalProperties: false</code>，因为它会在某些模式下破坏 Anthropic 的宽容校验器，并强制 OpenAI strict 模式才合法。把两者都在"逐厂商 emitter"这一步加回，不要放进共享规格。</p>
+
+    <p>把五步合起来读，JSON Schema 就不再是同一件东西。三家厂商、三个子集、一处可以依赖的窄交集，扩展则挂在 emitter 后面。让 schema 可移植性长期健康的团队做两件事——他们从不直接为某一家厂商起草 schema，且每次提交都跑一次逐厂商 CI 校验——两条实践搭建都要花几小时，却能在代码库一辈子里省下几周"为什么 enum 不再工作"的调试。</p>
+  </div>
+</section>
