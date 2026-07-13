@@ -1,0 +1,98 @@
+<section class="phase">
+  <div class="phase-num">D11</div>
+  <div class="week">Deep Dive · Architectures & Patterns</div>
+  <h2>WebArena numbers say browser agents are close to shipping; the six failure modes benchmarks don't catch say they aren't, and each mode has a harness fix that doesn't need a better model.</h2>
+  <p class="goal">WebArena's leaderboard put Claude Mythos Preview at 68.7% and dozens of "browser agents ship in 2026" posts followed. Then the same agents deployed to a real corporate portal timed out at 12% success. The gap is six failure modes benchmarks don't include: DOM drift between screenshots, screenshot ambiguity when a button is off-canvas, login state that expires mid-run, modal interruptions, per-tenant rate-limit cliffs, and irreversible actions the agent shouldn't have taken. Each has a fix in the harness, not the model.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The gap between WebArena and prod.</h3>
+
+    <p>WebArena is a serious benchmark: 812 tasks across four self-hosted webapps (a shopping site, a Reddit clone, GitLab, a CMS). It runs in a fixed, deterministic environment — the DOM is reproducible, no ads, no cookie banners, no rate limits, no live logins that expire. The 68.7% score Claude Mythos Preview posted in early 2026 is a real number on that benchmark. What it is not is a prediction that a browser agent will hit 68.7% on your corporate expense-report portal, and the internal deployments that tried it report success rates between 8% and 20%. The gap is not "the model is not good enough" — the same model, prompted the same way, on WebArena still scores 68%. The gap is that WebArena's environment removes the six things that break real deployments.</p>
+
+    <p>The general shape of the failure surface generalizes. This essay walks the six failure modes with a concrete trace per mode, then names the harness-level fix — DOM anchor hashing, viewport auto-scroll, session refresh, dismiss-modal-first, tenant-aware backoff, irreversibility classification. None of these need a better model. All of them need the <a href="/deep-dives/architectures-and-patterns/pattern-landscape" class="xref">agent's outer scaffold</a> to know a little more about the browser it is driving. A representative failure trace across the six modes:</p>
+
+<pre class="trace"><span class="c-out">t=00:12  navigate("/expenses/new")         OK
+t=00:15  screenshot                          -&gt; "click 'Attach Receipt' button"
+t=00:16  click(id="attach")                  OK (async modal starts loading)
+t=00:18  screenshot                          -&gt; "type 'Client dinner' into memo"    [mode 1: DOM drift — 'memo' field replaced by modal DOM]
+t=00:19  type(memo, "Client dinner")         no element found, retry
+t=00:21  screenshot                          -&gt; button not visible                   [mode 2: screenshot ambiguity — button off-canvas]
+t=00:24  wait 60s                            session token expired                   [mode 3: login state]
+t=00:25  click(id="submit")                  -&gt; redirected to /login
+t=00:27  screenshot                          "Session expired — click OK"            [mode 4: modal interruption ignored]
+t=00:29  retry loop: 12 clicks in 4 seconds  429 Too Many Requests                   [mode 5: rate-limit cliff]
+t=00:31  fallback: delete the draft          expense already submitted from t=00:22  [mode 6: irreversibility — no undo]
+t=00:32  run ends. reported success. actual: duplicated $340 expense with no receipt.
+</span></pre>
+
+    <p>Each of the six lines shows up in production traces regularly. The fixes come next.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>DOM drift: anchor-hash your click targets.</h3>
+
+    <p>The failure: the agent takes a screenshot, decides which button to click, and by the time the click fires the DOM has changed — a modal opened, an ajax refresh replaced the panel, a spinner became a form. The click lands on whatever element now occupies the coordinates the screenshot pointed at, which is not the element the agent chose. Traces show this looks exactly like "the model clicked the wrong thing" but the model was correct at the moment it decided.</p>
+
+    <p>The harness fix is <strong>anchor-hash</strong>: when the agent decides on a target, capture a stable fingerprint of the element (role + accessible name + a hash of its DOM path) and pass it back through the executor. The executor re-locates by fingerprint at click time. If the fingerprint is not present, the harness re-observes (new screenshot) and asks the agent to re-decide — costs one extra turn, avoids the misfire. This turns the tool from a coordinate-clicker into a semantic-clicker without changing the model.</p>
+
+<pre class="standalone"><span class="c-cm"># playwright + anchor-hash executor</span>
+<span class="c-kw">import</span> hashlib, json
+
+<span class="c-kw">def</span> fingerprint(el):
+    role = el.get_attribute(<span class="c-st">"role"</span>) or el.evaluate(<span class="c-st">"n =&gt; n.tagName.toLowerCase()"</span>)
+    name = el.evaluate(<span class="c-st">"n =&gt; n.innerText || n.ariaLabel || ''"</span>).strip()[:<span class="c-st">80</span>]
+    path = el.evaluate(<span class="c-st">"n =&gt; { let p=[]; while(n && n.nodeType===1){ p.push(n.tagName+':'+([...n.parentNode.children].indexOf(n))); n=n.parentNode;} return p.join('/'); }"</span>)
+    key = json.dumps({<span class="c-st">"role"</span>: role, <span class="c-st">"name"</span>: name, <span class="c-st">"path_hash"</span>: hashlib.sha1(path.encode()).hexdigest()[:<span class="c-st">10</span>]}, sort_keys=<span class="c-kw">True</span>)
+    <span class="c-kw">return</span> key
+
+<span class="c-kw">def</span> click_by_fingerprint(page, fp):
+    <span class="c-kw">for</span> el <span class="c-kw">in</span> page.locator(<span class="c-st">"*"</span>).element_handles():
+        <span class="c-kw">if</span> fingerprint(el) == fp:
+            el.click(); <span class="c-kw">return</span> <span class="c-kw">True</span>
+    <span class="c-kw">return</span> <span class="c-kw">False</span>   <span class="c-cm"># harness re-observes and re-decides</span></pre>
+
+    <p>Anchor-hashing costs about 40ms per click in Playwright and eliminates the most common wrong-target failure. The remaining edge case — the target legitimately no longer exists — is now visible to the harness as a distinct signal instead of a silent misclick.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Screenshot ambiguity: auto-scroll before you look.</h3>
+
+    <p>The failure: the agent is asked to "click the 'Submit' button," takes a screenshot, and the button is off-canvas because the form is longer than the viewport. The model either hallucinates a click coordinate (bad) or reports failure and stops (better but wasteful). Neither is what you want. The fix is: before every screenshot the harness takes, it runs a <em>scroll-to-relevant-region</em> heuristic — scroll to the focused element, or scroll to the bottom of the visible form if a form is in focus, or scroll to a target the agent named — and captures multiple viewports if the page exceeds a size threshold. The agent then sees a stitched or multi-frame observation that includes the button that was off-canvas.</p>
+
+    <p>Two secondary tricks pay for themselves. First, at zoom levels the agent's coordinate system stops matching the DOM's, so freeze the zoom to 100% for the agent's session. Second, emit an <em>overlay</em> in the screenshot marking the interactive regions the harness recognises — every button, link, input — with numeric IDs. The agent clicks by ID instead of by pixel; the ambiguity of "which pixel" goes away.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Login state and modals: refresh at the boundary, dismiss first.</h3>
+
+    <p>Two related failures. Login-state expiration mid-run: the session token was valid at t=0, expires at t=15min, the agent's next action gets a 302 to <code class="inline">/login</code> and the trace fills with retry loops. Modal interruptions: a cookie banner appears halfway through the run and blocks every click until dismissed; the agent tries to click through it, fails, retries, fails.</p>
+
+    <p>The fixes are boring and effective. For login: the harness maintains a <em>refresh policy</em> — refresh the session ~20% before its documented expiry, and always refresh at each new tool boundary. Auth state lives outside the agent's control loop. For modals: the harness classifies every new DOM node as either "content" or "overlay" using a small ruleset (position: fixed, z-index above a threshold, contains a Close/OK button). Overlays are dismissed automatically before the next observation is served to the model. The model never sees the modal; the harness handled it. If a modal cannot be safely auto-dismissed (a payment confirmation, a legal consent), it is elevated to the human — a policy call, not a model call. This is the same pattern as <a href="/deep-dives/architectures-and-patterns/tool-error-recovery" class="xref">layered error recovery</a> for tool failures: some errors belong below the model, not in it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Rate-limit cliffs: exponential backoff with tenant awareness.</h3>
+
+    <p>The failure: the agent's retry loop, when a click fails, retries three times in three seconds. On a real corporate portal that shares rate limits across the tenant, one browser agent generates the traffic of ten users, hits the tenant's 60 rpm limit, gets a 429, retries again, gets a 429 again, and the whole tenant is throttled. The trace looks like "the app is broken"; the real story is the agent DoS'd its own workspace.</p>
+
+    <p>The fix is standard networking discipline that agent harnesses often skip. Wrap every retry in <em>exponential backoff with jitter</em> starting at 500ms and capping at 30 seconds. Cap the retry count at 3 for user-visible actions and defer to the human after that. Read the <code class="inline">Retry-After</code> header if the response has one and honor it. Most importantly: run one browser session per tenant, not per task; if a tenant is in a backoff state, all the tasks running against it wait, not just the one that got the 429. This is a coordination problem the harness owns, not a prompt the model gets.</p>
+
+    <p>The observability move that makes this durable: emit an "agent request rate" metric per tenant per minute and alert when it exceeds 10× a typical human's rate. That's the earliest signal that a bug is turning a normal run into an outage.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Irreversibility budgets: classify actions before you take them.</h3>
+
+    <p>The final failure mode, and the most expensive one. The agent submits a form it should not have — pays a duplicate invoice, cancels a shipment, sends a message. A model that decided the submit button was correct still owns the mistake, but the reason the mistake was possible is that the harness treated "click Submit" the same as "click Next." The fix is to classify every action the harness surfaces into three tiers before the tool call:</p>
+
+    <p><em>Undoable</em>: creates a draft, navigates, opens a menu. Free to attempt; retry is cheap. <em>Reversible with effort</em>: sends a message that could be recalled, uploads a file that can be deleted. Allowed but logged prominently; the harness offers an "undo" tool automatically after the action. <em>Irreversible</em>: submits a payment, cancels an order, sends a public post. Requires human confirmation before execution. The classification lives in the tool metadata, not in the model — a <code class="inline">destructive: true</code> or <code class="inline">requires_confirmation: true</code> flag per action — and the harness enforces it. See the same pattern in <a href="/deep-dives/architectures-and-patterns/tool-error-recovery" class="xref">tool-error recovery</a> for non-browser tools; the browser is the same problem with less structure.</p>
+
+    <p>The budget part: even in an approved workflow, cap the number of irreversible actions per run. If your automation is normally supposed to submit one expense, and the trace is about to submit three, the harness should refuse and route to human review. That is the last-line-of-defense against the 12%-success failure mode where the agent is thrashing and each thrash costs money. The pattern generalizes to <a href="/playbooks/coding-and-computer-use-agents/browser-agents" class="xref">any browser-agent deployment</a>: the harness fixes above are prerequisites, not optional. WebArena's 68% is the ceiling; production only touches it when the six modes are handled by the layer below the model.</p>
+  </div>
+</section>
