@@ -1,0 +1,80 @@
+<section class="phase">
+  <div class="phase-num">M8</div>
+  <div class="week">Deep Dive · Memory &amp; Context</div>
+  <h2>The read side of memory is a solved problem; the write side is where 2026 architectures diverge — episodic vs semantic vs procedural vs relational memory each want different write policies, and RAG-only is not one of them.</h2>
+  <p class="goal">For years "give the agent memory" meant "put a vector store next to it." That works for the retrieval side. It falls over on the write side: what earns a memory slot, when the slot expires, who invalidates a stale entry, and whether the write is user-visible. 2026 memory architectures split by memory kind — episodic (event traces), semantic (facts), procedural (learned behaviors), relational (entity graphs) — and each demands its own write policy. This essay is the taxonomy, the write-time decisions, and where teams still ship RAG-only in 2026.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The four memory kinds, and why one write policy will not cover them.</h3>
+
+    <p>The temptation to treat memory as one thing comes from the retrieval side, where an embedding-based store handles almost every read. Downstream of that store, four kinds of memory show up in production agents, each with a different lifetime, a different failure mode, and a different notion of "correct." Episodic memory is the trace of what happened — turns, tool calls, observations, timestamps — cheap to write, hard to summarize, useful mostly for replay and post-hoc audit. Semantic memory is the distilled fact set — "the user prefers metric units," "this customer's account was upgraded on the 12th" — expensive to write correctly and expensive to invalidate when the world changes. Procedural memory is the "how to do X here" recipe — the tool sequence that worked last time, the flag that must be set on this tenant, the retry policy that this environment needs — earned by success and forgotten when it stops paying off. Relational memory is the entity graph — people, orgs, projects, and the edges between them — the surface a stateful agent uses to reason about who's who.</p>
+
+    <p>Each of these can technically be stuffed into one vector store, and that is what most 2024 memory stacks did. The failure mode is not that retrieval breaks; retrieval usually still returns something plausible. The failure mode is that <a href="/deep-dives/memory-and-context/short-vs-long-term-memory" class="xref">the promotion/demotion cycle</a> stops making sense — a stale fact and a fresh trace get the same weight, a working procedure and an obsolete one both surface, and the agent's behavior becomes a function of whichever entry the embedder happened to rank higher today. The taxonomy in <a href="/deep-dives/memory-and-context/memory-types" class="xref">the memory-types essay</a> treats episodic, semantic, and procedural as separate mechanisms for a reason, and the 2026 architectures that actually work take that separation as the seam where write policies attach.</p>
+
+<pre class="trace">Kind         | Lifetime      | Write cost   | Invalidation      | User-visible?
+-------------|---------------|--------------|-------------------|---------------
+Episodic     | session-days  | cheap        | TTL / roll-off    | usually no
+Semantic     | months-years  | expensive    | source-driven     | often yes
+Procedural   | usage-decayed | medium       | reward-driven     | sometimes
+Relational   | project-life  | medium       | edge-invalidation | sometimes
+
+Write path per kind is different; one policy for all four is the anti-pattern.</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The four write-path decisions every architecture makes (whether it names them or not).</h3>
+
+    <p>Regardless of memory kind, every write is a decision on four axes. First, <em>what earns a slot</em> — the gate that decides "this observation is worth remembering" versus "this is just trajectory noise." Second, <em>when to write</em> — inline during the turn, at the end of the turn, at the end of the session, or asynchronously via a reflection job. Third, <em>who invalidates</em> — a TTL, the arrival of a contradicting write, an explicit user delete, or a background reconciliation pass against a source of truth. Fourth, <em>whether the write is visible</em> — silent, logged, or surfaced in the UI as "I'll remember this." Naming these axes lets you compare policies across memory kinds instead of arguing about implementations.</p>
+
+    <p>The trap most teams fall into is answering only the first axis and letting the other three be accidents of the framework. "We use the LLM to decide what to remember" answers <em>what earns a slot</em>; it says nothing about invalidation, and six months later the memory store is a museum of things that used to be true. The <a href="/deep-dives/memory-and-context/retrieval-augmented-memory" class="xref">retrieval-augmented memory</a> essay covered the recall side of that failure — old entries drown the fresh signal — but the fix is not better retrieval, it is a write policy that named invalidation before the first write ever landed.</p>
+
+<pre class="standalone"><span class="c-cm"># A write-gate function that names all four axes explicitly.</span>
+<span class="c-kw">def</span> should_write(candidate, kind, ctx):
+    <span class="c-kw">if not</span> earns_slot(candidate, kind):        <span class="c-cm"># axis 1</span>
+        <span class="c-kw">return</span> <span class="c-kw">None</span>
+    when  = write_moment(kind, ctx)             <span class="c-cm"># axis 2: inline|end-turn|reflect</span>
+    inval = invalidation_policy(kind, candidate) <span class="c-cm"># axis 3: ttl|source|user|quorum</span>
+    vis   = visibility(kind, candidate, ctx)     <span class="c-cm"># axis 4: silent|logged|surfaced</span>
+    <span class="c-kw">return</span> WritePlan(kind=kind, when=when, invalidate=inval, visibility=vis)</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Episodic memory: append-only, cheap, ruthless about roll-off.</h3>
+
+    <p>Episodic memory is the easiest of the four to get right and the easiest to over-engineer. The write policy is append-only, per-session, timestamped, and cheap: a turn happens, a row lands, no LLM in the loop deciding "is this worth remembering." The gate on axis 1 is close to <em>always yes</em> because the store is designed to be scanned by time, not queried by relevance. Axis 2 is inline. Axis 3 is a TTL — 24 hours for interactive assistants, 30 days for research agents, 90 days for compliance-adjacent workflows — plus explicit user delete. Axis 4 is silent by default; the log exists to be replayed, not read.</p>
+
+    <p>Where teams over-engineer episodic is by trying to summarize it into semantic memory during the write, which mixes two write policies and gets the invalidation of both wrong. Keep episodic writes dumb. Run a separate reflection pass — periodic, offline, cheap to re-run — that reads the episodic log and proposes semantic writes. The two paths meet at the reflection boundary, not at the write. This is the same seam the <a href="/deep-dives/memory-and-context/context-compaction" class="xref">context-compaction ladder</a> uses when it promotes trajectory into structured summaries: append-only underneath, distillation on top.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Semantic memory: the write path where every axis is hard.</h3>
+
+    <p>Semantic memory is where the write path earns its architecture budget. Axis 1 has to answer "is this a fact, or a passing preference, or a joke?" — and the honest answer requires the model to have some ground for the claim, not just an eager promoter classifier. Axis 2 is almost never inline; the right moment is a reflection job after the session, when the trajectory as a whole tells you which claims were confirmed by downstream success. Axis 3, invalidation, is the hardest problem in agent memory: facts have provenance (a document, a tool result, a user statement), and when the provenance is superseded the fact must be too. This is why source-tagged writes are load-bearing; a semantic entry without provenance is an entry you cannot invalidate correctly.</p>
+
+    <p>Axis 4 is where the UX layer earns its keep. A silent semantic write that later steers the agent surprises the user and burns trust; a surfaced write ("I'll remember you prefer metric units") lets the user correct or delete it before it does harm. The pattern that ships in 2026 is: reflection produces a proposed semantic entry, the entry is surfaced to the user at a natural moment (end of session, next session's opening, a settings pane), the user gets consent and delete. The write is not committed to the "used-for-inference" partition until that consent is real. Skipping the consent step is how memory poisoning starts looking like a normal Tuesday for the agent — a topic the next essay covers.</p>
+
+    <p>Dedupe belongs to this write path, not to retrieval. Two writes that mean the same thing ("prefers metric," "wants units in kg") should collapse at write time via a normalization step (embed, cluster, canonicalize, promote the winning form to the store, alias the losers). Retrieval-time dedupe is possible but wasteful and inconsistent — the same query can surface the alias one day and the canonical the next. Semantic writes are expensive; they should be few, and each should be canonical.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Procedural and relational writes: reward-driven and edge-invalidated.</h3>
+
+    <p>Procedural memory is the "recipe" store — "on this tenant, always call <code class="inline">refresh_session()</code> before <code class="inline">list_orders()</code>," "the CSV export needs the region flag to avoid pagination bugs." The write path is reward-driven: a recipe earns a slot when it explains a success (or averts a failure the agent recognized) and loses its slot when its usage-weighted success rate falls below a threshold. Axis 3 is neither TTL nor source but <em>reward decay</em> — a procedure that used to work but has stopped paying off should quietly retire. Axis 4 is usually silent for agent-internal procedures and surfaced for user-facing ones ("I'll do it this way next time — okay?"). The <a href="/deep-dives/memory-and-context/memory-stores" class="xref">memory-stores essay</a> covered the backend fit (usually KV keyed by (tenant, task-shape), not a vector index); the write path is what makes the store not rot.</p>
+
+    <p>Relational memory is the entity graph — nodes are people/orgs/projects/tickets, edges are relationships, both carry provenance. The write path splits naturally into node writes (a new entity is observed) and edge writes (a relationship is asserted). Axis 3 is edge-invalidation: when a relationship changes ("Alice is no longer the account owner"), the edge must be marked historical, not deleted — the graph's job is to remember the change, not to lie about the present. Axis 1 for edges must include a confidence: an edge asserted once by a single tool call is not the same as an edge confirmed by three sources over a month. Retrieval that ignores edge confidence gets fooled by rumor.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>User-visible writes, consent, and why RAG-only still ships in 2026.</h3>
+
+    <p>The consent surface is not decoration. When the agent commits a semantic entry that will later steer its behavior toward this user, the user needs to know it happened, needs to be able to inspect it, and needs to be able to delete it. Teams that skip this ship two failure modes at once: users are surprised by "creepy" recall of things they didn't realize were stored, and attackers get a free write channel because "if the model decided to remember it, it must be a fact." The write-visibility axis is how you turn that into a controllable surface. In practice: a "memory tab" or per-session summary that lists what was remembered and why, with a one-click delete. Nothing exotic, but the presence of that surface is what makes the semantic write path safe to leave on.</p>
+
+    <p>Given all of the above, why does RAG-only still ship in 2026? Because for a class of workloads — stateless single-turn assistants, retrieval over a corpus that already has its own edit trail, agents that never accumulate user-specific state — RAG-only is genuinely enough. The rule of thumb: if the agent's usefulness does not compound across sessions, RAG-only is fine. If it does — if next Tuesday's session should be measurably better because of what happened this Tuesday — the write path is where that compounding lives, and none of the four axes will design themselves. The essays that follow (<a href="/deep-dives/memory-and-context/evaluating-memory" class="xref">evaluating memory</a>, and the poisoning-defense essay next in this group) assume you have a write path to measure and defend; this one is how it gets built.</p>
+  </div>
+</section>
