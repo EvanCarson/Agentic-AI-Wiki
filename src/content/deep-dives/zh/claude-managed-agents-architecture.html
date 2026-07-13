@@ -1,0 +1,92 @@
+<section class="phase">
+  <div class="phase-num">D12</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>Claude Managed Agents 通过把会话建模为只追加事件日志、外壳保持无状态，把"从上次断点唤醒"做成了一级原语；即便你不用这个产品，这份设计也值得读。</h2>
+  <p class="goal">2026 年 4 月 Anthropic 上线 Managed Agents，宣称恢复时 p50 TTFT 降 60%、p95 降 90%（数据待独立复核）。机制是多数智能体框架迟早都会走到的设计：会话是 Anthropic 侧的只追加事件日志，客户端外壳无状态，<code class="inline">wake(sessionId)</code> 回放日志。这换来了不需要 Temporal 级运行时的持久性，但代价——不能客户端分支、不能部分回放——是实实在在的。这篇讲架构、取舍，以及这套模式向何处泛化。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>作为持久原语的只追加事件日志。</h3>
+
+    <p>Managed Agents 的核心思想是：一次长跑智能体会话的全部持久状态，就是一份由 Anthropic 服务端保存的只追加日志。会话期间发生的每一个事件——模型回合文本、模型发出的每一次工具调用、客户端返回的每一次工具结果、每一条用户消息——都作为一条带类型的条目追加到这份日志。此外没有别的持久状态。配置（system prompt、工具 schema、模型版本）在会话创建时一次绑定、终会话生命周期不变。没有旁路；日志里没有就是没发生。</p>
+
+    <p>这个形状为何奏效。日志同一时刻只有一个写入者（当前一轮），是单调的（只追加、从不改）、是完整的（每一份影响推理的输入与输出都在里面）。给定日志与绑定的配置，会话的当前状态是回放的纯函数：从初始态开始、按序应用每个事件，无论你放多少次都落在同一处。这份确定性让 Anthropic 在你调 wake 时不需要你把会话历史发回给他们——他们已经有了，按 session ID 建了索引。</p>
+
+    <p>日志条目由你能想到的四类构成：<code class="inline">turn</code>（模型输出）、<code class="inline">tool_call</code>（模型请客户端跑某物）、<code class="inline">tool_result</code>（客户端返回了什么）、<code class="inline">message</code>（用户或系统注入的一条输入）。一份跑到一半的真实会话轨迹：</p>
+
+<pre class="trace"><span class="c-out">// session: sess_9f4c2b1a  (Anthropic-side event log excerpt)
+{ "seq":  1, "type": "message",     "role": "user",
+  "content": "Analyze last quarter's revenue and flag anomalies." }
+{ "seq":  2, "type": "turn",        "role": "assistant",
+  "content": "I'll pull the ledger first.", "usage": {"in": 812, "out": 34} }
+{ "seq":  3, "type": "tool_call",   "id": "tc_01", "name": "run_query",
+  "input": {"sql": "SELECT month, revenue FROM ledger WHERE year=2026 Q1..."} }
+{ "seq":  4, "type": "tool_result", "id": "tc_01",
+  "content": "[{'month': 'Jan', 'revenue': 8412000}, ..." }
+{ "seq":  5, "type": "turn",        "role": "assistant",
+  "content": "One outlier in Feb. Let me check the contract table.",
+  "usage": {"in": 1204, "out": 47} }
+{ "seq":  6, "type": "tool_call",   "id": "tc_02", "name": "run_query",
+  "input": {"sql": "SELECT * FROM contracts WHERE signed_month = 'Feb 2026'..."} }
+// --- worker crash here; nothing after seq 6 was ever written ---
+// on wake(sess_9f4c2b1a): server replays seq 1..6, re-issues tc_02 to client
+</span></pre>
+
+    <p>日志不是"模型上下文窗口的另一种写法"——服务端在把内容喂给模型之前，可能会把早期条目压缩成摘要；日志是"wake 回放用来重建会话"的东西，不是"模型某一轮真正看到"的东西。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>无状态外壳与 wake(sessionId)。</h3>
+
+    <p>设计的另一半是：客户端外壳——你的代码——完全不持有任何持久状态。它只有一个功能：收到服务端来的 <code class="inline">tool_call</code>，跑工具、返回结果。就这样。客户端没有需要落盘的会话对象、没有重连逻辑、没有"我们现在在第几轮"。外壳是一个从（session ID，tool call）到 tool result 的纯函数。跑外壳的机器挂了，另一台实例可以在同一 session ID 上接住下一次工具调用，两者之间不需要交接协议。</p>
+
+    <p><code class="inline">wake(sessionId)</code> 原语把这一切变成可恢复系统。客户端调 wake 时，Anthropic 加载该会话的日志、做确定性回放重建会话状态、并重新发出待处理的工具调用（或者，如果最后一条是"等待用户消息"的 turn，就等一条）。客户端外壳无法把"这个会话的第一次工具调用"和"三小时前崩溃后重发的工具调用"区分开——两者对外壳代码看起来一模一样，这就是重点。</p>
+
+    <p>Python 侧的具体循环短到可以写进一段：客户端对 Anthropic 会话端点保持一条 HTTP 连接。Anthropic 流式发工具调用；客户端把每次工具调用当成普通 Python 函数跑掉，把结果流式送回。连接断了，客户端拿相同 session ID 重连并调 wake；循环继续。没有客户端数据库、没有会话持久化、除了"错就重试、永远重试"以外没有重连状态机：</p>
+
+<pre class="standalone"><span class="c-cm"># Managed-agent client harness — stateless, wake on any drop</span>
+<span class="c-kw">import</span> anthropic
+client = anthropic.Anthropic()
+
+session_id = <span class="c-st">"sess_9f4c2b1a"</span>   <span class="c-cm"># persisted only as an ID</span>
+
+<span class="c-kw">while</span> <span class="c-kw">True</span>:
+    <span class="c-kw">try</span>:
+        <span class="c-kw">with</span> client.agents.wake(session_id=session_id, tools=TOOLS) <span class="c-kw">as</span> stream:
+            <span class="c-kw">for</span> event <span class="c-kw">in</span> stream:
+                <span class="c-kw">if</span> event.type == <span class="c-st">"tool_call"</span>:
+                    result = TOOLS[event.name].run(**event.input)   <span class="c-cm"># idempotent!</span>
+                    stream.submit_tool_result(event.id, result)
+                <span class="c-kw">elif</span> event.type == <span class="c-st">"session_end"</span>:
+                    <span class="c-kw">break</span>
+    <span class="c-kw">except</span> ConnectionError:
+        <span class="c-kw">continue</span>   <span class="c-cm"># wake again with same session_id</span></pre>
+
+    <p>外壳无状态，是因为日志持久；日志持久，是因为外壳无状态。两半各自站不住，只做一半忘另一半，你得到的不是"从断点唤醒"，只是"运气好的重连"。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>这一模式放弃了什么。</h3>
+
+    <p>三条约束，且都是承重的。<strong>不能客户端分支。</strong>日志是一条线性序列；没法说"唤醒这个会话，但从 seq 4 起走另一条历史"。如果你的产品想要分支——用户按"从这里重新生成"——你只能把它实现成一个新会话，把日志复制到那一点为止，然后你就拥有了这份复制逻辑。Anthropic 的产品不暴露这个；你要在会话 API 之上再建分支层。</p>
+
+    <p><strong>外壳无法部分回放。</strong>因为外壳无状态，它无法说"只重发上一个工具调用，早前的结果我这边还有。"服务端总是从"外壳最后确认的 seq"起（或者在 wake 时，从等待工具结果的那个 seq 起）回放日志。这是一个换回红利的简化——但意味着有副作用的工具必须能被安全重调：Anthropic 会在崩溃后重新发一次工具调用，工具自己的活儿是识别"我已经跑过"并返回上次的结果。</p>
+
+    <p><strong>工具须是确定性的。</strong>若一个工具对同一输入在重试时返回不同结果（"当前时间"工具、随机采样工具、"下一个可用时段"这种会改状态的工具），回放对会话的理解就与实际发生的偏离。修法与每一个持久执行运行时里的修法一样：把工具输入穿一条幂等键、或者把工具设计成"同输入即同输出"——与<a href="/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal" class="xref">"下面垫 Temporal"</a>那套模式共通，也是两种设计都奏效的原因。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>何时自建、何时用 Managed Agents。</h3>
+
+    <p>Anthropic 的实现让你拿到模式，却不必承担"存日志"和"写确定性回放代码"的运维成本。代价是日志住在 Anthropic 那侧。两个问题决定这笔交易适不适合你。</p>
+
+    <p>其一，你需不需要拥有日志？受监管负载——法律、医疗、国防——需要"模型的每一份输入、每一次工具调用、每一份结果"都落在你自己的数据边界内的，多半需要。Managed Agents 可以是工作流的一环，但你终究会在你这侧把日志镜像下来以满足审计。到那时有些团队会想："既然如此，我不如直接做主日志持有者，直接用这套模式，自己跑确定性回放。"这是更大的工程投入，但比"Anthropic 存日志 + 你这侧镜像 + 双方对账"少了几个动的零件。</p>
+
+    <p>其二，你的工具是不是本质上非确定？有些是：一个"给出下一个可用会议时段"的工具改变了世界、下一次调用会变，任何幂等键都救不了。如果你有相当比例的工具是这种形状，回放就不是干净的模型，一份改用"记录"工具输出而不是假设回放可用的运行时——Temporal、Restate、DBOS——反而更合适。在<a href="/concepts/agent-frameworks" class="xref">智能体框架总览</a>中对编排选择的讨论里，Managed Agents 这个形状是其中一个具体的点，不是通用答案。</p>
+
+    <p>即便你要自建，值得偷的模式是：把"服务端持有的日志"与"什么都不持有的外壳"这两半切开。这份切分让恢复故事变简单。一旦你的外壳开始"内存里留几个上次结果好节省重算"，你就引入了必须在崩溃后对账的状态，wake 故事就变成状态同步故事。让外壳保持纯函数，让持久状态住在日志里，设计本身就替你做了大部分工作。</p>
+  </div>
+</section>
