@@ -1,0 +1,92 @@
+<section class="phase">
+  <div class="phase-num">D12</div>
+  <div class="week">Deep Dive · Architectures & Patterns</div>
+  <h2>Claude Managed Agents shipped "wake up where you left off" as a first-class primitive by making the session an append-only event log and the harness stateless; the design is worth reading even if you don't use the product.</h2>
+  <p class="goal">In April 2026 Anthropic shipped Managed Agents with a claimed 60% p50 / 90% p95 TTFT drop on resumption. The mechanism is a design most agent frameworks reach for eventually: the session is an append-only event log on Anthropic's side, the client harness is stateless, and <code class="inline">wake(sessionId)</code> replays the log. It buys durability without a Temporal-shaped runtime, but the constraints — no client-side branching, no partial replay — are real. This essay is the architecture, the trade-offs, and where the pattern generalizes.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Append-only event log as the durable primitive.</h3>
+
+    <p>The core idea of Managed Agents is that the entire durable state of a long-running agent session is a single append-only log stored server-side by Anthropic. Every event that happens during the session — the model turn text, each tool call the model emitted, each tool result the client returned, each user message — is appended to that log as a typed entry. Nothing else is durable state. Configuration (system prompt, tool schemas, model version) is bound once at session creation and immutable for the session's lifetime. There is no side channel; if it isn't in the log, it didn't happen.</p>
+
+    <p>Why this shape works. The log has exactly one writer at a time (the current turn), it is monotonic (only appends, never edits), and it is complete (every input and every output that affected reasoning is there). Given the log and the bound configuration, the current state of the session is a pure function of replay: start from the initial state, apply each event in order, and you land at exactly the same place regardless of how many times you do it. That determinism is what lets Anthropic serve resumption without you sending the session's history back to them on wake — they already have it, indexed by session ID.</p>
+
+    <p>The pieces of a log entry are the four you would expect: <code class="inline">turn</code> (model output), <code class="inline">tool_call</code> (the model asked the client to run something), <code class="inline">tool_result</code> (what the client returned), and <code class="inline">message</code> (a user or system-injected input). The trace of a real, mid-flight session:</p>
+
+<pre class="trace"><span class="c-out">// session: sess_9f4c2b1a  (Anthropic-side event log excerpt)
+{ "seq":  1, "type": "message",     "role": "user",
+  "content": "Analyze last quarter's revenue and flag anomalies." }
+{ "seq":  2, "type": "turn",        "role": "assistant",
+  "content": "I'll pull the ledger first.", "usage": {"in": 812, "out": 34} }
+{ "seq":  3, "type": "tool_call",   "id": "tc_01", "name": "run_query",
+  "input": {"sql": "SELECT month, revenue FROM ledger WHERE year=2026 Q1..."} }
+{ "seq":  4, "type": "tool_result", "id": "tc_01",
+  "content": "[{'month': 'Jan', 'revenue': 8412000}, ..." }
+{ "seq":  5, "type": "turn",        "role": "assistant",
+  "content": "One outlier in Feb. Let me check the contract table.",
+  "usage": {"in": 1204, "out": 47} }
+{ "seq":  6, "type": "tool_call",   "id": "tc_02", "name": "run_query",
+  "input": {"sql": "SELECT * FROM contracts WHERE signed_month = 'Feb 2026'..."} }
+// --- worker crash here; nothing after seq 6 was ever written ---
+// on wake(sess_9f4c2b1a): server replays seq 1..6, re-issues tc_02 to client
+</span></pre>
+
+    <p>The log is not the model's context window in disguise — the server may compact old entries into a summary before feeding the model, and the log is what the wake replay uses to reconstitute the session, not what the model saw on any particular turn.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Stateless harness and wake(sessionId).</h3>
+
+    <p>The second half of the design is that the client harness — your code — holds no durable state at all. It has one function: given a <code class="inline">tool_call</code> from the server, run the tool, return the result. That's it. There is no client-side session object to persist, no reconnection logic, no "which turn are we on." The harness is a pure function from (session ID, tool call) → tool result. If the machine running the harness dies, another instance picks up the next tool call on the same session ID without any handoff protocol between them.</p>
+
+    <p>The <code class="inline">wake(sessionId)</code> primitive is what turns this into a resumable system. When a client calls wake, Anthropic loads the log for that session, does the deterministic replay to reconstruct the session state, and re-issues the pending tool call (or, if the last entry was a turn awaiting a user message, waits for one). The client harness has no way to distinguish "first tool call in this session" from "tool call re-issued after a crash three hours ago" — both look identical to the harness code, which is the point.</p>
+
+    <p>The concrete Python-side loop is small enough to fit in a paragraph. The client holds one HTTP connection open to the Anthropic session endpoint. Anthropic streams tool calls; the client runs each tool call as a normal Python function, streams the result back. If the connection drops, the client reconnects with the same session ID and calls wake; the loop resumes. There is no client-side database, no session persistence, no reconnection state machine beyond "retry on error, forever":</p>
+
+<pre class="standalone"><span class="c-cm"># Managed-agent client harness — stateless, wake on any drop</span>
+<span class="c-kw">import</span> anthropic
+client = anthropic.Anthropic()
+
+session_id = <span class="c-st">"sess_9f4c2b1a"</span>   <span class="c-cm"># persisted only as an ID</span>
+
+<span class="c-kw">while</span> <span class="c-kw">True</span>:
+    <span class="c-kw">try</span>:
+        <span class="c-kw">with</span> client.agents.wake(session_id=session_id, tools=TOOLS) <span class="c-kw">as</span> stream:
+            <span class="c-kw">for</span> event <span class="c-kw">in</span> stream:
+                <span class="c-kw">if</span> event.type == <span class="c-st">"tool_call"</span>:
+                    result = TOOLS[event.name].run(**event.input)   <span class="c-cm"># idempotent!</span>
+                    stream.submit_tool_result(event.id, result)
+                <span class="c-kw">elif</span> event.type == <span class="c-st">"session_end"</span>:
+                    <span class="c-kw">break</span>
+    <span class="c-kw">except</span> ConnectionError:
+        <span class="c-kw">continue</span>   <span class="c-cm"># wake again with same session_id</span></pre>
+
+    <p>The harness is stateless because the log is durable. The log is durable because the harness is stateless. Neither half stands alone, and if you build one and forget the other you don't have wake-up — you have a lucky reconnect.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What the pattern gives up.</h3>
+
+    <p>Three constraints, and they are load-bearing. <strong>No client-side branching.</strong> The log is one linear sequence; there is no way to say "wake this session but explore an alternative history from seq 4 onward." If your product wants branching — a user hitting "regenerate from this point" — you have to implement it as a new session that copies the log up to that point, and now you own the copy logic. Anthropic's product does not expose this; you would build the branching layer above the session API.</p>
+
+    <p><strong>No partial replay for the harness.</strong> Because the harness is stateless, it cannot say "just re-issue the last tool call; I still have the earlier results." The server always replays the log from the seq the harness confirmed last (or, on wake, from the seq that awaits a tool result). This is a simplification that pays dividends, but it means side-effectful tools have to be safely re-callable — Anthropic will re-issue a tool call after a crash, and it is the tool's job to detect that it already ran and return the previous result.</p>
+
+    <p><strong>Tool determinism is required.</strong> If a tool returns different results for the same input on retry (a "get current time" tool, a random-sampling tool, a "next available slot" tool that mutates state), the replay's understanding of the session diverges from what actually happened. The fix is the same fix that appears in every durable-execution runtime: pass tool inputs through an idempotency key, or design the tool so that "same input" implies "same output" — a common thread with the <a href="/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal" class="xref">Temporal-underneath pattern</a>, and the reason both designs work.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>When to build this yourself vs use Managed Agents.</h3>
+
+    <p>Anthropic's implementation earns you the pattern without the operational cost of storing the log or the code to do the deterministic replay. The trade you make is that the log lives on Anthropic's side. Two questions determine whether that trade is right for you.</p>
+
+    <p>First, do you need to own the log? Regulated workloads that need every model input, every tool call, every result inside your own data boundary — legal, healthcare, defense — probably do. Managed Agents can be part of the workflow, but you will end up mirroring the log on your side to satisfy audit. At that point some teams conclude they may as well be the primary log holder and use the pattern directly, running the deterministic replay themselves. That is a bigger engineering lift, but it is fewer moving parts than "log on Anthropic + mirror on you + reconcile."</p>
+
+    <p>Second, are your tools inherently non-deterministic? Some are: a tool that lists "the next available meeting slot" mutates the world in a way that changes future calls, and no idempotency key rescues it. If enough of your tools have this shape, replay is not a clean model, and a runtime that instead <em>records</em> tool outputs rather than assuming replay works — Temporal, Restate, DBOS — is the better fit. See the discussion in the <a href="/concepts/agent-frameworks" class="xref">agent-frameworks overview</a> of orchestration choices; the Managed Agents shape is a specific point on that space, not a universal answer.</p>
+
+    <p>The pattern to steal even if you build your own: the split between "log the server holds" and "harness that holds nothing." That split is what makes the resume story simple. The moment your harness starts holding "the last few results in memory to avoid recomputation," you have introduced state that has to be reconciled after crashes, and the wake story becomes a state-sync story. Keep the harness a pure function, keep the durable state in the log, and the design does most of the work for you.</p>
+  </div>
+</section>

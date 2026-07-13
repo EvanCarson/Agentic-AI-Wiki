@@ -1,0 +1,92 @@
+<section class="phase">
+  <div class="phase-num">T8</div>
+  <div class="week">Deep Dive · Training Agentic Models</div>
+  <h2>In 2026 you can GRPO an open-weight base against your own verifier — SageMaker RFT, TRL v1.0, LlamaFactory, VeRL — and the "should we tune or should we call the API" question flipped for verifiable tasks.</h2>
+  <p class="goal">SageMaker shipped RFT-as-a-service in March 2026. TRL 1.0 stabilized the GRPO API. LlamaFactory and VeRL rounded out the OSS side. The consequence: any team with a verifiable task now has a plausible path to a custom reasoning model on Qwen3, Llama 4, or DeepSeek V4. The buy-vs-tune math flipped for a specific class of workload — high-volume, verifiable, latency-sensitive. This essay is the playbook, the moves that don't work, and the honest cost math.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The tooling that made it plausible in the first place.</h3>
+
+    <p>Three shifts in the first half of 2026 turned RL fine-tuning of open-weight bases from a research paper into a Tuesday afternoon. First, Amazon SageMaker announced Reinforcement Fine-Tuning as a managed service in March 2026, taking the "provision a GPU cluster, wire up rollout workers, get the verifier over the network without introducing latency that kills the training loop" problem out of the critical path for teams that would rather pay someone else for the infrastructure. Second, Hugging Face's TRL library hit 1.0 the same quarter and stabilized its GRPO API — the same one that ships in every tutorial and the one that every OSS training script now inherits from — so that "which GRPO?" stopped being a question about which fork of which paper's reference code you had integrated. Third, two additional projects filled in the rough edges: LlamaFactory made the full recipe (data prep → SFT → DPO → GRPO) reproducible from a config file, and VeRL specialized in scaling the on-policy loop to large open bases with the sharded reference-policy tricks that used to be private to frontier labs.</p>
+
+    <p>The reason to enumerate the stack rather than pick one is that they compose in a specific way. TRL is the API surface most teams see; LlamaFactory is what they reach for when they want the config-file version of the same thing; SageMaker RFT is what they run once they have a working recipe and don't want to own the infrastructure; VeRL is what they migrate to when the base grows past a size TRL can efficiently drive on their hardware. The <a href="/deep-dives/training-agentic-models/rlvr-and-grpo-for-agents" class="xref">RLVR and GRPO essay</a> covers the algorithm side of what these tools implement; this essay is the delivery side. The claim is not that all four are needed; it is that between them, the "build the RL fine-tuning pipeline yourself from a paper" era ended.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The playbook: task selection, verifier, base, schedule.</h3>
+
+    <p>The playbook that ships is short and boring, which is its virtue. Task selection first: RLVR only works if you have a verifiable task, in the sense the <a href="/deep-dives/training-agentic-models/rl-for-tool-use" class="xref">RL for tool use essay</a> uses the term. Code with unit tests, math with a checker, SQL with ground-truth rows, structured extraction with a schema oracle — all fine. Prose rewriting against a rubric — not fine, no matter how tempting; you want DPO for that, not GRPO. The verifier design is the second bet, and it matters more than the base model choice: a fast, tight verifier that runs in a few seconds per rollout gives you a training loop that fits your budget; a slow verifier that runs in tens of seconds turns the same run into a bill your CFO will ask about. Adversarially probe the verifier before you start — write ten deliberately-cheating candidate outputs, see which ones the verifier accepts, and fix the ones it shouldn't.</p>
+
+    <p>Base selection is the third bet and it is smaller than the marketing suggests. Qwen3 is the reliable default for reasoning-flavored tasks in the 7B to 32B range; Llama 4 wins on the general-instruction-following axis and is what most agent-shaped tasks land on; DeepSeek V4 has a longer effective context and a coding lean. Pick the smallest base whose SFT-only ceiling would be within striking distance of your target, then let RL move it the rest of the way. Skip this discipline and you either train a base too small (where the RL signal can't find gradients through the missing representation) or too large (where the run costs more than the API you were trying to replace). The <a href="/concepts/open-vs-closed-models" class="xref">open-vs-closed models</a> concept covers the base-selection landscape at a higher level; the RL-fine-tuning-specific rule is "smallest base that could theoretically get there."</p>
+
+    <p>The training schedule is the last knob and the one every team gets wrong once. SFT for one to three epochs on maybe 50k to 200k demonstrations; DPO for one epoch on a preference dataset an order of magnitude smaller; GRPO for as many rollout batches as the budget allows, checkpointing every few thousand steps so you can restart from the best checkpoint rather than the last one. A common early failure is running GRPO for far too long past the point where the entropy has collapsed and the pass rate has plateaued; the useful diagnostic is not "did the loss go down" but "did the held-out eval move." Stop when the held-out eval stops.</p>
+
+<pre class="standalone"><span class="c-cm"># SageMaker RFT job spec (YAML). One config file per training run.</span>
+job_name: qwen3-8b-sql-rft-2026-05-01
+base_model: Qwen/Qwen3-8B
+recipe:
+  stage: grpo
+  group_size: 32
+  learning_rate: 5e-7
+  kl_beta: 0.02
+  max_rollouts: 200000
+  reference_policy: sft_checkpoint_v3    <span class="c-cm"># after SFT + DPO</span>
+verifier:
+  endpoint: https://verifier.internal/sql/v2
+  timeout_ms: 4000
+compute:
+  training: p5.48xlarge x 4
+  rollout_workers: 32
+observability:
+  dashboards: [pass_rate, entropy, kl_to_ref, held_out_eval]</pre>
+
+    <p>The two lines to flag in that spec are the <code class="inline">reference_policy</code> that GRPO's KL leash pulls against — pointing it at the raw base rather than the post-DPO checkpoint is a common mistake that erases the alignment work — and the <code class="inline">verifier.timeout_ms</code>, which quietly caps how expensive your rollouts can get. A four-second timeout is generous for a SQL oracle and stingy for a code oracle that runs a real test suite; picking the wrong number silently truncates trajectories and injects noise the policy will happily learn.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Moves that don't work.</h3>
+
+    <p>Three failure patterns show up often enough to name. The first is no-verifier RLVR: a team decides to "GRPO against an LLM judge because we don't have unit tests" and discovers that the judge is a learned reward model in a costume, with the same reward-hacking dynamics <a href="/deep-dives/training-agentic-models/reward-design-and-hacking" class="xref">the reward-hacking essay</a> catalogs. The signal degrades over the run, the judge starts approving output no human would, and the deployment regresses. The fix is not a better judge — it is admitting the task isn't RLVR-shaped and picking DPO with the judge as a preference source instead.</p>
+
+    <p>The second is undersized dataset. GRPO's group-relative advantage needs enough distinct tasks that the policy can't memorize the pool; a run against 500 tasks with a group size of 32 will produce a policy that pattern-matches those 500 verifiers rather than learning the underlying skill. The generalization failure shows up on the held-out eval, not on the training pass rate, which is why every serious run keeps a held-out set that never touches the training loop. The pragmatic number is at least 10k distinct tasks for a modest run and 100k for a serious one; less than that is a demo, not a fine-tune.</p>
+
+    <p>The third is base-model mismatch. Picking a base whose SFT-only quality is far below your target ceiling is a run that costs a lot and lands short — no amount of RL will teach a 7B model to reason like a 70B one, and pretending otherwise wastes weeks. Picking a base whose SFT-only quality is already close to the target is a run whose GRPO stage arguably shouldn't have been booked, because the marginal improvement doesn't justify the compute; you would have shipped by finishing SFT. The middle band — where the base can plausibly get most of the way and RL adds the last 10 to 30 percentage points — is where RL fine-tuning earns its keep.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Cost math vs a closed-model API.</h3>
+
+    <p>The cost calculation is what convinces the finance approver, and it separates into three lines: one-time training cost, per-inference cost after deployment, and per-inference cost of the closed alternative. The one-time training cost is dominated by rollouts: a run that samples 200k rollouts with a group size of 32 executes the base 6.4M times, and for a 7B to 14B base on modern accelerators that is a few tens of thousands of dollars of accelerator time. Add the SFT and DPO stages and the verifier compute and the total for a serious run lands in the tens-to-low-hundreds of thousands. This is a capital expense, not an operating one.</p>
+
+<pre class="trace">workload: 20M requests/month, avg 4k input + 500 output tokens per request
+
+Option A — closed API (Claude Sonnet 4.7):
+  input:  20M × 4000 × $3.00/1M      = $240,000/month
+  output: 20M × 500  × $15.00/1M     = $150,000/month
+  monthly: $390,000  |  annual: $4.68M
+
+Option B — RFT'd Qwen3-8B on own inference stack:
+  training (one-time, amortized 12mo): $85,000  →  $7,083/month
+  serving: ~$0.35/M input, $0.90/M output on H100 fleet
+  input:  20M × 4000 × $0.35/1M      = $28,000/month
+  output: 20M × 500  × $0.90/1M      = $9,000/month
+  monthly: $44,083  |  annual: $529K
+
+Break-even on training cost: month 3 of production traffic.</pre>
+
+    <p>The comparison is honest only when the closed API and the RFT'd model deliver the same quality on the workload, which is the assumption the training discipline in step two exists to protect. A team that RFT'd a base and only tested it on training-like tasks is comparing an untested model to a battle-tested one and will discover the difference in production. Hold out a fraction of production traffic as a live A/B before switching the whole workload, and keep the closed API as a fallback for the tail the tuned model gets wrong.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When the closed API is still right.</h3>
+
+    <p>Three shapes still favor the API. The first is low-volume workloads: a few hundred thousand requests per month never pays back a six-figure training bill, no matter how favorable the per-token math looks. The second is workloads that are not verifiable — everything that lives in the "prose, judgment, taste" bucket, where the honest recipe is DPO with an AI judge and even that doesn't get you a model that beats a well-prompted frontier system, so you keep the API and iterate on prompting instead. The third is latency-flexible workloads that can tolerate the API's tail: RFT is worth its overhead when latency and throughput are business-critical constraints, and less so when a two-second p99 is fine.</p>
+
+    <p>The framing worth taking from this essay is that "buy vs tune" is no longer a binary between vendors. It is a decision per workload — verifiable and high-volume tunes; unverifiable or low-volume calls the API — and the same team often runs both simultaneously, tuning the two or three workloads that pay for it and paying list on everything else. The tooling that shipped in 2026 made the tune side of that decision cheap enough to reach for; the discipline that has to travel with the tooling is knowing when to reach for it.</p>
+  </div>
+</section>

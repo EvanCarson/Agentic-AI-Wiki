@@ -12,6 +12,7 @@ const group: Group = {
     { page: 'verifier-guided-search', slug: 'verifier-guided-search', title: L('Verifier-Guided Search','核验器引导的搜索'), summary: L('Outcome vs process reward models steering best-of-N and beam search, reward hacking at inference time, and why the verifier is the product.','结果型与过程型奖励模型如何引导 best-of-N 与束搜索、推理时的奖励作弊，以及为何核验器才是产品。') },
     { page: 'inference-time-scaling', slug: 'inference-time-scaling', title: L('Inference-Time Scaling','推理时扩展'), summary: L('Test-time compute as a second scaling axis, the difficulty-adaptive compute-optimal frontier, and where more thinking stops paying.','测试时计算作为第二条扩展轴、按难度自适应的计算最优前沿，以及更多思考何处停止见效。') },
     { page: 'when-reasoning-helps', slug: 'when-reasoning-helps', title: L('When Reasoning Helps (and When It Burns Money)','推理何时有用（何时烧钱）'), summary: L('The synthesis decision rule — task class × verifiability × budget — an escalation ladder, the named money-burning patterns, and a do/don\'t list.','综合决策规则——任务类别 × 可核验性 × 预算——升级阶梯、点名的烧钱模式，以及一份该做/不该做清单。') },
+    { page: 'adaptive-thinking-and-effort-budgets', slug: 'adaptive-thinking-and-effort-budgets', title: L('Adaptive Thinking & Effort Budgets','自适应思考与努力度预算'), summary: L("`budget_tokens` is deprecated — Claude's `effort`, Gemini's `thinking_level`, OpenAI's `reasoning_effort`, and when the model overrides your budget.",'`budget_tokens` 已废弃——Claude 的 `effort`、Gemini 的 `thinking_level`、OpenAI 的 `reasoning_effort`，以及模型何时会覆盖你的预算。') },
   ],
 };
 export default group;

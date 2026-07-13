@@ -1,0 +1,98 @@
+<section class="phase">
+  <div class="phase-num">D11</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>WebArena 的分数看起来"浏览器智能体接近上线"；基准抓不到的六种失败模式则说"没接近"，而每一种都有不需要更强模型的外壳级修法。</h2>
+  <p class="goal">WebArena 排行榜上 Claude Mythos Preview 拿到 68.7%，然后几十篇"浏览器智能体 2026 年就要上线了"的帖子跟进。同样的智能体部署到真实企业门户，成功率超时降到 12%。差距在于六种基准不测的失败模式：截图之间的 DOM 漂移、按钮出画时的截图歧义、跑到一半过期的登录状态、模态弹窗打断、按租户设置的限流断崖，以及"本不该做出的"不可逆操作。每一种都是外壳（harness）而非模型的修法。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>WebArena 与生产之间的差距。</h3>
+
+    <p>WebArena 是一个正经基准：812 个任务，跨四个自建 Web 应用（购物站、Reddit 克隆、GitLab、CMS）。它跑在一个固定、确定性的环境里——DOM 可复现，无广告、无 cookie 提示、无限流、无会过期的活登录。Claude Mythos Preview 在 2026 年初拿到的 68.7% 是这个基准上的真数字。它不是"你公司的报销门户上也会拿 68.7%"的预测，试过的内部部署报告的成功率在 8% 到 20% 之间。差距不是"模型不够好"——同样的模型、同样的提示，在 WebArena 上仍是 68%。差距在于 WebArena 的环境去掉了六件会打断真实部署的事。</p>
+
+    <p>失败面的形状是普遍的。本文按每一种失败模式给出一条具体轨迹，然后点出外壳层的修法——DOM 锚点哈希、截图前自动滚动、会话续期、先关模态、按租户的退避、不可逆分级。没有一条需要更强的模型；每一条都需要<a href="/deep-dives/architectures-and-patterns/pattern-landscape" class="xref">智能体的外壳</a>对它正在驱动的浏览器多知道一点。跨六种模式的一条代表性失败轨迹：</p>
+
+<pre class="trace"><span class="c-out">t=00:12  navigate("/expenses/new")         OK
+t=00:15  screenshot                          -&gt; "click 'Attach Receipt' button"
+t=00:16  click(id="attach")                  OK (async modal starts loading)
+t=00:18  screenshot                          -&gt; "type 'Client dinner' into memo"    [mode 1: DOM drift — 'memo' field replaced by modal DOM]
+t=00:19  type(memo, "Client dinner")         no element found, retry
+t=00:21  screenshot                          -&gt; button not visible                   [mode 2: screenshot ambiguity — button off-canvas]
+t=00:24  wait 60s                            session token expired                   [mode 3: login state]
+t=00:25  click(id="submit")                  -&gt; redirected to /login
+t=00:27  screenshot                          "Session expired — click OK"            [mode 4: modal interruption ignored]
+t=00:29  retry loop: 12 clicks in 4 seconds  429 Too Many Requests                   [mode 5: rate-limit cliff]
+t=00:31  fallback: delete the draft          expense already submitted from t=00:22  [mode 6: irreversibility — no undo]
+t=00:32  run ends. reported success. actual: duplicated $340 expense with no receipt.
+</span></pre>
+
+    <p>六行里的每一行都在生产轨迹里定期出现。修法接下来讲。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>DOM 漂移：给点击目标打锚点哈希。</h3>
+
+    <p>失败：智能体截了一张图、决定点哪个按钮，等点击落下时 DOM 已经变了——一个模态弹出、一次 ajax 刷新替换了面板、一个 spinner 变成了表单。点击落在了现在占据"截图指过的坐标"的那个元素上，而不是智能体当初选中的那个。轨迹上看起来就是"模型点错了"，但模型在做决定的那一刻是对的。</p>
+
+    <p>外壳的修法是<strong>锚点哈希</strong>：智能体选中一个目标时，抓取它的稳定指纹（role + 可访问名 + DOM 路径的哈希）传回执行器；执行器在点击时按指纹重新定位。如果指纹不在，外壳重新观测（新截图）并请智能体重新决定——多花一轮，避免误点。这把工具从"按坐标点"变成"按语义点"，且不用改模型。</p>
+
+<pre class="standalone"><span class="c-cm"># playwright + anchor-hash executor</span>
+<span class="c-kw">import</span> hashlib, json
+
+<span class="c-kw">def</span> fingerprint(el):
+    role = el.get_attribute(<span class="c-st">"role"</span>) or el.evaluate(<span class="c-st">"n =&gt; n.tagName.toLowerCase()"</span>)
+    name = el.evaluate(<span class="c-st">"n =&gt; n.innerText || n.ariaLabel || ''"</span>).strip()[:<span class="c-st">80</span>]
+    path = el.evaluate(<span class="c-st">"n =&gt; { let p=[]; while(n && n.nodeType===1){ p.push(n.tagName+':'+([...n.parentNode.children].indexOf(n))); n=n.parentNode;} return p.join('/'); }"</span>)
+    key = json.dumps({<span class="c-st">"role"</span>: role, <span class="c-st">"name"</span>: name, <span class="c-st">"path_hash"</span>: hashlib.sha1(path.encode()).hexdigest()[:<span class="c-st">10</span>]}, sort_keys=<span class="c-kw">True</span>)
+    <span class="c-kw">return</span> key
+
+<span class="c-kw">def</span> click_by_fingerprint(page, fp):
+    <span class="c-kw">for</span> el <span class="c-kw">in</span> page.locator(<span class="c-st">"*"</span>).element_handles():
+        <span class="c-kw">if</span> fingerprint(el) == fp:
+            el.click(); <span class="c-kw">return</span> <span class="c-kw">True</span>
+    <span class="c-kw">return</span> <span class="c-kw">False</span>   <span class="c-cm"># harness re-observes and re-decides</span></pre>
+
+    <p>Playwright 里锚点哈希每次点击约花 40ms，能消除最常见的一类错点。剩下的边角——目标真的不在了——现在对外壳是一个独特信号，而不是一次静默的错点。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>截图歧义：看之前先滚动到相关区域。</h3>
+
+    <p>失败：智能体被要求"点 Submit 按钮"，截了一张图，按钮不在画布内——因为表单比可视区域长。模型要么幻觉一个点击坐标（糟）、要么报失败停下（好一点但浪费）。这两种都不是你想要的。修法是：外壳在每次截图前先跑一个<em>滚动到相关区域</em>的启发式——滚到当前聚焦元素、如果表单在焦点就滚到可视表单底部、或滚到智能体点名的目标——超过尺寸阈值时抓多帧。智能体看到的是拼接或多帧观测，里面包含了本来在画布外的按钮。</p>
+
+    <p>两个副手小招值得投入。其一，缩放变了智能体的坐标系就对不上 DOM，会话期间把缩放冻结在 100%。其二，在截图上叠一层<em>覆盖</em>，把外壳能识别的交互区（每个按钮、链接、输入框）标上数字 ID。智能体按 ID 点，而不是按像素点；"点哪个像素"的歧义就没了。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>登录状态与模态：在边界续期，遇到先关。</h3>
+
+    <p>两种相关失败。跑到一半登录状态过期：t=0 时会话令牌有效，t=15 分钟过期，智能体下一步动作被 302 重定向到 <code class="inline">/login</code>，轨迹里塞满重试循环。模态弹窗打断：跑到一半冒出一个 cookie 提示挡住每一次点击；智能体尝试穿过去、失败、重试、再失败。</p>
+
+    <p>修法很朴素但有效。登录：外壳持有一份<em>续期策略</em>——在文档标称过期时间前约 20% 续期，每次跨工具边界也续期。认证状态住在智能体控制循环之外。模态：外壳用一个小规则集把每一个新出现的 DOM 节点分类为"内容"或"覆盖层"（position: fixed、z-index 超过阈值、含 Close/OK 按钮）。覆盖层在把观测送给模型前自动关闭。模型永远看不到那个模态；外壳处理掉了。如果一个模态不能安全自动关闭（一次支付确认、一次法律同意），就升级到人——策略层面的判断，不是模型的判断。这与工具失败的<a href="/deep-dives/architectures-and-patterns/tool-error-recovery" class="xref">分层错误恢复</a>同构：有些错误住在模型之下，不在模型之内。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>限流断崖：带抖动的指数退避，按租户感知。</h3>
+
+    <p>失败：智能体点击失败后在 3 秒内重试 3 次。在按租户共享限流的真实企业门户上，一个浏览器智能体产生了 10 个用户的流量，撞到租户的 60 rpm 限，拿到 429，再重试，再 429，整个租户被拉黑。轨迹上看像"应用坏了"；真实故事是这个智能体把自己的工作区 DoS 了。</p>
+
+    <p>修法是智能体外壳常常跳过的标准网络纪律。把每次重试包在<em>带抖动的指数退避</em>里，起点 500ms、上限 30 秒。用户可见操作把重试次数封顶在 3 次，超过就交给人。如果响应有 <code class="inline">Retry-After</code> 头就读它、按它退。最重要的：每个租户只跑一个浏览器会话，而不是每个任务一个；如果一个租户处在退避中，跑在这个租户上的所有任务一起等，不只是拿到 429 的那一个。这是外壳自己拥有的协调问题，不是模型收到的一段提示。</p>
+
+    <p>让这份纪律持久的可观测性手段：按租户按分钟发一个"智能体请求速率"指标，超过普通人 10× 就报警。这就是"一个 bug 正在把普通运行变成故障"最早的信号。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>不可逆预算：动作在触发前先分级。</h3>
+
+    <p>最后一种失败模式，也是最贵的一种。智能体提交了不该提交的表单——重复付了一份发票、取消了一次发货、发了一条不该发的消息。判定 Submit 按钮"是对的"的模型仍要为错误负责，但错误之所以可能发生，是因为外壳把"点 Submit"和"点 Next"当同一件事。修法是外壳在工具调用之前把每个可暴露的动作分成三档：</p>
+
+    <p><em>可撤销</em>：创建草稿、导航、打开菜单。放心尝试；重试便宜。<em>可以费力挽回</em>：发出一条可撤回的消息、上传一份可删除的文件。放行但显眼记录；外壳在动作之后自动提供一个"撤销"工具。<em>不可逆</em>：提交支付、取消订单、发出公开帖子。执行前需要人类确认。分级住在工具元数据里，不在模型里——每个动作一个 <code class="inline">destructive: true</code> 或 <code class="inline">requires_confirmation: true</code> 标志——由外壳执行。同样的模式也见于<a href="/deep-dives/architectures-and-patterns/tool-error-recovery" class="xref">工具错误恢复</a>里的非浏览器工具；浏览器是同一个问题，只是结构更少。</p>
+
+    <p>"预算"部分：即便在已批准的工作流里，也要给每次运行的不可逆动作数上限。如果你的自动化本该提交一份报销、而轨迹将要提交三份，外壳应该拒绝并交给人评审。这是对"12% 成功率、每次抽风都要真金白银"的最后一道防线。这套模式向<a href="/playbooks/coding-and-computer-use-agents/browser-agents" class="xref">任何浏览器智能体部署</a>都推广得动：上面那些外壳级修法是前置条件，不是可选项。WebArena 的 68% 是上限；生产要靠近它，唯有模型之下这一层把六种模式接住。</p>
+  </div>
+</section>

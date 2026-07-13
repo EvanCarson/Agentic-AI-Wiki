@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">T9</div>
+  <div class="week">Deep Dive · Training Agentic Models</div>
+  <h2>Outcome rewards under-credit long-horizon agents; process rewards over-label; the honest 2026 approach is targeted PRMs on the steps that matter, not everything.</h2>
+  <p class="goal">Outcome rewards are cheap and sparse; process rewards are dense and expensive. For long-horizon SWE agents that run tens of steps to produce a diff, sparse outcome rewards under-credit the good intermediate moves. Process reward models (PRMs) label steps individually. The catch: labeling every step is prohibitively expensive. 2026 practice is targeted PRMs — SWE-TRACE, AgentPRM, SPARK identify which steps are decision points and only label those. This essay is the state of PRMs and the labeling economy.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why outcome rewards under-credit long horizons.</h3>
+
+    <p>A thirty-step SWE trajectory ends in one scalar reward: the tests passed or they didn't. That scalar has to explain what all thirty steps contributed, and the arithmetic doesn't work out. The good steps and the wasted steps share the same terminal signal, so the gradient update reinforces both equally when the trajectory succeeded and punishes both equally when it failed. The <a href="/deep-dives/training-agentic-models/process-vs-outcome-rewards" class="xref">process-vs-outcome rewards essay</a> lays out the general trade-off; the specific problem this essay treats is what to do when the horizon is long enough that the outcome signal has been diluted past the point of usefulness.</p>
+
+    <p>The failure mode this produces at scale is not obvious from a loss curve. Pass rate keeps climbing — the policy is learning something — but the learning is credit-assigned to whichever steps happen to correlate with success across the batch, which is not necessarily the same as the steps that caused it. On coding-agent runs the pattern shows up as the policy over-attending to superficial features (a specific import ordering that many passing solutions share) and under-learning the causal steps (choosing the right function to edit). The diagnostic is: hold out a set of trajectories where the same superficial pattern is present but the underlying decision is wrong, and watch what the outcome-trained policy does. It follows the pattern; a process-trained policy doesn't.</p>
+
+    <p>The crossover point is horizon-dependent. Trajectories under about ten steps are usually short enough that outcome credit is roughly right — every step is close enough to the end that the terminal reward tells you something useful about it. Above about twenty steps the signal has degraded enough that dense supervision starts paying its way, and above about fifty steps outcome-only RL wastes most of the compute it uses. The number is not exact; the shape is.</p>
+
+<pre class="trace">trajectory (30 steps, SWE task, tests eventually pass)
+
+outcome-only reward:
+  step 01..30: adv = +0.4    (uniform; the terminal +1.0 minus baseline 0.6)
+
+process reward (targeted, 5 labeled steps):
+  step 03  ls repo/                        [not labeled]  adv = 0
+  step 07  cat src/parser.py               [not labeled]  adv = 0
+  step 12  <b>edit src/parser.py</b>              [labeled +0.8]  adv = +0.3
+  step 15  pytest -k parser                [not labeled]  adv = 0
+  step 18  <b>edit src/parser.py</b>              [labeled -0.6]  adv = -0.9
+  step 22  <b>edit src/parser.py</b>              [labeled +0.9]  adv = +0.4
+  step 27  pytest -k parser                [not labeled]  adv = 0
+  step 30  git diff  →  tests pass         [terminal   ]  adv = +0.2</pre>
+
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>PRMs: labeling every step, and the classifier that results.</h3>
+
+    <p>A process reward model is, mechanically, a step-level classifier trained on labeled trajectories: for each step in the trajectory, a human (or a stronger AI) says whether that step was a useful move toward the outcome. The PRM learns to imitate this labeler, and at RL time it scores each step during a rollout, producing a dense signal that the policy optimizer distributes across the trajectory. The <a href="/deep-dives/reasoning-and-test-time-compute/verifier-guided-search" class="xref">verifier-guided search essay</a> treats the inference-time cousin — using a PRM to prune search — and the training-time use is closely related: the same signal that would prune a bad branch at test time can steer the policy away from producing it at training time.</p>
+
+    <p>The training data is the expensive part. A PRM needs labeled steps, and a step is labeled by someone (or something) that looked at it and decided "yes, this moved toward the outcome" or "no, it didn't." For math, the labeler can often be another checker: a step is good if the value it computed is correct given the previous steps. For code, the labeler is much harder — is this line of a partial diff on the right track? For general agentic tasks, the labeler is a stronger model reading the step in context and rendering a judgment, which is the same "learned reward" territory that gets reward-hacked at scale. The PRM is only as good as the labeler; the labeling economy — step two of the next section — is where the whole approach lives or dies.</p>
+
+<pre class="standalone"><span class="c-cm"># PRM inference: score each step of a rollout, feed dense advantage to RL.</span>
+<span class="c-kw">def</span> <span class="c-fn">score_trajectory</span>(prm, trajectory):
+    scores = []
+    <span class="c-kw">for</span> i, step <span class="c-kw">in</span> <span class="c-fn">enumerate</span>(trajectory):
+        prefix = trajectory[:i]
+        s = prm.<span class="c-fn">predict</span>(prefix=prefix, step=step)
+        scores.<span class="c-fn">append</span>(s)                <span class="c-cm"># scalar in [0, 1]</span>
+    <span class="c-kw">return</span> scores
+
+<span class="c-cm"># In GRPO, per-step advantage replaces the uniform terminal one:</span>
+<span class="c-cm">#   adv[i] = prm_score[i] - baseline[i]</span>
+<span class="c-cm"># The policy learns to move probability mass toward higher-scored steps.</span></pre>
+
+    <p>What that snippet hides is the fragility of the score itself. If the PRM was trained on trajectories from a policy weaker than the one you are now training, its judgments about what constitutes a "good step" reflect that weaker policy's distribution — steps that look wrong to it may be the smarter moves a stronger policy has learned to take. This distribution-shift failure is why long-running PRM-guided training tends to plateau: the policy improves past the PRM's frame of reference and the dense signal starts fighting the policy instead of guiding it. The fix is to retrain the PRM against fresh trajectories periodically, which reintroduces labeling cost the whole approach was trying to control.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The labeling economy: why every-step is prohibitive.</h3>
+
+    <p>The arithmetic that kills the naive PRM approach is straightforward. A thirty-step trajectory needs thirty step labels. A training set that gives the PRM enough coverage needs at least tens of thousands of trajectories, so the labeling task is on the order of a million step labels. At even a dollar per label (which is generous for hard tasks), that is a million-dollar labeling budget before any GPU time. At a stronger model's cost per judgment (a few cents), it is more affordable but adds up to weeks of compute on the labeler alone, plus the reward-hacking risk that comes with using a learned labeler.</p>
+
+    <p>The 2026 response is not to abandon PRMs but to be smarter about which steps get labeled. Two observations drive the shift. First, most steps in a long trajectory are not decision points — they are execution steps whose outcome is determined by earlier choices. Labeling these adds signal that the policy could infer from context. Second, on a well-shaped trajectory, the decision points are identifiable structurally: they are steps where the policy branched, where the tool called was one of several plausible options, where the reasoning turn changed the framing of the problem. Targeted PRMs — the SWE-TRACE, AgentPRM, and SPARK families — encode heuristics for identifying decision points and label only those, reducing the labeling budget by an order of magnitude while preserving most of the credit-assignment gain.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Targeted PRMs: SWE-TRACE, AgentPRM, SPARK.</h3>
+
+    <p>SWE-TRACE narrows the labeling to the steps where a coding-agent trajectory materially changes state: a file edit, a test run, a new subprocess. Steps that read a file or list a directory get an "informational" label that the PRM ignores at reward time; steps that change the world get a full labeler judgment. The result is that a thirty-step SWE trajectory typically has three to seven labeled steps, cutting the labeling cost by roughly five to ten times relative to labeling everything, and the empirical credit-assignment improvement on long trajectories is close to what a full PRM delivers.</p>
+
+    <p>AgentPRM generalizes the idea beyond code: it treats any step whose choice branches the trajectory as a decision point. Concretely, it runs a small brancher — often a cheap model — that estimates the entropy of the policy's action distribution at each step, and labels only the steps where the entropy exceeded a threshold. The intuition is that the policy already knew what to do on the low-entropy steps and doesn't need reward signal there; the high-entropy steps are the ones where the training signal actually changes behavior. The trade-off is that the branch detector adds compute per rollout, but the compute is cheap relative to the labeling cost it avoids.</p>
+
+    <p>SPARK sits between the two in another dimension: instead of choosing which steps to label at data-generation time, it labels sparingly and uses a self-consistency-style protocol to spread the label across nearby steps. If a labeler judges step 17 to be a wrong move, SPARK assumes the same judgment applies to some neighborhood of that step (17 plus or minus two), which produces dense-enough supervision from sparse labels. The cost is a slight bias — a step near a labeled wrong step gets marked wrong even if it happened to be right — but on aggregate the bias is smaller than the variance it eliminates. As of mid-2026, none of the three has dominated; teams tend to pick SWE-TRACE for code tasks, AgentPRM for general agentic tasks, and SPARK when the labeling budget is severely constrained.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When outcome-only is still right.</h3>
+
+    <p>Short trajectories don't earn the PRM overhead. Anything under about ten steps has outcome credit close enough to right that the extra machinery of process rewards is dead weight; the whole apparatus of decision-point detection, labeler pipelines, PRM training, and per-step advantage estimation exists to solve a problem that short-horizon tasks don't have. The <a href="/deep-dives/training-agentic-models/reward-design-and-hacking" class="xref">reward-design-and-hacking essay</a> makes the more general version of this point: the cheapest reward that closes the gap wins, and paying for density you don't need is a subtle way to lose money.</p>
+
+    <p>Cheap outcome verifiers are the second case. A task whose outcome check is instantaneous and cheap to run — a simple string match, a numeric equality — supports enough rollouts per unit budget that outcome-only RLVR just works. It is the tasks where the outcome check is slow (running a real test suite that takes tens of seconds) or expensive (a rubric-scored LLM judge) that benefit most from getting more information per rollout via a PRM, because the marginal cost of a labeled step is small compared to the marginal cost of another whole rollout.</p>
+
+    <p>The framing worth taking is that process reward models are a lever, not a default. On long, slow-verifier trajectories they are the difference between a run that keeps improving and one that plateaus; on short, fast-verifier trajectories they are complexity you don't owe yourself. The targeted PRM stack that shipped in 2026 made the lever cheaper to reach for than it used to be, and the honest discipline that has to travel with it is knowing on which trajectories it belongs.</p>
+  </div>
+</section>

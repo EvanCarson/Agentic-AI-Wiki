@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">K7</div>
+  <div class="week">Deep Dive · Tool &amp; Capability Design</div>
+  <h2>"Portable tool defs" was fiction; the 2026 vendor matrix has enough shared surface to look uniform and enough divergence to break every naive port.</h2>
+  <p class="goal">OpenAI Chat Completions vs Responses API. Anthropic's Programmatic Tool Calling and Tool Search Tool. Gemini's OpenAPI subset. Same underlying idea — model proposes a tool call, host executes, model reads the result — packaged three different ways, with three different JSON Schema dialects, three different streaming shapes, and three different ways to name "the same" flag. Teams port a working tool spec from one vendor to another expecting the diffs to be cosmetic; the diffs are the reason your parallel-call chain silently degrades or your <code class="inline">enum</code> constraint quietly disappears. This essay is the matrix, the divergences that matter (JSON Schema subsets, streaming, parallel calls, custom grammars), and the small set of tool-def shapes that survive a port unchanged.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The shared surface: model proposes, host executes, model reads.</h3>
+
+    <p>At the level a whiteboard drawing captures, every 2026 vendor implements the same three-move loop. The host presents a set of tool definitions alongside the user prompt; the model, at some assistant turn, chooses to emit one or more <em>tool calls</em> instead of (or alongside) a text reply; the host runs the calls out-of-band, packages the results as a synthetic message the model expects, and hands the loop back for another turn. The <a href="/concepts/tool-calling-explained" class="xref">tool-calling concept</a> works this shape at a beginner's altitude. The three-vendor divergence starts one layer down — in what a "tool definition" contains, how the model signals its choice, and how the result is threaded back — and everything below is that layer down.</p>
+
+    <p>Three shared conventions are worth pinning first because they are the closest thing to a portable subset. All three vendors accept JSON Schema for the argument shape (with subsets — see K10). All three name the loop primitive the same way at the user's altitude: OpenAI and Gemini call the model's emission a <em>tool call</em> (OpenAI's Responses API and Chat Completions both settled here after retiring "function_call"); Anthropic calls it a <em>tool_use</em> block, but the JSON payload has the same three fields — an id, a name, and a JSON object of arguments. All three carry the result back as a message whose role is either <code class="inline">tool</code> (OpenAI, Gemini's <code class="inline">functionResponse</code>) or a <code class="inline">tool_result</code> block (Anthropic) referencing the call id. A tool implementation that speaks JSON Schema args in and a JSON object out will not be the porting bottleneck. The bottleneck is <em>everything the spec adds around that</em>.</p>
+
+    <p>The <a href="/deep-dives/protocols-and-interop/tool-calling-standards" class="xref">tool-calling standards</a> essay treats the loop as a protocol question; what this essay adds is the vendor-by-vendor idiom you write when you actually reach for an SDK. The <a href="/deep-dives/protocols-and-interop/structured-tool-io" class="xref">structured tool I/O</a> essay owns the return-payload half of the story; this essay owns the request-side surface — where a tool def lives, what fields it exposes, and where each vendor added a knob the other two do not have.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>OpenAI: Chat Completions vs Responses, and where they diverge.</h3>
+
+    <p>OpenAI ships two live surfaces in 2026 and the choice is not academic. Chat Completions is the older shape, stable, universally supported by proxies and framework glue, and is where most existing code lives. Responses API is the newer shape, aligns tool calls with a first-class item type in a typed response stream, and is where new features (Reasoning items, custom-grammar tools, computer-use tool built-ins) land first. Both accept the same tool-def shape at the top — <code class="inline">{"type": "function", "function": {"name", "description", "parameters"}}</code> in Chat Completions, and the flatter <code class="inline">{"type": "function", "name", "description", "parameters"}</code> in Responses. A port between the two flavours is mostly one level of nesting different, plus the streaming shape (see K11).</p>
+
+    <p>Two OpenAI-specific knobs are load-bearing and easy to miss. <code class="inline">parallel_tool_calls</code> defaults to true on both surfaces, letting the model emit multiple tool calls in one assistant turn — the host runs them concurrently and returns all results before the next turn. Setting it to false serializes them, which is the fix when your tools are stateful or when the model's parallelization is picking a bad order. <code class="inline">tool_choice</code> takes <code class="inline">"auto"</code> (default), <code class="inline">"none"</code>, <code class="inline">"required"</code> (model must call some tool), or a named tool object (must call this one). Custom tools with a Lark or regex grammar arrived on Responses in early 2026 — the model emits text that matches your grammar, and the surface handles the constrained decoding without you writing a tool schema at all. The <code class="inline">strict: true</code> flag on a tool's parameters is what actually enforces the JSON Schema against the model's output; without it, the schema is a hint, not a guarantee.</p>
+
+<pre class="standalone"><span class="c-cm"># OpenAI (Chat Completions) — the tool def shape</span>
+tools = [{
+    <span class="c-st">"type"</span>: <span class="c-st">"function"</span>,
+    <span class="c-st">"function"</span>: {
+        <span class="c-st">"name"</span>: <span class="c-st">"refund_order"</span>,
+        <span class="c-st">"description"</span>: <span class="c-st">"Refund an order. Use for defective items or customer-reported issues."</span>,
+        <span class="c-st">"parameters"</span>: {
+            <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+            <span class="c-st">"properties"</span>: {
+                <span class="c-st">"order_id"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+                <span class="c-st">"reason"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>, <span class="c-st">"enum"</span>: [<span class="c-st">"defective"</span>, <span class="c-st">"wrong_item"</span>, <span class="c-st">"other"</span>]},
+            },
+            <span class="c-st">"required"</span>: [<span class="c-st">"order_id"</span>, <span class="c-st">"reason"</span>],
+            <span class="c-st">"additionalProperties"</span>: <span class="c-kw">False</span>,
+        },
+        <span class="c-st">"strict"</span>: <span class="c-kw">True</span>,
+    },
+}]
+resp = client.chat.completions.create(model=<span class="c-st">"gpt-5.1"</span>, messages=msgs,
+    tools=tools, parallel_tool_calls=<span class="c-kw">True</span>, tool_choice=<span class="c-st">"auto"</span>)</pre>
+
+    <p>The Responses-API port removes the outer <code class="inline">"function"</code> nesting and moves the tool calls into the typed <code class="inline">output</code> array as <code class="inline">function_call</code> items with an <code class="inline">arguments</code> string, a <code class="inline">name</code>, and a <code class="inline">call_id</code>. New code should default to Responses; framework code that already speaks Chat Completions has no forced migration and will keep working. What you do <em>not</em> want to do is generate tool defs for both surfaces from a single template that omits the nesting difference — the SDK will silently accept the malformed shape and drop the tools.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Anthropic: PTC, Tool Search, and Tool Use Examples.</h3>
+
+    <p>Anthropic's tool surface uses <code class="inline">tool_use</code> and <code class="inline">tool_result</code> content blocks inside the messages array — no separate <code class="inline">tools</code> field on the message role, just typed blocks the model produces and consumes. The tool def itself is flatter than OpenAI's Chat Completions shape: <code class="inline">{"name", "description", "input_schema"}</code>, where <code class="inline">input_schema</code> is JSON Schema (subset — see K10). <code class="inline">tool_choice</code> takes <code class="inline">{"type": "auto"}</code>, <code class="inline">{"type": "any"}</code> (must call some tool), <code class="inline">{"type": "tool", "name": "..."}</code>, or <code class="inline">{"type": "none"}</code>. Parallel tool calls are on by default and can be forced off with <code class="inline">disable_parallel_tool_use: true</code> inside the <code class="inline">tool_choice</code> object.</p>
+
+    <p>Three Anthropic-only primitives are the reason to reach for this vendor first when the tool surface is the hard part. <em>Programmatic Tool Calling</em> (PTC), shipped November 2025, changes the loop so the model writes a small Python program that runs in an Anthropic-managed sandbox, calls the tools from inside that program, and returns only the final result into context — the intermediate tool results never enter the model's context window at all. On multi-tool chains this is a large win on both cost and latency, and the <a href="/deep-dives/tool-capability-design/tool-granularity" class="xref">tool-granularity</a> problem softens because you can expose finer tools without paying the context tax on each call. The advanced-orchestration primitives that build on PTC are worth a <a class="xref" href="/deep-dives/tool-capability-design/advanced-tool-orchestration-patterns">separate essay</a> of their own. <em>Tool Search Tool</em> is a built-in whose only job is to semantically retrieve tool definitions from a corpus you upload — you register 200 tools once, ship a single Tool Search Tool in the prompt, and the model asks the tool to fetch the three or four defs it actually needs. Anthropic's own benchmark quotes an 85% token reduction on tool-rich prompts. <em>Tool Use Examples</em> attach few-shot examples directly to a tool def (<code class="inline">tool_use_examples</code> field) — same idea as few-shot in the system prompt, but scoped to the tool, so the model only sees them when it is considering that tool.</p>
+
+<pre class="standalone"><span class="c-cm"># Anthropic — same tool, native shape</span>
+tools = [{
+    <span class="c-st">"name"</span>: <span class="c-st">"refund_order"</span>,
+    <span class="c-st">"description"</span>: <span class="c-st">"Refund an order. Use for defective items or customer-reported issues."</span>,
+    <span class="c-st">"input_schema"</span>: {
+        <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+        <span class="c-st">"properties"</span>: {
+            <span class="c-st">"order_id"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+            <span class="c-st">"reason"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>, <span class="c-st">"enum"</span>: [<span class="c-st">"defective"</span>, <span class="c-st">"wrong_item"</span>, <span class="c-st">"other"</span>]},
+        },
+        <span class="c-st">"required"</span>: [<span class="c-st">"order_id"</span>, <span class="c-st">"reason"</span>],
+    },
+}]
+resp = client.messages.create(model=<span class="c-st">"claude-opus-4-7"</span>, messages=msgs,
+    tools=tools, tool_choice={<span class="c-st">"type"</span>: <span class="c-st">"auto"</span>})</pre>
+
+    <p>Two porting-gotchas to keep in view. Anthropic's <code class="inline">input_schema</code> validation ignores <code class="inline">minLength</code>, <code class="inline">maxLength</code>, <code class="inline">minimum</code>, <code class="inline">maximum</code> — the K10 essay covers the full subset, and the practical consequence is that a schema that visibly enforces string length on OpenAI silently permits any length on Anthropic. And Anthropic's <code class="inline">tool_result</code> block is separate content, not a role, so a framework that models messages as <code class="inline">{role, content}</code> tuples has to allow content-block arrays or fabricate an unnatural role. Both are small friction if you know about them; both are silent bugs if you don't.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Gemini: OpenAPI subset and tool_choice: any.</h3>
+
+    <p>Gemini's tool surface uses the OpenAPI 3.0 schema subset, not JSON Schema draft-2020-12 — <code class="inline">FunctionDeclaration.parameters</code> is a <code class="inline">Schema</code> object drawn from OpenAPI, and constructs that don't exist in OpenAPI 3.0 (like <code class="inline">const</code>, or <code class="inline">$defs</code>-based cross-references) don't validate. The model emits a <code class="inline">functionCall</code> part inside the response content, with <code class="inline">name</code> and <code class="inline">args</code> fields; the host returns a <code class="inline">functionResponse</code> part with the same name and a <code class="inline">response</code> object. Gemini's default is to allow the model to reply with either a function call or free text; <code class="inline">tool_config.function_calling_config.mode</code> takes <code class="inline">AUTO</code> (default), <code class="inline">ANY</code> (must call one of the exposed tools), or <code class="inline">NONE</code>, and an optional <code class="inline">allowed_function_names</code> restricts <code class="inline">ANY</code> to a subset.</p>
+
+    <p>Two Gemini-specific properties are worth budgeting for. First, Gemini natively supports multimodal function responses — the <code class="inline">functionResponse</code> parts can carry inline images or file-URI references, and the model reads them as part of the tool result. That is unique in the matrix and is the reason browser-agent and document-agent teams reach for Gemini even when their primary model is elsewhere. Second, Gemini exposes function-calling on both the Vertex and AI Studio surfaces with slightly different SDKs and different quota knobs; the tool-def shape is the same but the client boilerplate isn't, and template-driven codegen has to know which surface a given deployment targets.</p>
+
+<pre class="standalone"><span class="c-cm"># Gemini — OpenAPI 3.0 subset</span>
+tools = [{
+    <span class="c-st">"function_declarations"</span>: [{
+        <span class="c-st">"name"</span>: <span class="c-st">"refund_order"</span>,
+        <span class="c-st">"description"</span>: <span class="c-st">"Refund an order. Use for defective items or customer-reported issues."</span>,
+        <span class="c-st">"parameters"</span>: {
+            <span class="c-st">"type"</span>: <span class="c-st">"OBJECT"</span>,
+            <span class="c-st">"properties"</span>: {
+                <span class="c-st">"order_id"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"STRING"</span>},
+                <span class="c-st">"reason"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"STRING"</span>, <span class="c-st">"enum"</span>: [<span class="c-st">"defective"</span>, <span class="c-st">"wrong_item"</span>, <span class="c-st">"other"</span>]},
+            },
+            <span class="c-st">"required"</span>: [<span class="c-st">"order_id"</span>, <span class="c-st">"reason"</span>],
+        },
+    }],
+}]
+resp = client.models.generate_content(model=<span class="c-st">"gemini-3.5-pro"</span>, contents=msgs,
+    config={<span class="c-st">"tools"</span>: tools,
+            <span class="c-st">"tool_config"</span>: {<span class="c-st">"function_calling_config"</span>: {<span class="c-st">"mode"</span>: <span class="c-st">"ANY"</span>}}})</pre>
+
+    <p>The uppercase <code class="inline">"OBJECT"</code> / <code class="inline">"STRING"</code> type names are OpenAPI-style enums, not the lowercase JSON Schema strings the other two vendors take. A tool-def template that emits lowercase will fail validation on Gemini with a message about unknown type; a template that emits uppercase will fail on the other two vendors for the same reason. The pragmatic move is a per-vendor emitter around a common intermediate representation, not a stringly-typed template.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Divergence that matters: parallel, streaming, structured output.</h3>
+
+    <p>Four axes carry most of the port-breaking surprises. <em>Parallel tool calls</em> are on by default everywhere, but the wire shapes differ — OpenAI emits multiple <code class="inline">tool_calls</code> items in one assistant message, Anthropic emits multiple <code class="inline">tool_use</code> content blocks, Gemini emits multiple <code class="inline">functionCall</code> parts. Frameworks that model a tool call as "one per message" break silently on parallel calls; you get the first one, the rest disappear. A framework that iterates the list works uniformly. <em>Streaming</em> deltas differ enough to deserve their own essay — see K11 — and the aggregation semantics (does <code class="inline">arguments</code> accumulate across chunks, or is each chunk a full replacement?) are where the accumulators most commonly break. <em>Structured output</em> is the same constrained-decoding trick as tool calling but with a value-return contract instead of an action-proposal contract; see K9 for the port rules.</p>
+
+    <p><em>JSON Schema subsets</em> are the fourth and most costly axis. Every vendor advertises "JSON Schema" and each enforces a different set. OpenAI's strict mode requires <code class="inline">additionalProperties: false</code> everywhere and marks every field required (nullable-optional workarounds required). Anthropic ignores string- and number-range keywords entirely. Gemini enforces the OpenAPI 3.0 subset and rejects constructs outside it. See the K10 essay for the full three-column table you keep next to your editor; the summary is that any schema you ported by copy-paste from one vendor's docs is a candidate bug on the other two.</p>
+
+    <p>One more axis is more subtle but bites in production: <em>tool-choice semantics on the retry</em>. When the model emits a bad tool call and you push a corrective tool result back, OpenAI's <code class="inline">tool_choice="required"</code> re-fires on the next turn; Anthropic's <code class="inline">{"type": "any"}</code> does too; Gemini's <code class="inline">ANY</code> mode does too — but their interaction with <code class="inline">stop_sequences</code> and end-of-turn detection is not uniform, and a retry harness that assumes "required forces a tool call" without checking the response can loop. The safe harness reads the response and only re-fires if the model actually produced text instead of a call.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The portable subset: what actually ports without editing.</h3>
+
+    <p>The tool-def shape that survives a port unchanged is smaller than teams hope and larger than they expect. What ports: a description written as instruction (verb-first, when-and-when-not, one example), a small parameters object with a top-level <code class="inline">"type": "object"</code>, string / integer / number / boolean primitives, a <code class="inline">required</code> array, and an <code class="inline">enum</code> constraint on strings. What does not port: string- and number-range keywords (<code class="inline">minLength</code>, <code class="inline">maxLength</code>, <code class="inline">minimum</code>, <code class="inline">maximum</code>) if Anthropic is a target; <code class="inline">const</code>, <code class="inline">$defs</code>, <code class="inline">anyOf</code>-with-null tricks if Gemini is a target; <code class="inline">additionalProperties</code> presence rules if OpenAI strict mode is on. The lowercase-vs-uppercase type names for Gemini and the extra <code class="inline">"function"</code> nesting for OpenAI Chat Completions are trivial rewrites; the schema-subset differences are semantic and are the ones you catch late.</p>
+
+    <p>Two patterns keep teams sane. The first is an intermediate representation — an internal tool spec with the union of the portable subset plus per-vendor extensions — and per-vendor emitters that render it into the right shape. The moment you have three call-sites emitting three tool-def shapes by hand, one of them will drift. The second is a per-vendor validation pass that runs your schemas through each vendor's SDK validator at CI time; every vendor ships one, and the CI cost is a few seconds per tool. If your CI does not catch a schema-subset regression, your production traffic will, and the trace will look like "the model started ignoring the enum," which is a slow bug to find.</p>
+
+    <p>Read the six steps together and the vendor matrix stops looking like a compatibility question and starts looking like a design one. The shared surface is real — model proposes, host executes, model reads — and every serious vendor now supports it well enough that the loop is boring. The bumps are all at the edges: how you wrap a tool def, how you stream, how you retry, and what schema keywords silently vanish. Treat the portable subset as your baseline and every extension as an explicit per-vendor opt-in, and the port is a diff you can read; treat "JSON Schema is JSON Schema" as the porting model and every new vendor is a fresh production incident waiting for a schema keyword to go quiet.</p>
+  </div>
+</section>

@@ -1,0 +1,117 @@
+<section class="phase">
+  <div class="phase-num">D9</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>持久执行不是"LangGraph 的一个特性 vs Temporal 的一个特性"——2026 年正确的做法是"推理图 + 持久运行时"，而团队踩坑的地方几乎全在两者的接缝处。</h2>
+  <p class="goal">LangGraph 的 checkpointer 在节点之间保存状态。Temporal 在工作流函数之内保存状态。把两者混为一谈，你的 30 分钟研究智能体会在第 27 分钟崩掉、且没有可续跑的状态。2026 年真正上线的模式是"推理图 + 持久运行时"：LangGraph 掌控推理形状，Temporal 承担持久性保证。Cordum 的工程文章基准跑出：纯 LangGraph 循环在约 1 万条目时崩溃，Temporal 承接的执行仍能继续。接缝设计——谁负责重试、谁负责幂等、checkpoint 边界放在哪里——就是全部博弈。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>两种持久性口味，以及它们为何不能互相替代。</h3>
+
+    <p>LangGraph 和 Temporal 都会告诉你它们提供"持久执行"，两家说的都是真话，只是各自指的是不同的东西。LangGraph 的持久性是一个 <em>checkpointer</em>：图中的每个节点跑完后，框架把图状态序列化并写入存储（开发用 SQLite，生产用 Postgres/Redis）。如果进程在两个节点之间挂掉，可以从上一个 checkpoint 恢复。Temporal 的持久性则是<em>工作流函数</em>本身：Temporal 工作流内的每一个 <code class="inline">await</code> 都是一个持久化点，如果 worker 在 <code class="inline">await</code> 中间挂掉，Temporal 会依据历史记录把函数回放到那个 <code class="inline">await</code>，然后继续。</p>
+
+    <p>"checkpoint"这个词掩盖了粒度上的千倍差异。LangGraph 的一个节点是一个完整的推理步骤——规划、调用三个工具、汇总——checkpoint 在节点<em>返回之后</em>触发。如果你的节点是一个 for 循环、跑 1 万条数据，在第 8,742 条时崩了，恢复后的运行会从第 0 条开始重跑这个节点，因为框架只知道节点边界。Temporal 工作流函数如果按条调用 activity，每个 activity 之后就 checkpoint，所以 8,742 崩了，恢复后从 8,743 继续。两者没有"谁对"，它们回答的是"你愿意在哪里损失工作"这个不同问题。</p>
+
+    <p>这在 2026 年之所以要紧，是因为智能体变长了。以前 5 分钟的研究智能体现在跑 40 分钟；以前碰百行的批量补齐任务现在碰 1 万行。在这样的规模下，"节点级持久性"和"activity 级持久性"的差别就是"能不能上线"的差别。错误在于挑一边。真正奏效的模式是<a href="/deep-dives/architectures-and-patterns/pattern-landscape" class="xref">把两者叠起来</a>：上面用 LangGraph 管推理形状，下面用 Temporal 提供持久执行保证。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>LangGraph 与 Temporal 分别在哪打点。</h3>
+
+    <p>把画面画出来，差别就不再让人困惑。一次 LangGraph 运行是一张节点组成的有向图；checkpointer 在每个节点的返回值可用之后把状态写入存储。节点之间：持久。节点<em>内部</em>：节点自己的代码怎么写就怎么跑，靠自己。如果一个节点调用了三次 HTTP API、更新了一次数据库然后返回，在两次 HTTP 调用之后、数据库更新之前挂掉，恢复的运行不会有那一点半成品——它会把整个节点重跑一次。</p>
+
+    <p>一次 Temporal 运行是一个工作流函数，函数里每一个 <code class="inline">await</code> 点都是一次持久化事件；框架把每一次 activity 调用与结果记录到历史日志。<code class="inline">await</code> 之间：持久。恢复时，Temporal 从函数最上面重新执行工作流函数，凡是历史中已经记录的 <code class="inline">await</code>，都直接回放已经记录的结果，而不是真的再去调一次 activity。让这一切成立的是"确定性"——工作流函数本身不能直接做 I/O，只能通过 activity；也不能用非确定性的操作（真实时间、随机数），除非走 Temporal 提供的确定性 API。</p>
+
+    <p>一个搞混了的团队会交付出这样的具体失败：他们把 LangGraph 智能体包在一个 Temporal 工作流里，然后让 LangGraph 节点自己在节点体内做 HTTP 调用、自己重试、自己设超时。Temporal 完全不知道那一切发生过——从它的视角看，工作流只是调了一个 activity（"跑一次 LangGraph 节点"）并拿到了一个结果。这个 activity 跑了 27 分钟然后崩了；重试时那 27 分钟又跑一遍。持久性保证被放在了接缝的错误一侧。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>1 万条目断崖，以及到底是什么崩了。</h3>
+
+    <p>Cordum 的工程博客在一个批量补齐任务上做了纯 LangGraph 循环与 Temporal 承接执行的对比——形态是智能体规划一次、然后一次调用一个工具地处理一份清单。约 1 千条以下两者都没问题；约 5 千条时 LangGraph 慢但能跑；到 1 万条时 LangGraph 循环崩掉，而失败方式并不是"代码抛异常"——而是图状态（其中包括累积的结果）已经涨到一个规模，让每个 checkpoint 的序列化/反序列化成本超过了每个节点做的有效工作。框架大部分时间都在写状态，而不是在推进步骤。同规模下 Temporal 承接的执行仍是线性的，因为 Temporal 的历史日志是只追加的、条目"流经"状态而不是驻留在状态里——状态本身不会随条目数增长。</p>
+
+    <p>这不是 LangGraph 的 bug，而是"节点间 checkpointer"语义在"状态是一份不断增长的列表"时的必然代价。修复不是"调 checkpointer"——而是把循环从图里搬出去。与其让一个节点在内部遍历 1 万条，不如让图规划这次循环、然后按条（或按批）分派到 Temporal activity。每个 activity 都很小，其结果进入持久化历史而不是进入不断增长的内存列表，图状态也就保持很小。</p>
+
+    <p>同样的形态也出现在读一百份文档的研究智能体里：把它塞进一个 LangGraph 节点，则每次 checkpoint 都要传一百份文档正文；把它做成 Temporal 里"每份文档一个 activity"，则每个 activity 的结果只是历史中固定大小的一条记录。经验法则：只要你推理中的某个"步骤"扇出超过约 100，这个循环就想住在图之外，图只想看到"这一批的摘要"。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>真正上线的模式：推理图 + 持久运行时。</h3>
+
+    <p>一旦你接受"两个框架各自对不同的事情是对的"，那个不再制造麻烦的模式，不管你用哪家 SDK 都是同一个。推理形状——规划、调用工具、反思、重规划——住在 LangGraph（或类似编排库）里。持久性保证——重试、超时、恢复——住在 Temporal（或类似运行时：Restate、Inngest、DBOS 都是同一形态）里。两者只在一个地方相接：每个 LangGraph 节点体是一个 Temporal activity。</p>
+
+    <p>机械层面。你写一个 Temporal 工作流函数，函数里实例化一个 LangGraph <code class="inline">StateGraph</code>。图中的每个节点不再内联跑活儿，而是把一个 activity 提交给 Temporal。activity 才是真正做事的地方——模型调用、HTTP 请求、数据库写入。activity 返回时，Temporal 已经把结果持久化记录；节点返回时，LangGraph 已经把图状态持久化 checkpoint。两个持久性就叠起来了，两者之间的接缝就是 activity 边界。这与<a href="/deep-dives/architectures-and-patterns/plan-and-execute" class="xref">Plan-and-Execute</a> 的形态天然吻合——规划器是一个图节点，执行器的每一步是一个 activity。</p>
+
+<pre class="standalone"><span class="c-cm"># workflow.py — Temporal workflow calling LangGraph nodes as activities</span>
+<span class="c-kw">from</span> temporalio <span class="c-kw">import</span> workflow, activity
+<span class="c-kw">from</span> langgraph.graph <span class="c-kw">import</span> StateGraph
+<span class="c-kw">from</span> datetime <span class="c-kw">import</span> timedelta
+
+<span class="c-at">@activity.defn</span>
+<span class="c-kw">async def</span> plan_node(state: dict) -&gt; dict:
+    <span class="c-cm"># actual model call lives here, not inside the graph node body</span>
+    <span class="c-kw">return</span> {<span class="c-st">"plan"</span>: await llm.plan(state)}
+
+<span class="c-at">@activity.defn</span>
+<span class="c-kw">async def</span> tool_node(state: dict, item: dict) -&gt; dict:
+    <span class="c-kw">return</span> {<span class="c-st">"result"</span>: await tool.run(item, key=state[<span class="c-st">"idem_key"</span>])}
+
+<span class="c-at">@workflow.defn</span>
+<span class="c-kw">class</span> ResearchAgent:
+    <span class="c-at">@workflow.run</span>
+    <span class="c-kw">async def</span> run(self, task: dict) -&gt; dict:
+        state = await workflow.execute_activity(
+            plan_node, task, start_to_close_timeout=timedelta(minutes=<span class="c-st">2</span>))
+        <span class="c-cm"># fanout is Temporal's job, not the graph's</span>
+        results = await asyncio.gather(*[
+            workflow.execute_activity(
+                tool_node, state, item,
+                start_to_close_timeout=timedelta(seconds=<span class="c-st">30</span>),
+                retry_policy=RetryPolicy(maximum_attempts=<span class="c-st">5</span>))
+            <span class="c-kw">for</span> item <span class="c-kw">in</span> task[<span class="c-st">"items"</span>]])
+        <span class="c-kw">return</span> {<span class="c-st">"summary"</span>: results}</pre>
+
+    <p>这里在做事的是：LangGraph 的推理形状被保留（先规划再执行），但图节点是 activity，所以 Temporal 掌控重试和状态持久化。工作流函数自身只是一个薄的协调者。如果你在扇出中间杀掉 worker，Temporal 会以已在历史中返回过的 activity 为基础恢复，只重新发起还没开始的那些。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>接缝处的幂等与重试。</h3>
+
+    <p>接缝有两条不可谈判的规则，两条都来自同一个观察：运行时会重试 activity，而且是默默地。规则一：<strong>重试归运行时，不归工具。</strong>如果持久运行时已经提供了重试策略，就不要在工具代码里再套一层重试循环。你会得到"重试之上的重试"——短时间内一阵爆发把下游 API 限流打满，调试起来很痛苦。把 Temporal 的 <code class="inline">RetryPolicy</code>（或等价物）配在 activity 上，把工具里那种临时拼的重试拿掉。如果这个工具是通过智能体里<a href="/deep-dives/architectures-and-patterns/tool-error-recovery" class="xref">通用错误恢复循环</a>调的，请确保这个循环把"Temporal 重试之后 activity 仍失败"当作一个独特信号，而不是又一次可重试错误。</p>
+
+    <p>规则二：<strong>幂等归工具，不归运行时。</strong>运行时无法知道"给 X 卡扣 12 美元"两次调用不安全，工具自己得知道。每一个有副作用的 activity 都应接受一个由 Temporal 提供的幂等键（工作流 ID + activity 尝试 ID 是标准套路），并把它当作对下游系统的去重令牌——Stripe 的 idempotency-key、数据库的 ON CONFLICT，下游支持什么就用什么。如果运行时重试了 activity，第二次调用应该看到第一次的结果并短路，而不是再执行一次副作用。</p>
+
+    <p>一个形状良好的接缝长这样：</p>
+
+<pre class="trace"><span class="c-out">workflow                       runtime                       tool
+   |                              |                             |
+   | execute_activity(charge) --&gt; |                             |
+   |                              | attempt 1, idem=WF-A1 -----&gt;|
+   |                              |                             | charge OK, store idem
+   |                              | &lt;----- result recorded -----|
+   |                              |     (worker crash here)     |
+   |                              |     replay from history     |
+   |                              | attempt 2, idem=WF-A1 -----&gt;|
+   |                              |                             | idem match: return prior
+   |                              | &lt;----- same result ---------|
+   | &lt;---- durable result ------- |                             |
+</span></pre>
+
+    <p>注意工作流函数看不到什么：崩溃、重试、第二次调用。从工作流的视角看，activity 跑了一次、返回了一次。这就是持久性契约。破了任一条——在工具里重试，或者忘了幂等键——你就会得到重复扣款、重复数据库写入，以及一份说谎的追踪。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>何时不需要持久性。</h3>
+
+    <p>"下面垫一层 Temporal"这个模式只有在运行足够长、足够贵、或副作用足够重（丢掉它会真的花掉真钱或用户信任）时才值那份复杂度预算。对于 5 分钟以内、无实质副作用的交互式对话——助手回答，用户读，会话结束——框架开销就是死重。只用 LangGraph 的 checkpointer（甚至只用内存状态）就够，因为一次崩溃只意味着用户按下重试然后继续过日子。</p>
+
+    <p>对延迟敏感、面向用户的循环是另一个可以跳过的情况。经过一次持久运行时的每一跳都是若干毫秒；一个必须"感觉即时"的语音智能体或流式 UI 循环在热路径上负担不起。那里更常见的做法是让快路径进程内跑，只有当请求变成一件长跑的事（研究任务、批处理作业、多步交易）才升级到持久工作流。如果你利用<a href="/concepts/agent-frameworks" class="xref">框架的抽象</a>让这个升级无缝，持久性就会在你需要时可用、在你不需要时不碍事。</p>
+
+    <p>如果只想抄一件事：即使没搭全套 Temporal，也从第一天起给每一次有副作用的工具调用配一个幂等键。快乐路径上零成本，日后添加持久性时它就是"优雅恢复"与"补偿事务"的差别。这就是接缝在为还没到位的运行时预先做好准备。</p>
+  </div>
+</section>

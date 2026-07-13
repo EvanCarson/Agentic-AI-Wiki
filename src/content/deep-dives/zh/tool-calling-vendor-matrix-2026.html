@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">K7</div>
+  <div class="week">深入解析 · 工具与能力设计</div>
+  <h2>"可移植工具定义"是童话；2026 年的厂商矩阵有足够共同表面看起来一致，也有足够差异让每一次朴素移植都翻车。</h2>
+  <p class="goal">OpenAI 的 Chat Completions 与 Responses API。Anthropic 的 Programmatic Tool Calling 与 Tool Search Tool。Gemini 的 OpenAPI 子集。底层思路相同——模型提出一次工具调用、宿主执行、模型读到结果——却是三种打包、三种 JSON Schema 方言、三种流式形状，以及三种"同一个开关"的不同起名。团队把一份能跑的工具规格从这家搬到那家，以为差异只是外观；差异恰恰就是你的并行链路悄悄退化、或者 <code class="inline">enum</code> 约束无声消失的原因。这篇讲这份矩阵、真正要紧的分歧（JSON Schema 子集、流式、并行、自定义语法），以及"移植也不会坏"的那一小组工具定义形状。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>共同表面：模型提出、宿主执行、模型读取。</h3>
+
+    <p>在白板画得清楚的抽象层级上，2026 年每一家厂商实现的都是同一套三步循环。宿主把一组工具定义与用户提示一并交给模型；模型在某个助手回合里选择发出一次或多次<em>工具调用</em>，替代（或并列于）文本回复；宿主带外执行这些调用，把结果打包成模型预期形状的合成消息，交回下一个回合。<a href="/zh/concepts/tool-calling-explained" class="xref">工具调用概念</a>在入门高度上刻画了这个形状。三家分歧从更下一层开始——"工具定义"包含什么、模型如何示意选择、结果如何回穿——下文全是那一层的事。</p>
+
+    <p>先钉三个共同约定，因为它们最接近"可移植子集"。三家都接受 JSON Schema 描述参数形状（各带子集——见 K10）。三家都在用户视角上把循环原语叫同一个名字：OpenAI 与 Gemini 把模型的发出叫作<em>工具调用</em>（OpenAI 的 Responses API 与 Chat Completions 都在弃用 "function_call" 之后收敛到这里）；Anthropic 叫作 <em>tool_use</em> 块，但 JSON 载荷仍有相同三字段——一个 id、一个 name、一个作为 JSON 对象的 arguments。三家都把结果按角色为 <code class="inline">tool</code>（OpenAI、Gemini 的 <code class="inline">functionResponse</code>）或 <code class="inline">tool_result</code> 块（Anthropic）的消息回穿，并引用调用 id。一份工具实现——参数为 JSON Schema、返回为 JSON 对象——不会成为移植瓶颈。瓶颈是<em>规格在这之外加的所有东西</em>。</p>
+
+    <p><a href="/zh/deep-dives/protocols-and-interop/tool-calling-standards" class="xref">工具调用标准</a>一文从协议问题角度处理这个循环；本文加的是你真正抬手去用 SDK 时逐厂商的写法。<a href="/zh/deep-dives/protocols-and-interop/structured-tool-io" class="xref">结构化工具 I/O</a>一文承担返回载荷那半的叙事；本文承担请求侧的表面——工具定义住在哪里、暴露哪些字段、每家在哪里加了另外两家没有的旋钮。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>OpenAI：Chat Completions 与 Responses 的分歧点。</h3>
+
+    <p>OpenAI 在 2026 年同时在线两个表面，选择不是学术问题。Chat Completions 是较旧形状，稳定，代理与框架胶水普遍支持，也是大部分存量代码所在。Responses API 是较新形状，把工具调用对齐为类型化响应流中的一级 item 类型，也是新特性（Reasoning 项、自定义语法工具、内置的 computer-use 工具）首先落地的地方。两者顶层的工具定义形状相同——Chat Completions 是 <code class="inline">{"type": "function", "function": {"name", "description", "parameters"}}</code>，Responses 则更扁平：<code class="inline">{"type": "function", "name", "description", "parameters"}</code>。两者之间的移植大致差一层嵌套，加上流式形状（见 K11）。</p>
+
+    <p>两个 OpenAI 特有的旋钮承重且容易漏。<code class="inline">parallel_tool_calls</code> 在两种表面上都默认为 true，允许模型在一个助手回合中发出多次工具调用——宿主并发执行、下一个回合前一并返回结果。置为 false 会串行化，用于工具有状态或模型并行选了坏顺序的场景。<code class="inline">tool_choice</code> 接受 <code class="inline">"auto"</code>（默认）、<code class="inline">"none"</code>、<code class="inline">"required"</code>（必须调用某工具）或具名工具对象（必须调用这一个）。带 Lark 或 regex 语法的自定义工具于 2026 年初落地 Responses——模型发出匹配你语法的文本，表面自行处理受限解码，你无需写工具 schema。工具 <code class="inline">parameters</code> 上的 <code class="inline">strict: true</code> 才是真正把 JSON Schema 强制到模型输出上的开关；不设它，schema 只是提示，不是保证。</p>
+
+<pre class="standalone"><span class="c-cm"># OpenAI (Chat Completions) — the tool def shape</span>
+tools = [{
+    <span class="c-st">"type"</span>: <span class="c-st">"function"</span>,
+    <span class="c-st">"function"</span>: {
+        <span class="c-st">"name"</span>: <span class="c-st">"refund_order"</span>,
+        <span class="c-st">"description"</span>: <span class="c-st">"Refund an order. Use for defective items or customer-reported issues."</span>,
+        <span class="c-st">"parameters"</span>: {
+            <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+            <span class="c-st">"properties"</span>: {
+                <span class="c-st">"order_id"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+                <span class="c-st">"reason"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>, <span class="c-st">"enum"</span>: [<span class="c-st">"defective"</span>, <span class="c-st">"wrong_item"</span>, <span class="c-st">"other"</span>]},
+            },
+            <span class="c-st">"required"</span>: [<span class="c-st">"order_id"</span>, <span class="c-st">"reason"</span>],
+            <span class="c-st">"additionalProperties"</span>: <span class="c-kw">False</span>,
+        },
+        <span class="c-st">"strict"</span>: <span class="c-kw">True</span>,
+    },
+}]
+resp = client.chat.completions.create(model=<span class="c-st">"gpt-5.1"</span>, messages=msgs,
+    tools=tools, parallel_tool_calls=<span class="c-kw">True</span>, tool_choice=<span class="c-st">"auto"</span>)</pre>
+
+    <p>移植到 Responses 时去掉外层 <code class="inline">"function"</code> 嵌套，把工具调用挪进类型化的 <code class="inline">output</code> 数组，作为带 <code class="inline">arguments</code> 字符串、<code class="inline">name</code> 与 <code class="inline">call_id</code> 的 <code class="inline">function_call</code> 项。新代码应默认走 Responses；已在讲 Chat Completions 的框架代码没有强制迁移压力，会继续可用。你<em>不要</em>做的是用一份省略嵌套差异的模板同时给两种表面生成工具定义——SDK 会静默接收畸形形状并把工具丢掉。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Anthropic：PTC、Tool Search 与 Tool Use Examples。</h3>
+
+    <p>Anthropic 的工具表面使用 <code class="inline">tool_use</code> 与 <code class="inline">tool_result</code> 内容块，位于 messages 数组内部——没有独立的 <code class="inline">tools</code> 字段挂到消息角色上，只有模型产出与消费的类型化块。工具定义本身比 OpenAI Chat Completions 更扁：<code class="inline">{"name", "description", "input_schema"}</code>，其中 <code class="inline">input_schema</code> 是 JSON Schema（子集——见 K10）。<code class="inline">tool_choice</code> 接受 <code class="inline">{"type": "auto"}</code>、<code class="inline">{"type": "any"}</code>（必须调用某工具）、<code class="inline">{"type": "tool", "name": "..."}</code> 或 <code class="inline">{"type": "none"}</code>。并行调用默认开启，可通过 <code class="inline">tool_choice</code> 对象内的 <code class="inline">disable_parallel_tool_use: true</code> 强制关闭。</p>
+
+    <p>三个 Anthropic 独有的原语正是"工具表面是难点时首先够它"的理由。<em>Programmatic Tool Calling</em>（PTC）于 2025 年 11 月发布，把循环改成：模型写一小段 Python 程序，运行在 Anthropic 管理的沙箱里，从那段程序内部调用工具，只有最终结果回到上下文——中间工具结果根本不进入模型的上下文窗口。在多工具链路上，这是成本与延迟双重可观的胜利，<a href="/zh/deep-dives/tool-capability-design/tool-granularity" class="xref">工具粒度</a>问题也会缓解，因为你能暴露更细的工具而不需要为每次调用付上下文税。建立在 PTC 之上的进阶编排原语值得<a class="xref" href="/zh/deep-dives/tool-capability-design/advanced-tool-orchestration-patterns">独立成篇</a>。<em>Tool Search Tool</em> 是一款内置工具，唯一职责就是在你上传的语料上做工具定义的语义检索——一次注册 200 个工具，提示里只挂一个 Tool Search Tool，模型请求它取回它真正需要的三四个定义。Anthropic 自家基准报了工具密集提示上 85% 的令牌下降。<em>Tool Use Examples</em> 把 few-shot 示例直接挂到工具定义上（<code class="inline">tool_use_examples</code> 字段）——与 system 提示里的 few-shot 是同一思路，只是范围限定到工具，因此模型只在考虑这一工具时才看见它们。</p>
+
+<pre class="standalone"><span class="c-cm"># Anthropic — same tool, native shape</span>
+tools = [{
+    <span class="c-st">"name"</span>: <span class="c-st">"refund_order"</span>,
+    <span class="c-st">"description"</span>: <span class="c-st">"Refund an order. Use for defective items or customer-reported issues."</span>,
+    <span class="c-st">"input_schema"</span>: {
+        <span class="c-st">"type"</span>: <span class="c-st">"object"</span>,
+        <span class="c-st">"properties"</span>: {
+            <span class="c-st">"order_id"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>},
+            <span class="c-st">"reason"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"string"</span>, <span class="c-st">"enum"</span>: [<span class="c-st">"defective"</span>, <span class="c-st">"wrong_item"</span>, <span class="c-st">"other"</span>]},
+        },
+        <span class="c-st">"required"</span>: [<span class="c-st">"order_id"</span>, <span class="c-st">"reason"</span>],
+    },
+}]
+resp = client.messages.create(model=<span class="c-st">"claude-opus-4-7"</span>, messages=msgs,
+    tools=tools, tool_choice={<span class="c-st">"type"</span>: <span class="c-st">"auto"</span>})</pre>
+
+    <p>两个移植陷阱要留在视野里。Anthropic 的 <code class="inline">input_schema</code> 校验会忽略 <code class="inline">minLength</code>、<code class="inline">maxLength</code>、<code class="inline">minimum</code>、<code class="inline">maximum</code>——K10 一文覆盖完整子集，实操结果是：一份在 OpenAI 上显式强制字符串长度的 schema，到了 Anthropic 会静默放行任何长度。以及 Anthropic 的 <code class="inline">tool_result</code> 是独立的内容块，不是角色，所以一个把消息建模为 <code class="inline">{role, content}</code> 元组的框架必须允许内容块数组，或者伪造一个不自然的角色。两者只要你知道就都是小摩擦；不知道就都是静默 bug。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Gemini：OpenAPI 子集与 tool_choice: any。</h3>
+
+    <p>Gemini 的工具表面使用 OpenAPI 3.0 schema 子集，而非 JSON Schema draft-2020-12——<code class="inline">FunctionDeclaration.parameters</code> 是取自 OpenAPI 的 <code class="inline">Schema</code> 对象，OpenAPI 3.0 中不存在的构造（如 <code class="inline">const</code>，或基于 <code class="inline">$defs</code> 的交叉引用）不会校验通过。模型在响应内容里发出 <code class="inline">functionCall</code> part，带 <code class="inline">name</code> 与 <code class="inline">args</code> 字段；宿主返回同名的 <code class="inline">functionResponse</code> part 与一个 <code class="inline">response</code> 对象。Gemini 默认允许模型以工具调用或自由文本回应；<code class="inline">tool_config.function_calling_config.mode</code> 接受 <code class="inline">AUTO</code>（默认）、<code class="inline">ANY</code>（必须调用暴露工具中的一个）或 <code class="inline">NONE</code>，可选的 <code class="inline">allowed_function_names</code> 把 <code class="inline">ANY</code> 收敛到子集。</p>
+
+    <p>两个 Gemini 特有属性值得预算。第一，Gemini 原生支持多模态函数响应——<code class="inline">functionResponse</code> parts 可承载内联图像或文件 URI 引用，模型把它们视为工具结果的一部分来读。这在矩阵中独一份，也是浏览器智能体和文档智能体团队即使主力模型在别处、仍会伸手够 Gemini 的原因。第二，Gemini 在 Vertex 与 AI Studio 两个表面都暴露函数调用，SDK 略有不同，配额旋钮不同；工具定义形状相同，但客户端样板不同，模板驱动的代码生成必须知道某个部署对应的是哪个表面。</p>
+
+<pre class="standalone"><span class="c-cm"># Gemini — OpenAPI 3.0 subset</span>
+tools = [{
+    <span class="c-st">"function_declarations"</span>: [{
+        <span class="c-st">"name"</span>: <span class="c-st">"refund_order"</span>,
+        <span class="c-st">"description"</span>: <span class="c-st">"Refund an order. Use for defective items or customer-reported issues."</span>,
+        <span class="c-st">"parameters"</span>: {
+            <span class="c-st">"type"</span>: <span class="c-st">"OBJECT"</span>,
+            <span class="c-st">"properties"</span>: {
+                <span class="c-st">"order_id"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"STRING"</span>},
+                <span class="c-st">"reason"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"STRING"</span>, <span class="c-st">"enum"</span>: [<span class="c-st">"defective"</span>, <span class="c-st">"wrong_item"</span>, <span class="c-st">"other"</span>]},
+            },
+            <span class="c-st">"required"</span>: [<span class="c-st">"order_id"</span>, <span class="c-st">"reason"</span>],
+        },
+    }],
+}]
+resp = client.models.generate_content(model=<span class="c-st">"gemini-3.5-pro"</span>, contents=msgs,
+    config={<span class="c-st">"tools"</span>: tools,
+            <span class="c-st">"tool_config"</span>: {<span class="c-st">"function_calling_config"</span>: {<span class="c-st">"mode"</span>: <span class="c-st">"ANY"</span>}}})</pre>
+
+    <p>大写的 <code class="inline">"OBJECT"</code> / <code class="inline">"STRING"</code> 类型名是 OpenAPI 风格的枚举，不是另外两家吃的 JSON Schema 小写字符串。发小写的模板会在 Gemini 上以"未知 type"报错；发大写的模板会在另外两家以同样原因报错。务实做法是围绕一份共同中间表示做逐厂商 emitter，而不是字符串化的模板。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>要紧的分歧：并行、流式、结构化输出。</h3>
+
+    <p>四条轴承担了移植破裂时的大多数惊讶。<em>并行工具调用</em>各家默认都开着，但线上形状不同——OpenAI 在一条助手消息中发出多个 <code class="inline">tool_calls</code> 项，Anthropic 发出多个 <code class="inline">tool_use</code> 内容块，Gemini 发出多个 <code class="inline">functionCall</code> parts。把工具调用建模为"每条消息一条"的框架会在并行调用上无声破裂；你只拿到第一个，其余全部消失。以列表迭代的框架则一致工作。<em>流式</em>增量差异足够大，值得独立一篇——见 K11——其拼接语义（<code class="inline">arguments</code> 是跨块累加，还是每块整体替换？）正是拼接器最常挂的地方。<em>结构化输出</em>与工具调用是同一种受限解码技法，只是契约由"动作提议"换成"值返回"；移植规则见 K9。</p>
+
+    <p><em>JSON Schema 子集</em>是第四条轴，也是代价最高的一条。各家都在宣传"JSON Schema"，各家强制的都是不同集合。OpenAI 的 strict 模式要求处处 <code class="inline">additionalProperties: false</code>，并把每个字段标为 required（"可空即可选"要绕开写）。Anthropic 完全忽略字符串与数字范围关键字。Gemini 强制 OpenAPI 3.0 子集，拒绝其外构造。放在编辑器旁边的三列完整表见 K10；小结是：任何你从某家文档复制粘贴而来的 schema，到另外两家都是候选 bug。</p>
+
+    <p>还有一条更隐微、但在生产里咬人的轴：<em>重试时的 tool-choice 语义</em>。当模型发出一次错误的工具调用、你把纠错性的 tool result 回穿回去，OpenAI 的 <code class="inline">tool_choice="required"</code> 会在下一回合再触发；Anthropic 的 <code class="inline">{"type": "any"}</code> 也会；Gemini 的 <code class="inline">ANY</code> 模式也会——但它们与 <code class="inline">stop_sequences</code>、回合结束检测的交互并不一致，一个假设"required 强制工具调用"却不查响应的重试外壳会陷入循环。稳妥的外壳会读响应，只有在模型确实产出了文本而非调用时才重触发。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>可移植子集：真的能不改就搬的部分。</h3>
+
+    <p>不改就能搬的工具定义形状比团队期望的小，比他们预计的大。能移植的：以指令方式写的描述（动词开头、"何时用与何时不用"、一个范例）、以顶层 <code class="inline">"type": "object"</code> 起头的小 parameters 对象、string / integer / number / boolean 原语、<code class="inline">required</code> 数组，以及 string 上的 <code class="inline">enum</code> 约束。不能移植的：目标含 Anthropic 时的字符串与数字范围关键字（<code class="inline">minLength</code>、<code class="inline">maxLength</code>、<code class="inline">minimum</code>、<code class="inline">maximum</code>）；目标含 Gemini 时的 <code class="inline">const</code>、<code class="inline">$defs</code>、"anyOf+null" 小把戏；目标是 OpenAI strict 模式开时的 <code class="inline">additionalProperties</code> 存在性规则。Gemini 的大小写类型名与 OpenAI Chat Completions 多出的 <code class="inline">"function"</code> 嵌套只是轻改；schema 子集差异是语义的，也是你最晚才抓到的那种。</p>
+
+    <p>两种模式让团队保持理智。第一种是中间表示——一份内部工具规格，含"可移植子集 + 逐厂商扩展"的并集——加上逐厂商 emitter 把它渲成正确形状。一旦你有三处调用点在手写三种工具定义形状，其中一处必然会漂。第二种是逐厂商校验通道，在 CI 时用各厂商 SDK 的校验器过一遍你的 schema；每家都提供了这样的校验器，CI 开销只是每工具几秒。你的 CI 若不抓 schema 子集回归，生产流量会替它抓，届时 trace 看起来像"模型开始忽略 enum"，这是慢 bug。</p>
+
+    <p>把六步合在一起读，厂商矩阵就从兼容性问题变成了设计问题。共同表面是真实的——模型提出、宿主执行、模型读取——每家像样厂商如今对循环的支持都足够好，循环本身平淡无奇。凸起全在边缘：怎么包一份工具定义、怎么流式、怎么重试、哪些 schema 关键字会无声消失。把可移植子集作为基线，每个扩展作为逐厂商的显式启用，移植就是你能读懂的 diff；把"JSON Schema 就是 JSON Schema"当作移植模型，每加一家厂商就是一场等某个 schema 关键字沉默的生产事故。</p>
+  </div>
+</section>

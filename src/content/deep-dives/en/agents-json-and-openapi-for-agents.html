@@ -1,0 +1,83 @@
+<section class="phase">
+  <div class="phase-num">P12</div>
+  <div class="week">Deep Dive · Protocols &amp; Interop</div>
+  <h2>OpenAPI is not sufficient for agent consumption — agents.json v0.1 and AGENTS.md are the practical patches, and their limits point at what MCP was actually solving.</h2>
+  <p class="goal">"Point the agent at your OpenAPI spec" gets you the endpoints; it does not get you which endpoints to use in what order, when to bail out, or what a successful run looks like. Two conventions patched this in 2025: agents.json v0.1 layers agent-specific hints on top of OpenAPI, and AGENTS.md (adopted by 20k+ GitHub repos) sits at the repository level. Both help. Both point at the reasons MCP exists as a distinct protocol.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What OpenAPI misses.</h3>
+
+    <p>An OpenAPI document tells you what endpoints exist, what parameters they take, and what responses they return. That is a lot. It is also almost none of what an agent needs to use the API well. Consider a bookings API with <code class="inline">POST /search</code>, <code class="inline">GET /listings/&lbrace;id&rbrace;</code>, <code class="inline">POST /reservations</code>, and <code class="inline">POST /payments</code>. The OpenAPI says all four exist. What it does not say is that a booking flow must call search first, then optionally fetch listings, then create a reservation, then create a payment against that reservation, and that skipping the reservation step means the payment fails with a cryptic error. It does not say that certain errors are recoverable by retry and others are terminal. It does not say that <code class="inline">POST /payments</code> is irreversible and should require an explicit user confirmation. All four are things a human developer learns from documentation, tribal knowledge, and one or two production incidents. Agents lack the last two channels entirely, and the first — the docs — is where the missing information lives when it lives anywhere at all.</p>
+
+    <p>The <a href="/deep-dives/tool-capability-design/tool-discovery-and-docs" class="xref">tool discovery and docs</a> essay names this gap directly: the model's ability to use a tool is downstream of the tool's description, not of its signature. OpenAPI describes signatures precisely and descriptions loosely; the loose part is what agents most need. The result is that "just point the agent at your OpenAPI" gets you an agent that discovers the endpoints, calls them in a plausible-looking order, and fails in ways that look like API misuse but are actually orchestration errors. The fix is not a better model — it is more structure on the input side, and the two conventions covered here are the two shapes that have shipped.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>agents.json v0.1.</h3>
+
+    <p>agents.json, published by Wild Card AI in 2025 and now at v0.1, is a JSON document that sits alongside an existing OpenAPI spec and adds the agent-shaped information the OpenAPI lacks. It describes flows — named sequences of endpoints an agent should follow to accomplish a task — with each step naming the endpoint, the input mapping, the output mapping to the next step, and the failure semantics. It also carries top-level metadata about the service: what the agent should call it, what auth scheme to use, and which flows are supported. A conforming agent reads agents.json first, learns the intended flows, and only reaches into the underlying OpenAPI to construct the individual HTTP requests each flow step requires.</p>
+
+<pre class="standalone">{
+  "agentsJson": "0.1.0",
+  "info": {"title": "Bookings", "version": "2.3"},
+  "sources": [{"path": "./openapi.yaml", "type": "openapi/3.1"}],
+  "flows": [
+    {
+      "id": "book-a-stay",
+      "title": "Search, reserve, and pay for a stay.",
+      "actions": [
+        {"id": "search",   "sourceRef": "openapi:/search",   "responseSchema": "..."},
+        {"id": "reserve",  "sourceRef": "openapi:/reservations",
+                           "input": {"listingId": "$.search[0].id"}},
+        {"id": "pay",      "sourceRef": "openapi:/payments",
+                           "input": {"reservationId": "$.reserve.id"},
+                           "userConfirmation": "required"}
+      ]
+    }
+  ]
+}</pre>
+
+    <p>Two features of the format do useful work. The <code class="inline">sourceRef</code> pointers keep the OpenAPI as the source of truth for signatures — the endpoint definitions are not duplicated, so a schema change in the OpenAPI does not require re-authoring agents.json. And the <code class="inline">userConfirmation</code> hint on the payment step is the shape of the "irreversible action needs consent" pattern; a compliant agent surfaces the confirmation step as a distinct user-facing prompt rather than executing the payment silently. The v0.1 spec is small — the whole grammar fits on a page — and that is the point; it is the minimum surface area on top of OpenAPI that captures the flow, the mapping, and the consent surface.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>AGENTS.md at repo level.</h3>
+
+    <p>The other 2025 convention operates at a different granularity. AGENTS.md is a plain Markdown file, placed at the root of a code repository, that documents the repository for an agent operator — a coding agent, a code-review agent, a deployment agent. The convention grew organically, was popularised by a small group of open-source projects in mid-2025, and by mid-2026 had been adopted by 20,000+ repos on GitHub. Its content is documentation-shaped: how to run the tests, how the module layout is organised, which files are generated (do not edit), which commit conventions the project follows, and any project-specific tools an agent should prefer to standard equivalents.</p>
+
+<pre class="standalone"># AGENTS.md
+
+## Running tests
+- Full suite: `pytest -q`
+- Fast subset: `pytest -q -m "not slow"`
+- Coverage: `pytest --cov=src`
+
+## Layout
+- `src/` — library code; treat as source of truth
+- `tests/` — mirror `src/` structure
+- `docs/generated/` — auto-generated; do not edit
+
+## Commits
+Conventional Commits. One logical change per commit.
+
+## Preferred tools
+- Formatting: `ruff format` (not `black`)
+- Linting: `ruff check --fix`</pre>
+
+    <p>AGENTS.md's success is exactly its shape: it looks like a README for humans, it reads like a README for humans, but the specific content is what an agent needs to avoid characteristic failure modes — running the wrong test command, editing generated files, formatting inconsistently, committing in a style the project rejects. It has no schema. It has no versioning. It has no discovery mechanism beyond "the file is at the repo root." Its adoption ceiling is therefore the fraction of agents that check for it, which as of mid-2026 is essentially every serious coding agent — Claude Code, Cursor, Aider, Devin, and the OpenAI Codex CLI all read it. The file gets edited when the project changes, exactly the same way a README gets edited, and drift is caught the same way: reviewers notice when the file lies.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Why MCP is still needed.</h3>
+
+    <p>Both agents.json and AGENTS.md are useful. Neither is what MCP is doing. Read together, their limits point at three specific reasons MCP exists as a distinct protocol rather than as a JSON overlay on OpenAPI. First, MCP encodes a full session — an <code class="inline">initialize</code> handshake, a set of tools that stay live for the session's duration, a lifecycle for streaming state and cancelling in-flight calls. agents.json describes flows but not sessions; each agent call is stateless from the API's perspective, and long-running operations have to be modelled as polling loops in the agent's own logic. Second, MCP tools carry structured metadata that a serving process can update at runtime — a tool's description can change per tenant, per user, per feature flag — and the client fetches it dynamically at session start. agents.json is a static file; per-tenant behaviour requires per-tenant files, which none of the tooling makes easy.</p>
+
+    <p>Third, and most load-bearing, MCP defines an inversion of control that neither convention offers: a server can call back to the client during a session, via sampling to borrow the host's model and via elicitation to ask the user a question. The <a href="/deep-dives/protocols-and-interop/structured-tool-io" class="xref">structured tool I/O</a> essay describes the shape; the point here is that agents.json can name the endpoints an agent will call, but cannot describe endpoints that call the agent back. For a class of tools — a code-refactoring server that needs the client model to draft edits, an admin server that needs a user to confirm before proceeding — server-initiated interaction is the whole point, and neither OpenAPI nor agents.json models it.</p>
+
+    <p>The pragmatic reading is that agents.json and AGENTS.md are what you ship when you have an existing API surface and cannot rewrite the transport; MCP is what you ship when you are designing for agents from the start. The overlay conventions will keep spreading — most APIs will not be rewritten as MCP servers, and agents.json is the cheap way to make an existing API more usable — but the "just point the agent at your OpenAPI" argument is the one to close the tab on. It gets a demo working. It does not get a production system working, and the two conventions above are the industry's admission of exactly which parts it does not solve.</p>
+  </div>
+</section>

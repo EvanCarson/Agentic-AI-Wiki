@@ -1,0 +1,92 @@
+<section class="phase">
+  <div class="phase-num">T8</div>
+  <div class="week">深入解析 · 训练智能体模型</div>
+  <h2>2026 年，你可以对开放权重底座跑 GRPO、以自家 verifier 作为奖励——SageMaker RFT、TRL v1.0、LlamaFactory、VeRL——"该调还是该调 API"的问题在可核验任务上已经反转。</h2>
+  <p class="goal">SageMaker 于 2026 年 3 月推出 RFT-as-a-service。TRL 1.0 稳定了 GRPO 的 API。LlamaFactory 与 VeRL 补齐了开源侧。结果：任何有"可核验任务"的团队，现在都有一条通向"基于 Qwen3、Llama 4 或 DeepSeek V4 的定制推理模型"的可行路径。买 vs 调的取舍在一类特定工作负载上——高流量、可核验、对延迟敏感——已经反转。这篇讲打法、行不通的招数，以及诚实的成本账。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>是哪些工具让这件事一开始变得可行。</h3>
+
+    <p>2026 年上半年的三次变化，把"对开放权重底座做 RL 微调"从一篇研究论文变成了一个周二下午。第一，Amazon SageMaker 于 2026 年 3 月把 Reinforcement Fine-Tuning 作为托管服务上线，把"开一片 GPU 集群、接好 rollout worker、让 verifier 上网可达且延迟不足以拖垮训练循环"这份工作从"宁愿付钱给别人做基础设施"的团队的关键路径上移走。第二，Hugging Face 的 TRL 库在同一季度到达 1.0，把 GRPO API 稳定下来——也就是每份教程里那个、也是每份开源训练脚本如今都从其继承的那个——于是 "用哪个 GRPO？" 不再取决于"你集成的是哪份论文参考代码的哪个 fork"。第三，两个补充项目补齐了粗糙的边缘：LlamaFactory 让完整配方（数据准备 → SFT → DPO → GRPO）可从一份配置文件复现；VeRL 专攻"把 on-policy 循环扩到大开放底座"，用上过去只属于前沿实验室的分片参考策略技巧。</p>
+
+    <p>之所以枚举整个栈而不是选一个，是因为它们以特定方式组合。TRL 是多数团队看到的 API 表面；LlamaFactory 是团队想要"同一件事的配置文件版本"时抬手够的；SageMaker RFT 是团队已有可跑配方、又不想自己拥有基础设施时上跑的；VeRL 是底座长到 TRL 无法在其手头硬件上高效驱动时迁到的。<a href="/zh/deep-dives/training-agentic-models/rlvr-and-grpo-for-agents" class="xref">RLVR 与 GRPO 一文</a>覆盖了这些工具所实现的算法侧；本文讲的是交付侧。这里的主张不是"四个都需要"；而是——在它们之间，"照着论文自己搭 RL 微调流水线"的年代结束了。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>打法：任务选择、verifier、底座、时程。</h3>
+
+    <p>真上线的打法简短又无聊，这正是它的美德。首选任务：RLVR 只在"可核验任务"上奏效，也就是<a href="/zh/deep-dives/training-agentic-models/rl-for-tool-use" class="xref">面向工具使用的 RL 一文</a>所用的那种意义。带单测的代码、有 checker 的数学、有 ground-truth 行的 SQL、有 schema oracle 的结构化抽取——都行。按 rubric 重写散文——不行，无论多诱人；那种活给 DPO 做，不给 GRPO。第二个赌注是 verifier 设计，它比底座选型更要紧：一个快、紧的 verifier，每次 rollout 几秒内跑完，就得到一份适配预算的训练循环；一个慢的 verifier，一次 rollout 几十秒，就把同一次 run 变成 CFO 会来问的一份账单。开跑之前对 verifier 做对抗性探测——写十份故意"作弊"的候选输出，看 verifier 会接受哪些，把它不该接受的那些修掉。</p>
+
+    <p>底座选型是第三个赌注，且比营销声调暗示的要小。Qwen3 是 7B 到 32B 区间、面向推理任务的稳定默认；Llama 4 在通用指令跟随轴上占优、也是多数智能体形任务落地之处；DeepSeek V4 有更长的有效上下文与偏代码的倾斜。挑"仅 SFT 天花板已能接近你目标"的最小底座，让 RL 走完剩下的路。跳过这份守纪，你要么训了一个太小的底座（RL 信号穿不过缺失的表征，找不到有用梯度），要么太大（run 花的钱超过你想替换的那份 API）。<a href="/zh/concepts/open-vs-closed-models" class="xref">开源 vs 闭源模型</a>这一概念在更高层覆盖底座选型全景；RL-微调特定的规则是"理论上能到达目标的最小底座"。</p>
+
+    <p>训练时程是最后一个旋钮，也是每个团队第一次都会拧错的那个。SFT 跑 1 到 3 个 epoch、约 5 万到 20 万条示范；DPO 跑一个 epoch、偏好集数量级更小；GRPO 跑至预算能承受的 rollout 批次上限，每几千步做一次 checkpoint，好从最好的 checkpoint 而不是最后一个 restart。常见的早期失败是把 GRPO 跑到熵早已坍缩、通过率早已平台化之后仍不停手；有用的诊断不是"loss 有没有下降"而是"held-out eval 有没有动"。等到 held-out eval 不动就停。</p>
+
+<pre class="standalone"><span class="c-cm"># SageMaker RFT job spec (YAML). One config file per training run.</span>
+job_name: qwen3-8b-sql-rft-2026-05-01
+base_model: Qwen/Qwen3-8B
+recipe:
+  stage: grpo
+  group_size: 32
+  learning_rate: 5e-7
+  kl_beta: 0.02
+  max_rollouts: 200000
+  reference_policy: sft_checkpoint_v3    <span class="c-cm"># after SFT + DPO</span>
+verifier:
+  endpoint: https://verifier.internal/sql/v2
+  timeout_ms: 4000
+compute:
+  training: p5.48xlarge x 4
+  rollout_workers: 32
+observability:
+  dashboards: [pass_rate, entropy, kl_to_ref, held_out_eval]</pre>
+
+    <p>这段 spec 里要点名的两行：一是 GRPO KL 牵绳所拉的 <code class="inline">reference_policy</code>——把它指向裸底座而不是 DPO 后的 checkpoint，是常见错法，会抹掉对齐工作；二是 <code class="inline">verifier.timeout_ms</code>，它悄悄给"你的 rollout 能贵到什么程度"戴上帽子。四秒对 SQL oracle 慷慨，对一个跑真单测套件的代码 oracle 抠门；挑错数字会静默截断轨迹、注入策略乐意学的噪声。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>行不通的招数。</h3>
+
+    <p>三种失败模式出现得够频繁，值得点名。第一种是"无 verifier RLVR"：一个团队决定"我们没有单测，就对着 LLM judge 跑 GRPO 吧"，然后发现 judge 是穿着不同衣服的学习奖励模型，带着<a href="/zh/deep-dives/training-agentic-models/reward-design-and-hacking" class="xref">奖励黑客一文</a>所罗列的、同样的奖励黑客动力学。信号在 run 中恶化，judge 开始批准人类不会接受的输出，部署出现回归。修法不是"更好的 judge"——而是承认这个任务不是 RLVR 形的，把 judge 当作偏好源改用 DPO。</p>
+
+    <p>第二种是数据集偏小。GRPO 的组内相对优势需要"足够多不同的任务"以使策略无法记住整个池；组大小 32、只用 500 个任务跑 run 会训出一个策略去对那 500 份 verifier 做模式匹配，而不是学习其下的技能。泛化失败会出现在 held-out eval 上，而不是训练通过率上，这就是每次认真 run 都要留一份从不接触训练循环的 held-out 集的原因。经验数字：一次小 run 至少 1 万个不同任务，一次认真 run 10 万；少于此是 demo，不是微调。</p>
+
+    <p>第三种是底座失配。挑一个"仅 SFT 质量远低于你目标天花板"的底座，等于开一次花大钱又走不远的 run——没有多少 RL 能教一个 7B 模型像 70B 那样推理，装作能做到就是白白扔掉几周。挑一个"仅 SFT 质量已经接近目标"的底座，则是"GRPO 阶段本可以不订"的 run，因为边际改进不值那份算力；SFT 收官你就已经能上线。中间那段——底座能合理地走完大半、RL 再补最后 10 到 30 个百分点——才是 RL 微调挣回自身开销的地方。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>与闭源 API 的成本账。</h3>
+
+    <p>能说服财务批款的是成本计算，它分成三行：一次性训练成本、部署后每次推理成本、以及闭源替代品每次推理成本。一次性训练成本被 rollout 主导：采 20 万次 rollout、组大小 32 的一次 run，会把底座执行 640 万次，对一台现代加速器上的 7B 到 14B 底座，就是几万美元级的加速器时间。加上 SFT 和 DPO 阶段以及 verifier 算力，一次认真 run 总额落在"几万到十几万"美元之间。这是一笔资本支出，不是运营支出。</p>
+
+<pre class="trace">workload: 20M requests/month, avg 4k input + 500 output tokens per request
+
+Option A — closed API (Claude Sonnet 4.7):
+  input:  20M × 4000 × $3.00/1M      = $240,000/month
+  output: 20M × 500  × $15.00/1M     = $150,000/month
+  monthly: $390,000  |  annual: $4.68M
+
+Option B — RFT'd Qwen3-8B on own inference stack:
+  training (one-time, amortized 12mo): $85,000  →  $7,083/month
+  serving: ~$0.35/M input, $0.90/M output on H100 fleet
+  input:  20M × 4000 × $0.35/1M      = $28,000/month
+  output: 20M × 500  × $0.90/1M      = $9,000/month
+  monthly: $44,083  |  annual: $529K
+
+Break-even on training cost: month 3 of production traffic.</pre>
+
+    <p>比较只有在"闭源 API 与 RFT 之后的模型在这份负载上交付同等质量"时才诚实——这正是第二步里的训练守纪所要保护的假设。一支只在训练分布上验证过 RFT 结果的团队，是在拿一个未经检验的模型去对比一个久经沙场的模型，会在生产里发现差距。上线前先切一部分生产流量做实时 A/B，并把闭源 API 保留为"调过的模型搞砸的尾部"的兜底。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>何时闭源 API 仍然是对的。</h3>
+
+    <p>三种形状仍偏向 API。第一种是低流量负载：一个月几十万请求永远回不了六位数的训练账单，不管每 token 数字看起来多有利。第二种是不可核验负载——一切住在"散文、判断、品味"桶里的东西，诚实的配方是"DPO 配 AI judge"，而即便这样也很难得到"胜过一份被良好提示的前沿系统"的模型；那就留在 API 上、在提示词上迭代。第三种是对延迟宽容的负载：当延迟和吞吐是业务的关键约束时，RFT 值得它的开销；当 p99 两秒就够时，RFT 的价值弱得多。</p>
+
+    <p>本文希望你带走的整体思路：跨厂商的"买 vs 调"不再是二选一。它是按负载做的决策——可核验且高流量的调；不可核验或低流量的调 API——同一支团队常常两者并跑，把还得起本的那两三份负载调过来，剩下一切照标价用 API。2026 年落地的工具让"调"这一侧变得便宜到伸手够；随之要抵达的守纪，就是知道"什么时候不该伸手"。</p>
+  </div>
+</section>

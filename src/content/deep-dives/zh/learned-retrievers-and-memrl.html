@@ -1,0 +1,65 @@
+<section class="phase">
+  <div class="phase-num">M11</div>
+  <div class="week">深入解析 · 记忆与上下文工程</div>
+  <h2>学习型检索器把排序函数从"相似度"换成"对当前任务的效用"——MemRL 是训练配方。</h2>
+  <p class="goal">语义相似度是"能不能帮上忙"的可用代理。学习到的效用函数则更好。MemRL 用 RL 训练记忆系统的读/写/更新/丢弃动作，以下游任务成功作为奖励。在有状态智能体基准上，其结果优于仅按相似度的排序。这篇讲配方、奖励设计的陷阱，以及何时"学习型检索"值得那份复杂度。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>以相似度为排序，以及它撞到的上限。</h3>
+
+    <p>查询嵌入与存储条目嵌入之间的余弦相似度，是一个称职的排序函数。它奏效，是因为语义邻域靠近查询的那些条目，平均而言比随机更可能有用。这个"平均"掩盖了一个系统性失败模式：<em>有用</em>与<em>相似</em>不是同一回事，两者之间的落差会在"智能体需要某个话题的具体侧面，而不是这话题下任何内容"时冒出来。问"我们什么时候升级了这位客户的套餐？"——相似度排序会把每一条同时提到这位客户和"套餐"字样的记忆浮上来；但真正回答这条查询的，是那条<em>点出日期</em>的条目——它与查询共享的表层 token 也许还不如排序器排在首位的那条。<a href="/zh/deep-dives/memory-and-context/retrieval-augmented-memory" class="xref">检索增强记忆那一篇</a>把这当作打分问题，用"相关性 + 时近性 + 显著性"来解；这一混合抬高了上限，但没改变底层信号。</p>
+
+    <p>学习型检索器的论点是：排序函数应当在"智能体真正在乎的下游指标"上被训练。如果智能体的活是把问题回答对，那么排序器的活就是浮出"能引向正确答案"的条目，而不是"看起来像问题"的条目。学到的效用捕捉的是这个差别。这个想法并不新（learning-to-rank 比 Transformer 早了几十年）；2026 年变了的是：整套记忆子系统——读、写、更新、摘要、丢弃——都成了可训练的动作空间，产出推理智能体的同一套 RL 机器也能产出记忆智能体。这就是 MemRL 这一步。</p>
+
+<pre class="trace">Query: "when did we upgrade this customer's plan?"
+
+Similarity-ranked top-5                    | Learned-utility top-5
+-------------------------------------------|------------------------------------------
+1. "Customer asks about plan features"     | 1. "Plan upgrade confirmed — 2026-04-12"
+2. "Support call: plan tier questions"     | 2. "Upgrade order processed for customer"
+3. "Plan comparison chart shared"          | 3. "Customer asks about plan features"
+4. "Plan upgrade confirmed — 2026-04-12"   | 4. "Support call: plan tier questions"
+5. "Notes on typical plan lifecycle"       | 5. "Billing entry: tier change effective"
+
+Similarity ranks lexical neighbors first; utility ranks the date-bearing entry first.
+Same store, same query, ranker difference is the whole delta.</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>MemRL：把记忆操作当工具，让 RL 学策略。</h3>
+
+    <p>MemRL 的框法把记忆子系统变成一组可调用的动作：<code class="inline">store(entry)</code>、<code class="inline">retrieve(query, k)</code>、<code class="inline">update(id, fields)</code>、<code class="inline">summarize(ids)</code>、<code class="inline">discard(id)</code>。一次 rollout 就是智能体完成一次任务的整段情节，其间那些动作被调若干次。奖励是下游成功——任务是否完成、答案是否对齐、工具调用是否成功。信用通过 GRPO/DAPO 一族被反赋给那些记忆动作，与推理训练一系列里覆盖工具使用的通用做法同一套；<a href="/zh/deep-dives/training-agentic-models/rl-for-tool-use" class="xref">面向工具使用的 RL</a> 那一篇是训练侧的伴侣。</p>
+
+    <p>微妙之处是，<code class="inline">retrieve()</code> 之内那个排序器本身也是可训练的，而不只是"选哪个动作"这一层。会被学到的策略有两层。外层策略——<em>这一步选哪个记忆动作</em>——是智能体级 RL 看到的。内层策略——<em>选了 retrieve 之后如何排候选</em>——通过"经选择的可微技巧"或"自带梯度的 reranker 头"把排序器输出也暴露在同一奖励下训练。实操上，2026 年的多数实现从"冻结的相似度检索器"起步，先加一个学习型 reranker 作为第一段，等奖励信号稳了再把底座检索器换成学习型打分器。<a href="/zh/deep-dives/memory-and-context/memory-stores" class="xref">记忆存储那一篇</a>讲过后端匹配；MemRL 坐在团队选定的存储之上，把它当作策略去探索的环境。</p>
+
+<pre class="standalone"><span class="c-cm"># The MemRL action space: memory ops as tools with a shared reward.</span>
+memory_actions = [
+    Action(<span class="c-st">"store"</span>,     schema={<span class="c-st">"entry"</span>: Entry}),
+    Action(<span class="c-st">"retrieve"</span>,  schema={<span class="c-st">"query"</span>: <span class="c-kw">str</span>, <span class="c-st">"k"</span>: <span class="c-kw">int</span>}),
+    Action(<span class="c-st">"update"</span>,    schema={<span class="c-st">"id"</span>: <span class="c-kw">str</span>, <span class="c-st">"fields"</span>: Fields}),
+    Action(<span class="c-st">"summarize"</span>, schema={<span class="c-st">"ids"</span>: <span class="c-kw">list</span>[<span class="c-kw">str</span>]}),
+    Action(<span class="c-st">"discard"</span>,   schema={<span class="c-st">"id"</span>: <span class="c-kw">str</span>}),
+]
+<span class="c-cm"># reward: downstream task success; credit assignment: GRPO-family, group-relative.</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>奖励设计陷阱：总会出现的那几种。</h3>
+
+    <p>任何 RL 系统都要交奖励设计税，MemRL 版有教育意义，因为陷阱落在一小组形状里。<em>奖励作弊</em>的表现是：智能体学会存下大量小条目、再把它们都取回来——一种能推高任何"与成功正相关的召回项"、却不做实事的策略。修法是在奖励里加一个存储成本项，让策略学到"不被使用的条目带小额惩罚"。<em>长时程的信用分配</em>是第二个陷阱：一个跑 40 步、末端产出正确答案的智能体，很难说清楚它 12 次 <code class="inline">retrieve</code> 中的哪些贡献了。组内相对优势（GRPO）通过在同一任务上比对 rollout 提供帮助；更长时程的任务受益于命名的中间检查点（每回合对照黄金中间态的正确性），把每次梯度信号有效地缩短。</p>
+
+    <p><em>对训练任务分布过拟合</em>是第三个陷阱，也是最容易毁掉生产的那个。在某个任务家族上训练出的排序器，会学到与该家族成功相关但对相邻任务不成立的线索；把它部署到邻居上，性能连"冻结相似度基线"都跑不赢。缓解手段是训练混合里保有任务家族多样性，并周期性地在留出家族上与相似度基线对比——只要学习型排序器在某个家族输给了相似度，那个家族就回训练集。<em>比较歧义</em>是第四个：记忆动作非终结、其效应在多步之后才显形，因此当第 3 步是 retrieve、结果发散从第 30 步开始时，宣布一个 rollout 优于另一个是一个建模选择，不是不言而喻的事实。这个选择——通常是带调优折扣的折现回报——值得在训练配置里显式写出来，因为它对学出策略形状的影响，比奖励绝对值还要大。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>何时学习型检索值得那份复杂度，何时不。</h3>
+
+    <p>学习型检索不是相似度之上的免费升级。训练流水线需要环境、奖励函数，以及足够多能推动策略的 rollout——在成本、工程时间、以及随任务与存储演进的持续维护上都有量级。能挣回这份代价的工作负载共享三条属性：每次检索的赌注高（一次错失代价是真金白银或真信任）、跨会话高复用（排序器的改善能在很多次调用上摊薄），以及任务分布足够稳（训练数据不会一周就过时）。长寿命的个人助手、有明确租户的企业智能体、代码库范围清晰的编码智能体——这些是合身对象。临时的单次流程、任务分布每次会话都变的探索型研究智能体、以及冻结相似度检索器已经能拿高分的小型内部工具——这些不该采纳 MemRL。</p>
+
+    <p>2026 年多数团队最终走的诚实的中间路径是：底座仍是一个冻结的相似度检索器，加一个按会话级结果训练的学习型 reranker，让一个启发式策略（用团队能审计的手写规则）挑动作（存/取/更新/丢弃）。全套 MemRL——整个动作空间端到端训——是上限，不是下限。它奖励"产品已经重度依赖记忆式累计"的团队，惩罚"因为它新所以要用"的团队。介于相似度排序的下限与 MemRL 的上限之间，才是 2026 年多数记忆系统真正落脚的地方；判定因子几乎总是这一个：下周二的会话是否因这周二记忆系统学到的东西而可测地更好。</p>
+  </div>
+</section>

@@ -1,0 +1,97 @@
+<section class="phase">
+  <div class="phase-num">K11</div>
+  <div class="week">深入解析 · 工具与能力设计</div>
+  <h2>流式工具调用在文档里看起来一致，各厂商却各有各的坏习——增量拼接语义、重复调用 bug、并行工具的交错，正是"是否正确"住在的地方。</h2>
+  <p class="goal">每家厂商都写了"流式时你会收到工具调用的增量"。没被一致地写下来的是：OpenAI GPT-4.1-nano 偶尔会发出与已有块同 index 的重复 tool-call 块；Gemini 的 <code class="inline">arguments</code> 字段跨块聚合的方式与 OpenAI 相似但块边界不同；Anthropic 会以特定顺序交错并行工具调用，拼接器必须识别。按第一家的文档写好拼接器再移植到第二家，正确性 bug 是静默的：字段解析到一半、调用被丢、本应是一次调用的 arguments 被拆成两次。这篇给"真能跑对"的逐厂商拼接代码，附上 bug 备注与"三家都能扛住"的可移植适配器形状。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>共同的增量形状（以及它在哪里不再共同）。</h3>
+
+    <p>三家厂商在同一份大致宣传下交付工具调用流：模型先发一个命名工具的初始事件（带 id / call_id / block_id、一个 index 或内容块 index，以及函数名），随后是一串每个携带 JSON <code class="inline">arguments</code> 字符串片段的增量事件，最后是一次"调用完成"事件。按顺序拼片段，JSON 解析结果，派发。<a href="/zh/deep-dives/tool-capability-design/tool-calling-vendor-matrix-2026" class="xref">K7 厂商矩阵</a>覆盖非流式的调用形状；流式复用同一份底层事件内容，却包在各厂商的 SSE 或流封装里，起名不同。</p>
+
+    <p>三条轴发散，制造了多数 bug。第一，片段粒度：OpenAI 的 <code class="inline">arguments</code> 增量可能一次一个 token，也可能是整行，视模型而定；Gemini 的块通常更大，有时是整个值；Anthropic 的通常是小段 JSON 增量文本。第二，调用身份：OpenAI 用 tool-call 数组上的 <code class="inline">index</code> 加一个首块出现且随后重复的 <code class="inline">tool_call_id</code>；Anthropic 用一个跨块整段生命周期都稳定的内容块 index；Gemini 用 candidate/part index 对。第三，并行调用交错：三家都可能在一条流里发出多个并行调用的 token，但顺序保证与"块完成哨兵"存在与否并不一致。拼接器必须按身份键值，而不是按位置假设，否则会静默污染并行调用。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>OpenAI 拼接与 GPT-4.1-nano 重复调用 bug。</h3>
+
+    <p>OpenAI 的 Chat Completions 流形状稳定、文档清晰。每个流块携带一个 <code class="inline">choices[0].delta.tool_calls</code> 数组；数组每个元素有一个 <code class="inline">index</code>，要么携带首块字段（<code class="inline">id</code>、<code class="inline">type</code>、<code class="inline">function.name</code>），要么携带进行中的片段字段（<code class="inline">function.arguments</code>——一段跨块拼接的部分 JSON 字符串）。拼接器按 <code class="inline">index</code> 键值、首见时初始化条目、每块有 <code class="inline">arguments</code> 时追加、外层 <code class="inline">finish_reason</code> 变为 <code class="inline">"tool_calls"</code> 时关闭。</p>
+
+<pre class="standalone"><span class="c-cm"># OpenAI Chat Completions — accumulator keyed on tool-call index</span>
+calls = {}
+<span class="c-kw">for</span> chunk <span class="c-kw">in</span> stream:
+    <span class="c-kw">for</span> tc <span class="c-kw">in</span> chunk.choices[<span class="c-nu">0</span>].delta.tool_calls <span class="c-kw">or</span> []:
+        e = calls.setdefault(tc.index, {<span class="c-st">"id"</span>: <span class="c-kw">None</span>, <span class="c-st">"name"</span>: <span class="c-kw">None</span>, <span class="c-st">"args"</span>: <span class="c-st">""</span>})
+        <span class="c-kw">if</span> tc.id: e[<span class="c-st">"id"</span>] = tc.id
+        <span class="c-kw">if</span> tc.function <span class="c-kw">and</span> tc.function.name: e[<span class="c-st">"name"</span>] = tc.function.name
+        <span class="c-kw">if</span> tc.function <span class="c-kw">and</span> tc.function.arguments:
+            e[<span class="c-st">"args"</span>] += tc.function.arguments
+final = [{<span class="c-st">"id"</span>: v[<span class="c-st">"id"</span>], <span class="c-st">"name"</span>: v[<span class="c-st">"name"</span>], <span class="c-st">"args"</span>: json.loads(v[<span class="c-st">"args"</span>])}
+         <span class="c-kw">for</span> _, v <span class="c-kw">in</span> <span class="c-fn">sorted</span>(calls.items())]</pre>
+
+    <p>GPT-4.1-nano 的重复调用 bug 值得点名。在某些提示上，nano 模型会发出与首次同 <code class="inline">index</code>、同 <code class="inline">id</code> 的第二个 tool-call 块，等于把整次调用重复一遍。朴素拼接器看到重复，把它的 <code class="inline">arguments</code> 追加到已完成的 args 字符串上，JSON 解析失败，因为拼出来的字符串是两个 JSON 对象粘一起。防御修法是幂等：一旦一个调用的 args 干净解析，再看到同 id 的块就作为 no-op 处理。OpenAI SDK 的 issue tracker 有一份具体的报告；绕开只需几行代码，能挡住一个否则会让你花一小时追的静默污染。</p>
+
+    <p>Responses API 稍微改了形状，拼接器模式相同——你按 <code class="inline">function_call</code> 项的 <code class="inline">item_id</code> 键值、追加 <code class="inline">arguments</code> 增量。类型化流事件名不同（<code class="inline">response.function_call_arguments.delta</code>），但状态机一一对应。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Gemini：块更大、聚合更粗。</h3>
+
+    <p>Gemini 的流式发出 <code class="inline">GenerateContentResponse</code> 块，每块携带 <code class="inline">candidates[0].content.parts</code>。函数调用 part 是 <code class="inline">functionCall: {name, args}</code>——与 OpenAI 的增量字符串不同，<code class="inline">args</code> 字段常常在一块中就以基本完整或整份 JSON 对象到达。拼接器仍需容忍同一次调用收到多块（Gemini 较新模型偶尔会把大参数对象拆成两块），但常见情形是每条流一份函数调用 part，来得晚，完整。</p>
+
+<pre class="standalone"><span class="c-cm"># Gemini — accumulate function-call parts, tolerant of coarser chunks</span>
+calls = []
+<span class="c-kw">for</span> chunk <span class="c-kw">in</span> stream:
+    <span class="c-kw">for</span> part <span class="c-kw">in</span> (chunk.candidates[<span class="c-nu">0</span>].content.parts <span class="c-kw">or</span> []):
+        fc = <span class="c-fn">getattr</span>(part, <span class="c-st">"function_call"</span>, <span class="c-kw">None</span>)
+        <span class="c-kw">if</span> fc <span class="c-kw">is</span> <span class="c-kw">None</span>: <span class="c-kw">continue</span>
+        <span class="c-cm"># If Gemini split args across chunks, merge into the last-open call</span>
+        <span class="c-kw">if</span> calls <span class="c-kw">and</span> calls[<span class="c-nu">-1</span>][<span class="c-st">"name"</span>] == fc.name <span class="c-kw">and</span> <span class="c-kw">not</span> calls[<span class="c-nu">-1</span>][<span class="c-st">"closed"</span>]:
+            calls[<span class="c-nu">-1</span>][<span class="c-st">"args"</span>].update(<span class="c-fn">dict</span>(fc.args))
+        <span class="c-kw">else</span>:
+            calls.append({<span class="c-st">"name"</span>: fc.name, <span class="c-st">"args"</span>: <span class="c-fn">dict</span>(fc.args), <span class="c-st">"closed"</span>: <span class="c-kw">False</span>})
+<span class="c-cm"># Close on stream end</span>
+<span class="c-kw">for</span> c <span class="c-kw">in</span> calls: c[<span class="c-st">"closed"</span>] = <span class="c-kw">True</span></pre>
+
+    <p>两个 Gemini 具体点要留意。第一，<code class="inline">args</code> 以结构化对象到达，不是 JSON 字符串——你不解析，你消费。这比 OpenAI 的形状更好，但会打破任何假设"流式意味着拼字符串"的代码。第二，Gemini 的并行调用以同一块 <code class="inline">parts</code> 数组里的多个 <code class="inline">functionCall</code> parts、或跨块出现；拼接器要逐块遍历 parts 列表，别假设每块一次调用。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Anthropic：内容块、并行调用交错。</h3>
+
+    <p>Anthropic 的流式是事件类型化的：<code class="inline">message_start</code>、<code class="inline">content_block_start</code>、<code class="inline">content_block_delta</code>、<code class="inline">content_block_stop</code>、<code class="inline">message_stop</code>。一次工具调用以 <code class="inline">content_block_start</code>（携带一个 <code class="inline">tool_use</code> 块，带 <code class="inline">id</code> 与 <code class="inline">name</code>）开始，随后是一串 <code class="inline">content_block_delta</code>，携带 <code class="inline">input_json_delta</code> 部分 JSON 字符串，最后是 <code class="inline">content_block_stop</code>。多个并行工具调用作为多个不同 index 的内容块出现，Anthropic 会在同一条流里交错来自不同块的增量——拼接器按块 index 键值，等到 <code class="inline">content_block_stop</code> 才认调用完成。</p>
+
+<pre class="standalone"><span class="c-cm"># Anthropic — event-typed stream, index-keyed accumulator</span>
+blocks = {}
+<span class="c-kw">for</span> event <span class="c-kw">in</span> stream:
+    <span class="c-kw">if</span> event.type == <span class="c-st">"content_block_start"</span> <span class="c-kw">and</span> event.content_block.type == <span class="c-st">"tool_use"</span>:
+        blocks[event.index] = {<span class="c-st">"id"</span>: event.content_block.id,
+                               <span class="c-st">"name"</span>: event.content_block.name,
+                               <span class="c-st">"args"</span>: <span class="c-st">""</span>, <span class="c-st">"done"</span>: <span class="c-kw">False</span>}
+    <span class="c-kw">elif</span> event.type == <span class="c-st">"content_block_delta"</span> <span class="c-kw">and</span> event.index <span class="c-kw">in</span> blocks:
+        <span class="c-kw">if</span> <span class="c-fn">getattr</span>(event.delta, <span class="c-st">"type"</span>, <span class="c-kw">None</span>) == <span class="c-st">"input_json_delta"</span>:
+            blocks[event.index][<span class="c-st">"args"</span>] += event.delta.partial_json
+    <span class="c-kw">elif</span> event.type == <span class="c-st">"content_block_stop"</span> <span class="c-kw">and</span> event.index <span class="c-kw">in</span> blocks:
+        blocks[event.index][<span class="c-st">"done"</span>] = <span class="c-kw">True</span>
+        blocks[event.index][<span class="c-st">"args"</span>] = json.loads(blocks[event.index][<span class="c-st">"args"</span>] <span class="c-kw">or</span> <span class="c-st">"{}"</span>)</pre>
+
+    <p>并行调用陷阱是真的。两个并行运行的 tool_use 块可能交错：流可以载 block 1 的增量、再载 block 2、再载 block 1，而按"最后一个块"（而非事件里的块 index）键值的拼接器会把片段错路。这在 Anthropic SDK 里有文档，但下游框架胶水未必总同步；<a href="/zh/deep-dives/architectures-and-patterns/tool-error-recovery" class="xref">工具错误恢复</a>一文处理拼接器错路后的清理模式，更便宜的修法则是上面这份按 index 键值的拼接器。</p>
+
+    <p>再来一条 Anthropic 特有的：tool_use 的初始 <code class="inline">content_block_start</code> 带一个通常为空的 <code class="inline">input: {}</code> 字段——真正的 args 在增量里。某些拼接器把空的 <code class="inline">input</code> 误当作最终 args、错过增量，最终拿到一次 args 为空对象的工具调用。修法是永远把增量拼进一段新字符串，忽略空的初始 input。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>一份可移植的拼接器形状。</h3>
+
+    <p>三种拼接器，一个共同状态机。每一种看起来都是：(1) 首次出现"命名工具调用"事件时，为该调用按其身份（index、块 index 或 item id）分配一份状态；(2) 每次收到已知调用的参数片段事件时，追加它；(3) 流结束（或每调用完成事件）时，解析并校验 args，把完成的调用列表交给外壳。一份把各厂商流映射到同一组"start / append / close"事件三元组的可移植适配器不大——每家厂商大约一百来行——能让你外壳的其余部分与厂商无关。</p>
+
+    <p>从一开始就该接进两件事。第一，逐调用幂等：跟踪已派发过的调用 id，丢重复。这挡住 OpenAI GPT-4.1-nano 的重复调用 bug，也挡住其他厂商模型演化时可能冒出的同类问题。第二，畸形 JSON 容忍：如果 args 字符串在关闭时解析不通，别静默交付一次坏工具调用——把畸形 args 上抛给外壳，让它发出一段模型可据以重试的纠错性 tool result。<a href="/zh/deep-dives/tool-capability-design/tool-error-messages" class="xref">把错误消息当作提示</a>一文处理"那段纠错消息该长什么样"。</p>
+
+    <p>把五步合起来读，流式工具调用就不再是逐厂商的谜题，而是适配层的一件差事。形状哪里都一样：按身份键值的拼接器、片段追加、完成时解析关闭。凸起全在各厂商特有的字段名、块粒度，以及特定模型上出现的具体 bug。适配器一次做对，把各厂商 bug 备注留在分支旁的注释里，流式循环就不再是你外壳在生产里翻船的地方——它成了所有有趣推理下面那份无聊的底座。</p>
+  </div>
+</section>

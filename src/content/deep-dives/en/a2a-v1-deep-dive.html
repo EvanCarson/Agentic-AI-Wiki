@@ -1,0 +1,140 @@
+<section class="phase">
+  <div class="phase-num">P8</div>
+  <div class="week">Deep Dive · Protocols &amp; Interop</div>
+  <h2>A2A v1.0 (April 2026) is not the same protocol as pre-1.0 — the nine-state task lifecycle, the Message vs Artifact distinction, and the versioning header are the load-bearing pieces the <code class="inline">a2a-communication</code> essay predates.</h2>
+  <p class="goal">A2A shipped v1.0 on April 9, 2026, one year after Google announced it. 150+ member orgs, five official SDKs, adopted in Azure and Bedrock. The concept-level <a href="/deep-dives/protocols-and-interop/a2a-communication" class="xref">A2A communication</a> essay on this site predates it and describes four task states; v1.0 has nine, including <code class="inline">INPUT_REQUIRED</code>, <code class="inline">AUTH_REQUIRED</code>, and <code class="inline">REJECTED</code> — states you will build your delegation logic around. The Message vs Artifact split (turns vs outputs), the <code class="inline">A2A-Version</code> header, and the streaming-per-transport model are the parts to read carefully. This essay is v1.0 the way you will implement it.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What changed from pre-1.0.</h3>
+
+    <p>Every A2A tutorial older than April 2026 is now describing an earlier draft. The gap between draft-A2A and v1.0 is not cosmetic; the state machine grew, the message model split in two, transport bindings were separated, and a version header was added so old and new clients could coexist. The <a href="/deep-dives/protocols-and-interop/a2a-communication" class="xref">A2A communication</a> essay on this site was written against the pre-1.0 draft — a four-state lifecycle (<code class="inline">submitted → working → input-required → completed</code>) and a single message type carrying both turns and outputs. That model is what most tutorials and every "how A2A works" blog post from 2025 still shows. It is enough for a demo; it is not enough to build against.</p>
+
+    <p>The four biggest breaking changes to track. First, the task state machine went from four states to nine — the new states <code class="inline">AUTH_REQUIRED</code> and <code class="inline">REJECTED</code> in particular carry semantics the four-state model simply could not express (a peer asking you to authenticate before it will proceed, vs a peer refusing a task outright). Second, the Message and Artifact objects split — a Message is now strictly a turn in the conversation about a task, an Artifact is strictly a deliverable the peer produced. Pre-1.0 collapsed the two into one message-with-parts object; v1.0 gives you a clean seam between "how we talked about the work" and "what the work produced." Third, streaming moved from a top-level concept to a per-transport binding — SSE for JSON-RPC over HTTP, native streaming for gRPC, chunked responses for the REST binding, each with slightly different framing rules. Fourth, an <code class="inline">A2A-Version</code> HTTP header was added on every request and every response, so a v1.0 client can negotiate with a pre-1.0 peer without either side guessing.</p>
+
+    <p>The upgrade path the spec recommends: implementations MAY continue to serve pre-1.0 through 2026, MUST advertise their supported versions on the <a href="/deep-dives/protocols-and-interop/capability-discovery" class="xref">capability discovery</a> Agent Card, and SHOULD reject requests with an <code class="inline">A2A-Version</code> the server does not implement rather than silently degrading to a lower version. In practice most SDKs implement both, feature-detect the peer, and choose the lower common version — the same shape MCP <code class="inline">initialize</code> takes for its own version negotiation. The rest of this essay covers v1.0; the pre-1.0 essay stays useful for the "why an agent-to-agent protocol at all" framing but should not be used as an implementation reference.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The nine-state task lifecycle.</h3>
+
+    <p>The task is A2A's durable identity — it has a stable id, an owner, an assignee, a state, and a message and artifact history. The state field is a nine-value enum, and the transitions between states are what your delegation logic actually programs against. The four terminal states (<code class="inline">COMPLETED</code>, <code class="inline">FAILED</code>, <code class="inline">CANCELED</code>, <code class="inline">REJECTED</code>) close the task and forbid further messages; the five non-terminal states are the places where work happens and where callers wait. Read them once and the whole protocol becomes shape-shaped rather than string-shaped.</p>
+
+<pre class="trace">                 ┌───────────┐
+                 │ SUBMITTED │
+                 └─────┬─────┘
+                       │
+                       v
+              ┌────────────────┐   auth cycle    ┌──────────────┐
+              │  WORKING       │&lt;───────────────&gt;│ AUTH_REQUIRED│
+              └──┬──────┬──────┘                 └──────────────┘
+                 │      │
+   ask user      │      │  produce output
+                 v      v
+        ┌───────────────┐    ┌──────────────┐
+        │ INPUT_REQUIRED│    │  ARTIFACT_*  │  (streaming)
+        └──────┬────────┘    └──────┬───────┘
+               │                    │
+               └──────┬─────────────┘
+                      v
+              ┌───────────────┐
+              │  COMPLETED    │ ── or ── FAILED / CANCELED / REJECTED
+              └───────────────┘</pre>
+
+    <p><code class="inline">SUBMITTED</code> and <code class="inline">WORKING</code> are the ordinary path: a task lands, the assignee starts on it, most tasks live in <code class="inline">WORKING</code> for the duration of the work. <code class="inline">INPUT_REQUIRED</code> is where the peer needs more from you — a clarifying question, a missing parameter — and the caller MUST send another Message on the same task id to move it back to <code class="inline">WORKING</code>. <code class="inline">AUTH_REQUIRED</code> is a v1.0 addition and is a state the peer moves the task into when it discovers it needs a credential the caller has not presented; the caller resolves it out-of-band (typically an OAuth hop the caller drives) and then re-sends. <code class="inline">REJECTED</code> is also new: a terminal refusal, distinct from <code class="inline">FAILED</code>, that says "I understood the task and chose not to do it." Policy engines land tasks in <code class="inline">REJECTED</code>; runtime errors land in <code class="inline">FAILED</code>.</p>
+
+    <p>The state transitions are directed and constrained by the spec. From <code class="inline">SUBMITTED</code> the peer may go to <code class="inline">WORKING</code>, <code class="inline">REJECTED</code>, or <code class="inline">AUTH_REQUIRED</code>; from <code class="inline">WORKING</code> the peer may go to <code class="inline">INPUT_REQUIRED</code>, <code class="inline">AUTH_REQUIRED</code>, or any terminal; from <code class="inline">INPUT_REQUIRED</code> a caller Message returns the task to <code class="inline">WORKING</code>. Illegal transitions (a caller trying to send a Message on a <code class="inline">COMPLETED</code> task, a peer trying to move from <code class="inline">SUBMITTED</code> directly to <code class="inline">COMPLETED</code> without any work signal) are protocol errors and MUST be rejected with a JSON-RPC error code. This is where the four-state pre-1.0 model was a footgun in production — teams built delegation graphs that could not represent a peer asking for a credential mid-run, and the ad-hoc workarounds (encoding the auth request in the Message body) broke every attempt at cross-vendor interop. The nine-state machine names each of these paths once, which is the reason it exists.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Message vs Artifact.</h3>
+
+    <p>Pre-1.0 had one object — a Message with parts — and used it for both the caller's requests and the peer's outputs. v1.0 splits this into two distinct objects with different semantics. A Message is a turn in the conversation about a task, carrying text, files, or structured data as parts, and always attached to a role (<code class="inline">user</code> or <code class="inline">agent</code>). An Artifact is a deliverable the peer produced — a completed CSV, a rendered PDF, a structured record — also composed of parts, but with a stable id inside the task and an implicit versioning story. A task accumulates zero or more Messages (the conversation) and zero or more Artifacts (the outputs). Reading the split as "turns vs outputs" is the mnemonic that sticks.</p>
+
+    <p>Concretely, this matters for long-running tasks. A research agent that takes twenty minutes to produce a report will typically emit progress Messages ("looking at second source now," "found a contradiction, checking a third") and then a final Artifact (the report itself). The <a href="/deep-dives/protocols-and-interop/capability-discovery" class="xref">capability discovery</a> Agent Card advertises which content modes the peer produces for each artifact type — <code class="inline">text/markdown</code>, <code class="inline">application/pdf</code>, <code class="inline">application/json</code> — and the caller sizes its rendering path off that. Because Artifacts have their own ids and versioning, a peer can update an artifact mid-task (a partial draft, then a refined one) without either side losing the previous version — the version history is retrievable through <code class="inline">tasks/artifacts/get</code> and the caller can display or discard old versions as it chooses.</p>
+
+<pre class="trace">POST /a2a HTTP/1.1
+A2A-Version: 1.0
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0", "id": 42, "method": "tasks/send",
+  "params": {
+    "task": {"id": "t_9c4a", "state": "WORKING"},
+    "message": {
+      "role": "agent",
+      "parts": [{"type": "text", "text": "which fiscal year?"}]
+    }
+  }
+}
+
+HTTP/1.1 200 OK
+A2A-Version: 1.0
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 42, "result": {"state": "INPUT_REQUIRED"}}</pre>
+
+    <p>The wire shape above is a JSON-RPC binding but the concept is transport-independent. The Message goes on the wire; the state transition (<code class="inline">WORKING → INPUT_REQUIRED</code>) is the peer's response to the send. The caller now knows the task is blocked on their reply and can surface the question to the human on the other side. Artifacts follow the same shape but arrive on <code class="inline">artifacts/added</code> or streamed <code class="inline">artifacts/chunk</code> events, never inside a Message. The split is minor when you say it out loud and load-bearing every time you write a state machine against it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Streaming per transport.</h3>
+
+    <p>A2A v1.0 defines three official transport bindings: JSON-RPC over HTTP (the default), gRPC (for polyglot backends), and a REST-shaped HTTP binding (for the "just curl it" case ACP originally chased). Streaming works differently in each. The JSON-RPC binding uses Server-Sent Events for streaming — the caller opens a long-lived <code class="inline">tasks/subscribe</code> connection, the server pushes state and artifact events as SSE frames, the connection stays open for the task's duration or the SSE timeout. The gRPC binding uses native bidirectional streaming — every event is a gRPC message on an open stream, no framing gymnastics. The REST binding uses chunked <code class="inline">text/event-stream</code> responses much like SSE but with slightly different retry semantics.</p>
+
+    <p>The consequence for implementers is that you cannot write "an A2A streaming client" once and use it across bindings without an abstraction. The SDK you pick handles this — the official Python SDK exposes an <code class="inline">a2a.stream(task_id)</code> iterator that internally switches on the peer's transport — but a hand-rolled client has to pick a binding and stay in it. For long-running tasks that outlive an SSE connection (research agents that take an hour, batch jobs), v1.0 also defines push notifications: the caller registers a webhook on task creation, the peer POSTs state and artifact events to the webhook, and neither side holds an open connection. This is the pattern that scales past a single load balancer's connection budget, and it is what production A2A deployments in the wild actually use for anything longer than a minute.</p>
+
+    <p>The subscription itself is per-task, not per-agent, which is a small detail with a big operational consequence. A caller running a fleet of tasks against the same peer opens N connections, one per task; a peer serving many callers must be sized for the concurrent-subscription count rather than the request rate. Rate limits documented on Agent Cards are v1.0-defined as "requests per minute" for send-shaped calls and "concurrent streams" for subscribe-shaped calls, and the two are typically different by an order of magnitude. Miss this on the client side and you will spend an afternoon debugging why the same peer that accepts 10k requests per minute refuses your 200th open subscription.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Versioning: A2A-Version and migration.</h3>
+
+    <p>The <code class="inline">A2A-Version</code> HTTP header is on every request and every response in v1.0. The value is a semver string — the current release is <code class="inline">1.0.0</code>, patches will be <code class="inline">1.0.x</code>, minor additions <code class="inline">1.x.0</code>. The client sends the version it implements; the server responds with the version it will actually use on the response, which is either the client's version or a lower one the server also implements. If the server does not implement any version the client requested, the response is a JSON-RPC error with code <code class="inline">-32600</code> and a message naming the supported versions.</p>
+
+<pre class="standalone">GET /.well-known/agent.json HTTP/1.1
+Host: agents.example.com
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+A2A-Version: 1.0
+
+{
+  "name": "invoice-reconciler",
+  "description": "Matches invoices to purchase orders.",
+  "url": "https://agents.example.com/a2a",
+  "protocolVersion": "1.0",
+  "supportedProtocolVersions": ["0.9", "1.0"],
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": true,
+    "artifacts": true
+  },
+  "defaultInputModes": ["text", "file"],
+  "defaultOutputModes": ["text", "file", "application/json"],
+  "skills": [
+    {"id": "reconcile", "description": "Reconcile invoice batch against POs.",
+     "inputModes": ["file"], "outputModes": ["file"]}
+  ]
+}</pre>
+
+    <p>The <code class="inline">supportedProtocolVersions</code> array on the Agent Card is the discovery-time counterpart of the request header — a caller reads the card, sees the peer supports 0.9 and 1.0, and picks 1.0. The <code class="inline">protocolVersion</code> field is the peer's preferred default. A peer that has fully migrated off pre-1.0 drops 0.9 from the array; a peer still serving legacy callers keeps both. This is exactly the pattern the <a href="/deep-dives/protocols-and-interop/capability-discovery" class="xref">capability discovery</a> essay describes as feature-test version negotiation, applied to the protocol version rather than to a single capability. The header on every request keeps the negotiation cheap — no re-fetching the card, no session-state — at the cost of two bytes of header per hop.</p>
+
+    <p>The migration guidance from the A2A working group is pragmatic: a peer serving both versions typically shares a task store between them, translates pre-1.0 messages into v1.0 Messages on ingest (and back on egress), and collapses the four-state model onto the nine-state one by mapping <code class="inline">submitted → SUBMITTED</code>, <code class="inline">working → WORKING</code>, <code class="inline">input-required → INPUT_REQUIRED</code>, <code class="inline">completed → COMPLETED</code>, <code class="inline">failed → FAILED</code>. Tasks that would land in <code class="inline">AUTH_REQUIRED</code> or <code class="inline">REJECTED</code> under v1.0 semantics get demoted to <code class="inline">failed</code> for pre-1.0 callers with the reason encoded in the failure message — a small lossy compression but one that keeps the legacy callers working while the peer moves.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Adoption reality check.</h3>
+
+    <p>The Linux Foundation press release announcing v1.0 named 150+ member organizations backing the protocol, five official SDKs (Python, TypeScript, Go, Java, .NET), and adoption in Microsoft Azure's AI Foundry and Amazon Bedrock AgentCore. Those are real numbers and they matter for signalling — a protocol with vendor backing at that scale is one you can bet on for a multi-year roadmap. They are also the marketing numbers. The number that decides whether A2A shows up in your architecture is different: how many production peer-to-peer agent deployments actually run A2A rather than a bespoke REST endpoint. That number, as of mid-2026, is closer to a couple of dozen than to 150.</p>
+
+    <p>The gap between "orgs signed the announcement" and "orgs shipped an A2A endpoint in production" is the normal shape of protocol adoption. Google, Anthropic, Microsoft, Salesforce, and a handful of vertical AI vendors ship A2A endpoints today; the rest of the 150 are either in preview, in staging, or in the "we're evaluating it" bucket that press releases collapse. The <a href="/deep-dives/protocols-and-interop/interop-problem" class="xref">interop problem</a> essay names the underlying condition: agent-to-agent traffic today is dominated by intra-vendor calls (an agent inside a stack calling another agent in the same stack), not cross-vendor calls (an agent from vendor A calling an agent from vendor B). A2A optimizes for the cross-vendor case, and the cross-vendor case is not yet the dominant traffic pattern. It will be — that is the bet — but do not read the 150-org number as "150 places you can already talk to."</p>
+
+    <p>Two operational notes for teams building against v1.0 now. First, run against the official reference implementation before you run against a partner peer: the reference implementation is strict about spec compliance, most partner peers are not, and a bug you discover integration-time against a lenient partner will fail against the reference. Second, pin your <code class="inline">A2A-Version</code> to the minor — <code class="inline">1.0</code>, not <code class="inline">1.x</code> — until 1.1 ships and the working group has published a migration note; the header is meant to enable this exact discipline. The protocol is real, the shape is stable, and the number of production deployments is smaller than the announcement suggests — plan against all three.</p>
+  </div>
+</section>

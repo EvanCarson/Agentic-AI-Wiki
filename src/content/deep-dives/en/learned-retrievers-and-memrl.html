@@ -1,0 +1,65 @@
+<section class="phase">
+  <div class="phase-num">M11</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>Learned retrievers replace "similarity" as the ranking function with "utility for the current task" — and MemRL is the training recipe.</h2>
+  <p class="goal">Semantic similarity is a decent proxy for "will this help." A learned utility function is better. MemRL trains the memory system's read/write/update/discard actions with RL, using downstream task success as the reward. The result outperforms similarity-only ranking on stateful agent benchmarks. This essay is the recipe, the reward-design pitfalls, and when learned retrieval earns the complexity.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Similarity as ranking, and the ceiling it hits.</h3>
+
+    <p>Cosine similarity between a query embedding and stored entry embeddings is a workhorse ranking function. It works because the entries whose semantic neighborhood is close to the query are, on average, more likely to be useful than random. That average conceals a systematic failure mode: <em>useful</em> and <em>similar</em> are not the same thing, and the gap between them shows up wherever an agent needs a specific facet of a topic instead of any content on the topic. Ask "when did we upgrade this customer's plan?" — a similarity ranker will surface every memory that mentions the customer and the word "plan," but the entry that actually resolves the query is the one that pinpoints the date, which may share fewer surface tokens with the query than the ranker's top pick. The <a href="/deep-dives/memory-and-context/retrieval-augmented-memory" class="xref">retrieval-augmented memory essay</a> treats this as a scoring problem best solved by blending relevance with recency and salience; that blend raises the ceiling but does not change the underlying signal.</p>
+
+    <p>The learned-retriever thesis is that the ranking function should be trained on the downstream metric the agent actually cares about. If the agent's job is to answer questions correctly, the ranker's job is to surface entries that lead to correct answers, not entries that look like the question. Learned utility captures the difference. The idea is old (learning-to-rank predates transformers by decades); what changed in 2026 is that the entire memory subsystem — read, write, update, summarize, discard — is trainable as an action space, and the same RL machinery that produces reasoning agents can produce memory agents. That is the MemRL move.</p>
+
+<pre class="trace">Query: "when did we upgrade this customer's plan?"
+
+Similarity-ranked top-5                    | Learned-utility top-5
+-------------------------------------------|------------------------------------------
+1. "Customer asks about plan features"     | 1. "Plan upgrade confirmed — 2026-04-12"
+2. "Support call: plan tier questions"     | 2. "Upgrade order processed for customer"
+3. "Plan comparison chart shared"          | 3. "Customer asks about plan features"
+4. "Plan upgrade confirmed — 2026-04-12"   | 4. "Support call: plan tier questions"
+5. "Notes on typical plan lifecycle"       | 5. "Billing entry: tier change effective"
+
+Similarity ranks lexical neighbors first; utility ranks the date-bearing entry first.
+Same store, same query, ranker difference is the whole delta.</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>MemRL: treat memory operations as tools, and let RL learn the policy.</h3>
+
+    <p>The MemRL framing turns the memory subsystem into a set of callable actions: <code class="inline">store(entry)</code>, <code class="inline">retrieve(query, k)</code>, <code class="inline">update(id, fields)</code>, <code class="inline">summarize(ids)</code>, <code class="inline">discard(id)</code>. A rollout is a full episode of the agent doing a task, during which those actions are called some number of times. The reward is downstream success — did the task complete, did the answer match ground truth, did the tool call succeed. Credit is assigned back through the memory actions using the same GRPO/DAPO family the reasoning-training essays cover for tool use in general; the <a href="/deep-dives/training-agentic-models/rl-for-tool-use" class="xref">RL-for-tool-use</a> essay is the training-side companion.</p>
+
+    <p>The subtlety is that the ranker inside <code class="inline">retrieve()</code> is itself trainable, not just the choice of which action to take. Two levels of policy get learned. The outer policy — <em>which memory action to take at this step</em> — is what the agent-level RL sees. The inner policy — <em>given retrieve was chosen, how to rank the candidates</em> — is trained by exposing the ranker's output to the same reward via a differentiable-through-selection trick or a reranker head that gets its own gradient. In practice most 2026 implementations start with a frozen similarity retriever and add a learned reranker as the first stage, then move the base retriever to a learned scorer once the reward signal is stable. The <a href="/deep-dives/memory-and-context/memory-stores" class="xref">memory-stores essay</a> covered the backend fit; MemRL sits on top of whatever store the team chose, treating it as the environment its policy explores.</p>
+
+<pre class="standalone"><span class="c-cm"># The MemRL action space: memory ops as tools with a shared reward.</span>
+memory_actions = [
+    Action(<span class="c-st">"store"</span>,     schema={<span class="c-st">"entry"</span>: Entry}),
+    Action(<span class="c-st">"retrieve"</span>,  schema={<span class="c-st">"query"</span>: <span class="c-kw">str</span>, <span class="c-st">"k"</span>: <span class="c-kw">int</span>}),
+    Action(<span class="c-st">"update"</span>,    schema={<span class="c-st">"id"</span>: <span class="c-kw">str</span>, <span class="c-st">"fields"</span>: Fields}),
+    Action(<span class="c-st">"summarize"</span>, schema={<span class="c-st">"ids"</span>: <span class="c-kw">list</span>[<span class="c-kw">str</span>]}),
+    Action(<span class="c-st">"discard"</span>,   schema={<span class="c-st">"id"</span>: <span class="c-kw">str</span>}),
+]
+<span class="c-cm"># reward: downstream task success; credit assignment: GRPO-family, group-relative.</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Reward-design pitfalls: the ones that always show up.</h3>
+
+    <p>Every RL system pays a reward-design tax, and MemRL's version is instructive because the pitfalls fall in a small set of shapes. <em>Reward hacking</em> shows up as the agent learning to store many small entries and retrieve them all — a strategy that raises the recall term of any success-correlated reward without doing real work. The fix is a store-cost term in the reward, so the policy learns that unused entries carry a small penalty. <em>Credit assignment across long horizons</em> is the second pitfall: an agent that runs 40 steps and produces a correct answer at the end cannot easily tell which of its 12 <code class="inline">retrieve</code> calls contributed. Group-relative advantages (GRPO) help by comparing rollouts on the same task; longer-horizon jobs benefit from named intermediate checkpoints (per-turn correctness against a gold intermediate state) that shorten the effective horizon per gradient signal.</p>
+
+    <p><em>Overfitting to the training task distribution</em> is the third pitfall and the one that ruins production most reliably. A ranker trained on a specific task family learns cues that are correlated with success on that family but not on adjacent tasks; deploy it on the neighbors and it underperforms even the frozen similarity baseline. The mitigation is task-family diversity in the training mixture and periodic validation against the similarity baseline on held-out families — if the learned ranker ever loses to similarity on a family, that family goes back into training. <em>Comparison ambiguity</em> is the fourth: memory actions are non-terminal and their effect shows up steps later, so declaring one rollout better than another when the retrieval call sits at step 3 and the outcome divergence starts at step 30 is a modeling choice, not an obvious fact. The choice — usually a discounted return with a tuned discount — is worth naming explicitly in the training config, because it drives more of the learned policy's shape than the reward magnitudes do.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>When learned retrieval earns the complexity, and when it does not.</h3>
+
+    <p>Learned retrieval is not a free upgrade over similarity. The training pipeline needs an environment, a reward function, and enough rollouts to move the policy — meaningful in cost, in engineering time, and in ongoing maintenance as tasks and stores evolve. The workloads that earn that cost share three properties: high stakes per retrieval (a miss costs real money or trust), high reuse across sessions (the ranker's improvements amortize over many calls), and a stable-enough task distribution that the training data does not go stale weekly. Long-lived personal assistants, enterprise agents with a defined tenant, coding agents with a well-scoped codebase — these are the fits. Ad-hoc one-shot workflows, exploratory research agents whose task distribution changes each session, and small internal tools where a frozen similarity retriever already scores high — these should not adopt MemRL.</p>
+
+    <p>The honest 2026 middle path most teams end up on is: keep a frozen similarity retriever as the base, add a learned reranker trained on session-level outcomes, and let a heuristic policy pick the action (store/retrieve/update/discard) with hand-written rules the team can audit. Full MemRL — the whole action space trained end-to-end — is the ceiling, not the floor. It rewards teams whose products already lean hard on memory-based compounding, and it punishes teams who reach for it because it is new. Between similarity ranking's floor and MemRL's ceiling is where most 2026 memory systems actually live, and the deciding factor is almost always whether next Tuesday's session is measurably better than this Tuesday's because of what the memory system learned in between.</p>
+  </div>
+</section>

@@ -1,0 +1,106 @@
+<section class="phase">
+  <div class="phase-num">T10</div>
+  <div class="week">Deep Dive · Training Agentic Models</div>
+  <h2>GEPA is a prompt-and-program optimizer, not a weight optimizer — and on tasks where the bottleneck is program shape, it beats RL by 20% at 35× fewer rollouts.</h2>
+  <p class="goal">GEPA (ICLR 2026 oral, vendor numbers not yet independently reproduced) claims to outperform MIPROv2 by 13 points and full RL / GRPO by 20 at 35× fewer rollouts. The mechanism is search over program shapes and prompt fragments, not weight updates. On tasks where the bottleneck is "which module should call which," GEPA is the right lever; on tasks where the bottleneck is capability, it isn't. This essay is DSPy 3 + GEPA's actual mechanism and the decision rule for when to reach for it.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>DSPy programs and the shape of "prompt-and-program optimization."</h3>
+
+    <p>A DSPy 3 program is a small graph of modules, each of which is a call to a language model wrapped in a signature that declares its inputs and outputs. A retrieval-augmented QA program is three modules: a query rewriter, a retriever call, and an answer generator that reads the retrieved context. A math reasoning program might be a chain-of-thought producer feeding into a checker feeding into a corrector. The program's <em>shape</em> — which modules exist, how they connect, what their signatures declare — is a design decision the author makes, and the prompt text at each module is initially whatever the author wrote. This is the object DSPy optimizes.</p>
+
+    <p>Optimization here is not weight training. The models are frozen — often frontier closed models the team could not tune if they wanted to — and what changes are the prompts, the few-shot examples inside them, and, in GEPA's case, the composition itself. The optimizer runs the program end-to-end on a small labeled set, measures the outcome, changes the program, and iterates. The output is a program that scores better than what the author wrote, with the same underlying models. The <a href="/concepts/agent-frameworks" class="xref">agent frameworks concept</a> covers where DSPy sits relative to LangGraph and CrewAI; what matters here is that DSPy's central promise is optimization of the composition, not just orchestration of it.</p>
+
+    <p>Two families of optimizers have owned this space through 2025. Bootstrap-few-shot generates few-shot examples for each module from a small labeled set. MIPROv2 does a joint search over module instructions and few-shot bundles, coordinated across the graph. Both leave the graph structure alone. GEPA's contribution — the reason the ICLR 2026 oral drew a crowd — is to search over the graph itself, adding, removing, and reshaping modules in addition to editing their prompts.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>GEPA vs MIPROv2 vs RL/GRPO: the comparison and its caveats.</h3>
+
+    <p>The paper's headline numbers are the ones every "Read GEPA" post cites: 13 points better than MIPROv2 on the reported task suite, 20 points better than full GRPO fine-tuning at 35× fewer rollouts. Those numbers deserve two caveats. The first is that they were reported by the authors, on the tasks the authors chose, and independent reproduction as of mid-2026 is thin; the responsible framing is "large, credible, not-yet-independently-confirmed advantage on the reported benchmarks." The second is that "35× fewer rollouts" is doing arithmetic across categories: GEPA's rollouts are end-to-end program executions with a fixed frozen model, while GRPO's rollouts include the gradient step that updates the model. Comparing them one-for-one flatters GEPA slightly; the honest read is that GEPA needs far less compute than GRPO for the same lift when the lift is available at all.</p>
+
+    <p>The "when the lift is available at all" clause is the important one. GRPO changes the model; GEPA does not. On tasks where the underlying model's capability is the ceiling — where no arrangement of prompts and modules gets the frozen model to solve a class of problem it can't solve — GEPA plateaus, and no amount of search fixes the plateau. Where the model can solve the problem in principle but a poorly-composed program keeps it from doing so in practice, GEPA is dramatically effective. Which side of that line a task lives on is empirically detectable — measure the frozen model's ceiling by hand-tuning prompts and see whether the ceiling is above the target — and it should be measured before booking GEPA's compute.</p>
+
+    <p>The comparison to MIPROv2 is on the same axis but at a smaller scale. Both keep the model frozen; the difference is that MIPROv2 optimizes prompts within a fixed graph while GEPA optimizes both prompts and graph. On graph shapes the author got right the first time, the two converge to similar performance; on graph shapes that were wrong, GEPA can reshape while MIPROv2 cannot. The signal that suggests GEPA over MIPROv2 is not benchmark envy — it is having tried MIPROv2 and seen it plateau below the model's ceiling.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>When shape-optimization wins.</h3>
+
+    <p>The archetype task for GEPA is a multi-module pipeline whose module boundaries are load-bearing but weren't quite drawn in the right places by the author. A retrieval-augmented QA program that puts the query-rewriting logic in the retriever's prompt rather than as its own module often benefits from GEPA moving the rewrite into a dedicated module; the same program with a monolithic "read context and answer" module sometimes benefits from GEPA splitting off a "check the answer against the context" module. These are the shape decisions the author would notice given enough iteration; GEPA notices them faster, with an oracle in the loop.</p>
+
+    <p>The second archetype is a pipeline with clear intermediate signals. GEPA's search benefits from being able to reward or penalize individual modules based on the quality of their intermediate outputs, not just the terminal task score. When a module's job is to produce a structured artifact that a downstream module consumes — a query, a plan, a schema — the artifact's quality is checkable independently, and GEPA can direct search toward better intermediate quality. Pipelines whose intermediate outputs are opaque (a hidden state, an unstructured summary) are harder for GEPA to improve because the search has less feedback to work with.</p>
+
+<pre class="standalone"><span class="c-cm"># Minimal DSPy 3 program: a two-module RAG QA. GEPA optimizes both.</span>
+<span class="c-kw">import</span> dspy
+
+<span class="c-kw">class</span> <span class="c-fn">QueryRewrite</span>(dspy.Signature):
+    <span class="c-st">"""Rewrite the user question to maximize retrieval recall."""</span>
+    question: <span class="c-fn">str</span> = dspy.<span class="c-fn">InputField</span>()
+    query:    <span class="c-fn">str</span> = dspy.<span class="c-fn">OutputField</span>()
+
+<span class="c-kw">class</span> <span class="c-fn">GroundedAnswer</span>(dspy.Signature):
+    <span class="c-st">"""Answer using only the provided context; cite the passage id."""</span>
+    question: <span class="c-fn">str</span>       = dspy.<span class="c-fn">InputField</span>()
+    context:  <span class="c-fn">list</span>[<span class="c-fn">str</span>] = dspy.<span class="c-fn">InputField</span>()
+    answer:   <span class="c-fn">str</span>       = dspy.<span class="c-fn">OutputField</span>()
+    cite:     <span class="c-fn">str</span>       = dspy.<span class="c-fn">OutputField</span>()
+
+<span class="c-kw">class</span> <span class="c-fn">RAG</span>(dspy.Module):
+    <span class="c-kw">def</span> <span class="c-fn">__init__</span>(<span class="c-kw">self</span>, retriever):
+        <span class="c-kw">self</span>.rewrite = dspy.<span class="c-fn">Predict</span>(QueryRewrite)
+        <span class="c-kw">self</span>.answer  = dspy.<span class="c-fn">Predict</span>(GroundedAnswer)
+        <span class="c-kw">self</span>.retrieve = retriever
+
+    <span class="c-kw">def</span> <span class="c-fn">forward</span>(<span class="c-kw">self</span>, question):
+        q   = <span class="c-kw">self</span>.<span class="c-fn">rewrite</span>(question=question).query
+        ctx = <span class="c-kw">self</span>.<span class="c-fn">retrieve</span>(q, k=<span class="c-fn">8</span>)
+        <span class="c-kw">return</span> <span class="c-kw">self</span>.<span class="c-fn">answer</span>(question=question, context=ctx)
+
+<span class="c-cm"># GEPA searches over prompt fragments AND graph composition.</span>
+optimizer = dspy.<span class="c-fn">GEPA</span>(metric=<span class="c-fn">exact_match</span>, budget=<span class="c-fn">400</span>)
+optimized = optimizer.<span class="c-fn">compile</span>(<span class="c-fn">RAG</span>(retriever), trainset=labeled_qa)</pre>
+
+    <p>The last two lines are where the interesting behavior lives. GEPA's <code class="inline">compile</code> call runs a small budget of program executions on the training set, uses a search-with-reflection procedure to propose changes (new prompt fragments, alternative module compositions, added or removed modules), and returns the best-scoring program it found. The budget parameter is the knob that controls how much search: 400 executions is a plausible starting number for a two-module program, and larger programs can need thousands.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>When it can't help.</h3>
+
+    <p>Capability-limited tasks are the first case GEPA cannot fix. If the frozen model doesn't have the underlying reasoning ability to solve a class of problem, no rearrangement of prompts and modules produces the answer. GEPA's search plateaus quickly, and the honest response is to change the model, not the program. This is the boundary where the <a href="/deep-dives/training-agentic-models/rlvr-and-grpo-for-agents" class="xref">RLVR and GRPO essay's</a> recipe becomes the right lever instead: RL can teach the model a skill it didn't have; GEPA can only surface the skills it already has.</p>
+
+    <p>Single-module programs are the second. If the program is a single LM call, there is no graph to optimize — GEPA is doing the same thing MIPROv2 does, and the extra machinery of graph search is unused. The break-even complexity for GEPA over MIPROv2 is around three modules with non-trivial connectivity; below that, the simpler optimizer is competitive.</p>
+
+    <p>Programs with opaque intermediate signals are the third. GEPA's search relies on being able to reward intermediate quality, and pipelines whose middle steps produce unstructured or hard-to-check artifacts starve the search of signal. The workaround — adding structured intermediate outputs to the signature so their quality is checkable — is often exactly the refactor that would have been worth doing anyway, which is a mild endorsement of the discipline GEPA imposes.</p>
+
+<pre class="trace">GEPA search log (budget=400, initial score=0.42 on val, target=0.75)
+
+iter  step                                                      val_score  delta
+----+---------------------------------------------------------+----------+------
+  012  edit rewrite prompt: add "expand acronyms" instruction    0.48     +0.06
+  031  edit answer prompt: force citation before answer          0.51     +0.03
+  058  ADD module: passage_selector between retrieve and answer  0.61     +0.10
+  094  edit passage_selector prompt: rank by claim overlap       0.66     +0.05
+  147  REMOVE module: passage_selector (regressed on subset)     0.63     -0.03
+  183  ADD module: check_answer after answer (verifies cite)     0.72     +0.09
+  247  edit check_answer prompt: reject if cite missing          0.76     +0.04
+  312  RESHAPE: check_answer feeds back to answer on reject      0.78     +0.02
+  400  budget exhausted — best: iter 312 program                 0.78     final</pre>
+
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>How to run DSPy 3 + GEPA in practice.</h3>
+
+    <p>The workflow that ships in production teams is short and repeatable. Start with a hand-written DSPy 3 program that runs correctly on a handful of examples. Measure its performance on a small labeled evaluation set — 100 to 300 items is enough to see meaningful movement. Run MIPROv2 first, because it is faster and if the graph shape is already right MIPROv2 will get you most of the way. If MIPROv2's improvement plateaus below the target, switch to GEPA with a modest budget (200 to 500 executions) and let it search for shape changes. If GEPA plateaus, either the model is the bottleneck (change model) or the intermediate signals are opaque (refactor to expose them).</p>
+
+    <p>The failure mode teams learn the hard way is over-fitting to the training set. GEPA's search will find a program that scores well on the training examples, and if the training set is small the program often exploits idiosyncratic patterns that don't generalize. The mitigation is the same as anywhere in ML: hold out a validation set that GEPA never sees, and treat validation-set improvement, not training-set improvement, as the signal. Teams that ship without a held-out set ship regressions and blame GEPA; teams that ship with one get the reported benefits.</p>
+
+    <p>The framing worth taking is that DSPy 3 + GEPA is a lever with a specific fulcrum: it moves a fixed model further than hand-written prompts can, on the class of tasks where the model was capable and the program shape was holding it back. Where those conditions hold, it is the cheapest optimizer in the 2026 toolbox. Where they don't, the RL stack is where the gains live. Knowing which side of the line you are on is worth more than any single optimizer.</p>
+  </div>
+</section>

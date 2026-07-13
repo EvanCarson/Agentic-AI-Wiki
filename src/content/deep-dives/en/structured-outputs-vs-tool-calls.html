@@ -1,0 +1,65 @@
+<section class="phase">
+  <div class="phase-num">K9</div>
+  <div class="week">Deep Dive · Tool &amp; Capability Design</div>
+  <h2>Structured outputs and tool calls are the same constrained-decoding trick with different consent surfaces — knowing which is which decides which one you want.</h2>
+  <p class="goal">Under the hood, "output must match this schema" and "call this tool" are the same trick: constrained decoding narrows the token distribution to match a grammar. The difference is above the hood — one asks the model to produce a <em>value</em>, the other asks it to propose an <em>action</em>. Anthropic finally shipped native structured outputs GA in early 2026 with <code class="inline">output_config.format</code>, closing the odd gap where they were the last major vendor without it. Choosing between the two shapes badly is what makes teams write "the model returned JSON that looks like a tool call and my harness ignored it" incident reports; choosing well makes both surfaces boringly reliable. This essay is when to use each, why the value-vs-action distinction is the deciding line, and why reads port cleanly between them while writes do not.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Same trick underneath: constrained decoding narrows the distribution.</h3>
+
+    <p>Every 2026 constrained-output feature — structured outputs, JSON mode, tool calls with a schema, custom-grammar tools — is a variation on the same mechanic. At each token step, the decoder normally samples over the full vocabulary; a grammar (typically compiled from JSON Schema, sometimes from Lark or regex directly) tells the sampler which tokens are legal <em>next</em>, and the distribution is masked to that subset before sampling. Get the schema right and the model cannot produce syntactically invalid output — the tokens are unavailable. Get it wrong and the model produces the closest legal thing to what it wanted to say, which can be worse than an unstructured error.</p>
+
+    <p>The upside is that "structured output" and "tool call" are two dresses on the same doll. A tool def with a JSON Schema for <code class="inline">parameters</code> is a grammar the model's output has to satisfy for that tool's argument block. A structured-output request with a JSON Schema for the whole response is the same grammar, applied to the whole assistant message. The K7 essay's <a href="/deep-dives/tool-capability-design/tool-calling-vendor-matrix-2026" class="xref">vendor matrix</a> shows the tool-call wrapper differences; the K10 essay covers the JSON Schema subsets each vendor enforces. Both apply here identically. If your schema fails on one vendor for a tool call, it will fail on the same vendor for a structured output, and vice versa.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Consent surface: value vs action.</h3>
+
+    <p>The mechanic is the same; the semantics are not. A structured output says "produce a value in this shape" — the model is answering a question, the response goes back to the user (or your code), and no side effects happen unless your code causes them by reading the response. A tool call says "propose an action" — the model is asking for something to happen, your harness runs it, and the effect is real by the time the model reads the result on the next turn. That distinction is the whole design axis, and it is what makes porting between the two shapes easy for reads and hard for writes.</p>
+
+    <p>For a read — "extract the fields from this document," "classify this ticket," "return the top three candidates" — either shape works and the choice is ergonomic. Structured outputs are shorter: one request, one response, done. Tool calls take an extra round trip (the model calls, your harness returns, the model responds), which is wasted for a read where the harness has nothing to add. The <a href="/concepts/structured-outputs" class="xref">structured-outputs concept</a> covers the read case at a beginner's altitude. For a write — "refund this order," "send this email," "commit this file" — tool calls are the shape, and structured outputs are the wrong tool. The model producing a JSON object called <code class="inline">refund_order_intent</code> looks like a proposal to your framework and is one to the reader, but there is no protocol seam where your harness gets to run the refund and hand the model back a confirmation. Force the read shape onto a write and you have re-implemented tool calling with a worse schema and no result path.</p>
+
+<pre class="standalone"><span class="c-cm"># Same task, two shapes — one for reads, one for writes.</span>
+
+<span class="c-cm"># Structured output (read): extract fields, return to caller</span>
+resp = client.messages.create(
+    model=<span class="c-st">"claude-opus-4-7"</span>,
+    output_config={<span class="c-st">"format"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"json_schema"</span>, <span class="c-st">"schema"</span>: extract_schema}},
+    messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: <span class="c-st">"Extract customer, item, and reason from: ..."</span>}],
+)
+result = json.loads(resp.content[<span class="c-nu">0</span>].text)   <span class="c-cm"># value in hand, no side effect</span>
+
+<span class="c-cm"># Tool call (write): propose action, harness executes, model reads result</span>
+resp = client.messages.create(
+    model=<span class="c-st">"claude-opus-4-7"</span>,
+    tools=[refund_order_def],
+    tool_choice={<span class="c-st">"type"</span>: <span class="c-st">"any"</span>},
+    messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: <span class="c-st">"Refund order 42 (defective)."</span>}],
+)
+<span class="c-cm"># harness executes tool_use, sends tool_result back for next turn</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The Anthropic 2026 GA change and the strict-mode caps.</h3>
+
+    <p>Anthropic was the odd vendor out through 2025 — every serious competitor shipped a strict structured-outputs mode and Anthropic's answer was "use a tool with the schema you want and pull the args." That works in a pinch and reads awkwardly. The early-2026 GA of native structured outputs closed the gap: <code class="inline">output_config.format</code> takes a <code class="inline">json_schema</code> object, the sampler masks against that schema, and the model returns text that parses cleanly on the first try. The <a href="/deep-dives/protocols-and-interop/structured-tool-io" class="xref">structured tool I/O</a> essay treats the return-payload half of the tool loop; this essay treats the whole-message case that structured outputs address.</p>
+
+    <p>Two Anthropic strict-mode caps are worth knowing. First, structured outputs cap at about 20 tools when combined with tool calling in the same request — the guarantee weakens as the tool list grows and the docs call out the boundary explicitly. Second, optional-parameter counts are capped at around 24 per schema in strict mode, per Anthropic's docs. Both numbers are generous for real tools; both bite when a codegen pipeline emits schemas with 40+ optional fields "just in case." The mechanical fix is the same discipline the <a href="/deep-dives/tool-capability-design/tool-schemas-and-contracts" class="xref">schemas &amp; contracts</a> essay preaches — narrow the schema to what the model has business filling — and the strict-mode caps are one more reason to do it.</p>
+
+    <p>OpenAI's strict mode has its own gotcha in the same neighbourhood: it requires <code class="inline">additionalProperties: false</code> on every object level and treats every property as required. Optional fields are expressed by making the type a union with <code class="inline">null</code>. Gemini's structured output uses <code class="inline">response_mime_type: application/json</code> plus <code class="inline">response_schema</code>, and the schema is the same OpenAPI 3.0 subset the tool-call side uses. Same trick, three different flavour texts, and — because the underlying constraint is a grammar — the same failure mode when the schema violates the vendor's subset: silent enforcement failure, not an error.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>When to port between them — and when to design new.</h3>
+
+    <p>The port rules split cleanly. A read that works as a tool call becomes a structured output by moving the schema from the tool's <code class="inline">parameters</code> into the top-level <code class="inline">output_config</code>, dropping the tool wrapper, and reading the assistant message instead of the tool-use block. The savings are one round trip and one layer of ceremony. Going the other way — read as structured output today, want to bolt a write onto the same call tomorrow — is when you realize structured outputs cannot carry the action semantics, and you have to redesign the call around tools before you can add the write. Design writes as tools from the start even if today's flow is read-only; it costs almost nothing today and saves a redesign later.</p>
+
+    <p>Two mixed patterns are worth naming. First, <em>tool call plus structured tool result</em>: the tool returns a structured JSON that the model then reasons over. This is the common shape and works everywhere — the K10 essay's portable subset applies to the tool's <code class="inline">parameters</code>, and the returned JSON is just data the model reads. Second, <em>structured output that names an action but does not execute it</em>: the model returns a schema that includes an <code class="inline">action</code> field the harness inspects and dispatches on. This is a legitimate shape for approval flows where the human is the loop's next step — the response is a value, not an action, and the human decides whether to execute. Do not confuse it with tool calling: the harness has no obligation to execute anything, and the model gets no confirmation on the next turn.</p>
+
+    <p>Read the four steps together and the two features stop feeling like alternatives. They are the same primitive with two different social contracts around it. Reads want the short shape and the direct return; writes want the round trip and the confirmation. Reads port; writes design. The Anthropic 2026 GA finally gave the read shape a native surface across all three major vendors, and the practical consequence is that "should this be a structured output or a tool call?" is now a question your codegen pipeline can answer from the presence or absence of side effects — value, or action — and stop asking humans to decide case by case.</p>
+  </div>
+</section>

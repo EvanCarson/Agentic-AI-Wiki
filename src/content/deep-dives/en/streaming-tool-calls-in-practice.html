@@ -1,0 +1,97 @@
+<section class="phase">
+  <div class="phase-num">K11</div>
+  <div class="week">Deep Dive · Tool &amp; Capability Design</div>
+  <h2>Streaming tool calls look uniform in the docs and misbehave differently per vendor — the accumulation semantics, duplicate-call bugs, and parallel-tool interleaving are where correctness lives.</h2>
+  <p class="goal">Every vendor documents "you'll receive tool-call deltas as you stream." What they don't document uniformly is: OpenAI GPT-4.1-nano occasionally emits duplicate tool-call blocks with the same index; Gemini's <code class="inline">arguments</code> field aggregates across chunks in a way OpenAI's does too but with different chunk boundaries; Anthropic interleaves parallel tool calls in a specific order the accumulator has to detect. Write your accumulator against the first vendor's docs and port to the second and the correctness bugs are silent: fields half-parsed, calls dropped, arguments split into two calls that were supposed to be one. This essay is the accumulation code that actually works, per vendor, with the bug notes and the portable adapter shape that survives all three.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The common delta shape (and where it stops being common).</h3>
+
+    <p>All three vendors ship tool-call streaming under the same general pitch: the model emits an initial event that names the tool being called (with an id / call_id / block_id, an index or content-block index, and the function name), followed by a series of delta events that each carry a fragment of the JSON <code class="inline">arguments</code> string, followed by a completion event when the tool call is done. Concatenate the fragments in order, JSON-parse the result, dispatch. The <a href="/deep-dives/tool-capability-design/tool-calling-vendor-matrix-2026" class="xref">K7 vendor matrix</a> covers the non-streaming call shape; streaming reuses the same underlying event content but wraps it in per-vendor SSE or stream envelopes with different names.</p>
+
+    <p>Three axes diverge and cause most bugs. First, the granularity of the fragment: OpenAI's <code class="inline">arguments</code> deltas can carry one token at a time or a whole line depending on the model; Gemini's chunks tend to be larger and sometimes whole values; Anthropic's are typically small JSON-delta text pieces. Second, the identity of the call: OpenAI uses an <code class="inline">index</code> on the tool-call array plus a <code class="inline">tool_call_id</code> that appears in the first chunk and repeats; Anthropic uses a content-block index that is stable across the block's lifetime; Gemini uses a candidate/part-index pair. Third, parallel-call interleaving: all three can emit tokens from multiple parallel calls in one stream, but the ordering guarantees and the presence/absence of chunk-completion sentinels are not uniform. The accumulator has to key on the identity, not on positional assumptions, and any that doesn't will silently corrupt parallel calls.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>OpenAI accumulation, and the GPT-4.1-nano duplicate-call bug.</h3>
+
+    <p>OpenAI's Chat Completions streaming shape is stable and well-documented. Each stream chunk carries a <code class="inline">choices[0].delta.tool_calls</code> array; each element in that array has an <code class="inline">index</code>, and either the first-chunk fields (<code class="inline">id</code>, <code class="inline">type</code>, <code class="inline">function.name</code>) or the ongoing-fragment fields (<code class="inline">function.arguments</code> — a partial JSON string that concatenates over chunks). The accumulator keys on <code class="inline">index</code>, seeds the entry on first sighting, appends <code class="inline">arguments</code> on every chunk that has it, and closes when the outer <code class="inline">finish_reason</code> becomes <code class="inline">"tool_calls"</code>.</p>
+
+<pre class="standalone"><span class="c-cm"># OpenAI Chat Completions — accumulator keyed on tool-call index</span>
+calls = {}
+<span class="c-kw">for</span> chunk <span class="c-kw">in</span> stream:
+    <span class="c-kw">for</span> tc <span class="c-kw">in</span> chunk.choices[<span class="c-nu">0</span>].delta.tool_calls <span class="c-kw">or</span> []:
+        e = calls.setdefault(tc.index, {<span class="c-st">"id"</span>: <span class="c-kw">None</span>, <span class="c-st">"name"</span>: <span class="c-kw">None</span>, <span class="c-st">"args"</span>: <span class="c-st">""</span>})
+        <span class="c-kw">if</span> tc.id: e[<span class="c-st">"id"</span>] = tc.id
+        <span class="c-kw">if</span> tc.function <span class="c-kw">and</span> tc.function.name: e[<span class="c-st">"name"</span>] = tc.function.name
+        <span class="c-kw">if</span> tc.function <span class="c-kw">and</span> tc.function.arguments:
+            e[<span class="c-st">"args"</span>] += tc.function.arguments
+final = [{<span class="c-st">"id"</span>: v[<span class="c-st">"id"</span>], <span class="c-st">"name"</span>: v[<span class="c-st">"name"</span>], <span class="c-st">"args"</span>: json.loads(v[<span class="c-st">"args"</span>])}
+         <span class="c-kw">for</span> _, v <span class="c-kw">in</span> <span class="c-fn">sorted</span>(calls.items())]</pre>
+
+    <p>The GPT-4.1-nano duplicate-call bug is worth flagging by name. On some prompts, the nano model emits a second tool-call block with the same <code class="inline">index</code> and <code class="inline">id</code> as the first, effectively repeating the whole call. The naive accumulator sees the repeat, appends its <code class="inline">arguments</code> onto the already-completed args string, and JSON-parse fails because the concatenated string is two JSON objects glued together. The defensive fix is idempotency: once a call's args parse cleanly, treat further chunks with the same id as a no-op. The tracker on the OpenAI SDK repo has a specific report for this pattern; the workaround is a couple of lines and prevents a silent corrupt-call bug you will spend an hour chasing otherwise.</p>
+
+    <p>The Responses API changes the shape a little but the accumulator pattern is the same — you key on <code class="inline">item_id</code> for a <code class="inline">function_call</code> item and append <code class="inline">arguments</code> deltas. The typed stream event names are different (<code class="inline">response.function_call_arguments.delta</code>), but the state machine is one for one.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Gemini: chunks are larger, aggregation is coarser.</h3>
+
+    <p>Gemini's streaming emits <code class="inline">GenerateContentResponse</code> chunks, each carrying <code class="inline">candidates[0].content.parts</code>. Function-call parts appear as <code class="inline">functionCall: {name, args}</code> — and the <code class="inline">args</code> field, unlike OpenAI's incremental string, tends to arrive as a mostly-complete or whole JSON object in one chunk. The accumulator still has to be tolerant of receiving multiple chunks for the same call (Gemini's newer models occasionally split large arg objects across two chunks), but the common case is one function-call part per stream, arriving late, complete.</p>
+
+<pre class="standalone"><span class="c-cm"># Gemini — accumulate function-call parts, tolerant of coarser chunks</span>
+calls = []
+<span class="c-kw">for</span> chunk <span class="c-kw">in</span> stream:
+    <span class="c-kw">for</span> part <span class="c-kw">in</span> (chunk.candidates[<span class="c-nu">0</span>].content.parts <span class="c-kw">or</span> []):
+        fc = <span class="c-fn">getattr</span>(part, <span class="c-st">"function_call"</span>, <span class="c-kw">None</span>)
+        <span class="c-kw">if</span> fc <span class="c-kw">is</span> <span class="c-kw">None</span>: <span class="c-kw">continue</span>
+        <span class="c-cm"># If Gemini split args across chunks, merge into the last-open call</span>
+        <span class="c-kw">if</span> calls <span class="c-kw">and</span> calls[<span class="c-nu">-1</span>][<span class="c-st">"name"</span>] == fc.name <span class="c-kw">and</span> <span class="c-kw">not</span> calls[<span class="c-nu">-1</span>][<span class="c-st">"closed"</span>]:
+            calls[<span class="c-nu">-1</span>][<span class="c-st">"args"</span>].update(<span class="c-fn">dict</span>(fc.args))
+        <span class="c-kw">else</span>:
+            calls.append({<span class="c-st">"name"</span>: fc.name, <span class="c-st">"args"</span>: <span class="c-fn">dict</span>(fc.args), <span class="c-st">"closed"</span>: <span class="c-kw">False</span>})
+<span class="c-cm"># Close on stream end</span>
+<span class="c-kw">for</span> c <span class="c-kw">in</span> calls: c[<span class="c-st">"closed"</span>] = <span class="c-kw">True</span></pre>
+
+    <p>Two Gemini specifics matter. First, <code class="inline">args</code> arrives as a structured object, not a JSON string — you do not parse it, you consume it. That is nicer than OpenAI's shape but breaks any code that assumes "streaming means concatenating strings." Second, parallel calls in Gemini appear as multiple <code class="inline">functionCall</code> parts in the same chunk's <code class="inline">parts</code> array or across chunks; the accumulator has to walk the parts list per chunk, not assume one call per chunk.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Anthropic: content blocks, parallel-call interleaving.</h3>
+
+    <p>Anthropic's streaming is event-typed: <code class="inline">message_start</code>, <code class="inline">content_block_start</code>, <code class="inline">content_block_delta</code>, <code class="inline">content_block_stop</code>, <code class="inline">message_stop</code>. A tool call arrives as a <code class="inline">content_block_start</code> with a <code class="inline">tool_use</code> block (carrying <code class="inline">id</code> and <code class="inline">name</code>), followed by a series of <code class="inline">content_block_delta</code> events with <code class="inline">input_json_delta</code> partial JSON strings, followed by a <code class="inline">content_block_stop</code>. Multiple parallel tool calls appear as multiple content blocks with different indices, and Anthropic can interleave deltas from different blocks in the same stream — the accumulator keys on the block index and does not assume a call is complete until its <code class="inline">content_block_stop</code> arrives.</p>
+
+<pre class="standalone"><span class="c-cm"># Anthropic — event-typed stream, index-keyed accumulator</span>
+blocks = {}
+<span class="c-kw">for</span> event <span class="c-kw">in</span> stream:
+    <span class="c-kw">if</span> event.type == <span class="c-st">"content_block_start"</span> <span class="c-kw">and</span> event.content_block.type == <span class="c-st">"tool_use"</span>:
+        blocks[event.index] = {<span class="c-st">"id"</span>: event.content_block.id,
+                               <span class="c-st">"name"</span>: event.content_block.name,
+                               <span class="c-st">"args"</span>: <span class="c-st">""</span>, <span class="c-st">"done"</span>: <span class="c-kw">False</span>}
+    <span class="c-kw">elif</span> event.type == <span class="c-st">"content_block_delta"</span> <span class="c-kw">and</span> event.index <span class="c-kw">in</span> blocks:
+        <span class="c-kw">if</span> <span class="c-fn">getattr</span>(event.delta, <span class="c-st">"type"</span>, <span class="c-kw">None</span>) == <span class="c-st">"input_json_delta"</span>:
+            blocks[event.index][<span class="c-st">"args"</span>] += event.delta.partial_json
+    <span class="c-kw">elif</span> event.type == <span class="c-st">"content_block_stop"</span> <span class="c-kw">and</span> event.index <span class="c-kw">in</span> blocks:
+        blocks[event.index][<span class="c-st">"done"</span>] = <span class="c-kw">True</span>
+        blocks[event.index][<span class="c-st">"args"</span>] = json.loads(blocks[event.index][<span class="c-st">"args"</span>] <span class="c-kw">or</span> <span class="c-st">"{}"</span>)</pre>
+
+    <p>The parallel-call trap is real. Two tool_use blocks running in parallel can interleave: the stream can carry a delta for block 1, then block 2, then block 1 again, and the accumulator that keys on "the last block" (rather than the block index in the event) will misroute the fragment. This is documented in the Anthropic SDK but not always mirrored in downstream framework glue; the <a href="/deep-dives/architectures-and-patterns/tool-error-recovery" class="xref">tool-error-recovery</a> essay treats the recovery patterns that clean up when the accumulator does misroute, but the cheaper fix is the index-keyed accumulator above.</p>
+
+    <p>One more Anthropic-specific note: the initial <code class="inline">content_block_start</code> for a tool_use includes a <code class="inline">input: {}</code> field that is usually empty — the real args come in the deltas. Some accumulators mistake the empty <code class="inline">input</code> for the final args and miss the deltas entirely, ending up with a tool call whose arguments are the empty object. The fix is to always concatenate deltas into a fresh string, ignoring the empty initial input.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>A portable accumulator shape.</h3>
+
+    <p>Three accumulators, one common state machine. Every one of them looks like: (1) on the first event that names a tool call, allocate a per-call state keyed on the call's identity (index, block index, or item id); (2) on every event that carries an argument fragment for a known call, append it; (3) on stream end (or per-call completion event), parse and validate the args, then hand the completed call list to the harness. A portable adapter that maps each vendor's stream into the same "start / append / close" event trio is small — a hundred or so lines per vendor — and lets the rest of your harness be vendor-agnostic.</p>
+
+    <p>Two things are worth wiring in from the start. First, per-call idempotency: track which call ids you have already dispatched, and drop repeats. This defeats the OpenAI GPT-4.1-nano duplicate-call bug and any equivalent that shows up on the other vendors as their models evolve. Second, malformed-JSON tolerance: if the args string does not parse at close time, do not silently ship a broken tool call — surface the malformed args to the harness and let it emit a corrective tool result the model can retry against. The <a href="/deep-dives/tool-capability-design/tool-error-messages" class="xref">error-messages-as-prompts</a> discipline treats what that corrective message should look like.</p>
+
+    <p>Read the five steps together and streaming tool calls stop being a per-vendor puzzle and start being an adapter-layer exercise. The shape is the same everywhere: identity-keyed accumulator, fragment append, complete-and-parse close. The bumps are all in the vendor-specific field names, the chunk granularity, and the specific bugs that show up on specific models. Get the adapter right once, keep the per-vendor bug notes in a comment next to the branches, and the streaming loop stops being where your harness breaks in production — it becomes the boring piece under all the interesting reasoning.</p>
+  </div>
+</section>

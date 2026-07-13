@@ -1,0 +1,80 @@
+<section class="phase">
+  <div class="phase-num">M8</div>
+  <div class="week">深入解析 · 记忆与上下文工程</div>
+  <h2>记忆的读侧问题已解；2026 年的架构分歧出现在写侧——情景、语义、程序、关系四类记忆各要各的写策略，而 RAG-only 不是其中之一。</h2>
+  <p class="goal">多年以来，"给智能体加记忆"意思是"旁边挂一份向量库"。这在读侧奏效。写侧则崩掉：谁配占用一个记忆槽、槽何时过期、过期条目谁去失效、写入是否用户可见。2026 年的记忆架构按记忆种类分——情景（事件轨迹）、语义（事实）、程序（学到的行为）、关系（实体图）——每一类都要求各自的写策略。这篇讲分类法、写时决策，以及"2026 年为何仍有团队只交付 RAG-only"。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>四类记忆，以及为何一份写策略罩不住它们。</h3>
+
+    <p>把记忆当成一件事的诱惑来自读侧——基于嵌入的存储几乎能承接所有读。这份存储的下游，生产智能体里会出现四类记忆，各自有不同的生命周期、不同的失败模式、不同的"什么叫对"。情景记忆是"发生了什么"的轨迹——回合、工具调用、观察、时间戳——写起来便宜、摘要起来困难，主要用于回放与事后审计。语义记忆是被蒸馏出的事实集——"用户偏好公制单位"、"该客户的账户在 12 号升了级"——写正确的代价高，世界变化后失效的代价也高。程序记忆是"在这里怎么做 X"的配方——上次奏效的工具序列、该租户必须先置位的 flag、这套环境需要的重试策略——凭"成功"得来，"不再回本"就被遗忘。关系记忆是实体图——人、组织、项目，以及它们之间的边——是有状态智能体推理"谁是谁"时倚仗的面。</p>
+
+    <p>技术上这四类都能塞进一份向量库，2024 年多数记忆栈也确实这么干。失败模式不是检索坏了；检索通常仍能返回看似合理的东西。失败模式在于<a href="/zh/deep-dives/memory-and-context/short-vs-long-term-memory" class="xref">提升／降级循环</a>不再讲得通——过期事实与新鲜轨迹拿到同样权重，能用的程序和过时的程序都会浮上来，智能体的行为就成了"今天嵌入器碰巧把哪条排得高"的函数。<a href="/zh/deep-dives/memory-and-context/memory-types" class="xref">记忆类型那篇</a>把情景、语义、程序当作彼此独立的机制处理是有原因的，2026 年真正能跑的架构就是以那份切分作为写策略挂靠的接缝。</p>
+
+<pre class="trace">Kind         | Lifetime      | Write cost   | Invalidation      | User-visible?
+-------------|---------------|--------------|-------------------|---------------
+Episodic     | session-days  | cheap        | TTL / roll-off    | usually no
+Semantic     | months-years  | expensive    | source-driven     | often yes
+Procedural   | usage-decayed | medium       | reward-driven     | sometimes
+Relational   | project-life  | medium       | edge-invalidation | sometimes
+
+Write path per kind is different; one policy for all four is the anti-pattern.</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>每个架构都会做（不管它是否说出口）的四个写路径决策。</h3>
+
+    <p>不论记忆种类，任何一次写入都是四个轴上的决策。第一，<em>谁配占位</em>——那道决定"这条观察值得记住"而非"这只是轨迹噪声"的门。第二，<em>何时写</em>——本回合内联、回合末、会话末，还是异步反思任务里写。第三，<em>谁去失效</em>——TTL、来了一条相互矛盾的新写入、用户显式删除，或后台对着真相源做的对账。第四，<em>写入是否可见</em>——沉默、进日志，还是在 UI 里被浮出成"我会记住这条"。把这四条轴命名出来，就能在不同记忆种类之间比较策略，而不是在实现细节上打嘴仗。</p>
+
+    <p>多数团队踩的坑是只回答了第一条轴，剩下三条听凭框架偶然决定。"我们用 LLM 决定要记什么"回答了<em>谁配占位</em>；对失效则一言未发，六个月后记忆库就成了"曾经为真"的博物馆。<a href="/zh/deep-dives/memory-and-context/retrieval-augmented-memory" class="xref">检索增强记忆</a>那篇讲的是这场失败的召回侧——老条目淹没新信号——修法不是更聪明的检索，而是"第一次写入落库之前就已命名了失效"的写策略。</p>
+
+<pre class="standalone"><span class="c-cm"># A write-gate function that names all four axes explicitly.</span>
+<span class="c-kw">def</span> should_write(candidate, kind, ctx):
+    <span class="c-kw">if not</span> earns_slot(candidate, kind):        <span class="c-cm"># axis 1</span>
+        <span class="c-kw">return</span> <span class="c-kw">None</span>
+    when  = write_moment(kind, ctx)             <span class="c-cm"># axis 2: inline|end-turn|reflect</span>
+    inval = invalidation_policy(kind, candidate) <span class="c-cm"># axis 3: ttl|source|user|quorum</span>
+    vis   = visibility(kind, candidate, ctx)     <span class="c-cm"># axis 4: silent|logged|surfaced</span>
+    <span class="c-kw">return</span> WritePlan(kind=kind, when=when, invalidate=inval, visibility=vis)</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>情景记忆：只追加、便宜、对滚出无情。</h3>
+
+    <p>四类里，情景记忆最好做对，也最容易过度设计。写策略是只追加、按会话、带时间戳、便宜：一回合发生、一行落库，环里不塞一个 LLM 去判"这条值不值得记"。第一条轴上"总是可以"接近正解，因为这份存储是按时间扫、不是按相关性查的。第二条轴内联。第三条轴是 TTL——交互式助手 24 小时、研究智能体 30 天、合规相关流程 90 天——加用户显式删除。第四条轴默认沉默；日志的存在是给回放用，不是给读的。</p>
+
+    <p>情景侧的过度设计通常出现在"写入时就把它汇成语义记忆"，这就把两份写策略混在一起、两侧的失效都做错。让情景写入保持笨。另开一条反思——周期性、离线、可反复重跑——它去读情景日志、提出候选的语义写入。两条路径在反思边界汇合，而不是在写入这一步。这与<a href="/zh/deep-dives/memory-and-context/context-compaction" class="xref">上下文压缩阶梯</a>把轨迹提升为结构化摘要时用的是同一道接缝：底层只追加、上层做蒸馏。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>语义记忆：四条轴上每一条都难的写路径。</h3>
+
+    <p>语义记忆是写路径值得占用架构预算的地方。第一条轴要回答"这是事实、只是路过的偏好，还是玩笑？"——诚实的答案要求模型有点根据支撑这句话，而不是靠一个"什么都想记住"的分类器。第二条轴几乎从不是内联；正确的时刻是会话结束后的反思任务，此时整条轨迹告诉你哪些主张被下游的成功所证实。第三条轴失效是智能体记忆里最难的问题：事实带出处（一份文档、一次工具结果、一句用户陈述），出处被替换时事实也必须被替换。这就是"带源标签的写入"承重的原因；没有来源的语义条目，是你无法正确失效的条目。</p>
+
+    <p>第四条轴上，UX 层挣自己的饭钱。悄悄写入的语义条目日后引导智能体行事，会让用户吃惊、烧掉信任；被浮出的写入（"我会记住你偏好公制单位"）让用户在造成伤害之前更正或删除。2026 年真正上线的模式是：反思产出一条候选语义条目，条目在自然时点（会话末、下次会话开场、设置面板）被浮到用户面前，用户给出同意与删除。在真正拿到同意之前，写入不进入"用于推理"的分区。跳过同意步骤，就是"记忆毒化对智能体来说像个普通礼拜二"的开始——这是下一篇的主题。</p>
+
+    <p>去重属于这条写路径，不属于检索。两条意思相同的写入（"偏好公制"、"想要单位用 kg"）应在写入时通过归一化步骤合并（嵌入、聚类、规范化、把胜出形式提升进库、把其余的做成别名）。检索时去重可行但浪费且不一致——同一条查询今天返别名、明天返规范化名。语义写入是贵的；应当少而每一条都是规范化的。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>程序与关系写入：由奖励驱动、由边失效。</h3>
+
+    <p>程序记忆是"配方"存储——"在这个租户上，<code class="inline">list_orders()</code> 之前先调 <code class="inline">refresh_session()</code>"、"CSV 导出必须带上 region flag 才能绕过分页 bug"。写路径由奖励驱动：一条配方在解释一次成功（或规避一次智能体察觉到的失败）时得到一个位置，在其"按使用加权的成功率"跌破阈值后失去位置。第三条轴既不是 TTL 也不是来源，而是<em>奖励衰减</em>——曾经奏效但已不再回本的程序应当悄然退场。第四条轴对智能体内部程序通常沉默、对面向用户的程序则浮出（"下次我就这么做——可以吗？"）。<a href="/zh/deep-dives/memory-and-context/memory-stores" class="xref">记忆存储那篇</a>讲过后端匹配（通常是按（tenant, task-shape）键的 KV，不是向量索引）；写路径是让这份存储不腐烂的东西。</p>
+
+    <p>关系记忆是实体图——节点是人／组织／项目／工单，边是关系，两者都带来源。写路径自然拆成节点写入（观察到一个新实体）和边写入（断言一段关系）。第三条轴是边失效：关系改变时（"Alice 不再是账户负责人"），边应被标为历史、而不是删除——图的任务是记住这次变化，而不是对现在撒谎。边的第一条轴必须包含一个置信度：被一次工具调用一次断言的边，与一个月内被三条来源确认的边不是一回事。忽略边置信度的检索会被谣言骗到。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>用户可见的写入、同意，以及 RAG-only 为何在 2026 仍在出货。</h3>
+
+    <p>同意界面不是装饰。当智能体提交一条日后将引导它对这位用户行事的语义条目时，用户需要知道它发生过、需要能查看、需要能删除。跳过这一步的团队一次交付两种失败：用户被"莫名其妙记得的、他们从未意识到已被存下的东西"吓到；攻击者拿到一条免费写入通道，因为"既然模型选择记住它，那它必是事实"。写入可见性这条轴，就是把它变成一个可控界面的抓手。实操层面：一个"记忆标签页"或"每会话摘要"，列出记住了什么、为什么记住，一键删除。没有花活，但这份界面的存在，就是让语义写路径可以被安心留开的原因。</p>
+
+    <p>把以上都说清之后，为什么 RAG-only 在 2026 还能出货？因为对某一类工作负载——无状态的单轮助手、检索一份自带修订轨迹的语料、从不积累用户特有状态的智能体——RAG-only 确实够用。经验法则是：如果智能体的有用度不随会话累计，RAG-only 就够。如果会累计——如果下周二的会话应因为这周二发生过的事而可测地更好——写路径就是这份累计的所在，四条轴不会自己设计出来。后续的几篇（<a href="/zh/deep-dives/memory-and-context/evaluating-memory" class="xref">评估记忆</a>，以及本组接下来的毒化防御那一篇）都假设你已有一条可衡量、可防御的写路径；这一篇讲的是它怎么建起来。</p>
+  </div>
+</section>

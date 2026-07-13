@@ -1,0 +1,76 @@
+<section class="phase">
+  <div class="phase-num">E3</div>
+  <div class="week">Deep Dive · Evaluating Agents</div>
+  <h2>Static benchmarks miss what breaks agents in production &mdash; HAL measures cost-per-solve and reliability, Gaia2 forces asynchronous environments &mdash; and the numbers are lower than SWE-bench for reasons that matter.</h2>
+  <p class="goal">Static benchmarks reward the shape of a solvable puzzle; real deployment adds cost, reliability, and asynchrony. HAL (Princeton) reports cost-per-solve and a five-dimension reliability dashboard &mdash; consistency, predictability, robustness, safety, self-awareness. Gaia2 forces write-action verifiers, temporal constraints, and asynchronous environments where the world changes between the agent's steps. The numbers are lower than SWE-bench; the reasons are honest. This essay is what each measures and why to plan against them.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Static-benchmark blindness.</h3>
+
+    <p>A static benchmark is one that hands the agent a fixed problem instance, waits until the agent has finished, and checks whether the final state satisfies a fixed grader. SWE-bench Verified and Pro fit this description exactly, and it is what makes them cheap enough to run at leaderboard scale. It is also what makes them blind to three failure modes that dominate real deployment. The world does not stop moving while the agent thinks &mdash; a ticket closes, a config file changes, a downstream service starts rate-limiting &mdash; and none of that shows up in a puzzle-shaped benchmark. The cost of a solve is not the price of a single API call; it is the price of the agent's full trajectory including retries, tool calls, and dead ends, and puzzle-shaped benchmarks report pass rate without cost. Reliability across repeated runs is not the same as pass@1 on a single run; a model that solves the task 60% of the time on ten runs is a wildly different production risk from a model that solves it every time, and puzzle-shaped benchmarks do not distinguish those.</p>
+
+    <p>The <a href="/deep-dives/evaluating-agents/benchmark-landscape-2026" class="xref">benchmark landscape essay</a> makes the ranking case for treating Verified as an audit signal rather than a leaderboard. The reliability case is stronger: the properties that puzzle-benchmarks skip are precisely the properties that decide whether the agent survives its first month in production. HAL and Gaia2 exist because the field noticed.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>HAL: cost-per-solve.</h3>
+
+    <p>Princeton's Holistic Agent Leaderboard reports a cost-per-solve number alongside every pass rate, computed as total dollar spend on model calls and tool invocations during the benchmark run divided by the number of solved instances. The formula is banal; publishing it is the innovation. A ranking on pass rate alone treats a model that spends $8 per solve identically to one that spends $0.40; a procurement team cannot make a decision from that number. A ranking that includes cost-per-solve says "this model leads by three points but costs 4x as much" and lets you weigh the trade-off against your traffic pattern.</p>
+
+    <p>The measurement has one subtlety worth naming. Cost-per-solve is computed only over solved instances, not over all attempts, because the alternative (total spend divided by total attempts) rewards models that fail cheaply. A model that gives up early on hard problems would look "cheap" under the total-attempts denominator; under HAL's solved-instances denominator it correctly looks more expensive because the harder solves cost more, and giving up on them does not reduce the price of the ones it did solve. The <a href="/deep-dives/evaluating-agents/judge-calibration-and-meta-evaluation" class="xref">judge-calibration essay</a> made a parallel point about which denominator to use for agreement metrics; the pattern generalizes &mdash; the denominator is where benchmark design lives or dies.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>HAL: 5-dim reliability.</h3>
+
+    <p>HAL's reliability dashboard reports five scores per model, each in [0, 1], and each defined against a specific experimental protocol. Consistency is agreement between multiple runs on the same input &mdash; how often does the agent produce the same solved-or-not outcome. Predictability is the calibration of the agent's stated confidence against actual success &mdash; when the agent says "I got it," how often did it actually get it. Robustness is pass rate under adversarial input perturbation &mdash; typo-injected prompts, tool-error injection, resource-limit throttling. Safety is refusal-quality on a curated red-team subset. Self-awareness is the joint of predictability and calibrated abstention &mdash; when the agent should have said "I cannot do this" instead of trying and failing, how often did it.</p>
+
+<pre class="trace"><span class="c-out">HAL reliability dashboard &mdash; per-model panel
+------------------------------------------------
+consistency      0.88   run-to-run outcome agreement
+predictability   0.79   stated vs actual success
+robustness       0.71   pass rate under perturbation
+safety           0.94   red-team refusal quality
+self_awareness   0.55   calibrated abstention
+------------------------------------------------
+notes:
+  self_awareness &lt; 0.70 = frequent overconfident tries on infeasible tasks
+  predictability &lt; 0.60 = stated confidence unusable for gating</span></pre>
+
+    <p>The dashboard is worth reading in a specific order. Safety is the floor &mdash; if it is not high, nothing else matters. Consistency and predictability together tell you whether the pass-rate number is stable enough to plan against. Robustness tells you how the agent behaves at the edges you did not test yourself. Self-awareness is the one that decides whether the agent can be trusted in a workflow with a human-review escalation step, because a low-self-awareness agent that "tries anyway" on infeasible tasks is the one that produces the most expensive failures &mdash; long trajectories that end in a wrong answer confidently delivered.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Gaia2: async environments.</h3>
+
+    <p>Gaia2's design is where the "world changes between steps" property gets forced into the benchmark. Tasks run inside a simulated environment where background actors modify shared state on their own schedule &mdash; tickets close, calendars shift, files get rewritten &mdash; and the grader is a set of write-action verifiers that check each of the agent's mutations against the environment's live state at the moment of the mutation, not at some pre-computed answer key. An action that would have been correct at t=0 can be graded wrong at t=30 because the underlying resource was closed by a background actor, and the agent has to notice.</p>
+
+<pre class="standalone"><span class="c-cm"># gaia2_task_example.py &mdash; simplified.</span>
+<span class="c-kw">from</span> gaia2 <span class="c-kw">import</span> Environment, WriteVerifier
+
+env = Environment.load(<span class="c-st">"tickets/scheduling-conflict-v3"</span>)
+env.schedule_background(<span class="c-st">"ticket_closed_by_ops"</span>, at_step=<span class="c-nb">4</span>)
+
+<span class="c-kw">async def</span> run(agent):
+    trace = <span class="c-kw">await</span> agent.solve(env)
+    <span class="c-kw">for</span> action <span class="c-kw">in</span> trace.write_actions:
+        WriteVerifier.check(action, env.state_at(action.timestamp))</pre>
+
+    <p>The write-action verifier is the piece that makes the setup gradable. Read-only actions are cheap to verify &mdash; the grader just re-reads. Write actions are the hard part, because "did the agent make a legitimate mutation" depends on both the input state and the mutation's contract, and both can be different at t=30 than at t=0. Gaia2 solves this by requiring every write action to declare its expected pre-state, which the verifier checks against the actual state at the mutation's timestamp. An action whose expected pre-state matches the actual pre-state and whose post-state matches the contract passes; otherwise it fails, and the agent gets credited only for its correct writes.</p>
+
+    <p>Best pass@1 numbers on Gaia2 sit around 42% for the strongest frontier models, and most frontier models are in the 25-35% band &mdash; substantially lower than SWE-bench Verified. The gap is not because the models got worse; it is because Gaia2 is measuring properties Verified never checked. Async awareness, mid-trajectory adaptation, and correct handling of stale-state errors are not what static benchmarks reward.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>How to plan against them.</h3>
+
+    <p>Three planning rules survive contact with these benchmarks. First, budget cost-per-solve, not per-call. If your HAL cost-per-solve is $1.40, and you expect to serve 20,000 solves a month, your model bill is $28,000 before any tool or infrastructure cost &mdash; and if a model's pass rate goes up 2 points but its cost-per-solve doubles, that trade is almost certainly a bad deal at scale. Second, treat the reliability dashboard as a gate, not a rank. Consistency below 0.85 means you cannot use pass rate to compare candidate deployments because the run-to-run noise floor is higher than the difference between them. Safety below 0.90 means the agent is not deployable in a workflow that touches customer input without a second gate. Self-awareness below 0.70 means you should not deploy without an outer verifier that catches confident-wrong outputs. Third, weight async-benchmark scores when the workload is async. If your production surface involves background state changes (support tickets, CRM records, scheduling systems), Gaia2 pass rate matters more than SWE-bench Pro rank, and the reverse if your surface is closer to code-review-style batch tasks.</p>
+
+    <p>The load-bearing point across all three rules is that pass rate on a single benchmark is not enough information to make a deployment decision. The 2026 discipline is a panel: a pass rate you trust the ranking of, a cost-per-solve you can afford, a reliability dashboard whose weakest dimension is above the deployment floor, and (for async workloads) a Gaia2 score whose gap from the static-benchmark score you have made peace with. Any team that has run an agent in production for more than a quarter has learned this the expensive way; HAL and Gaia2 are the frame that lets a team learn it before the incident.</p>
+  </div>
+</section>

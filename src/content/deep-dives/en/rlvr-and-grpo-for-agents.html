@@ -1,0 +1,103 @@
+<section class="phase">
+  <div class="phase-num">T7</div>
+  <div class="week">Deep Dive · Training Agentic Models</div>
+  <h2>RLVR + GRPO is the 2026 canonical recipe for agentic post-training, and the failure modes — entropy collapse, KL drift, credit assignment across turns — have named fixes.</h2>
+  <p class="goal">By mid-2026 the frontier agent-training recipe converged: SFT to imitate, DPO or SimPO to align, GRPO or DAPO with a verifiable reward to optimize. RLVR (Reinforcement Learning with Verifiable Rewards) is the load-bearing idea — grade at the outcome, not the trajectory. The failure modes — entropy collapse when GRPO's group-relative signal saturates, KL drift from the base policy, credit assignment across multi-turn tool loops — each have named fixes (ARPO, StepPO, Turn-PPO). This essay is the recipe and the traps.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The three-stage recipe: SFT, preference alignment, verifiable-reward RL.</h3>
+
+    <p>The pipeline every serious post-training team runs in 2026 has three stages, in this order, for reasons the ablations have made hard to argue with. Stage one is supervised fine-tuning on a corpus of demonstrations: correct trajectories, often distilled from a stronger model, that teach the policy the shape of the task and get its output distribution into the neighborhood of useful behavior. Skip SFT and the RL that follows spends most of its budget teaching syntax rather than skill. Stage two is preference alignment — DPO on offline preference pairs, or SimPO when you want a simpler length-normalized alternative — which nudges the policy toward the ordering humans (or a stronger AI judge) prefer without the cost of a full learned reward model. The <a href="/deep-dives/training-agentic-models/rlhf-and-rlaif" class="xref">RLHF and RLAIF walkthrough</a> covers the ordering logic in more detail; what matters here is that stage two happens before the verifiable-reward stage, not instead of it.</p>
+
+    <p>Stage three is where 2026 diverged from 2024. The optimizer is GRPO or one of its DAPO-family variants, and the reward is verifiable: pass/fail from unit tests, from a proof checker, from ground-truth string match, from an executable oracle. This is what "RLVR" — Reinforcement Learning with Verifiable Rewards — names. The claim is not that verifiable rewards are new; it is that they are the only reward signal that survives contact with the reward-hacking dynamics <a href="/deep-dives/training-agentic-models/reward-design-and-hacking" class="xref">the reward-hacking essay</a> catalogs at scale. A learned reward model can be gamed; a compiler cannot. The stage three budget is where the capability gains show up on hard benchmarks, and where the failure modes named in the rest of this essay live.</p>
+
+    <p>The one arrangement question worth flagging: DPO and GRPO are not interchangeable substitutes. DPO is cheap, offline, and cannot leverage new rollouts against a verifier; GRPO is expensive, on-policy, and needs a verifier to run at all. Teams that skip stage two and jump from SFT straight to GRPO find that the group-relative advantage estimation is noisy on a policy that hasn't been aligned yet, and they eat sample budget teaching preferences that DPO would have taught cheaply. Teams that skip stage three and stop at DPO have a well-aligned model that plateaus below what the verifier could have unlocked. The three stages compose; each one earns its slice of the budget.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Verifiable rewards: what earns the label, what doesn't.</h3>
+
+    <p>A reward is verifiable when the check is cheap, deterministic, and hard to game — an executable oracle that returns a scalar without a learned model in the loop. Code is the canonical case: run the unit tests, return 1.0 if they pass and 0.0 if they don't. Math is the second: run the numeric answer through a checker or a symbolic equality test. SQL and structured data-extraction tasks are the third: compare the produced rows against ground truth on a fixed evaluation set. Each of these has the two properties that make RLVR work — the verifier costs less per rollout than the policy did, and the policy can't fool it by writing plausible-looking output.</p>
+
+    <p>The label starts falling off when any of those properties weaken. A rubric-based rewrite scored by an LLM judge is not verifiable; it is <em>learned</em>, in the same sense a reward model is, and it suffers the same reward-hacking dynamics. A "does the code compile" reward is technically verifiable but so weak that policies learn to produce trivial code that compiles and does nothing. A verifier that leaks the answer into an observation — the tool returns the ground truth to the model before the model was supposed to derive it — is a training bug that the policy will find and exploit within a few thousand rollouts. The disciplined move is to write down what your verifier accepts and rejects, then adversarially probe it before starting the run, not after.</p>
+
+<pre class="standalone"><span class="c-cm"># Verifiable reward: an executable oracle, not a learned RM.</span>
+<span class="c-cm"># For each rollout, run the check; the scalar goes back to GRPO.</span>
+<span class="c-kw">def</span> <span class="c-fn">verifiable_reward</span>(task, trajectory):
+    final = <span class="c-fn">extract_final</span>(trajectory)
+    <span class="c-kw">if</span> task.kind == <span class="c-st">"code"</span>:
+        <span class="c-kw">return</span> 1.0 <span class="c-kw">if</span> <span class="c-fn">run_tests</span>(final, task.tests) <span class="c-kw">else</span> 0.0
+    <span class="c-kw">if</span> task.kind == <span class="c-st">"math"</span>:
+        <span class="c-kw">return</span> 1.0 <span class="c-kw">if</span> <span class="c-fn">numeric_equal</span>(final, task.answer) <span class="c-kw">else</span> 0.0
+    <span class="c-kw">if</span> task.kind == <span class="c-st">"sql"</span>:
+        <span class="c-kw">return</span> 1.0 <span class="c-kw">if</span> <span class="c-fn">rows_equal</span>(<span class="c-fn">execute</span>(final), task.gold_rows) <span class="c-kw">else</span> 0.0
+    <span class="c-kw">raise</span> <span class="c-fn">NotVerifiable</span>(task.kind)</pre>
+
+    <p>The domain question that decides whether you have an RLVR project at all is the one written into the last line of that snippet: what is <code class="inline">task.kind</code> if the answer is not code, math, or a structured query? For agentic tasks the answer is often "a sequence of tool calls with a state check at the end," which the <a href="/deep-dives/training-agentic-models/rl-for-tool-use" class="xref">RL for tool use</a> essay treats in detail; the verifier becomes an environment plus a terminal predicate rather than a one-shot function. For prose tasks the honest answer is "you don't have a verifier," and the recipe becomes DPO with an AI judge, not GRPO. Which one you're doing matters more than which optimizer you pick.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>GRPO and DAPO: the group-relative advantage and what it buys.</h3>
+
+    <p>GRPO — Group Relative Policy Optimization — is PPO with the value function removed. Instead of learning a critic to estimate baselines, it samples a group of trajectories on the same task, uses the group's mean reward as the baseline, and computes each trajectory's advantage as reward minus baseline. The effect is that the optimizer never needs a value network, which halves the compute per training step and eliminates a class of value-critic-instability failure modes. The cost is that the group has to be large enough for the mean to be a stable baseline (typically 8 to 64 trajectories per task) and the reward has to be a scalar the group can be usefully compared on. Binary verifiable rewards suit this perfectly: half the group passes, half doesn't, and the advantage signal is exactly whether this trajectory was on the winning side.</p>
+
+    <p>DAPO — Direct Advantage Policy Optimization, and the several variants that share the name — extend GRPO in two directions. First, they replace the group-relative baseline with a more sophisticated estimator (running statistics per task family, per-difficulty normalization) that reduces variance on tasks where the pass rate is very high or very low. Second, they add clipping and constraint terms adapted from PPO's proximal update to keep the policy from moving too far in one step. The reason to know the name is that DAPO variants are what production teams reach for once vanilla GRPO's variance stops being tolerable at scale; the reason not to over-invest in the taxonomy is that the DAPO family is still consolidating, and papers published a quarter apart are often relabeling the same core trick.</p>
+
+<pre class="standalone"><span class="c-cm"># GRPO training step, simplified. Group size G, task t, policy pi.</span>
+<span class="c-kw">for</span> t <span class="c-kw">in</span> batch_of_tasks:
+    trajs = [<span class="c-fn">sample</span>(pi, t) <span class="c-kw">for</span> _ <span class="c-kw">in</span> <span class="c-fn">range</span>(G)]
+    rewards = [<span class="c-fn">verifiable_reward</span>(t, tr) <span class="c-kw">for</span> tr <span class="c-kw">in</span> trajs]
+    baseline = <span class="c-fn">mean</span>(rewards)
+    advs = [r - baseline <span class="c-kw">for</span> r <span class="c-kw">in</span> rewards]
+    <span class="c-kw">for</span> tr, a <span class="c-kw">in</span> <span class="c-fn">zip</span>(trajs, advs):
+        loss = -a * <span class="c-fn">logprob</span>(pi, tr)
+        loss += beta * <span class="c-fn">kl</span>(pi, pi_ref, tr)   <span class="c-cm"># KL leash to the base</span>
+        <span class="c-fn">optimizer_step</span>(loss)</pre>
+
+    <p>Two implementation details reliably decide whether a GRPO run succeeds. The KL term against the frozen reference policy — the <code class="inline">pi_ref</code> in the snippet — is the leash that prevents the policy from drifting into a region where the verifier still accepts its output but human-judge quality has collapsed. Set the coefficient <code class="inline">beta</code> too low and stage three erases the alignment stage two paid for; set it too high and the policy can't move enough to actually optimize. The other detail is what to do with a group where every trajectory passes or every trajectory fails: the advantage is zero and the update carries no signal, so most implementations detect this and either resample the task or skip the update, since counting these steps as training progress is how run-averaged loss curves lie to you.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Entropy collapse and KL drift: the two failure modes with dashboards.</h3>
+
+    <p>Entropy collapse is the failure mode that shows up first and is easiest to detect. GRPO's group-relative signal reinforces the actions the winning trajectory took, and when the same class of task keeps being drawn, the policy's action distribution over the tokens that matter narrows until the group produces near-identical trajectories, which produces near-zero advantage, which stops training. The dashboard signature is the per-token entropy averaged over the group falling monotonically for several thousand steps and then plateauing near zero; the pass rate keeps climbing for a while, then plateaus too, at a level below what a healthier entropy profile would have reached. The interventions that work — an entropy bonus in the loss, a floor enforced by adding uniform noise below a threshold, sampling with slightly higher temperature during rollouts — are all cheap; noticing the collapse is what most teams get wrong.</p>
+
+<pre class="trace">step  |  pass_rate  |  group_entropy  |  kl_to_ref  |  status
+------+-------------+-----------------+-------------+--------
+  200 |   0.42      |   1.83          |   0.04      |  healthy
+  800 |   0.61      |   1.51          |   0.11      |  healthy
+ 1600 |   0.73      |   1.02          |   0.19      |  entropy trending down
+ 2400 |   0.79      |   0.48          |   0.28      |  ENTROPY COLLAPSE
+ 3200 |   0.79      |   0.11          |   0.44      |  stalled + KL drifting</pre>
+
+    <p>KL drift is the second failure mode, and it is less obvious because the pass rate goes on climbing while the policy silently walks away from the reference. The failure surface is not the verifier score; it is everything the verifier does not measure. A coding-verifier RL run whose KL to the reference exceeds some run-specific threshold — for a 7B base, 0.5 nats per token is a plausible early-warning number — will start producing tests-passing code that no human wants to read, or math solutions whose numeric answer is right and whose reasoning is nonsense. Watching pass rate alone will not flag this. The mitigation is not to eliminate KL drift — the whole point of stage three is to move the policy — but to bound it, using the beta coefficient as an active knob, and to hold out a small evaluation set the verifier is not the only judge on. Teams that skip that held-out set are teams that ship regressions and blame the verifier.</p>
+
+    <p>A third pattern shows up on longer runs and deserves a mention: verifier over-fitting. If the verifier is a fixed set of unit tests, the policy learns to pattern-match those tests specifically, and generalization to new tests in the same domain suffers. The fix is to rotate the verifier — sample tests from a larger pool, generate paraphrases, hold some out — which is expensive but is the difference between an RL run that improves the model and one that improves the benchmark.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Multi-turn: ARPO, StepPO, Turn-PPO and why one algorithm is not enough.</h3>
+
+    <p>Everything above assumes a single trajectory ends in one scalar reward. Agentic post-training breaks that assumption immediately: a trajectory is a sequence of turns with tool calls in between, and the outcome reward at the end is one scalar for a trajectory that made dozens of decisions. Vanilla GRPO applies the terminal advantage to every step in the trajectory equally, which spreads the training signal too thin and forces the policy to guess which of its many actions actually mattered. The multi-turn algorithm family — ARPO, StepPO, Turn-PPO, and the several near-synonyms these have gone by since 2025 — are all attempts to concentrate the signal on the step or turn that actually deserves credit.</p>
+
+    <p>ARPO (Advantage-Reweighted Policy Optimization) uses a lightweight critic — trained only on turn-level state, not on individual tokens — to redistribute advantage across turns proportionally to how much each turn changed the trajectory's expected value. StepPO takes a similar approach at a finer grain, using a process reward model (which the <a href="/deep-dives/training-agentic-models/process-vs-outcome-rewards" class="xref">process-vs-outcome-rewards essay</a> treats in more detail) to score each step and applying advantage per step. Turn-PPO cuts the trajectory into per-turn PPO updates with a small learned advantage per turn, which is the simplest of the three and the most stable in early experiments. None of the three has dominated at the time of writing; teams pick based on whether they have process labels (StepPO), whether they can afford the critic (ARPO), or whether they want the least infrastructure (Turn-PPO).</p>
+
+    <p>The design decision the essay wants to leave you with is not which of the three to pick. It is that the choice matters exactly when the trajectories are long enough that credit assignment is a bottleneck — thirty steps or more, and rollout counts in the tens of thousands. On shorter trajectories, vanilla GRPO's uniform credit is close enough to right that the extra machinery is dead weight. This is the same pattern the <a href="/deep-dives/training-agentic-models/rl-for-tool-use" class="xref">RL for tool use</a> essay makes for horizon-dependent choices generally: measure the horizon, then match the algorithm to it, not the other way around.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When PPO alone, DPO alone, or nothing is still the right answer.</h3>
+
+    <p>The recipe above is expensive. Stage one is cheap; stage two is moderate; stage three is where the bill lives, because on-policy RL against a real verifier means running the verifier on tens of thousands of rollouts, which for anything but the simplest oracles is where the compute goes. Three cases are worth reserving the recipe for something less: small policies where the base model's capability ceiling is already the bottleneck, tasks whose verifier isn't stable enough to survive adversarial rollouts, and workloads where SFT plus a lightweight preference-alignment pass produces a policy already inside the acceptable quality band.</p>
+
+    <p>Small policies — anything under ~3B parameters for reasoning-flavored tasks — often gain more from SFT-plus-distillation than from RL, because the RL signal has trouble finding useful gradients through a network that lacks the underlying representation. This is the pattern the <a href="/deep-dives/training-agentic-models/sft-rejection-sampling-distillation" class="xref">SFT, rejection sampling, and distillation</a> essay treats: pull knowledge in from a stronger teacher, then align, and skip the RL stage unless you have a specific reason to think the small model has unrealized capability that RL will surface. Reasoning models under 7B routinely plateau on GRPO where distillation would have kept climbing.</p>
+
+    <p>Tasks whose verifier is not stable — where the pass/fail signal changes with the runtime environment, or where a tolerable answer can be rejected by a strict oracle — poison RLVR because the reward becomes noisy and the policy learns to game the noise. The fix is to harden the verifier first, in the same spirit as fixing a flaky test suite before running it a million times. And workloads whose SFT-plus-DPO quality is already inside the acceptable band do not owe themselves the RL stage; the value of stage three shows up where the ceiling of stage two is materially below what the task requires, not where the ceiling is comfortable. RLVR + GRPO is the 2026 canonical recipe for agentic post-training because the returns on stage three are real for reasoning, coding, and tool-use tasks; the discipline is to name that the returns are conditional, and to skip the stage when the condition doesn't hold.</p>
+  </div>
+</section>

@@ -12,6 +12,7 @@ const group: Group = {
     { page: 'agent-debate-and-ensembles', slug: 'agent-debate-and-ensembles', title: L('Debate, Voting & Ensembles','辩论、投票与集成'), summary: L('Most of the gain is ensembling, not debate; without engineered diversity, debate collapses to the initial majority.','大部分收益来自集成而非辩论；没有设计出的多样性，辩论会坍缩回最初的多数派。') },
     { page: 'shared-memory-and-blackboard', slug: 'shared-memory-and-blackboard', title: L('Shared Memory & the Blackboard','共享记忆与黑板'), summary: L('A blackboard replaces N² messages with one shared store — and inherits write contention, stale reads, and lost updates.','黑板用一份共享存储替换 N² 条消息——并继承写争用、陈旧读和丢失更新。') },
     { page: 'multi-agent-failure-modes', slug: 'multi-agent-failure-modes', title: L('Multi-Agent Failure Modes','多智能体失败模式'), summary: L('Error propagation, groupthink, deadlock/livelock, cost explosion — the system-level bugs single-agent tooling cannot see.','错误传播、群体思维、死锁/活锁、成本爆炸——单智能体工具看不见的系统级 bug。') },
+    { page: 'sub-agent-patterns-comparison', slug: 'sub-agent-patterns-comparison', title: L('Sub-Agent Patterns Compared','子智能体模式对比'), summary: L('LangGraph supervisor / hierarchical / collaborative vs OpenAI Agents SDK handoffs-vs-agents-as-tools vs deepagents — when each shape works.','LangGraph 的 supervisor/层级/协作，与 OpenAI Agents SDK 的 handoff vs 智能体即工具，与 deepagents——各形态各自何时奏效。') },
   ],
 };
 export default group;

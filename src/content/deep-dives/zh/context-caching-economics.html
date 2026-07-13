@@ -1,0 +1,103 @@
+<section class="phase">
+  <div class="phase-num">D10</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>上下文缓存是 2026 年多数团队用得最不到位的单位经济性杠杆，而细则——写入溢价、TTL、失效——决定"缓存 9 折"在实操里究竟是 9 折还是 3 折。</h2>
+  <p class="goal">每家模型厂商都在宣传"缓存命中可省 90%"，而每个团队的实际节省差不多只有其一半。Anthropic 的缓存写入按基础价 1.25× 计费，读取按 0.1× 计费，TTL 只有 5 分钟。Gemini 报的是"统一 90% off"，TTL 更长，但有最小块大小。OpenAI 自动缓存，可控性更差。缓存叠加批处理大约 95% off——但仅当你的流量形状让缓存真能命中。这篇讲的就是细则、逐厂商，以及把"广告节省"变成"实际节省"的请求形状决定。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>跨厂商缓存计价，"9 折"到底是怎么算的。</h3>
+
+    <p>三家厂商，三份不同的合约。Anthropic 的 Claude 缓存是按块显式开启：你用 <code class="inline">cache_control</code> 标记提示的一段前缀，第一次请求要按基础输入费率 1.25× 支付<em>写入溢价</em>把这段前缀存下；随后命中同一份缓存前缀的请求，对这些 token 按 0.1× 计费（读取减 90%），TTL 5 分钟。Google 的 Gemini 缓存是按模型注入的 <em>cachedContent</em> 资源：写入价格与普通输入相同、命中前缀的读取减 90%、TTL 用户可设（默认 5 分钟，新模型上限 24 小时），且有最小可缓存块大小（2.5 Flash 约 1024 token，Pro 更高）。OpenAI 面向 GPT-4.1 及推理模型的提示缓存是自动的：任何以相同前缀 ≥1024 token 开头的提示都会命中缓存；非推理模型对缓存 token 打 5 折、o 系列可达 9 折，TTL 约 5–10 分钟，且没有写入溢价，因为是厂商决定什么进缓存。</p>
+
+    <p>大多数成本表格里被忘掉的正是"写入溢价"。在 Anthropic 上，如果你缓存一段 10 万 token 的 system prompt，而在 5 分钟 TTL 内只有一个请求命中，你就为写入付了 1.25×、为读取付了 0.1×——一个请求付出了 1.35× 基础价，而不是 1.0×。盈亏平衡大约是每次写入三次读取。低于此值，缓存反而亏钱。<a href="/concepts/cost-quality-latency" class="xref">成本-质量-延迟</a>三角在这个高度上多了第四维：复用率——把写入溢价换成读取节省的乘数。</p>
+
+    <p>如果你通过网关或<a href="/concepts/inference-providers" class="xref">推理提供方</a>接入，合约又不同。Bedrock 和 Vertex 暴露的是同一套底层缓存，但计费包装是自己的；Fireworks、Together 等转售开源权重模型，通常不缓存。请对着具体厂商的条目读，不要看营销页上的"最高 9 折"。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>TTL 与"新鲜度/命中率"的取舍。</h3>
+
+    <p>TTL 是缓存"从魔法变工程决策"的地方。Anthropic 默认 5 分钟的 TTL，本质上意味着缓存是"同会话内工具"——用户的下一轮命中上一轮的缓存前缀，一顿咖啡后闲置结束，缓存就没了。这对交互式对话可用，对"跨用户摊销"则很糟：一份被上千用户共享的 system prompt 无法在 5 分钟内摊平，除非流量足够密、每 5 分钟窗口里都有 ≥3 个命中此前缀的请求。Gemini 和 OpenAI 的 o 系列有更长的 TTL（Gemini 可到 24 小时，但要付一点小时级存储费；OpenAI 的 o 系列相比 4.1 明显持缓存更久）——这才打开跨用户摊销：同一份 system prompt 一天只写入一次，之后每次请求对共享字节只付 0.1×。</p>
+
+    <p>TTL 的另一面是失效。每家厂商在缓存内容有任何改动时都会失效：改动 system prompt 里的一个字符，下一次请求就要重新写入。于是 system prompt 的版本也进入了你的单位经济性模型。下午 3 点把 prompt 变更 100% 上线，周三下午的头 15 分钟就会因为写入溢价冲一波成本，随后回落。若你在做 system prompt 的 A/B 测试，每个变体是独立的缓存；切分比例乘 TTL 决定每个变体能否达到"能赚回来"的复用率。</p>
+
+    <p>在短 TTL 上把损失捞回大部分的设计手段，是把缓存前缀做成<em>不可变身份</em>——版本化、哈希化、按 ID 引用——即使没有一个"滑动窗口"保证流量密度，缓存也能在流量收敛处捡回来。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>真正被缓存的是什么：顺序要紧。</h3>
+
+    <p>每家厂商都按<em>前缀匹配</em>缓存：请求的 token 从头开始与缓存对比，第一个不同的字节就是命中的终点。调换你的提示顺序，缓存就没了。这带来一个硬性后果：把所有"可缓存"的放在前面，把所有"多变"的放在后面。形状良好的请求里，规范顺序是（1）system prompt、（2）工具定义、（3）长而稳定的上下文（代码库、文档、用户记忆）、（4）易变的一轮——近期消息、当前问题。反过来则拿不到命中。</p>
+
+    <p>Anthropic 具体来说，每个请求可最多设置 4 个 <code class="inline">cache_control</code> 分界点。把它们放在边界——system 末、tools 末、共享长上下文末——即使最后一段变化，部分命中仍能奏效。一个与前一次共享 system + tools 但文档不同的请求，前两块仍能省。如果你在用<a href="/deep-dives/memory-and-context/context-budgeting" class="xref">显式上下文预算</a>，就在预算边界上打 cache_control，缓存也沿同一条线。</p>
+
+<pre class="standalone"><span class="c-cm"># Anthropic messages request with cache_control at two boundaries</span>
+<span class="c-kw">import</span> anthropic
+client = anthropic.Anthropic()
+
+resp = client.messages.create(
+    model=<span class="c-st">"claude-opus-4-7"</span>,
+    max_tokens=<span class="c-st">1024</span>,
+    system=[
+        {<span class="c-st">"type"</span>: <span class="c-st">"text"</span>, <span class="c-st">"text"</span>: SYSTEM_PROMPT,
+         <span class="c-st">"cache_control"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"ephemeral"</span>}},   <span class="c-cm"># boundary 1</span>
+    ],
+    tools=[
+        {<span class="c-st">"name"</span>: <span class="c-st">"search"</span>,   <span class="c-st">"input_schema"</span>: SEARCH_SCHEMA},
+        {<span class="c-st">"name"</span>: <span class="c-st">"fetch"</span>,    <span class="c-st">"input_schema"</span>: FETCH_SCHEMA,
+         <span class="c-st">"cache_control"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"ephemeral"</span>}},   <span class="c-cm"># boundary 2</span>
+    ],
+    messages=[
+        {<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_turn},   <span class="c-cm"># volatile, not cached</span>
+    ],
+)
+<span class="c-cm"># resp.usage.cache_read_input_tokens vs cache_creation_input_tokens</span>
+<span class="c-cm"># tells you the actual hit rate for this request</span></pre>
+
+    <p>返回中的用量字段——<code class="inline">cache_read_input_tokens</code> 与 <code class="inline">cache_creation_input_tokens</code>——是你的在线命中率仪表盘。按前缀版本聚合，就能看到一次上线到底有没有在缓存。每家厂商都有等价字段；如果你的埋点里看不到命中率，缓存就只在你的营销页里，不在你的单位经济性里。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>缓存与批处理叠加：95% off 的路径。</h3>
+
+    <p>把缓存与 Batch API 结合，宣传节省会叠加。Anthropic 的 Message Batches API 与 OpenAI 的 Batch API 都对异步处理（24 小时 SLA）的输入与输出 token 打 5 折。在批处理任务里开启缓存——同样的 <code class="inline">cache_control</code> 标记、同样的前缀纪律——折扣会相乘：缓存读取 0.1× 基础价，再叠加 batch 5 折，实际读取约为原价的 0.05×。对于"一份稳定的大上下文（文档、代码库、评分表）套用到一批多变输入"的负载——评测跑、补齐任务、批量分类——正是这套形状把五位数月账单打到四位数。</p>
+
+    <p>一份常见形态的算术：</p>
+
+<pre class="trace"><span class="c-out">Workload: 100k-token system+context, 500 evaluations, 1k tokens output each.
+Vendor: Anthropic Claude Opus 4.7 (illustrative rates, base = $15/M input, $75/M output).
+
+No cache, no batch:
+  input : 100k * 500 = 50M tokens * $15 = $750
+  output: 500 *  1k  =  0.5M tokens * $75 = $37.50   -> total $787.50
+
+Cache only (1 write at 1.25x, 499 reads at 0.1x):
+  write : 100k * 1.25 * $15/M                       = $1.875
+  reads : 100k * 499 * 0.1 * $15 = ~$74.85
+  output: same $37.50                                -> total $114.23  (14.5% of list)
+
+Cache + batch (50% off both):
+  cache math halved: writes $0.94, reads $37.43
+  output halved: $18.75                              -> total ~$57.12   (7.3% of list)
+
+Savings vs list: 92.7%.  Reuse threshold met (499 reads / 1 write &gt;&gt; break-even).
+</span></pre>
+
+    <p>算术要落地，需要两个条件。其一，负载要能承受 batch 的 SLA——最多 24 小时。其二，复用率要越过写入溢价的盈亏平衡；对 Anthropic 约为"TTL 内每次写入至少三次读取"。交互式流量不加设计几乎难以做到；批处理流量几乎总能做到。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>缓存反而更贵的情形。</h3>
+
+    <p>缓存反而亏的形态清单不长、值得背下来。高基数、低复用：每个用户 system prompt 里有各自的画像，TTL 在会话之间过期，每次写入按 1.25× 付、只被读一次。频繁改 prompt：正在做实验的团队每天调 system prompt；每次调整都会失效缓存，接下来数分钟的流量重新付写入溢价。前缀太短：稳定部分只有 800 token 的请求，在 Gemini 上不到最小块大小、根本不缓存；在 Anthropic 上，800 token 的写入溢价可能把区区几次命中省下来的钱吃掉。</p>
+
+    <p>能一网打尽这几种的规则是：<em>候选缓存块在 TTL 内的复用率低于 3 就别缓存——把它写在"本来就会有变化的位置"。</em>这是不变式。听起来像会计，因为它就是会计。给每一块都打上 <code class="inline">cache_control</code>"因为万一有用"，就是团队最终账单比不缓存版还高、且追踪里看不到明显元凶的做法。</p>
+
+    <p>能抓住上述四种失败的审计只需一小时：按前缀版本抽一天的样，算"读/写比"，对上厂商的写入溢价乘数，把不达标的缓存块拿掉。这就是"广告节省"变成"实际节省"的地方。</p>
+  </div>
+</section>

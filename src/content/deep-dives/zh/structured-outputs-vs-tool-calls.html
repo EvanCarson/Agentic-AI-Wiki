@@ -1,0 +1,65 @@
+<section class="phase">
+  <div class="phase-num">K9</div>
+  <div class="week">深入解析 · 工具与能力设计</div>
+  <h2>结构化输出与工具调用是同一份受限解码的两种同意面——搞清哪个是哪个，就能选对你要的那个。</h2>
+  <p class="goal">底层看，"输出必须符合 schema" 与 "调这个工具" 是同一种技法：受限解码把令牌分布收缩到符合某种语法。差别在上层——一种是让模型产出一个<em>值</em>，另一种是让它提出一次<em>动作</em>。Anthropic 终于在 2026 年初把原生结构化输出 GA（<code class="inline">output_config.format</code>），补上了他们最后一家主流厂商还没有的这个奇怪空缺。在两种形状之间选错，就是团队写出"模型回了看起来像工具调用的 JSON、我的外壳把它忽略了"这类事故报告的原因；选对，两种表面都可靠到无聊。这篇讲各自何时用、为什么"值 vs 动作"是决定的分界线、以及为什么读用的移植简单、写用的移植麻烦。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>底层是同一种技法：受限解码收缩分布。</h3>
+
+    <p>2026 年每一种受限输出特性——结构化输出、JSON 模式、带 schema 的工具调用、自定义语法工具——都是同一套机制的变体。在每一步解码里，解码器本来在整个词表上采样；一份语法（通常从 JSON Schema 编译而来，有时直接从 Lark 或 regex 来）告诉采样器"下一步"哪些 token 合法，分布在采样前被 mask 到这个子集。schema 对，模型不可能产出语法非法的输出——那些 token 根本不可用。schema 错，模型会产出"离它本想说的最近的合法东西"，这可能比一个非结构化错误更糟。</p>
+
+    <p>好处在于"结构化输出"与"工具调用"是一娃两裙。一份带 <code class="inline">parameters</code> JSON Schema 的工具定义，就是该工具参数块必须满足的语法。一次带整份响应 JSON Schema 的结构化输出请求，是同一份语法应用到整条助手消息上。K7 一文的<a href="/zh/deep-dives/tool-capability-design/tool-calling-vendor-matrix-2026" class="xref">厂商矩阵</a>展示了工具调用外壳的差异；K10 一文覆盖各厂商强制的 JSON Schema 子集。两者在这里同样适用。你的 schema 在某家上工具调用会挂，在同一家上结构化输出也会挂，反之亦然。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>同意面：值 vs 动作。</h3>
+
+    <p>机制相同，语义不同。一次结构化输出是说"以这个形状产出一个值"——模型在回答问题，响应回到用户（或你的代码），除非你的代码读到响应后引发副作用，否则不会有副作用。一次工具调用是说"提出一次动作"——模型在请求发生某件事，你的外壳执行它，等到模型在下一回合读到结果时效果已经真实存在。这个区别就是全部设计轴，也是读用移植简单、写用移植困难的原因。</p>
+
+    <p>对于读——"从这份文档抽取字段"、"给这条工单分类"、"返回前三候选"——两种形状都能用，选择是人体工程学问题。结构化输出更短：一个请求、一个响应，完事。工具调用要多一次往返（模型调用、外壳返回、模型响应），这对"外壳没什么可加的读"是浪费。<a href="/zh/concepts/structured-outputs" class="xref">结构化输出概念</a>在入门高度上覆盖读的场景。对于写——"给这单退款"、"发这封邮件"、"提交这份文件"——工具调用才是那个形状，结构化输出是错的工具。模型产出一个叫 <code class="inline">refund_order_intent</code> 的 JSON 对象，看起来像给你的框架、给读者是一次提议，但没有一处协议接缝让你的外壳去执行退款、再把确认回穿给模型。把读形状强套在写上，就是你用更糟的 schema 加没有结果通道，把工具调用重新实现了一遍。</p>
+
+<pre class="standalone"><span class="c-cm"># Same task, two shapes — one for reads, one for writes.</span>
+
+<span class="c-cm"># Structured output (read): extract fields, return to caller</span>
+resp = client.messages.create(
+    model=<span class="c-st">"claude-opus-4-7"</span>,
+    output_config={<span class="c-st">"format"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"json_schema"</span>, <span class="c-st">"schema"</span>: extract_schema}},
+    messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: <span class="c-st">"Extract customer, item, and reason from: ..."</span>}],
+)
+result = json.loads(resp.content[<span class="c-nu">0</span>].text)   <span class="c-cm"># value in hand, no side effect</span>
+
+<span class="c-cm"># Tool call (write): propose action, harness executes, model reads result</span>
+resp = client.messages.create(
+    model=<span class="c-st">"claude-opus-4-7"</span>,
+    tools=[refund_order_def],
+    tool_choice={<span class="c-st">"type"</span>: <span class="c-st">"any"</span>},
+    messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: <span class="c-st">"Refund order 42 (defective)."</span>}],
+)
+<span class="c-cm"># harness executes tool_use, sends tool_result back for next turn</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Anthropic 2026 GA 的变化与 strict 模式上限。</h3>
+
+    <p>整个 2025 年 Anthropic 是那个另类——每家像样的竞争对手都发了严格结构化输出模式，Anthropic 的答案是"用一款带你想要 schema 的工具、把参数拉出来"。凑合能用，读起来别扭。2026 年初的原生结构化输出 GA 补上了这个空缺：<code class="inline">output_config.format</code> 接受一个 <code class="inline">json_schema</code> 对象，采样器按这份 schema 做 mask，模型返回的文本第一次就干净可解析。<a href="/zh/deep-dives/protocols-and-interop/structured-tool-io" class="xref">结构化工具 I/O</a>一文处理工具循环里返回载荷那半；本文处理结构化输出对应的"整条消息"场景。</p>
+
+    <p>两条 Anthropic 的 strict 模式上限值得记住。第一，与工具调用同请求组合时，结构化输出在约 20 个工具处封顶——保证会随工具列表增长而弱化，文档明确标出这个边界。第二，strict 模式下每份 schema 的可选参数数量约上限 24，见 Anthropic 文档。两者对真实工具都很宽裕；对代码生成流水线"以防万一"发出的 40+ 可选字段就会咬人。机械修法与<a href="/zh/deep-dives/tool-capability-design/tool-schemas-and-contracts" class="xref">模式与契约</a>一文反复强调的纪律相同——把 schema 收窄到"模型有理由填"的字段——strict 上限只是又一个照做的理由。</p>
+
+    <p>OpenAI 的 strict 模式在同一片邻里有它自己的坑：要求每一层对象都有 <code class="inline">additionalProperties: false</code>，并把每个属性视为 required。可选字段通过把类型与 <code class="inline">null</code> 做并集来表达。Gemini 的结构化输出用 <code class="inline">response_mime_type: application/json</code> 加 <code class="inline">response_schema</code>，schema 是它工具调用侧使用的同一份 OpenAPI 3.0 子集。同一种技法、三种不同的风味文本；由于底层约束是语法，schema 违反厂商子集时的失效模式也相同：静默的强制失败，而不是报错。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>何时移植——何时新设计。</h3>
+
+    <p>移植规则干净地一分为二。一次以工具调用运作的读，可以变成结构化输出：把 schema 从工具的 <code class="inline">parameters</code> 挪到顶层 <code class="inline">output_config</code>、去掉工具外壳、读助手消息而不是 tool-use 块。节省是一次往返加一层礼仪。反向走——今天是结构化输出的读，明天想在同一次调用上加一次写——就是你意识到结构化输出承载不了动作语义、要围绕工具重设计整次调用的时机。就算今天流是只读的，也把写从一开始就设计成工具；今天几乎不花钱，未来省一次重设计。</p>
+
+    <p>两种混合模式值得点名。第一，<em>工具调用 + 结构化的工具结果</em>：工具返回一份结构化 JSON，模型再对其推理。这是常见形状，四处可行——K10 的可移植子集适用于工具的 <code class="inline">parameters</code>，返回的 JSON 只是模型读到的数据。第二，<em>命名动作但不执行的结构化输出</em>：模型返回一份 schema，里头含一个 <code class="inline">action</code> 字段，外壳检视并派发。这是"人是下一步"的审批流里合法的形状——响应是值不是动作，是否执行由人决定。别与工具调用混淆：外壳没有义务执行任何东西，模型下一回合也不会收到确认。</p>
+
+    <p>把四步合起来读，两个特性就不再感觉像互斥选项。它们是同一个原语加两种不同的社会契约。读要短形状与直接返回；写要往返与确认。读能移植；写要设计。Anthropic 的 2026 GA 终于给读形状在三大厂商上都留下了原生表面，实操结果是"这应该是结构化输出还是工具调用？"如今是你的代码生成流水线可以根据"有无副作用"回答的问题——值，或者动作——而不再需要人一例一例做判断。</p>
+  </div>
+</section>

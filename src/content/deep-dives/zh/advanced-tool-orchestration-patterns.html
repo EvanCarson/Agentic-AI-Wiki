@@ -1,0 +1,90 @@
+<section class="phase">
+  <div class="phase-num">K8</div>
+  <div class="week">深入解析 · 工具与能力设计</div>
+  <h2>Programmatic Tool Calling——模型写代码、代码在沙箱里调工具、只有最终结果进上下文——不是 Claude 的专有特性，而是"代码即编排"跨厂商的预演。</h2>
+  <p class="goal">Anthropic 的 Tool Search Tool 把"向模型暴露多工具"的令牌开销砍掉约 85%。Programmatic Tool Calling 于 2025 年 11 月上线，把循环形状彻底改写——模型写一小段 Python，运行在 Anthropic 侧的沙箱里，从其中调用工具，只把最终输出穿回上下文。Tool Use Examples 在工具层加了 few-shot 语义。若把它们读成 Anthropic 的独家小把戏，只是三条产品要点。若读成下一代厂商即将收敛的形状，就是"代码即编排"的第一稿：工具循环不再是模型上下文里的消息舞蹈，而是模型撰写、沙箱执行的一段程序。这篇讲每一样做什么、何时抬手够它、生产里团队遇到的失效模式，以及模式在整个矩阵上正走向何处。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Tool Search Tool：多工具时的上下文税与检索式修法。</h3>
+
+    <p>任何一款正经智能体最终都会积累到"多得暴露不起"的工具数量。<a href="/zh/deep-dives/tool-capability-design/tool-granularity" class="xref">工具粒度</a>一文处理了当工具数越过几十以后田野里实测的 24 分选择准确率下降；<a href="/zh/deep-dives/tool-capability-design/tool-discovery-and-docs" class="xref">工具文档与可发现性</a>一文覆盖同一问题的命名与命名空间侧。两者都不处理的是工具列表本身的原始令牌开销：每份工具定义都有名称、描述、JSON Schema，200 个工具时仅工具列表就可能是每回合携带的 40–60k 令牌——用不用都花钱。Anthropic 的 Tool Search Tool 是一款内置工具，唯一职责就是解决这个：与其在提示里塞 200 份定义，不如把语料一次上传、只暴露一款 Tool Search Tool，模型自行查询，取回它当前步骤真正需要的三四份定义。Anthropic 自家基准在工具密集提示上报出约 85% 的令牌下降，工具选择准确率保持或提升，因为模型看到的干扰项更少。</p>
+
+    <p>底层机制朴素得让人不好意思。工具语料放在 Anthropic 侧，按语义嵌入索引。Tool Search Tool 接受一段自然语言查询，返回排名后的工具定义列表——名称、描述、schema——模型随后当它们是提示里的定义正常处理。第一回合的模型输出通常是对 Tool Search Tool 的一次调用，查询来自用户消息；第二回合的模型输出正常使用取回的工具。多出的一跳在第一回合花掉一次往返，此后每回合摊薄；只要"该提示原本需要少于四分之一工具"，交易就直白划算。</p>
+
+<pre class="standalone"><span class="c-cm"># Tool Search Tool — enable, then let the model pull only what it needs</span>
+resp = client.messages.create(
+    model=<span class="c-st">"claude-opus-4-7"</span>,
+    tools=[{<span class="c-st">"type"</span>: <span class="c-st">"tool_search_20250924"</span>, <span class="c-st">"name"</span>: <span class="c-st">"tool_search"</span>}],
+    tool_choice={<span class="c-st">"type"</span>: <span class="c-st">"auto"</span>},
+    messages=[{<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: <span class="c-st">"Refund order 42 for the customer who called about the defective batch."</span>}],
+)
+<span class="c-cm"># First turn: model emits tool_use for tool_search with query='refund order'</span>
+<span class="c-cm"># Second turn: model uses the refund_order def that tool_search returned</span></pre>
+
+    <p>两个失效模式先说清。第一，工具语料只与它的描述一样好——<a href="/zh/deep-dives/mcp/mcp-tool-design" class="xref">MCP 工具设计</a>反复强调的纪律（动词开头、"何时用与何时不用"、一个范例）在检索场景里变成承重件，因为模型的查询要匹配的是你写的文本，而为维护人员写的描述会在"模型对用户意图的改写"面前召回很差。第二，第一回合多花几百毫秒延迟——在延迟敏感的工作流（语音、IDE 内联）里预算通常已经承诺完。Tool Search 在做多回合规划、能吸收这一往返的智能体里赚钱；在"一工具、一调用"的单回合流里则不合适，因为答案本就一步到位。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Programmatic Tool Calling：沙箱就是循环。</h3>
+
+    <p>Programmatic Tool Calling（PTC）是更激进的原语，即便你不用 Claude 也值得细读。经典工具循环把结果作为消息穿回模型上下文：模型调 <code class="inline">list_files</code>，外壳执行，JSON 结果变成下一回合模型读的 <code class="inline">tool_result</code> 块。链到第十工具时，上下文正在承载每一份中间结果，而其中大部分模型只是为了喂下一次调用才需要，最后并不需要拿它去推理。PTC 打破这个模式：模型不发单次工具调用，而是写一小段 Python 程序（在 Anthropic 侧运行的沙箱里），程序在沙箱内调用工具，只有程序的最终返回值穿回模型上下文。中间工具结果——可能有几百次——根本不进入上下文窗口。</p>
+
+    <p>两个后果值得钉住。第一，在多工具链路上，上下文节省主导成本线。每回合十工具的工作流，从携带十份结果载荷降到一份，模型在长链上要付的"这份工具结果又是哪来的"推理税消失——代码是模型写的，它已经知道数据长什么样。第二，PTC 把 MapReduce 式的工具扇出泛化：一段程序可以在循环里把同一工具调一百次，过滤、聚合、把一份摘要交给模型；上下文窗口看到的是一百次调用的摘要，而不是一百次调用。这就是"代码即编排"所指的形状，也是让"多工具服务器"重新变得实用的那个形状。</p>
+
+<pre class="standalone"><span class="c-cm"># Programmatic Tool Calling — model writes this, sandbox runs it, only</span>
+<span class="c-cm"># the return value crosses back into the model's context.</span>
+<span class="c-kw">from</span> tools <span class="c-kw">import</span> list_orders, refund_order, notify_customer
+
+candidates = list_orders(status=<span class="c-st">"defective"</span>, batch_id=<span class="c-st">"B-9137"</span>)
+refunded = []
+<span class="c-kw">for</span> o <span class="c-kw">in</span> candidates:
+    <span class="c-kw">if</span> o.amount &lt;= <span class="c-nu">500</span>:
+        result = refund_order(order_id=o.id, reason=<span class="c-st">"defective"</span>)
+        notify_customer(order_id=o.id)
+        refunded.append(result.confirmation)
+<span class="c-kw">return</span> {<span class="c-st">"refunded_count"</span>: <span class="c-fn">len</span>(refunded), <span class="c-st">"confirmations"</span>: refunded}
+<span class="c-cm"># The model's context sees only this final dict, not the N tool results.</span></pre>
+
+    <p>成本是真实的，值得预算。PTC 需要一个 Anthropic 管理的沙箱——你不能在自己的进程里跑模型写的代码，也就是说工具必须能从那个沙箱触达（要么发布为 MCP 服务器，要么包成沙箱可调的 HTTP 端点）。这条约束不是失误：让"模型撰写的代码"在你自己的进程里执行，就是<a href="/zh/deep-dives/mcp/mcp-security-anti-patterns" class="xref">MCP 安全反模式</a>一文会用一节警告的姿态，Anthropic 的沙箱是正确的隔离。但它意味着 PTC 不是本地工具的即插即用；它在"沙箱本就能触达"的服务端托管工具表面上赚回它的复杂度。另一份成本是模型必须能写对 Python——PTC 早期部署撞到"代码有语法错"的恢复循环比团队预计的多，外壳需要一条重试通道，把 traceback 作为上下文回穿，让模型改。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Tool Use Examples：工具层的 few-shot。</h3>
+
+    <p>Tool Use Examples 给工具定义加了一个 <code class="inline">tool_use_examples</code> 字段，列出示例调用，模型只在考虑这一工具时才读到它们。与 system 提示里的 few-shot 是同一思路——目标输出形状的工作示例——只是范围限定，示例不会在模型挑选别的工具时消耗注意力。解锁点在于：参数形状棘手的工具（比如带三个可选过滤器和特定键序的查询 DSL）可以内联携带示例；模型不必只从 schema 推断正确调用，可以拿工具作者提供的示例做模式匹配。</p>
+
+    <p>实操效果在"正确形状按 schema 看歧义大"的工具上最大。一款 <code class="inline">search</code> 工具接受一段查询字符串、一个过滤对象、一个排序规格，合法调用空间巨大，其中有用的只是很小一部分；工具定义里三条好示例，几乎完全收敛模型的用法。Anthropic 的指导是保持示例简短（两到五条，每种常见形状一条），system 提示里 few-shot 的原则同样适用——挑你实际见到的失效模式的示例，而不是演示里好看的那种。<a href="/zh/deep-dives/tool-capability-design/tool-error-messages" class="xref">把错误消息当作提示</a>的纪律（回显坏值、开出修正后的调用）是 tool-use-example 位可以吸收的反例来源。</p>
+
+<pre class="standalone"><span class="c-cm"># Tool Use Examples — inline few-shot on the tool definition itself.</span>
+tools = [{
+    <span class="c-st">"name"</span>: <span class="c-st">"search_orders"</span>,
+    <span class="c-st">"description"</span>: <span class="c-st">"Search orders. Use for filtering by customer, date range, or status."</span>,
+    <span class="c-st">"input_schema"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"object"</span>, <span class="c-st">"properties"</span>: {...}},
+    <span class="c-st">"tool_use_examples"</span>: [
+        {<span class="c-st">"query"</span>: <span class="c-st">"defective batch B-9137"</span>,
+         <span class="c-st">"filters"</span>: {<span class="c-st">"status"</span>: <span class="c-st">"defective"</span>, <span class="c-st">"batch_id"</span>: <span class="c-st">"B-9137"</span>},
+         <span class="c-st">"sort"</span>: [{<span class="c-st">"field"</span>: <span class="c-st">"created_at"</span>, <span class="c-st">"dir"</span>: <span class="c-st">"desc"</span>}]},
+        {<span class="c-st">"query"</span>: <span class="c-st">"customer alice orders last week"</span>,
+         <span class="c-st">"filters"</span>: {<span class="c-st">"customer"</span>: <span class="c-st">"alice"</span>, <span class="c-st">"since"</span>: <span class="c-st">"2026-07-06"</span>}},
+    ],
+}]</pre>
+
+    <p>有一条告诫要大声读。Tool Use Examples 是 Claude 特有字段；把带 <code class="inline">tool_use_examples</code> 键的工具定义发去 OpenAI 或 Gemini，要么被忽略（如果厂商容忍未知属性）、要么被拒绝（如果 strict 模式开着）。K7 一文推荐的"中间表示"模式就是处理这个的地方：示例保留在内部规格里，让逐厂商 emitter 丢弃或改造它们。没有原生"工具层 few-shot"原语的厂商仍可通过在描述里拼一行示例做效果模拟——人体工程学更差，但在关键模型上的行为效果相当。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>模式向何处泛化：代码即编排。</h3>
+
+    <p>把三样原语并在一起读，形状浮现出来。Tool Search Tool 用检索解决"多工具、每回合只用少数"的问题。Programmatic Tool Calling 用沙箱解决"每回合多调用、大部分是中间的"问题。Tool Use Examples 用 few-shot 解决"正确调用按 schema 有歧义"的问题。不同问题，一种统一直觉：<em>把编排移出模型上下文，搬到一个为承载它而设计的底座上</em>。上下文窗口是稀缺资源；工具列表贵；中间结果对模型推理来说无聊。每一样原语都把无聊的部分挪出模型，把有趣的部分留在它身上。</p>
+
+    <p>值得关注的泛化是"代码即编排"在整个厂商矩阵上的走向。OpenAI 的自定义工具语法（见 K7）在同一方向上迈了一步——让模型发出受限文本、由外壳解释，而不是发自然语言计划、由外壳去解析。Gemini 的函数调用 <code class="inline">ANY</code> 模式加上日益丰富的内置工具（代码解释器、检索）从另一个角度指向同一形状：沙箱是你的模型厂商的，其中的工具有名。<a href="/zh/deep-dives/architectures-and-patterns/pattern-landscape" class="xref">模式全景</a>一文把 ReAct 与 Plan-and-Execute 钉为两种主导循环形状；PTC 是第三种，其卖点是在多工具链路上同时在成本与延迟维度压倒另外两种。</p>
+
+    <p>对尚未把 Claude 定为主锚的团队，两步动作有意义。第一，把工具定义表面当作<em>中间表示</em>，而不是线上格式。若你的内部规格捕获名称、描述、schema、示例、副作用标志，逐厂商 emitter 就能丢掉目标厂商不理解的部分。第二，按"PTC 明年就会来到你的厂商"预算上下文。设计能在沙箱内很好组合的工具——小、确定、幂等——你现在的循环继续工作，周边原语变好时你自然对齐。走向"代码即编排"最快的团队，会是那些在沙箱到达之前工具就已是沙箱形状的团队。</p>
+
+    <p>把四步合起来读，表面张力就化解。这些不是三样孤立的、要死记硬背的 Claude 特性；而是同一个设计方向上的三种动作，且方向清晰到团队无需等另外两家追上就能下注。今天下注代价很小——一份中间表示、能在沙箱内良好工作的工具设计、按检索思路写的描述——买到的是"PTC 形态原语落到别处时立即采用"的选项。把当前工具循环当作终点的团队，往往会构建出后来还要重塑的外壳；把 Anthropic 2025–2026 的动作读成预演的团队，构建的外壳会优雅地老化成大家最终都会收敛到的那种形状。</p>
+  </div>
+</section>

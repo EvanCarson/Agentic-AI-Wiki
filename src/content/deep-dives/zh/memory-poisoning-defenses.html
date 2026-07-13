@@ -1,0 +1,71 @@
+<section class="phase">
+  <div class="phase-num">M9</div>
+  <div class="week">深入解析 · 记忆与上下文工程</div>
+  <h2>记忆毒化是真实的攻击类别——AgentPoison 在 0.1% 毒化率下达 80% 成功率——而防御分布在生命周期的四段，而不是集中在一个"检测恶意输入"关卡。</h2>
+  <p class="goal">AgentPoison 在被投毒条目占比不到 0.1% 时，对智能体记忆系统实现 80% 攻击成功率。MemoryGraft、SpAIware、Morris-II 蠕虫分别攻击不同层。朴素防御——"写入时消毒"——失败，因为输入看起来往往无害；漏洞在于"记忆之后如何被回忆"。真正的防御是四段生命周期：摄取时做门控、存储时做溯源、检索时做多数决、监控时做漂移检测。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>威胁目录：2026 年真正打记忆的攻击是什么。</h3>
+
+    <p>记忆毒化不是单一手法。AgentPoison（源自 RAG 文献，2025 年被扩展到智能体存储）表明，检索增强记忆里不到 0.1% 的投毒条目就能把下游智能体任务的攻击成功率推到 80% 以上——机制是把触发短语藏进一条记忆里，命中匹配查询时它被召回，把智能体的下一步动作导向恶意工具调用。MemoryGraft 是横向移动的变体：在多智能体系统的共享记忆里投毒，让下游智能体继承 payload 而从未见过攻击者的流量。SpAIware 瞄准长寿命的个人助手：写入伪装成偏好，召回时把它翻译成指令（"用户偏好把转账确认邮件删掉"）。Morris-II 是蠕虫场景——被投毒的记忆被召回后，让智能体把毒素传播到另一个它有写权限的记忆库里。</p>
+
+    <p>共同的线索是：这些攻击都不需要被攻陷的模型或有 bug 的工具 schema。它们利用的是"记忆系统把召回内容当作可信上下文"以及"LLM 把召回上下文当作权威——除非流水线里有别的东西说它不是"。<a href="/zh/operations/safety-and-security/prompt-injection" class="xref">提示词注入</a>的文献讲的是这份信任的读时面；<a href="/zh/operations/safety-and-security/agentic-threat-model" class="xref">智能体威胁模型</a>那一篇把记忆点名为杠杆最高的数据外泄通道之一。本文补的是写侧——被投毒的条目最初是怎么进来的、以及那四道便宜的防御阶段落在哪里。<a href="/zh/deep-dives/memory-and-context/evaluating-memory" class="xref">评估记忆</a>那篇里的毒化指标是可观测性层；下面的防御则是这些指标能检出的东西。</p>
+
+<pre class="trace">Attack     | Vector                       | Payload survives via
+-----------|------------------------------|-------------------------------
+AgentPoison| write-time inject to store   | trigger phrase in recall
+MemoryGraft| lateral via shared memory    | cross-agent inheritance
+SpAIware   | preference-shaped write      | preference → instruction slide
+Morris-II  | poisoned recall + write tool | self-propagation, worm-style
+
+Four attacks, one common failure: retrieval treats stored content as trusted.</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>摄取阶段的防御：写入落地之前限速与隔离。</h3>
+
+    <p>第一道便宜的杠杆在摄取。每一次写入都带上来源标签（产生它的工具调用、用户回合，或上游智能体）和按来源的限速预算。一个用户会话在一分钟里写 300 条语义条目，不是记忆的正当用法；一个从未产出过语义写入的工具突然产出几十条，也不是。这道门要问的不是"这段内容是不是恶意"（一个摄取阶段答不好的问题），而是"这次写入的形状像不像这来源的历史形状"。形状异常就进隔离——写入落在一个单独分区里，对检索不可见，直到人或次级检查确认为止。</p>
+
+    <p>隔离是承重的部分。跳过它、改在写入时用分类器判定内容的团队会撞上一条尽人皆知的不对称：良性偏好和对抗性偏好在文本分类器眼里长得一样，分类器的漏报率就是攻击的成功率。隔离把决策从"这是不是恶意"（难）延后到"这个来源随后有没有做其他可疑动作"（更容易，因为行为会累积）。<a href="/zh/deep-dives/memory-and-context/memory-write-path-architectures" class="xref">写路径那篇</a>把写入可见性列为第四条轴；摄取阶段的隔离就是这条轴挣回自身代价的地方。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>存储阶段：每一条都带来源与版本，永远不原地改。</h3>
+
+    <p>来源不是可有可无的东西；它是让下游一切防御成为可能的原语。每条记忆条目都存下自己的来源（哪个工具、哪个用户、哪个上游智能体产出的它）、写入时间戳、置信度、以及产出它的轨迹 ID。条目不可变——"更新"是一条新行去替代旧行、旧行仍可被审计查询。选择不可变的原因是：原地改会让毒化攻击严格更难被检出——如果攻击者能覆盖一条事实，审计轨迹就丢了本可以浮出异常的"改前状态"。支持多数决推理（下节）的存储需要多个并存的版本，而不是一行被覆写的行。</p>
+
+    <p><a href="/zh/deep-dives/memory-and-context/memory-stores" class="xref">记忆存储那篇</a>讲了后端选型；毒化防御在此之上加的是：不管你挑了哪种后端（向量、KV、图、混合），schema 都需要把来源相关的列作为一等公民，而不是当作旁枝的 metadata。日后检索按来源可信度做过滤时，过滤跑在索引列上，而不是一个必须逐行 parse 的 JSON blob。查不动的来源信息，就是热路径上不会用的来源信息；不会跑的防御，就不是防御。</p>
+
+<pre class="standalone"><span class="c-cm"># Quorum retrieval: pull k candidates, require agreement or drop outliers.</span>
+<span class="c-kw">def</span> quorum_retrieve(store, query, k=<span class="c-nb">5</span>, agree_min=<span class="c-nb">3</span>):
+    hits = store.top_k(query, k=k)                 <span class="c-cm"># diverse-source retrieval</span>
+    clusters = cluster_by_meaning(hits)             <span class="c-cm"># normalize + group</span>
+    top = <span class="c-kw">max</span>(clusters, key=<span class="c-kw">lambda</span> c: <span class="c-kw">len</span>(c.entries))
+    <span class="c-kw">if</span> <span class="c-kw">len</span>(top.entries) &lt; agree_min:              <span class="c-cm"># no quorum → do not answer from memory</span>
+        <span class="c-kw">return</span> <span class="c-kw">None</span>
+    <span class="c-kw">if</span> single_source(top.entries):                  <span class="c-cm"># quorum but from one source → suspicious</span>
+        flag_for_review(top); <span class="c-kw">return</span> <span class="c-kw">None</span>
+    <span class="c-kw">return</span> top.canonical()</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>检索阶段：多数决、投票，与来源多样的 top-k。</h3>
+
+    <p>检索是 AgentPoison 式攻击兑现的地方——触发之所以点火，是因为被投毒的条目正是嵌入器排在最上的那条。防御是多数决：拉 k 条候选而不是一条，要求至少一定数量（比如 5 中的 3）之间达成一致，且达成一致的条目需要来自超过一个来源。"单一来源多数决"的情形是一个重要修饰——一次落下 10 条几乎相同、来自同一来源的投毒记忆会轻易赢下朴素 top-k，但按来源多样性的多数决会把这 10 条视作一票。若形不成多数决，正确的答案是<em>不</em>从记忆里回答；退回新鲜检索、问用户，或直接说"我记不清了"——总之别让一条未经证实的条目单独驱动下一步动作。</p>
+
+    <p>投票不仅是抗毒化的防御，也是对过期的对冲。当两簇因为一新一旧而不一致时，时间戳来决定，检索返回更新的那一簇、并在旧簇上加一个"已被替代"的注记。团队有时会因为"多数决多花一次 k-向量查询"而抵触；诚实的账是：为把整整一类攻击在数量上变难，付出个位到两位数百分比的检索时间。若你的延迟预算连它都容不下，那么这个工作负载本就不该让记忆无监督地驱动关键动作。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>监控：漂移检测把记忆变成一个可观测系统。</h3>
+
+    <p>最后一段是监控，它把记忆从"智能体写入的一份存储"变成一个可观测系统。三种信号要紧。第一，检索来源分布随时间的变化：当某来源在检索里的占比出现实质性偏移——原本 5% 现在是 40%——这个变化会浮出毒化或值得知道的良性使用变迁。第二，动作—结果与被召回记忆的相关性：当"某条记忆被召回后紧跟失败工具调用"的比例异常高，那条记忆要么是错的、要么在被武器化。第三，跨库传播：当同一段文本模式在多个记忆库里以短时间内相继出现，Morris-II 式传播就是在被排除之前的首选假设。</p>
+
+    <p>漂移监控接的是一个良好插桩的智能体本就会发出的遥测：检索事件、工具调用结果、会话边界。仪表板按设计就是"无聊"的——检索来源占比直方图、按记忆的成功率、以及近期写入之间的跨库文本相似度。要点不是监控能抓住每一次攻击，而是"任何一条信号都能被推动的持续投毒行动"，是防御方能在 payload 造成不可逆伤害之前响应的行动。与摄取隔离、存储来源、检索多数决叠起来看，四阶段把 AgentPoison 在 0.1% 毒化率下 80% 的成功率，压到攻击方不再有兴趣把它跑起来的量级。</p>
+  </div>
+</section>

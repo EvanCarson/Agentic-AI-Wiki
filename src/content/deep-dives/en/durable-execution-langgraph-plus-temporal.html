@@ -1,0 +1,117 @@
+<section class="phase">
+  <div class="phase-num">D9</div>
+  <div class="week">Deep Dive · Architectures & Patterns</div>
+  <h2>Durable execution is not a LangGraph feature vs a Temporal feature — the correct 2026 pattern is a reasoning graph on top of a durable runtime, and the seam between them is where teams get it wrong.</h2>
+  <p class="goal">A LangGraph checkpointer saves state between nodes. Temporal saves state within a workflow function. Confuse the two and your 30-minute research agent crashes 27 minutes in with nothing to resume from. The 2026 pattern that ships is "reasoning graph on top of durable runtime": LangGraph orchestrates the reasoning shape, Temporal owns the durability guarantee. Cordum's engineering post benchmarked plain LangGraph loops failing at ~10k items where Temporal-backed executions kept going. The seam design — which side owns retries, which side owns idempotency, where the checkpoint boundary sits — is the whole game.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Two flavors of durability, and why they don't substitute for each other.</h3>
+
+    <p>Both LangGraph and Temporal will tell you they give you "durable execution," and both are telling the truth about a different thing. LangGraph's durability is a <em>checkpointer</em>: after each node in the graph runs, the framework serializes the graph state and writes it to a store (SQLite in dev, Postgres/Redis in prod). If the process dies between nodes, you can resume from the last checkpoint. Temporal's durability is a <em>workflow function</em>: every <code class="inline">await</code> inside a Temporal workflow is a durable persistence point, so if the worker dies mid-<code class="inline">await</code>, Temporal replays the function up to that <code class="inline">await</code> from history and continues.</p>
+
+    <p>The word "checkpoint" hides a factor-of-a-thousand difference in granularity. A LangGraph node is a whole reasoning step — plan, call three tools, summarize — and the checkpoint fires <em>after</em> the node returns. If your node is a for-loop over 10,000 items and it crashes at item 8,742, the resumed run restarts the node from item 0, because the framework only knows about node boundaries. A Temporal workflow function calling an activity per item checkpoints after each activity, so a crash at 8,742 resumes at 8,743. Neither is "wrong"; they are answering different questions about where you're willing to lose work.</p>
+
+    <p>The reason this matters in 2026 is that agents got longer. A research agent that used to take five minutes now takes forty. A batch enrichment job that used to touch a hundred rows now touches ten thousand. At those sizes, the difference between node-level and activity-level durability is the difference between shipping and not. The mistake is to pick a side. The pattern that works is to <a href="/deep-dives/architectures-and-patterns/pattern-landscape" class="xref">layer the two</a>: LangGraph on top for reasoning shape, Temporal underneath for the durable execution guarantee.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Where LangGraph checkpoints, where Temporal checkpoints.</h3>
+
+    <p>Draw the picture and the difference stops being confusing. A LangGraph run is a directed graph of nodes; the checkpointer writes to storage after each node's return value is available. Between nodes: durable. Inside a node: whatever the node's own code does, on its own. If a node calls three HTTP APIs, updates a database, and returns, and it crashes after the two HTTP calls but before the database update, the resumed run has none of that partial progress — it starts the node over.</p>
+
+    <p>A Temporal run is a workflow function whose every <code class="inline">await</code> point is a durable persistence event; the framework records every activity invocation and every activity result to a history log. Between <code class="inline">await</code>s: durable. On resume, Temporal re-executes the workflow function from the top and, for each <code class="inline">await</code> it has already recorded, replays the recorded result rather than actually calling the activity. Determinism is what makes this work — the workflow function itself may not do any I/O directly, only through activities, and it may not use non-deterministic operations (real time, random numbers) without going through Temporal's deterministic APIs.</p>
+
+    <p>The concrete failure a mixed-up team ships: they wrap a LangGraph agent inside a Temporal workflow, then let the LangGraph node body do its own HTTP calls, own retries, own timeouts. Temporal has no idea any of that happened — from its perspective the workflow just called one activity ("run the LangGraph node") and got a result. The activity took 27 minutes and crashed; on retry, the whole 27 minutes runs again. The durability guarantee was on the wrong side of the seam.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The 10k-item cliff, and what actually breaks.</h3>
+
+    <p>Cordum's engineering write-up benchmarked plain LangGraph loops against Temporal-backed executions on a batch enrichment task — the shape where an agent needs to plan once, then process a list of items with a tool call per item. Below about a thousand items, both are fine. Around 5k the LangGraph run gets slow but works. At 10k the LangGraph loop falls over, and the failure mode is not "the code raises an exception" — it is that the graph state, which includes the accumulated results, has grown to the point where the serialize / deserialize cost at each checkpoint exceeds the useful work done by each node. The framework spends most of its time writing state, not doing steps. Temporal-backed executions at the same size stay linear because Temporal's history log is append-only and streams items past the state — the state itself does not grow with the item count.</p>
+
+    <p>This is not a bug in LangGraph; it is what checkpointer-between-nodes semantics cost you when the "state" is a growing list. The fix is not "tune the checkpointer" — it is to move the loop out of the graph. Instead of a node that iterates 10k items internally, the graph plans the loop and dispatches to a Temporal activity per item (or per batch of items). Each activity is small, its result goes into the durable history rather than into a growing in-memory list, and the graph state stays small.</p>
+
+    <p>The same shape shows up in a research agent that reads a hundred documents. Do it inside one LangGraph node and every checkpoint ships all hundred document contents. Do it as one activity per document under Temporal and each activity's result is a fixed-size record in history. The heuristic: any time a "step" in your reasoning has a fanout larger than about 100, the loop wants to live outside the graph, and the graph wants to see only the summary of the batch.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The pattern that ships: reasoning graph on top of durable runtime.</h3>
+
+    <p>Once you accept that both frameworks are right about different things, the pattern that stops causing problems is the same regardless of which SDKs you use. The reasoning shape — plan, call tools, reflect, replan — lives in LangGraph (or a similar orchestration library). The durability guarantee — retry, timeout, resume — lives in Temporal (or a similar runtime: Restate, Inngest, or DBOS all fit the shape). The two meet in exactly one place: each LangGraph node body is a Temporal activity.</p>
+
+    <p>The mechanical version. You write a Temporal workflow function that instantiates a LangGraph <code class="inline">StateGraph</code>. Each node in the graph, instead of running its work inline, submits an activity to Temporal. The activity does the actual work — the model call, the HTTP request, the database write. When the activity returns, Temporal has durably recorded the result; when the node returns, LangGraph has durably checkpointed the graph state. Both durabilities are now stacked, and the seam between them is the activity boundary. This aligns naturally with the <a href="/deep-dives/architectures-and-patterns/plan-and-execute" class="xref">plan-and-execute</a> shape where the planner is a graph node and each executor step is an activity.</p>
+
+<pre class="standalone"><span class="c-cm"># workflow.py — Temporal workflow calling LangGraph nodes as activities</span>
+<span class="c-kw">from</span> temporalio <span class="c-kw">import</span> workflow, activity
+<span class="c-kw">from</span> langgraph.graph <span class="c-kw">import</span> StateGraph
+<span class="c-kw">from</span> datetime <span class="c-kw">import</span> timedelta
+
+<span class="c-at">@activity.defn</span>
+<span class="c-kw">async def</span> plan_node(state: dict) -&gt; dict:
+    <span class="c-cm"># actual model call lives here, not inside the graph node body</span>
+    <span class="c-kw">return</span> {<span class="c-st">"plan"</span>: await llm.plan(state)}
+
+<span class="c-at">@activity.defn</span>
+<span class="c-kw">async def</span> tool_node(state: dict, item: dict) -&gt; dict:
+    <span class="c-kw">return</span> {<span class="c-st">"result"</span>: await tool.run(item, key=state[<span class="c-st">"idem_key"</span>])}
+
+<span class="c-at">@workflow.defn</span>
+<span class="c-kw">class</span> ResearchAgent:
+    <span class="c-at">@workflow.run</span>
+    <span class="c-kw">async def</span> run(self, task: dict) -&gt; dict:
+        state = await workflow.execute_activity(
+            plan_node, task, start_to_close_timeout=timedelta(minutes=<span class="c-st">2</span>))
+        <span class="c-cm"># fanout is Temporal's job, not the graph's</span>
+        results = await asyncio.gather(*[
+            workflow.execute_activity(
+                tool_node, state, item,
+                start_to_close_timeout=timedelta(seconds=<span class="c-st">30</span>),
+                retry_policy=RetryPolicy(maximum_attempts=<span class="c-st">5</span>))
+            <span class="c-kw">for</span> item <span class="c-kw">in</span> task[<span class="c-st">"items"</span>]])
+        <span class="c-kw">return</span> {<span class="c-st">"summary"</span>: results}</pre>
+
+    <p>What is doing work here: the LangGraph reasoning shape is preserved (plan then execute), but the graph nodes are activities, so Temporal owns the retries and the state persistence. The workflow function itself is a thin coordinator. If you kill the worker mid-fanout, Temporal resumes with the activities that already returned recorded in history and only re-issues the ones that hadn't started.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Idempotency and retries at the seam.</h3>
+
+    <p>The seam has two rules that are non-negotiable, and both come from the same observation: the runtime will retry activities, and it will do so silently. Rule one: <strong>retries are owned by the runtime, not by the tool.</strong> Do not put retry loops inside your tool code when a durable runtime already gives you retry policies. You will get retries on top of retries — a burst that hits your downstream API rate limit within seconds and makes debugging painful. Configure Temporal's <code class="inline">RetryPolicy</code> (or the equivalent) on the activity and remove the ad-hoc retry from the tool. If the tool is called through <a href="/deep-dives/architectures-and-patterns/tool-error-recovery" class="xref">a general error-recovery loop</a> in the agent, make sure the loop treats "activity failed after Temporal's retries" as a distinct signal, not as another retryable error.</p>
+
+    <p>Rule two: <strong>idempotency is owned by the tool, not by the runtime.</strong> The runtime cannot know that "charge $12 to card X" is not safe to call twice; the tool has to know. Every side-effectful activity should accept an idempotency key that Temporal supplies (the workflow ID plus the activity attempt ID is a standard pattern) and use it as a dedupe token against the downstream system — Stripe idempotency-key, database ON CONFLICT, whatever the downstream supports. If the runtime retries the activity, the second call should see the first call's result and short-circuit, not repeat the side effect.</p>
+
+    <p>The picture of what a well-formed seam looks like:</p>
+
+<pre class="trace"><span class="c-out">workflow                       runtime                       tool
+   |                              |                             |
+   | execute_activity(charge) --&gt; |                             |
+   |                              | attempt 1, idem=WF-A1 -----&gt;|
+   |                              |                             | charge OK, store idem
+   |                              | &lt;----- result recorded -----|
+   |                              |     (worker crash here)     |
+   |                              |     replay from history     |
+   |                              | attempt 2, idem=WF-A1 -----&gt;|
+   |                              |                             | idem match: return prior
+   |                              | &lt;----- same result ---------|
+   | &lt;---- durable result ------- |                             |
+</span></pre>
+
+    <p>Notice what the workflow function never sees: the crash, the retry, the second call. From the workflow's perspective, the activity ran once and returned once. That is the durability contract. Break either rule — retry inside the tool, or forget the idempotency key — and you get double charges, duplicate database writes, and traces that lie about what happened.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When you don't need durability.</h3>
+
+    <p>The Temporal-underneath pattern earns its complexity budget only when the runs are long, expensive, or side-effectful enough that losing them costs real money or user trust. For interactive chats under five minutes with no meaningful side effects — the assistant answers, the user reads, the session ends — the framework overhead is dead weight. A LangGraph checkpointer alone (or even in-memory state) is fine, because a crash means the user hits retry and lives.</p>
+
+    <p>Latency-sensitive user-facing loops are the other case where you skip it. Every extra hop through a durable runtime is milliseconds; a voice agent or a UI streaming loop that has to feel instant cannot afford them on the hot path. The right answer there is often to run the fast path in-process and only escalate to a durable workflow if the request turns into something long-running (a research task, a batch job, a multi-step transaction). If you use <a href="/concepts/agent-frameworks" class="xref">the framework's abstractions</a> to make that escalation seamless, the durability is available when you need it and out of the way when you don't.</p>
+
+    <p>The pattern to steal, if you skip only one thing: even without a full Temporal setup, put an idempotency key on every side-effectful tool call from day one. It costs nothing on the happy path and is the difference between a graceful recovery and a compensating transaction if you ever add durability later. That is the seam preparing itself for a runtime that isn't there yet.</p>
+  </div>
+</section>
