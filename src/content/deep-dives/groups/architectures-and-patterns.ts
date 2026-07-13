@@ -14,6 +14,7 @@ const group: Group = {
     { page: 'router-pattern', slug: 'router-pattern', title: L('Routing & Dispatch — Selection, Fan-out, Parallelism','路由与分派——选择、扇出、并行'), summary: L('Classifier vs tool-call routing, parallel fan-out, and the failure modes of the routing layer.','分类器与工具调用路由、并行扇出，以及路由层的失败模式。') },
     { page: 'tool-error-recovery', slug: 'tool-error-recovery', title: L('Tool-Use Loops & Error Recovery','工具使用循环与错误恢复'), summary: L('The failure taxonomy, layered recovery, error-messages-as-prompts, and side-effect durability.','失败分类法、分层恢复、错误消息即提示词，以及副作用持久性。') },
     { page: 'single-vs-multi-agent', slug: 'single-vs-multi-agent', title: L('Single-Agent vs. Multi-Agent Orchestration','单智能体 vs. 多智能体编排'), summary: L('Real reasons to split, supervisor/worker vs hand-off, the coordination tax, and a decision framework.','拆分的真实理由、监督者/工作者与交接、协调税，以及一个决策框架。') },
+    { page: 'durable-execution-langgraph-plus-temporal', slug: 'durable-execution-langgraph-plus-temporal', title: L('Durable Execution: LangGraph + Temporal','持久执行：LangGraph + Temporal'), summary: L("Checkpointer-between-nodes vs Temporal-within-node — replay semantics, why LangGraph loops don't survive at 10k items, and the 'reasoning graph + durable runtime' pattern.",'节点间 checkpointer 与节点内 Temporal——回放语义、LangGraph 循环为何在 1 万条时撑不住，以及"推理图 + 持久运行时"这一模式。') },
   ],
 };
 export default group;

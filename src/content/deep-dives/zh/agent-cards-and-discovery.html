@@ -1,0 +1,99 @@
+<section class="phase">
+  <div class="phase-num">P9</div>
+  <div class="week">深入解析 · 协议与互操作</div>
+  <h2>A2A 通过 <code class="inline">/.well-known/agent.json</code> 上的 Agent Card 做发现——思路等同 OpenID Connect 的发现，只是应用到智能体，签名则是悬而未决的问题。</h2>
+  <p class="goal">智能体通过 <code class="inline">/.well-known/agent.json</code> 自我披露——能力、端点、版本、扩展卡片位置、缓存提示。这个模式借自 OpenID Connect，运转良好——直到你问"我怎么信任这张 Agent Card？"Signed Agent Cards 提案（A2A #1672）目前仍未合并。本文写的是：卡片里现在有什么、未来该有什么、以及和基于 MCP 注册表的发现相比一拉一推的差异。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>今天卡片的形状。</h3>
+
+    <p>Agent Card 是一份 JSON 文档，托管在智能体自有 origin 的一个稳定、well-known 的 URL 上。默认位置是 <code class="inline">/.well-known/agent.json</code>，而 <code class="inline">/.well-known/</code> 前缀不是装饰——它与 OpenID Connect discovery、ACME、WebFinger、OAuth Protected Resource Metadata 同属一个注册过的 URI 空间，任何称职的运维团队都已经明白它的缓存、TLS、CDN 特性。尚不认识智能体的调用方会问该 DNS 名的这条路径并读取返回文档；已经认识智能体的调用方可以跳过此 fetch 直接命中之前卡片给出的端点。发现就是一次 HTTPS GET，并终结在智能体自身的 origin 上——路径中没有第三方注册表，读取文档除 TLS 证书之外不再需要额外信任锚。</p>
+
+    <p>卡片的 schema 由 A2A v1.0 规范定义，六个承重字段。<code class="inline">name</code> 与 <code class="inline">description</code> 是人类可读的身份——对端如何自称、宣称能做什么。<code class="inline">url</code> 是调用方发送 task 的 JSON-RPC（或 REST、gRPC）端点。<code class="inline">protocolVersion</code> 与 <code class="inline">supportedProtocolVersions</code> 承担 <a href="/zh/deep-dives/protocols-and-interop/a2a-v1-deep-dive" class="xref">A2A v1.0</a> 一文所述的协商面。<code class="inline">capabilities</code> 是一个小对象，带若干特性开关——<code class="inline">streaming</code>、<code class="inline">pushNotifications</code>、<code class="inline">artifacts</code>——而 <code class="inline">skills</code> 是对端所提供、可分别寻址的能力清单，每项含 id、描述、输入/输出内容模式。其余字段皆可选，或是运维元数据（联系人、文档 URL），或是尚未标准化的扩展所使用的前向兼容载荷。</p>
+
+<pre class="standalone">GET /.well-known/agent.json HTTP/1.1
+Host: agents.example.com
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: max-age=3600, must-revalidate
+A2A-Version: 1.0
+
+{
+  "name": "invoice-reconciler",
+  "description": "Matches invoices to purchase orders.",
+  "url": "https://agents.example.com/a2a",
+  "protocolVersion": "1.0",
+  "supportedProtocolVersions": ["0.9", "1.0"],
+  "capabilities": {"streaming": true, "pushNotifications": true, "artifacts": true},
+  "defaultInputModes": ["text", "file"],
+  "defaultOutputModes": ["text", "file", "application/json"],
+  "authentication": {"schemes": ["oauth2"], "credentials": {"tokenUrl": "https://auth.example.com/oauth/token"}},
+  "extendedCardUrl": "https://agents.example.com/agent.card.extended",
+  "skills": [
+    {"id": "reconcile", "description": "Reconcile invoice batch against POs.",
+     "inputModes": ["file"], "outputModes": ["file"]}
+  ]
+}</pre>
+
+    <p>schema 里有两个设计决定值得点名。第一，基础卡片刻意做小——意图是让调用方能在一次响应内就决定要不要跟对端对话，只有提交后才去取更重的细节。第二，调用方发起一次已鉴权请求所需的一切都在卡片上：端点、<a href="/zh/deep-dives/protocols-and-interop/capability-discovery" class="xref">能力发现</a>的协商输入、鉴权方案。没有额外的带外配置步骤。这与 <code class="inline">/.well-known/oauth-authorization-server</code> 模式如出一辙，理由相同——调用方拿到 URL 并信任 TLS，就已具备全部所需。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>扩展卡片与 /.well-known 约定。</h3>
+
+    <p>基础卡片按设计能塞进一次响应；当调用方需要更丰富的细节——大型舰队的完整 skill schema、动态定价、按租户配额、实时状态——基础卡片会指向一个 <code class="inline">extendedCardUrl</code>。扩展卡片托管在同一 origin 但不在 well-known 路径上，通常以 bearer 令牌获取，可以按租户或按调用方定制。这种拆分让基础卡片保持小、CDN 友好、可缓存数小时甚至数天，而扩展卡片承载会秒级击穿 CDN 的动态与已鉴权载荷。调用方每 TTL 拉一次基础卡片，仅在需要时拉扩展卡片；线上部署里两者比例通常是 100:1 或更好。</p>
+
+    <p>扩展卡片是内容协商真正兑现的地方。基础卡片声明对端接受 <code class="inline">text</code>、<code class="inline">file</code>、<code class="inline">application/json</code>；扩展卡片可描述每个 skill 具体想要的 schema、每 skill 的速率上限、每 skill 所需的授权 scope。因为它在鉴权之后，对端可以按租户变换回答，而不改变公开的发现契约。</p>
+
+<pre class="trace">GET /agent.card.extended HTTP/1.1
+Host: agents.example.com
+Accept: application/json
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: private, max-age=60
+Vary: Authorization
+
+{"skills": [
+  {"id": "reconcile", "inputSchema": {...}, "outputSchema": {...},
+   "rateLimit": {"perMinute": 120}, "scope": "invoice:reconcile"}
+]}</pre>
+
+    <p>把 <code class="inline">/.well-known/agent.json</code> 选作路径在运维上有实际意义。反向代理、CDN、WAF 会把 <code class="inline">/.well-known/</code> 路径当系统元数据路由，常规配置下不对其做请求体审查、请求改写或机器人对抗。若智能体把卡片放到别处——比如 <code class="inline">/api/agent-card</code>——就会被"未知 /api 下 JSON 端点"的企业代理机器人规则丢弃。注册前缀的差别，是"任一客户端从任一网络都能走通的发现流程"与"只有网络运营者显式加白名单才能走通"的差别。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>签名卡片：尚未合并的提案。</h3>
+
+    <p>基础卡片未签名。调用方信任其内容，凭据是 TLS 在对端自有 origin 终结、证书链校验通过——与任何 HTTPS 资源一样的信任模型，与 OpenID Connect 发现所依赖的一致。对多数流程够用；对两种具体情形不够用。第一，位于对端 origin 与调用方之间被入侵的中转——一台配置被投毒的 CDN 边缘、一台被攻击者控制的反向代理——会给调用方递上一张看起来合理但受攻击者控制的卡片，调用方看不到任何 TLS 失败。第二，被中间层缓存下来、在底层对端能力改变之后再被复用的卡片，无法与一份新鲜的权威卡片区分。</p>
+
+    <p>Signed Agent Cards 提案，作为 A2A GitHub issue #1672 提出、截至 2026 年年中仍未合并，通过给卡片外包一层签名信封同时解两处：工作提案用 ECDSA over P-256，配 JOSE 风格的紧凑序列化；签名密钥或直接在卡片里公布（自证型），或经一个指向 JWKS URL 的 <code class="inline">iss</code> 字段可达。调用方在信任卡片任何内容之前先验签；一份被中间层复用的过期卡片会被身上签名的 <code class="inline">not_after</code> 声明抓到；替换了卡片体的恶意中转要么伪造签名要么校验失败。机制是标准的——每一件都在 OAuth 家族里用过——之所以没合并不是技术问题而是政治问题：工作组还在讨论签名密钥应按发现节拍轮换还是更长周期，撤销该走 CRL、走 OCSP 式装订响应、还是靠 <code class="inline">not_after</code> 的短 TTL。</p>
+
+    <p>给当下就要照 A2A 建的团队两条实操注解。第一，把当前未签名的卡片当作可接受的信任根——面向你与之有带外关系（既有 SaaS 合同、身份联邦里的伙伴）的对端；面向从未打过交道的对端就当作较弱的信任信号。第二，写卡片时，从稳定的规范 URL 提供——主域名下的 <code class="inline">/.well-known/</code> 路径——而不是子域或别名主机，这样签名落地时你能补上而不必与每个现有调用方重新谈 URL。没有稳定规范 URL 的卡片，在签名提案上线时最难迁移。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>对比：A2A card 与 MCP registry。</h3>
+
+    <p>A2A 的发现是拉式、按 origin：调用方问对端、对端回答，两者之间没有第三方。MCP 的发现是推式、集中：服务器向 <a href="/zh/deep-dives/mcp/mcp-registry-and-distribution" class="xref">MCP 注册表</a>注册自己，调用方按能力查询注册表寻找服务器，信任锚是注册表本身而非某个服务器的 TLS 证书。两种形状不是同一想法的相互竞争实现；是对不同问题的不同回答。搞清你的架构在问哪个问题，就是全部的取舍。</p>
+
+    <p>拉式按 origin（A2A）更适合"调用方已经知道要找谁、需要对方能力最新答复"的场景。它平凡可扩展——没有中心注册表要维护、没有注册表侧宕机风险、没有"存在哪些 agent"的跨租户泄漏——并让每个对端按自己的节奏演进能力。它的短板出现在"调用方不知道该找谁"时；如果你在做一个需要找到"任意能对账发票的智能体"的编排器，拉式按 origin 的发现循环就是一本要求你已经知道所有电话号码的电话簿。推式到注册表（MCP）就是电话簿本身：调用方查询"哪些服务器提供工具 X？"并取回名单，注册表的 schema 是让跨厂发现能走通的共享词汇。代价是注册表可用性、策划工作，以及一次远离服务器本身的信任跳。</p>
+
+    <p>2026 年中的生产部署会混用两种。已经知道对端 URL 的 A2A 调用方使用拉式卡片。要找"任意具备 skill X 的对端"的调用方要么用自维护的私有目录，要么用那些正在浮现、基于 well-known 卡片之上分层的第三方发现服务。MCP 注册表调用方在连接打开后仍要校验服务器自身的元数据。<a href="/zh/deep-dives/protocols-and-interop/interop-problem" class="xref">互操作问题</a>一文的框架在这里直接适用：对主导 2026 智能体工作负载的组织内流量，拉式按 origin 已足够且更简单；对协议在押注的 2027 及以后跨组织流量，某种注册表形状的层会落地，而 A2A 的 Agent Card 已经是那一层将要索引的源格式。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>缓存语义。</h3>
+
+    <p>基础卡片按设计就是可缓存资源。对端设置标准 HTTP <code class="inline">Cache-Control</code> 头——<code class="inline">max-age</code> 决定 TTL、<code class="inline">must-revalidate</code> 到期强制条件 GET、<code class="inline">ETag</code> 让重新验证廉价。尊重这些头的调用方以可以忽略的带宽成本换来可预测的新鲜度。一个稳定生产对端的推荐 TTL 是数小时量级；易变字段——动态定价、按租户状态——归扩展卡片，而不是把它们塞进只有两分钟 TTL 的基础卡片。</p>
+
+    <p>两个失败模式要防。对端换端点却不更新基础卡片的 <code class="inline">url</code>，会把已缓存副本搁浅在旧地址上直到 TTL 到期——要么选短 TTL 加稳定 URL，要么选长 TTL 且永不搬端点。而把卡片当不透明二进制块缓存、忽略 <code class="inline">must-revalidate</code> 的调用方，会一直向能力已在其脚下改变的对端发流量；缓解办法是对端在收到请求时检测到版本不匹配、以 <code class="inline">409 Conflict</code> 加指向卡片 URL 的 <code class="inline">Location</code> 头回复，触发重新取卡。撤销是它的暗面：签名落地之前，没有内建路径提前强制缓存失效——把卡片 TTL 当作"一个被入侵的对端能被绕开多快"的软上限，选择你猜错了也能扛下来的 TTL。</p>
+  </div>
+</section>

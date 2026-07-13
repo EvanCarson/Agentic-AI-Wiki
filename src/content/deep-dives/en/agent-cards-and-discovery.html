@@ -1,0 +1,99 @@
+<section class="phase">
+  <div class="phase-num">P9</div>
+  <div class="week">Deep Dive · Protocols &amp; Interop</div>
+  <h2>Agent Cards at <code class="inline">/.well-known/agent.json</code> are how A2A does discovery — same idea as OpenID Connect discovery, applied to agents, with signing as the open question.</h2>
+  <p class="goal">Agents advertise themselves at <code class="inline">/.well-known/agent.json</code> — capabilities, endpoints, versioning, extended-card location, cache hints. The pattern is stolen from OpenID Connect and works well until you ask "how do I trust this Agent Card?". The Signed Agent Cards proposal (A2A #1672) is still open. This essay is what is in the card today, what belongs there tomorrow, and how it contrasts with MCP's registry-based discovery — one pull vs push, both live in production.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The card shape today.</h3>
+
+    <p>An Agent Card is a JSON document served at a stable, well-known URL on the agent's own origin. The default location is <code class="inline">/.well-known/agent.json</code>, and the <code class="inline">/.well-known/</code> prefix is not decorative — it is the same registered URI space that OpenID Connect discovery, ACME, WebFinger, and OAuth Protected Resource Metadata all live in, which means any competent operations team already understands its cache, TLS, and CDN properties. A caller that does not know the agent yet asks its DNS name for that path and reads the returned document; a caller that already knows the agent can skip the fetch and hit the endpoint the card previously named. Discovery is one HTTPS GET, and it terminates on the agent's own origin — no third-party registry sits in the path, and no additional trust anchor beyond the TLS certificate is required to read the document.</p>
+
+    <p>The card's schema is defined by the A2A v1.0 specification and describes six load-bearing fields. <code class="inline">name</code> and <code class="inline">description</code> are the human-readable identity — what the peer calls itself and what it claims to do. <code class="inline">url</code> is the JSON-RPC (or REST, or gRPC) endpoint the caller sends tasks to. <code class="inline">protocolVersion</code> and <code class="inline">supportedProtocolVersions</code> carry the negotiation surface the <a href="/deep-dives/protocols-and-interop/a2a-v1-deep-dive" class="xref">A2A v1.0</a> essay walks through. <code class="inline">capabilities</code> is a small object with feature flags — <code class="inline">streaming</code>, <code class="inline">pushNotifications</code>, <code class="inline">artifacts</code> — and <code class="inline">skills</code> is the list of individually addressable capabilities the peer offers, each with an id, description, and input/output content modes. Everything else on the card is optional and either operational metadata (contact, docs URL) or forward-compatibility payload for extensions the group has not yet standardised.</p>
+
+<pre class="standalone">GET /.well-known/agent.json HTTP/1.1
+Host: agents.example.com
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: max-age=3600, must-revalidate
+A2A-Version: 1.0
+
+{
+  "name": "invoice-reconciler",
+  "description": "Matches invoices to purchase orders.",
+  "url": "https://agents.example.com/a2a",
+  "protocolVersion": "1.0",
+  "supportedProtocolVersions": ["0.9", "1.0"],
+  "capabilities": {"streaming": true, "pushNotifications": true, "artifacts": true},
+  "defaultInputModes": ["text", "file"],
+  "defaultOutputModes": ["text", "file", "application/json"],
+  "authentication": {"schemes": ["oauth2"], "credentials": {"tokenUrl": "https://auth.example.com/oauth/token"}},
+  "extendedCardUrl": "https://agents.example.com/agent.card.extended",
+  "skills": [
+    {"id": "reconcile", "description": "Reconcile invoice batch against POs.",
+     "inputModes": ["file"], "outputModes": ["file"]}
+  ]
+}</pre>
+
+    <p>Two design decisions in the schema deserve calling out. First, the base card is deliberately small — the intent is that a caller can decide whether to talk to the peer at all from what fits in a single response, and only fetches heavier detail if it commits. Second, everything the caller needs to make an authenticated request is on the card: the endpoint, the <a href="/deep-dives/protocols-and-interop/capability-discovery" class="xref">capability discovery</a> negotiation inputs, and the authentication scheme. There is no additional out-of-band configuration step. This mirrors the <code class="inline">/.well-known/oauth-authorization-server</code> pattern precisely, and for the same reasons — a caller with a URL and TLS trust has everything it needs.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Extended cards and the /.well-known convention.</h3>
+
+    <p>The base card fits in a single response by design; when a caller needs richer detail — the full skill schema for a large fleet, dynamic pricing, per-tenant quota, live status — the base card points at an <code class="inline">extendedCardUrl</code>. The extended card is served on the same origin but not at a well-known path, is typically fetched with a bearer token, and can be per-tenant or per-caller. The split lets the base card stay small, CDN-friendly, and cacheable for hours or days, while the extended card carries the dynamic and authenticated payload that would blow the CDN cache in seconds. Callers fetch the base card once per TTL and the extended card only when they need to, and the ratio of base-to-extended fetches in a live deployment is typically 100:1 or better.</p>
+
+    <p>The extended card is where content negotiation earns its keep. A base card advertises the peer accepts <code class="inline">text</code>, <code class="inline">file</code>, <code class="inline">application/json</code>; the extended card can describe the specific schema each skill wants, the per-skill rate limit, and the per-skill authorisation scope. Because it lives behind auth, the peer can vary its answer by tenant without changing the public discovery contract.</p>
+
+<pre class="trace">GET /agent.card.extended HTTP/1.1
+Host: agents.example.com
+Accept: application/json
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: private, max-age=60
+Vary: Authorization
+
+{"skills": [
+  {"id": "reconcile", "inputSchema": {...}, "outputSchema": {...},
+   "rateLimit": {"perMinute": 120}, "scope": "invoice:reconcile"}
+]}</pre>
+
+    <p>The choice of <code class="inline">/.well-known/agent.json</code> as the path matters operationally. Reverse proxies, CDNs, and WAFs treat <code class="inline">/.well-known/</code> paths as system-metadata routes and are conventionally configured to serve them without body inspection, request rewriting, or bot mitigation. An agent that hosts its card elsewhere — under <code class="inline">/api/agent-card</code>, say — will find its discovery endpoint dropped by every enterprise proxy whose bot rules match "unknown JSON endpoint under /api." The registered prefix is the difference between a discovery flow that works from any client on any network and one that only works from callers whose network operators know to whitelist it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Signed cards: the unmerged proposal.</h3>
+
+    <p>The base card is unsigned. A caller trusts what it reads because TLS terminated on the peer's own origin and the certificate chain checked out — the same trust model as any HTTPS resource, and identical to what OpenID Connect discovery relies on. It is enough for most flows and it is not enough for two specific cases. First, a card served by a compromised host between the peer's origin and the caller — a CDN edge with a rogue configuration, a reverse proxy an attacker has taken over — will hand the caller a plausible-looking but attacker-controlled card without any TLS failure the caller can see. Second, a card cached at an intermediary and later re-served after the underlying peer changed its capabilities cannot be distinguished from a fresh authoritative one.</p>
+
+    <p>The Signed Agent Cards proposal, filed as A2A GitHub issue #1672 and still open as of mid-2026, addresses both by wrapping the card in a signed envelope — the working proposal uses ECDSA over P-256 with a JOSE-style compact serialization, and the signing key is either published in the card itself (self-attesting) or reachable via an <code class="inline">iss</code> field pointing at a JWKS URL. A caller verifies the signature before trusting anything in the card; a cache that re-serves a stale card is caught because the signed body carries a <code class="inline">not_after</code> claim that expires; a rogue intermediary that swaps the card body has to forge the signature or fail the check. The mechanism is standard — every piece of it is used somewhere in the OAuth family — and the reason it has not merged is not technical but political: the working group is debating whether signing keys should rotate on the discovery cadence or on a longer schedule, and whether revocation is expressed via a CRL, an OCSP-style stapled response, or a short TTL on the <code class="inline">not_after</code> claim.</p>
+
+    <p>Two practical notes for teams building against A2A now. First, treat the current unsigned card as an acceptable trust root for peers you have an out-of-band relationship with (an existing SaaS contract, a partner in your identity federation) and as a weaker trust signal for peers you have never talked to before. Second, when you author a card, publish it from a stable canonical URL — the <code class="inline">/.well-known/</code> path on your primary hostname — rather than from a subdomain or aliased host, so that when signing lands you can retrofit it without needing to renegotiate URLs with every existing caller. Cards without a stable canonical URL will be the hardest to migrate when the signature proposal ships.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Contrast: A2A card vs MCP registry.</h3>
+
+    <p>A2A's discovery is pull-shaped and per-origin: the caller asks the peer, the peer answers, no third party sits between them. MCP's discovery is push-shaped and central: servers register themselves with the <a href="/deep-dives/mcp/mcp-registry-and-distribution" class="xref">MCP registry</a>, callers query the registry to find servers by capability, and the trust anchor is the registry itself rather than the individual server's TLS certificate. The two shapes are not competing implementations of the same idea; they are answers to different questions, and understanding which question your architecture is asking is the whole trade.</p>
+
+    <p>Pull-per-origin (A2A) is better when the caller already knows which peer it wants to talk to and needs the freshest possible answer about that peer's current capabilities. It scales trivially — there is no central registry to maintain, no registry-side outage risk, no cross-tenant leakage of which agents exist — and it lets each peer version its capabilities on its own schedule. It is worse when the caller does not know which peer to ask; if you are building an orchestrator that needs to find "any agent that can reconcile invoices," a pull-per-origin discovery loop is a phone-book that requires you to already know the phone numbers. Push-to-registry (MCP) is the phone book itself: callers query "which servers offer tool X?" and get a list, and the registry's schema is the shared vocabulary that makes cross-vendor discovery work. The cost is registry availability, curation, and a trust hop away from the servers themselves.</p>
+
+    <p>Production deployments in mid-2026 combine both. An A2A caller that knows its peer's URL uses the pull card. A caller looking for "any peer with skill X" uses either a private catalogue it maintains or one of the emerging third-party discovery services layered on top of well-known cards. MCP registry callers still validate the server's own metadata once the connection opens. The <a href="/deep-dives/protocols-and-interop/interop-problem" class="xref">interop problem</a> essay's framing applies directly here: for the intra-organisation traffic that dominates 2026 agent workloads, pull-per-origin is enough and simpler; for the cross-organisation traffic that the protocols are betting on for 2027 and beyond, some registry-shaped layer will land, and A2A's Agent Cards are already the source format that layer will index.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Caching semantics.</h3>
+
+    <p>The base card is a cacheable resource by design. The peer sets standard HTTP <code class="inline">Cache-Control</code> headers — <code class="inline">max-age</code> for the TTL, <code class="inline">must-revalidate</code> to force a conditional GET on expiry, and an <code class="inline">ETag</code> so the revalidation is cheap. A caller that respects these gets predictable freshness at negligible bandwidth cost. The recommended TTL for a stable production peer is on the order of hours; volatile fields — dynamic pricing, per-tenant status — belong in the extended card, not in the base card behind a two-minute TTL.</p>
+
+    <p>Two failure modes to design against. A peer that changes its endpoint without bumping the base card's <code class="inline">url</code> strands cached copies at the old address until the TTL expires — pick either short TTLs plus stable URLs, or long TTLs and never move the endpoint. And a caller that caches the card as an opaque blob and ignores <code class="inline">must-revalidate</code> will keep sending traffic to a peer whose capabilities changed underneath it; the mitigation is a peer detecting a version mismatch on an incoming request responding with a <code class="inline">409 Conflict</code> and a <code class="inline">Location</code> header pointing at the card URL, prompting a re-fetch. Revocation is the dark twin: before signing lands there is no built-in path to force cache invalidation early — treat the card TTL as a soft ceiling on how quickly a compromised peer can be routed around, and choose a TTL you can survive being wrong about.</p>
+  </div>
+</section>
