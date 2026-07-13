@@ -1,0 +1,119 @@
+<section class="phase">
+  <div class="phase-num">E1</div>
+  <div class="week">Deep Dive · Evaluating Agents</div>
+  <h2>LLM-as-judge without a calibration protocol is a metric that lies; the 2026 production discipline is 85-90% agreement with a human gold set, monthly recalibration, and named alarms for meta-evaluation collapse.</h2>
+  <p class="goal">LLM-as-judge scaled evals but broke calibration. "Meta-evaluation collapse" is the named failure &mdash; the judge model's own scoring distribution drifts, and the eval score becomes decorative. The production discipline that survived contact with reality: build a human-labeled gold set, calibrate the judge to 85-90% agreement against it, recalibrate monthly, alarm when agreement drops. Prometheus 2, JudgeBench, and RubricEval are the tools that make this cheap enough to do. This essay is the protocol, not the theory.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The meta-evaluation collapse pattern.</h3>
+
+    <p>Meta-evaluation collapse names what happens when the judge&mdash;the model you are using to score other models' outputs&mdash;itself drifts, and the scoreboard keeps producing plausible numbers while the underlying signal has decoupled from anything a human would call quality. The failure has a shape. On day one you point a judge model at a rubric and calibrate against a small human-labeled set; agreement lands somewhere in the 88-92% band, you ship the pipeline, and for a few weeks the eval scores track the anecdotal complaints inbox. Then the judge model gets silently updated (the vendor promotes a new snapshot, or your host swaps a route, or your own prompt drifts as engineers touch it), and the scoring distribution shifts a few points. Nothing alarms, because you are grading only the system-under-test, not the grader. A month in, the eval score has climbed three points and support tickets have doubled. The eval was still running the whole time. It just wasn't measuring anything real.</p>
+
+    <p>The pattern is easiest to see in a rolling seven-day window over live traffic. Take the same 500 traces every day, score them with the current judge, and plot the score histogram. In a healthy pipeline the histogram wobbles a little week over week but its mean and its shape are stable. In a collapsing pipeline the mean drifts monotonically&mdash;always upward when the drift is judge sycophancy, sometimes downward when the drift is judge nit-picking&mdash;while the human complaint rate moves in the opposite direction. The classical eval literature (see the <a href="/concepts/evals-101" class="xref">evals-101</a> concept) called this "test set contamination" and treated it as a one-time hygiene problem. In LLM-as-judge it is not a hygiene problem, it is a live-system problem, because the grader is itself a model whose behavior changes.</p>
+
+    <p>The other symptom worth naming is what practitioners have started calling "position collapse": when the judge is asked to compare two candidate outputs A and B, and its accuracy against a human gold set drops to near 50% while its self-consistency (same pair, same prompt, different runs) stays high. The judge has stopped discriminating on quality and has started discriminating on something incidental&mdash;length, formatting, first-position bias&mdash;that self-consistency does not expose. This is the failure that <a href="/operations/evaluation-and-observability/llm-as-judge-for-agents" class="xref">the operations essay on LLM-as-judge</a> treated as an implementation footnote; in 2026 it is a first-class alarm.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The 85-90% agreement floor.</h3>
+
+    <p>The number that the field has converged on is 85-90% agreement between the LLM judge and a human-labeled gold set, and the number that people initially reach for (95%+) is wrong for a reason that is worth internalizing. Human inter-annotator agreement on the same tasks is itself in the 88-93% band. If you tune a judge to 96% agreement with any single human labeler, you have almost certainly overfit the judge to that labeler's idiosyncrasies&mdash;the same set of items that two humans would disagree on will now match one of them and disagree with the other. The judge is not "better than human"; it is "more consistent with one human," which is the wrong optimization target when you cannot ship that specific human to production.</p>
+
+    <p>The floor being 85% (not 80%) matters for the opposite reason. Below 85%, the judge is materially disagreeing with the gold set often enough that the gap between two systems the judge scores 3 points apart is smaller than the judge's own noise floor; you cannot use the score to rank. Above 90%, you are almost always spending marginal calibration effort on the labeler-idiosyncrasy problem, not on real quality signal. Between 85% and 90% is the operating band where the score can be trusted to rank two candidate systems whose true difference exceeds a couple of points, and cannot be trusted to rank two systems within noise. Ranking-with-noise is what a production eval score is actually good for, and 85-90% is where it stays good for that.</p>
+
+    <p>Two practical corollaries. First, the agreement metric to track is Cohen's kappa or a class-balanced accuracy, not raw accuracy, because most eval rubrics are imbalanced (the "pass" class is the vast majority). Second, the gold set must include the disagreement cases&mdash;items where two labelers legitimately disagreed&mdash;because those are precisely the items the judge will be evaluated on. A gold set built only from the items three humans agreed on is a gold set that will accept a judge with hidden position bias.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Building the gold set.</h3>
+
+    <p>The gold set is the load-bearing artifact of the whole discipline, and the median team under-invests in it. The size that works empirically is 100-300 items per rubric dimension. Below 100 the confidence intervals on judge-vs-gold agreement are wide enough to hide a full point of drift; above 300 the marginal labeler-hour buys almost nothing on the calibration side and would be better spent on rubric quality. Sample from production traces, stratified across the failure modes you already know about (short-response, tool-error-recovery, refusal, jailbreak-attempt) and the ones you don't (a random slice from the tail of your logs, uniformly sampled). Do not sample only from failures&mdash;a gold set of only failures cannot detect a judge that has learned to always predict "fail."</p>
+
+    <p>Label with at least two humans per item, resolve disagreements with a third or with a written adjudication rule. Track inter-annotator agreement on the gold set itself; that number is the ceiling on what any LLM judge can achieve against this set. Publish the ceiling internally alongside every judge score, because engineers will otherwise chase agreement numbers above the human ceiling and interpret the resulting overfit as progress. The <a href="/deep-dives/retrieval-and-rag/evaluating-rag" class="xref">RAG eval essay</a> makes the same point about retrieval gold sets; memory eval work in <a href="/deep-dives/memory-and-context/evaluating-memory" class="xref">evaluating memory</a> makes it for memory-specific probes. The pattern is the same across surfaces: gold set is the thing everyone knows they should invest in, and few actually do until the judge collapses on them.</p>
+
+    <p>Version the gold set. Every item gets an ID, a labeler ID per label, a labeling timestamp, and a rubric-version pointer. When the rubric changes (which it will), you relabel affected items rather than migrating scores. When production distribution changes (new feature, new customer segment), you extend the gold set rather than reinterpreting old labels. A gold set with no version history is a gold set that silently rots.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Monthly recalibration cadence.</h3>
+
+    <p>Recalibration is a scheduled event, not an incident response. The cadence that has held up in production is monthly, with an emergency-recalibration trigger for score drift alarms (see STEP 5). Monthly is short enough to catch vendor-side model updates and slow prompt drift before they compound; it is long enough that the labeler cost per year (roughly twelve rounds of 100-300 items) stays in the budget of a single dedicated evaluator. Weekly recalibration sounds diligent but costs four times as much and rarely surfaces anything that a monthly cadence with a drift alarm would miss.</p>
+
+    <p>What a recalibration actually touches is smaller than most teams expect. You do not relabel the whole gold set; you re-score it with the current judge and re-compute the agreement metric. If agreement is in the operating band, the judge passes, and the calibration record for the month is a one-line entry. If agreement has fallen below the floor, you diagnose (prompt drift, model drift, distribution drift, gold-set rot) and take one of three actions: tune the judge prompt, roll back to a pinned judge model, or extend the gold set. You do not tune the rubric during a recalibration&mdash;rubric changes are a separate, less-frequent event that trigger their own gold-set relabel.</p>
+
+    <p>The output of every recalibration is a signed calibration record with judge model+version, judge prompt hash, gold-set version, agreement metric, and pass/fail. Keep the records; you will want them the next time someone asks "when did the eval score for feature X actually mean something and when did it stop meaning something." A pipeline with no calibration history cannot answer that question, and the honest answer&mdash;"we don't know when the numbers stopped being real"&mdash;is where most teams that skip this step end up.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Alarms and rollback.</h3>
+
+    <p>Two alarms are worth paging on. The first is agreement-below-floor: the rolling seven-day judge-vs-gold agreement drops below 85%, and the pipeline goes into a "score untrusted" state that blocks any eval-gated deployment. The second is score-drift-against-complaints: the eval score trend and the user-complaint trend diverge by more than a threshold over a rolling 14-day window, in either direction. The first alarm catches classical judge-model regressions; the second catches meta-evaluation collapse where the judge and the gold set have both drifted together and the internal-consistency check no longer detects it.</p>
+
+    <p>Rollback discipline is a design decision most teams make in a hurry the first time an alarm fires. Decide it in advance. The rollback target is a pinned judge configuration&mdash;model version, prompt, rubric, gold-set version&mdash;that was known-good at the last passing calibration. Rolling back the judge does not roll back the system-under-test; you keep shipping the product, you just stop letting the eval gate ship-decisions until the calibration is restored. The most common mistake here is treating a judge alarm as a system-under-test alarm and freezing product deployments until the eval is fixed, which trains the team to disable alarms rather than fix judges.</p>
+
+<pre class="trace"><span class="c-out">judge_calibration:
+  gold_set:
+    id: gold-set-v7
+    size: 240
+    dimensions: [factuality, task_success, refusal_appropriateness]
+  judge:
+    model: prometheus-2-8x7b
+    prompt_hash: sha256:9f4a...
+  agreement_floor: 0.85
+  alarms:
+    - name: agreement_below_floor
+      window: 7d
+      metric: cohens_kappa
+      threshold: &lt; 0.85
+      action: page + block_eval_gate
+    - name: score_vs_complaints_divergence
+      window: 14d
+      metric: abs(score_trend - inv(complaint_trend))
+      threshold: &gt; 0.15
+      action: page + open_recalibration
+  recalibration_cadence: monthly
+  pinned_rollback: judge-config-v6</span></pre>
+
+    <p>The dashboard config above is the shape you want in your monitoring stack, not the specific tool. What matters is that both alarms are pre-defined, both have a pinned rollback target, and both have an owner. In practice the owner of judge calibration should not be the same person who owns the system-under-test; the incentive to explain away a judge alarm as "just noise" is too high when the same person's roadmap depends on the score going up.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Tools: Prometheus 2, JudgeBench, RubricEval.</h3>
+
+    <p>Three open-source tools have become the practical backbone of this discipline. Prometheus 2 is a family of fine-tuned judge models (7B and 8x7B) trained specifically to produce calibrated rubric scores with explanations; the value is not that it out-performs GPT-4-class judges on raw accuracy, but that its scoring distribution is stable across model updates (because you host it) and its cost per judgment is roughly one to two orders of magnitude lower than a frontier-model judge. Use it for high-volume production evals where a frontier-model judge would exhaust the eval budget in a week.</p>
+
+    <p>JudgeBench is a benchmark for judges&mdash;a curated set of preference pairs where the "correct" preference is known, used to measure a judge's raw discriminative ability. Run JudgeBench when picking a judge model or when a recalibration surfaces an unexplained agreement drop, to separate "the judge got worse at judging" from "the gold set drifted." RubricEval is the missing complement: an open evaluation harness for scoring against explicit rubrics with per-dimension breakdowns, designed so that a judge's per-dimension scores can be inspected rather than collapsed to a single number.</p>
+
+    <p>The pattern that has emerged for teams running this stack in anger is a two-judge pipeline: a cheap Prometheus 2 judge scores every production trace for the rolling drift dashboard, and a more expensive frontier-model judge scores a stratified sample (say 5-10% of traces) for the recalibration and gold-set-extension pipeline. The cheap judge is what you page on; the expensive judge is what you diagnose with. Neither of them is what you ship your product on&mdash;that is the human gold set, and the whole edifice above exists to make sure the number the cheap judge reports still tracks what the gold set would say.</p>
+
+<pre class="standalone"><span class="c-cm"># tools/calibrate_judge.py &mdash; run monthly, or on alarm.</span>
+<span class="c-kw">from</span> pathlib <span class="c-kw">import</span> Path
+<span class="c-kw">from</span> sklearn.metrics <span class="c-kw">import</span> cohen_kappa_score
+
+<span class="c-kw">def</span> calibrate(judge, gold_set, floor=<span class="c-nb">0.85</span>):
+    preds = [judge.score(item.input, item.output) <span class="c-kw">for</span> item <span class="c-kw">in</span> gold_set.items]
+    truth = [item.human_label <span class="c-kw">for</span> item <span class="c-kw">in</span> gold_set.items]
+    kappa = cohen_kappa_score(truth, preds)
+
+    record = {
+        <span class="c-st">"gold_set"</span>: gold_set.version,
+        <span class="c-st">"judge_model"</span>: judge.model_id,
+        <span class="c-st">"judge_prompt_hash"</span>: judge.prompt_hash,
+        <span class="c-st">"agreement_kappa"</span>: kappa,
+        <span class="c-st">"floor"</span>: floor,
+        <span class="c-st">"pass"</span>: kappa &gt;= floor,
+    }
+    Path(<span class="c-st">"calibration/history"</span>).write_calibration_record(record)
+    <span class="c-kw">if not</span> record[<span class="c-st">"pass"</span>]:
+        <span class="c-kw">raise</span> CalibrationFailure(record)  <span class="c-cm"># pages on-call; blocks eval gate.</span>
+    <span class="c-kw">return</span> record</pre>
+
+    <p>The harness above is short by design. The whole discipline is short by design. What is load-bearing is not the code, it is the commitments: a versioned gold set, a documented floor, a monthly cadence, pre-defined alarms with pinned rollbacks, and an owner who is not the person shipping the system-under-test. Every collapse pattern in this essay starts with skipping one of those commitments; every team that has survived contact with production eval has kept all five.</p>
+  </div>
+</section>
