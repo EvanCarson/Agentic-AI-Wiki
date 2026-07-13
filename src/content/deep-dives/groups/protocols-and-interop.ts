@@ -15,6 +15,7 @@ const group: Group = {
     { page: 'building-interoperable-agents', slug: 'building-interoperable-agents', title: L('Building an Interoperable Agent','构建可互操作的智能体'), summary: L('Comparing tool calling, MCP, and A2A; a decision rule and one normalised registry architecture.','比较工具调用、MCP 与 A2A；一条决策规则与一个归一化注册表架构。') },
     { page: 'a2a-v1-deep-dive', slug: 'a2a-v1-deep-dive', title: L('A2A v1.0: Task Lifecycle, Messages, Artifacts','A2A v1.0：任务生命周期、消息、产物'), summary: L("A2A hit v1.0 in April 2026 — nine task states (not four), Message vs Artifact split, A2A-Version header, breaking changes from pre-1.0, and 150+ org adoption.",'A2A 于 2026 年 4 月发布 v1.0——九种任务状态（不是四种）、Message 与 Artifact 之分、A2A-Version 头、pre-1.0 破坏性变更，以及 150+ 组织采纳。') },
     { page: 'agent-cards-and-discovery', slug: 'agent-cards-and-discovery', title: L('Agent Cards & Discovery','智能体卡片与发现'), summary: L("A2A's /.well-known/agent.json — capability declaration, extended cards, signing, caching, and how it compares with MCP registry-based discovery.",'A2A 的 /.well-known/agent.json——能力声明、扩展卡片、签名、缓存，以及与基于 MCP 注册表的发现相比是何差异。') },
+    { page: 'acp-and-what-happened', slug: 'acp-and-what-happened', title: L('ACP: What Happened','ACP：后来怎么了'), summary: L("A short post-mortem — ACP existed, was REST-native, was contributed to the Linux Foundation in July 2025, and folded into A2A. Useful because search still surfaces stale 'ACP vs A2A' content.",'一份简短的复盘——ACP 存在过、以 REST 为原生、于 2025 年 7 月被贡献给 Linux 基金会，并并入 A2A。之所以有用，是因为搜索仍会返回过时的"ACP vs A2A"内容。') },
   ],
 };
 export default group;
