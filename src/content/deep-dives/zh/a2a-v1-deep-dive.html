@@ -1,0 +1,140 @@
+<section class="phase">
+  <div class="phase-num">P8</div>
+  <div class="week">深入解析 · 协议与互操作</div>
+  <h2>A2A v1.0（2026 年 4 月）与 pre-1.0 不是同一份协议——九种任务状态、Message 与 Artifact 之分、以及版本 header 才是承重件，而 <code class="inline">a2a-communication</code> 一文成文早于这些。</h2>
+  <p class="goal">A2A 于 2026 年 4 月 9 日发布 v1.0，距 Google 首次宣布正好一年。150+ 组织成员、五个官方 SDK、在 Azure 与 Bedrock 中被采纳。本站概念层的 <a href="/zh/deep-dives/protocols-and-interop/a2a-communication" class="xref">A2A 通信</a>一文成文早于 v1.0，描述的是四种任务状态；v1.0 有九种，包括 <code class="inline">INPUT_REQUIRED</code>、<code class="inline">AUTH_REQUIRED</code>、<code class="inline">REJECTED</code>——你会围绕它们构建委派逻辑。Message 与 Artifact 的拆分（回合 vs 输出）、<code class="inline">A2A-Version</code> 头，以及"按传输协议分别流式"的模型，才是要细读的部分。这篇写的是"你将去实现的" v1.0。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>相较 pre-1.0 有何变化。</h3>
+
+    <p>2026 年 4 月之前的每一份 A2A 教程，现在描述的都是更早的草案。draft-A2A 与 v1.0 之间的差距不是外观修饰；状态机长大了、消息模型一分为二、传输绑定被分离、并新增了一个版本头以便新老客户端并存。本站的 <a href="/zh/deep-dives/protocols-and-interop/a2a-communication" class="xref">A2A 通信</a>一文是照 pre-1.0 草案写的——四态生命周期（<code class="inline">submitted → working → input-required → completed</code>）与单一消息类型同时承担回合与输出。这个模型正是大多数教程与 2025 年每一篇"A2A 如何工作"博客所展示的。它够做 demo；不够拿来实现。</p>
+
+    <p>要跟进的四个最大破坏性变更。第一，任务状态机从四态扩至九态——新增的 <code class="inline">AUTH_REQUIRED</code> 与 <code class="inline">REJECTED</code> 尤其表达了四态模型根本无法表达的语义（对端要你先做鉴权再继续，与对端干脆拒绝任务，是两回事）。第二，Message 与 Artifact 对象拆开——Message 严格是关于某任务的一次对话回合，Artifact 严格是对端产出的可交付物。pre-1.0 把两者塞进同一个 message-with-parts 对象；v1.0 在"我们如何谈论这件事"与"这件事产出了什么"之间划出干净的接缝。第三，流式从顶层概念下沉为按传输的绑定——JSON-RPC over HTTP 用 SSE，gRPC 用原生流式，REST 绑定用分块响应，各自的分帧规则略有差异。第四，新增了 <code class="inline">A2A-Version</code> HTTP 头，出现在每一个请求与每一个响应上，好让 v1.0 客户端不用靠猜就能与 pre-1.0 对端协商。</p>
+
+    <p>规范建议的升级路径：实现可以在 2026 年内继续提供 pre-1.0；必须在 <a href="/zh/deep-dives/protocols-and-interop/capability-discovery" class="xref">能力发现</a>的 Agent Card 上公布所支持的版本；并且应当拒绝其未实现的 <code class="inline">A2A-Version</code> 请求，而不是悄悄降级。实际操作里，多数 SDK 同时实现新老两版、对对端做能力探测、选双方都实现的最低版本——这与 MCP <code class="inline">initialize</code> 的版本协商是同一形状。本文其余部分讲的是 v1.0；pre-1.0 那篇对"为何要一份 agent-to-agent 协议"的框架仍然有用，但不应作为实现参考。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>九态任务生命周期。</h3>
+
+    <p>Task 是 A2A 的持久身份——有稳定 id、拥有者、承接者、状态，以及消息与产物历史。状态字段是一个九值枚举，而状态之间的转移正是你委派逻辑真正编程的对象。四个终态（<code class="inline">COMPLETED</code>、<code class="inline">FAILED</code>、<code class="inline">CANCELED</code>、<code class="inline">REJECTED</code>）关闭 task 并禁止后续消息；五个非终态是工作发生、调用方等待的地方。读一遍，整套协议就从字符串状变成形状状。</p>
+
+<pre class="trace">                 ┌───────────┐
+                 │ SUBMITTED │
+                 └─────┬─────┘
+                       │
+                       v
+              ┌────────────────┐   auth cycle    ┌──────────────┐
+              │  WORKING       │&lt;───────────────&gt;│ AUTH_REQUIRED│
+              └──┬──────┬──────┘                 └──────────────┘
+                 │      │
+   ask user      │      │  produce output
+                 v      v
+        ┌───────────────┐    ┌──────────────┐
+        │ INPUT_REQUIRED│    │  ARTIFACT_*  │  (streaming)
+        └──────┬────────┘    └──────┬───────┘
+               │                    │
+               └──────┬─────────────┘
+                      v
+              ┌───────────────┐
+              │  COMPLETED    │ ── or ── FAILED / CANCELED / REJECTED
+              └───────────────┘</pre>
+
+    <p><code class="inline">SUBMITTED</code> 与 <code class="inline">WORKING</code> 是常规路径：任务落地、承接方开工、多数任务在工作期间一直处于 <code class="inline">WORKING</code>。<code class="inline">INPUT_REQUIRED</code> 是对端还需要你的东西——一句澄清、一个缺失参数——调用方必须在同一 task id 上再发一条 Message 才能把它推回 <code class="inline">WORKING</code>。<code class="inline">AUTH_REQUIRED</code> 是 v1.0 新增的状态，对端发现需要一个调用方尚未出示的凭证时会把 task 挪进这个状态；调用方在带外解决（通常是调用方驱动的一次 OAuth 跳转）之后再重发。<code class="inline">REJECTED</code> 也是新增：一种终态拒绝，与 <code class="inline">FAILED</code> 不同，含义是"我理解这项任务，选择不做"。策略引擎把任务落在 <code class="inline">REJECTED</code>；运行时错误落在 <code class="inline">FAILED</code>。</p>
+
+    <p>状态转移是有向的，并受规范约束。从 <code class="inline">SUBMITTED</code> 出发，对端可以走到 <code class="inline">WORKING</code>、<code class="inline">REJECTED</code>、<code class="inline">AUTH_REQUIRED</code>；从 <code class="inline">WORKING</code> 出发，对端可以走到 <code class="inline">INPUT_REQUIRED</code>、<code class="inline">AUTH_REQUIRED</code> 或任一终态；从 <code class="inline">INPUT_REQUIRED</code> 出发，一条来自调用方的 Message 把 task 送回 <code class="inline">WORKING</code>。非法转移（调用方向一个 <code class="inline">COMPLETED</code> task 再发 Message、对端从 <code class="inline">SUBMITTED</code> 直接跳到 <code class="inline">COMPLETED</code> 且没有任何工作信号）是协议错误，必须以 JSON-RPC 错误码拒绝。这正是 pre-1.0 四态模型在生产上的坑——团队构建的委派图表达不了"对端在半程要求凭证"，只能临时拿 Message 体去编码鉴权请求，把每一次跨厂商互操作尝试都打穿。九态机把这些路径逐一命名，正因如此才存在。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Message 与 Artifact。</h3>
+
+    <p>pre-1.0 只有一种对象——带 parts 的 Message——同时承担调用方的请求与对端的产出。v1.0 把它拆成两个语义各异的对象。Message 是关于某 task 的一次对话回合，parts 里可以承载文本、文件或结构化数据，并总是绑定到一个角色（<code class="inline">user</code> 或 <code class="inline">agent</code>）。Artifact 是对端产出的可交付物——已完成的 CSV、已渲染的 PDF、一条结构化记录——同样由 parts 组成，但在 task 内有稳定 id，隐含着版本化的叙事。一个 task 累积零或多条 Message（对话）与零或多个 Artifact（产出）。把这一拆理解成"回合 vs 产出"，就是记得住的助记。</p>
+
+    <p>具体来说，这对长时间运行的任务尤为重要。一个耗时二十分钟出报告的研究智能体，通常会持续发出进度类 Message（"正在看第二个来源"、"发现矛盾，去查第三处"），最后再交付一个 Artifact（报告本身）。<a href="/zh/deep-dives/protocols-and-interop/capability-discovery" class="xref">能力发现</a>的 Agent Card 会公布对端为每种 artifact 类型产出的内容模式——<code class="inline">text/markdown</code>、<code class="inline">application/pdf</code>、<code class="inline">application/json</code>——调用方据此规划渲染路径。因为 Artifact 有自己的 id 与版本，对端可以在 task 期间更新某个 artifact（先给草稿，再给精修版），两边都不会丢掉早先的版本——版本历史可通过 <code class="inline">tasks/artifacts/get</code> 取回，调用方按自己需要展示或丢弃老版本。</p>
+
+<pre class="trace">POST /a2a HTTP/1.1
+A2A-Version: 1.0
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0", "id": 42, "method": "tasks/send",
+  "params": {
+    "task": {"id": "t_9c4a", "state": "WORKING"},
+    "message": {
+      "role": "agent",
+      "parts": [{"type": "text", "text": "which fiscal year?"}]
+    }
+  }
+}
+
+HTTP/1.1 200 OK
+A2A-Version: 1.0
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": 42, "result": {"state": "INPUT_REQUIRED"}}</pre>
+
+    <p>上面的线上形状是 JSON-RPC 绑定，但概念与传输无关。Message 走线上；状态转移（<code class="inline">WORKING → INPUT_REQUIRED</code>）是对端对本次 send 的响应。调用方由此得知 task 阻塞在自己这一侧的回复上，可以把问题呈现给另一头的人。Artifact 沿同样形状但通过 <code class="inline">artifacts/added</code> 或流式 <code class="inline">artifacts/chunk</code> 事件到达，从不塞进 Message。这条拆分口头说来微小，落到实处每次写状态机都承重。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>按传输协议的流式。</h3>
+
+    <p>A2A v1.0 定义三种官方传输绑定：JSON-RPC over HTTP（默认）、gRPC（面向多语言后端）、以及一份 REST 形状的 HTTP 绑定（面向"直接 curl"那种，正是 ACP 原本追求的场景）。三者的流式各不相同。JSON-RPC 绑定用 Server-Sent Events 做流式——调用方打开一条长连的 <code class="inline">tasks/subscribe</code>，服务端把状态与 artifact 事件当作 SSE 帧推出去，连接在 task 时长或 SSE 超时之间保持打开。gRPC 绑定用原生双向流——每个事件都是一条 gRPC 消息在同一条开着的流上，无须分帧体操。REST 绑定用分块的 <code class="inline">text/event-stream</code>，形似 SSE，但重试语义略有出入。</p>
+
+    <p>对实现者的直接后果是：你没法写一次"A2A 流式客户端"就跨三种绑定通用而不做抽象。你选用的 SDK 会代劳——官方 Python SDK 暴露的 <code class="inline">a2a.stream(task_id)</code> 迭代器内部按对端传输切换——但手搓的客户端必须选一种绑定并守住。对那些活得比一次 SSE 连接还长的 task（跑一小时的研究智能体、批处理），v1.0 还定义了推送通知：调用方在 task 创建时注册一个 webhook，对端把状态与 artifact 事件 POST 到 webhook，两边都不用保持长连。这正是超出单个负载均衡器连接预算之上可扩展的模式，也是野外生产 A2A 部署对任何超过一分钟的任务实际采用的模式。</p>
+
+    <p>订阅本身是"按 task"而非"按 agent"的，这是一条细节但带来大的运维后果。同一调用方对同一对端跑多个 task 就会打开 N 条连接，每 task 一条；服务多调用方的对端必须按"并发订阅数"而不是"请求速率"来做容量。Agent Card 上标注的速率限制在 v1.0 里定义为：send 类调用按"每分钟请求数"，subscribe 类调用按"并发流数"，二者通常相差一个数量级。客户端漏掉这一点，就会花一个下午 debug 为什么同一个对端能接住每分钟一万次请求，却在你打开第 200 条订阅时拒绝。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>版本控制：A2A-Version 与迁移。</h3>
+
+    <p><code class="inline">A2A-Version</code> HTTP 头在 v1.0 的每一次请求与每一次响应上都在。取值是 semver 字符串——当前发布是 <code class="inline">1.0.0</code>，补丁将是 <code class="inline">1.0.x</code>，小版本增量是 <code class="inline">1.x.0</code>。客户端发它所实现的版本；服务端以它实际用于响应的版本回复，或者是客户端的版本，或者是服务端也实现的更低版本。若服务端没实现客户端所请求的任何版本，响应是一个 JSON-RPC 错误，代码 <code class="inline">-32600</code>，消息列出所支持的版本。</p>
+
+<pre class="standalone">GET /.well-known/agent.json HTTP/1.1
+Host: agents.example.com
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+A2A-Version: 1.0
+
+{
+  "name": "invoice-reconciler",
+  "description": "Matches invoices to purchase orders.",
+  "url": "https://agents.example.com/a2a",
+  "protocolVersion": "1.0",
+  "supportedProtocolVersions": ["0.9", "1.0"],
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": true,
+    "artifacts": true
+  },
+  "defaultInputModes": ["text", "file"],
+  "defaultOutputModes": ["text", "file", "application/json"],
+  "skills": [
+    {"id": "reconcile", "description": "Reconcile invoice batch against POs.",
+     "inputModes": ["file"], "outputModes": ["file"]}
+  ]
+}</pre>
+
+    <p>Agent Card 上的 <code class="inline">supportedProtocolVersions</code> 数组是请求头在发现时刻的对应件——调用方读卡片，看到对端支持 0.9 与 1.0，就选 1.0。<code class="inline">protocolVersion</code> 字段是对端偏好的默认。完全迁离 pre-1.0 的对端从数组里去掉 0.9；仍服务遗留调用方的对端两个都留。这正是<a href="/zh/deep-dives/protocols-and-interop/capability-discovery" class="xref">能力发现</a>一文所描述的"能力探测式版本协商"模式，只不过应用在协议版本这一位而非某个具体 capability 上。请求上的头让协商成本很低——不必重取卡片、不必会话状态——代价是每跳多两字节的 header。</p>
+
+    <p>A2A 工作组给出的迁移建议偏务实：同时服务两版的对端通常共享一份 task 存储，在入站时把 pre-1.0 消息翻成 v1.0 Message（出站再翻回去），并把四态模型映射到九态之上：<code class="inline">submitted → SUBMITTED</code>、<code class="inline">working → WORKING</code>、<code class="inline">input-required → INPUT_REQUIRED</code>、<code class="inline">completed → COMPLETED</code>、<code class="inline">failed → FAILED</code>。按 v1.0 语义本应落到 <code class="inline">AUTH_REQUIRED</code> 或 <code class="inline">REJECTED</code> 的 task，对 pre-1.0 调用方降级到 <code class="inline">failed</code>，原因编码进 failure message——这是一次小的有损压缩，但足以让遗留调用方在对端迁移期间不掉线。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>采纳现状核查。</h3>
+
+    <p>Linux 基金会宣布 v1.0 的新闻稿列了 150+ 成员组织支持、五个官方 SDK（Python、TypeScript、Go、Java、.NET）、以及在 Microsoft Azure AI Foundry 与 Amazon Bedrock AgentCore 的采纳。这些是真实数字，对信号意义重要——有这种量级的厂商背书，你可以为多年路线图押注这份协议。它们也是营销数字。真正决定 A2A 是否出现在你架构里的数字是另一个：到底有多少生产级的 peer-to-peer 智能体部署真在跑 A2A，而不是一个自定制 REST 端点。截至 2026 年年中，这个数字更接近"几十"而不是"150"。</p>
+
+    <p>"组织签名声援"与"组织在生产里上线了 A2A 端点"之间的落差，是协议采纳的正常形状。Google、Anthropic、Microsoft、Salesforce，加上少数垂直 AI 厂商，今天在生产里提供 A2A 端点；其余 150 家或在预览、或在预生产、或在被新闻稿压缩为一句的"我们在评估"桶里。<a href="/zh/deep-dives/protocols-and-interop/interop-problem" class="xref">互操作问题</a>一文点出了底层条件：今天的 agent-to-agent 流量以厂内调用（一个 stack 内的智能体调用同 stack 里另一个智能体）为主，而不是跨厂调用（厂商 A 的智能体调用厂商 B 的智能体）。A2A 是为跨厂场景优化的，而跨厂场景尚未成为主流流量。它会成为——那是这场押注——但不要把"150 家"读成"150 处你今天就能对话的地方"。</p>
+
+    <p>给现在就上 v1.0 的团队两条运维注解。第一，先对官方参考实现跑通，再对合作对端跑：官方参考实现严格遵规范，多数合作对端不严格，你在宽松合作方那里发现的 bug 到参考实现那里会挂。第二，把你的 <code class="inline">A2A-Version</code> 钉在 minor——<code class="inline">1.0</code>，不是 <code class="inline">1.x</code>——直到 1.1 发布且工作组给出迁移说明；这个 header 本就是为让你保持这份纪律。协议是真的、形状是稳的、生产部署数字比新闻稿听起来的更少——三条同时按它们规划。</p>
+  </div>
+</section>

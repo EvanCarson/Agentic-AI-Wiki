@@ -13,6 +13,7 @@ const group: Group = {
     { page: 'structured-tool-io', slug: 'structured-tool-io', title: L('Structured Tool I/O & Validation','结构化工具 I/O 与校验'), summary: L('Input and output as two trust boundaries: structural-then-semantic validation, and why typed output is still untrusted.','输入与输出作为两道信任边界：先结构后语义的校验，以及为何类型化输出仍不可信。') },
     { page: 'capability-discovery', slug: 'capability-discovery', title: L('Capability Discovery & Negotiation','能力发现与协商'), summary: L('Runtime discovery, feature-test version negotiation, and why discovery describes ability not permission.','运行时发现、特性探测式版本协商，以及为何发现描述的是能力而非许可。') },
     { page: 'building-interoperable-agents', slug: 'building-interoperable-agents', title: L('Building an Interoperable Agent','构建可互操作的智能体'), summary: L('Comparing tool calling, MCP, and A2A; a decision rule and one normalised registry architecture.','比较工具调用、MCP 与 A2A；一条决策规则与一个归一化注册表架构。') },
+    { page: 'a2a-v1-deep-dive', slug: 'a2a-v1-deep-dive', title: L('A2A v1.0: Task Lifecycle, Messages, Artifacts','A2A v1.0：任务生命周期、消息、产物'), summary: L("A2A hit v1.0 in April 2026 — nine task states (not four), Message vs Artifact split, A2A-Version header, breaking changes from pre-1.0, and 150+ org adoption.",'A2A 于 2026 年 4 月发布 v1.0——九种任务状态（不是四种）、Message 与 Artifact 之分、A2A-Version 头、pre-1.0 破坏性变更，以及 150+ 组织采纳。') },
   ],
 };
 export default group;
