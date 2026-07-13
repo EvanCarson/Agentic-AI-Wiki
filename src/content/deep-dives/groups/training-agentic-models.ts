@@ -12,6 +12,7 @@ const group: Group = {
     { page: 'reward-design-and-hacking', slug: 'reward-design-and-hacking', title: L('Reward Design & Reward Hacking','奖励设计与奖励黑客'), summary: L('The reward is always a proxy: concrete agent reward-hacking patterns, the KL leash to the base policy, and the discipline of auditing the top, not the mean.','奖励永远是代理：具体的智能体奖励黑客模式、到底座策略的 KL 牵绳，以及审计顶端而非平均的纪律。') },
     { page: 'sft-rejection-sampling-distillation', slug: 'sft-rejection-sampling-distillation', title: L('SFT, Rejection Sampling & Distillation','SFT、拒绝采样与蒸馏'), summary: L('The supervised techniques that solve most agentic training problems before RL: rejection sampling, expert iteration, and distilling a strong agent into a cheap one.','在 RL 之前解决多数智能体训练问题的有监督技术：拒绝采样、专家迭代，以及把强智能体蒸馏进便宜模型。') },
     { page: 'process-vs-outcome-rewards', slug: 'process-vs-outcome-rewards', title: L('Process vs Outcome Reward Models','过程奖励 vs 结果奖励模型'), summary: L('Pay for the answer or pay for the steps: when dense process reward beats sparse outcome reward, and the labeling-cost trade that decides it.','为答案付费还是为步骤付费：何时稠密过程奖励胜过稀疏结果奖励，以及决定它的标注成本取舍。') },
+    { page: 'rlvr-and-grpo-for-agents', slug: 'rlvr-and-grpo-for-agents', title: L('RLVR & GRPO for Agents','面向智能体的 RLVR 与 GRPO'), summary: L('The 2026 recipe — SFT → DPO/SimPO → GRPO/DAPO with verifiable rewards; entropy collapse, KL drift, and the multi-turn algorithms (ARPO, StepPO, Turn-PPO).','2026 年的配方——SFT → DPO/SimPO → GRPO/DAPO 且带可核验奖励；熵坍缩、KL 漂移，以及多轮算法（ARPO、StepPO、Turn-PPO）。') },
   ],
 };
 export default group;
