@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">T9</div>
+  <div class="week">深入解析 · 训练</div>
+  <h2>结果奖励对长时程智能体信用不足；过程奖励标注过多；2026 年诚实的做法是把 PRM 精准放在"要紧的那些步骤"，而不是每一步。</h2>
+  <p class="goal">结果奖励便宜且稀疏；过程奖励稠密且昂贵。对跑上几十步才产生一份 diff 的长时程 SWE 智能体，稀疏的结果奖励会低估其中"好的中间动作"。过程奖励模型（PRM）逐步打标。矛盾在于：给每一步都打标成本高得离谱。2026 年的实操是"精准 PRM"——SWE-TRACE、AgentPRM、SPARK 识别"决策点"，只标那些。这篇讲 PRM 现状与标注经济。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>为何结果奖励在长时程下信用不足。</h3>
+
+    <p>一条三十步的 SWE 轨迹以一个标量奖励收尾：测试要么通过、要么没通过。那个标量必须解释所有三十步各自贡献了什么，而算术上做不下去。轨迹成功时，好步骤和白费步骤共享同一个终端信号，梯度更新等强度地强化两者；失败时，等强度地惩罚两者。<a href="/zh/deep-dives/training-agentic-models/process-vs-outcome-rewards" class="xref">过程 vs 结果奖励一文</a>铺开了一般性取舍；本文治的具体问题是：时程一旦长到"结果信号已被稀释到用处消失"的地步，该怎么办。</p>
+
+    <p>由此在规模上产生的失败模式，从 loss 曲线上看不出来。通过率仍在爬升——策略在学东西——但学习信用被分配给"恰好在这一批里与成功相关的那些步骤"，未必等同于"造成成功的那些步骤"。在编程智能体的 run 上，模式表现为：策略过度关注表层特征（许多成功解共享的某种 import 顺序），而对因果步骤（挑对要编辑的函数）学习不足。诊断：留出一批"表层特征相同、下层判断错误"的轨迹，看结果训练的策略怎么处理它们。它跟着模式走；过程训练的策略不会。</p>
+
+    <p>交叉点与时程有关。大约十步以内的轨迹通常足够短，结果信用大致对——每一步都离末端够近，终端奖励能给出关于它的一点有用信号。二十步以上，信号已足够退化，稠密监督开始还得起本；五十步以上，仅结果 RL 会把大半算力浪费掉。这个数字不精确；形状是精确的。</p>
+
+<pre class="trace">trajectory (30 steps, SWE task, tests eventually pass)
+
+outcome-only reward:
+  step 01..30: adv = +0.4    (uniform; the terminal +1.0 minus baseline 0.6)
+
+process reward (targeted, 5 labeled steps):
+  step 03  ls repo/                        [not labeled]  adv = 0
+  step 07  cat src/parser.py               [not labeled]  adv = 0
+  step 12  <b>edit src/parser.py</b>              [labeled +0.8]  adv = +0.3
+  step 15  pytest -k parser                [not labeled]  adv = 0
+  step 18  <b>edit src/parser.py</b>              [labeled -0.6]  adv = -0.9
+  step 22  <b>edit src/parser.py</b>              [labeled +0.9]  adv = +0.4
+  step 27  pytest -k parser                [not labeled]  adv = 0
+  step 30  git diff  →  tests pass         [terminal   ]  adv = +0.2</pre>
+
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>PRM：给每一步打标，得出的分类器。</h3>
+
+    <p>过程奖励模型在机制上就是一个步骤级分类器，用带步骤标签的轨迹训练：对轨迹里的每一步，一个人类（或一个更强的 AI）说"这一步是不是朝结果推进的一次有用移动"。PRM 学着模仿这个打标者；到了 RL 阶段，它给 rollout 中的每一步打分，产出稠密信号，策略优化器把它分配到轨迹上。<a href="/zh/deep-dives/reasoning-and-test-time-compute/verifier-guided-search" class="xref">核验器引导搜索一文</a>治的是推理时的表亲——用 PRM 剪枝搜索——训练时的用法紧密相关：能在测试时剪掉坏分支的同一份信号，也能在训练时把策略引开、别产出它。</p>
+
+    <p>训练数据是昂贵的部分。PRM 需要标好的步骤，而步骤是被"看了它一眼"的人（或物）判断为"是，这一步朝结果推进"或"不是"来标注的。对数学，标注者常常可以是另一个 checker：若一步给出的值在上文步骤下正确，就是好步骤。对代码，标注者难得多——一份部分 diff 里的这一行走对了路吗？对一般的智能体任务，标注者是一个更强的模型在上下文中读那一步、下一份判断——就是同一片"学习奖励"的地盘，规模上会被奖励黑客攻击。PRM 只与标注者一样好；标注经济——下一节第二步——是整套办法生死的所在。</p>
+
+<pre class="standalone"><span class="c-cm"># PRM inference: score each step of a rollout, feed dense advantage to RL.</span>
+<span class="c-kw">def</span> <span class="c-fn">score_trajectory</span>(prm, trajectory):
+    scores = []
+    <span class="c-kw">for</span> i, step <span class="c-kw">in</span> <span class="c-fn">enumerate</span>(trajectory):
+        prefix = trajectory[:i]
+        s = prm.<span class="c-fn">predict</span>(prefix=prefix, step=step)
+        scores.<span class="c-fn">append</span>(s)                <span class="c-cm"># scalar in [0, 1]</span>
+    <span class="c-kw">return</span> scores
+
+<span class="c-cm"># In GRPO, per-step advantage replaces the uniform terminal one:</span>
+<span class="c-cm">#   adv[i] = prm_score[i] - baseline[i]</span>
+<span class="c-cm"># The policy learns to move probability mass toward higher-scored steps.</span></pre>
+
+    <p>那段代码没体现的是"分数本身的脆弱"。若 PRM 是在比"你如今在训练的"更弱的策略产生的轨迹上训的，它关于"什么是好步骤"的判断反映的就是那个更弱策略的分布——它看着像错的步骤，可能正是更强策略学会去走的更聪明动作。这份分布偏移失败，就是长 run 的 PRM 引导训练常常平台化的原因：策略越过了 PRM 的参照系，稠密信号开始与策略作对而不是引导它。修法是周期性地用新轨迹重训 PRM，这又把整套办法本想控制的标注成本请了回来。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>标注经济：为何"每一步都标"高得不可承受。</h3>
+
+    <p>杀死朴素 PRM 办法的算术很直白。三十步的轨迹要三十个步骤标注。给 PRM 足够覆盖的训练集至少要几万条轨迹，标注任务量在百万标注量级。哪怕每个标注一美元（对硬任务来说已经慷慨），那也是百万美元的标注预算，尚未开始烧 GPU。用一个更强模型每次判断的成本（几分钱），价格更可接受，但单是标注者算力就要几周，而"用学习标注者"带来的奖励黑客风险要额外付。</p>
+
+    <p>2026 年的回应不是放弃 PRM，而是更聪明地挑"哪些步骤该标"。两条观察驱动这一转变。其一，长轨迹里多数步骤不是决策点——它们是执行步骤，其结果由更早的选择决定。给它们打标带来的信号，策略从上下文里就能推断。其二，在形状良好的轨迹上，决策点在结构上可识别：它们是策略发生分叉的步骤、调用的工具是"几个合理选项之一"的步骤、以及推理轮次改变了问题框架的步骤。精准 PRM——SWE-TRACE、AgentPRM、SPARK 家族——为"识别决策点"编码了启发式，只标那些，把标注预算砍掉一个数量级，同时保留大部分信用分配收益。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>精准 PRM：SWE-TRACE、AgentPRM、SPARK。</h3>
+
+    <p>SWE-TRACE 把标注收窄到"编程智能体轨迹里对状态有实质改变"的步骤：一次文件编辑、一次测试运行、一个新子进程。读文件或列目录的步骤打上"信息性"标签、PRM 在奖励时忽略；改变世界的步骤拿完整的标注者判断。结果是：一条三十步的 SWE 轨迹通常只有 3 到 7 个被标注的步骤，相对"每一步都标"把标注成本砍到 1/5 到 1/10，在长轨迹上带来的信用分配改善接近完整 PRM 所提供的水平。</p>
+
+    <p>AgentPRM 把这个想法推广到代码之外：把任何"其选择让轨迹分叉"的步骤当作决策点。具体做法是跑一个小型分叉检测器——常常是一个便宜模型——在每一步估计策略动作分布的熵，只标注熵超过阈值的那些步骤。直觉是：低熵步骤上策略已经知道该做什么，不需要那里的奖励信号；高熵步骤才是训练信号真正改变行为的地方。取舍是每次 rollout 会多花一份分叉检测算力，但相对它省下的标注成本，这份算力是便宜的。</p>
+
+    <p>SPARK 在另一个维度上介于两者之间：不是在数据生成时挑"该标哪些步骤"，而是稀疏地打标、并用一份类似自洽的协议把标签向邻近步骤扩散。若标注者判断第 17 步走错了，SPARK 假设同一判断适用于该步的某个邻域（17 加减 2），从而由稀疏标签产生足够稠密的监督。代价是一点偏置——被标为错的步骤旁边一个恰巧正确的步骤也会被标错——但总体上偏置比它消掉的方差小。到 2026 年年中，三者都还没有分出胜负；团队倾向于：代码任务用 SWE-TRACE、一般智能体任务用 AgentPRM、标注预算被严格限制时用 SPARK。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>何时仅用结果仍是对的。</h3>
+
+    <p>短轨迹撑不起 PRM 的开销。大约十步以内的任何任务，结果信用已足够接近正确，过程奖励那一套额外机构就是死重；决策点识别、标注者管线、PRM 训练、按步优势估计——这一整套装置存在，是为了解决短时程任务没有的问题。<a href="/zh/deep-dives/training-agentic-models/reward-design-and-hacking" class="xref">奖励设计与奖励黑客一文</a>给出这个论点的更一般版本：能闭合差距的最便宜奖励取胜，为"你并不需要的稠密度"付账是一种微妙的赔钱方式。</p>
+
+    <p>便宜的结果核验器是第二种情况。若一个任务的结果检查即时且便宜——一次简单字符串匹配、一次数值相等——每单位预算能支撑的 rollout 数量足以让"仅结果 RLVR"直接奏效。反倒是结果检查慢（跑一次真实的、几十秒的测试套件）或贵（一个 rubric 打分的 LLM judge）的任务，最能从"每次 rollout 拿更多信息"中获益——PRM 的边际标注成本，相对"再跑一整次 rollout"的边际成本，是小的。</p>
+
+    <p>值得带走的思路：过程奖励模型是一根杠杆，不是默认值。在长的、慢核验器的轨迹上，它是"run 持续改进"与"平台化"之间的差别；在短的、快核验器的轨迹上，它是你不欠自己的复杂度。2026 年落地的精准 PRM 栈让这根杠杆比过去便宜到伸手够；随之要抵达的诚实纪律是：知道它属于哪些轨迹。</p>
+  </div>
+</section>
