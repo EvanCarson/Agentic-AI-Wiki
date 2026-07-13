@@ -1,0 +1,103 @@
+<section class="phase">
+  <div class="phase-num">D10</div>
+  <div class="week">Deep Dive · Architectures & Patterns</div>
+  <h2>Context caching is the biggest 2026 unit-economics lever most teams under-use, and the fine print — write premium, TTL, invalidation — decides whether "90% off cached" is 90% off in practice or 30%.</h2>
+  <p class="goal">Every model vendor now advertises "up to 90% cheaper" on cache hits, and every team's actual savings are half of that. Anthropic charges 1.25× the base rate on cache writes and gives you 0.1× on reads with a 5-minute TTL. Gemini quotes a uniform 90% off with a longer TTL but a minimum block size. OpenAI does it automatically with less control. Stack caching on top of batch and you're at roughly 95% off list — but only if your traffic shape lets the cache actually hit. This essay is the fine print, per vendor, and the request-shape decisions that turn advertised savings into real ones.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Cache pricing across vendors, and what "90% off" actually costs.</h3>
+
+    <p>Three vendors, three different deals. Anthropic's Claude cache is opt-in per block: you mark a chunk of your prompt with <code class="inline">cache_control</code> and the first request pays a <em>write premium</em> of 1.25× the base input rate to store that prefix; subsequent requests that hit the same cached prefix pay 0.1× (a 90% read discount) for those tokens, up to a 5-minute TTL. Google's Gemini cache is a per-model service you provision as a <em>cachedContent</em> resource: writes cost the same as normal input, reads on the cached prefix are 90% off, TTL is user-settable (5 minutes default, up to 24 hours on newer models), and there's a minimum cacheable block size (~1024 tokens on 2.5 Flash, higher on Pro). OpenAI's prompt caching for GPT-4.1 and reasoning models is automatic: any prompt starting with an identical prefix ≥1024 tokens hits the cache; the discount is 50% on the cached tokens for non-reasoning models and up to 90% on the o-series, TTL is ~5-10 minutes, and there's no write premium because the vendor decides what caches.</p>
+
+    <p>The write premium is what most cost spreadsheets forget. On Anthropic, if you cache a 100k-token system prompt and only one request hits it before the 5-minute TTL expires, you paid 1.25× on the write and 0.1× on the read — you spent 1.35× base for one request instead of 1.0×. The break-even is around three reads per write. Below that, caching costs you money. The <a href="/concepts/cost-quality-latency" class="xref">cost-quality-latency</a> triangle picks up a fourth dimension at this altitude: reuse rate, which is the multiplier that turns write premium into read savings.</p>
+
+    <p>Serving through a gateway or <a href="/concepts/inference-providers" class="xref">an inference provider</a> shifts the deal again. Bedrock and Vertex expose the same underlying caches with their own metering wrappers; Fireworks, Together, and others resell open-weights models and typically do not cache. Read the specific vendor's line, not the "up to 90%" tag on the marketing page.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>TTL and the freshness / hit-rate trade.</h3>
+
+    <p>TTL is where the cache stops being magic and becomes an engineering decision. Anthropic's 5-minute default means the cache is essentially a same-session tool — a user's turn hits their previous turn's cached prefix, and after the session goes idle for a coffee break the cache is gone. That is fine for interactive chats and terrible for cross-user amortization: a system prompt shared across a thousand users cannot pay itself back in 5 minutes unless traffic is dense enough that every 5-minute window sees ≥3 requests on that prefix. Gemini and OpenAI's o-series cache extended TTLs (Gemini up to 24 hours if you're willing to pay a small hourly storage fee; OpenAI's o-series holds the cache noticeably longer than 4.1) unlock cross-user amortization — the same system prompt caches once for the whole day and every request pays only 0.1× on the shared bytes.</p>
+
+    <p>The other side of TTL is invalidation. Every vendor invalidates on any change to the cached content: change a single character in the system prompt and the cache write happens again on the next request. That means the version of your system prompt is now part of your unit-economics model. Roll a prompt change to 100% of traffic at 3pm and the first fifteen minutes of Wednesday afternoon spike your cost by the write premium, then settle back. If you're doing A/B tests on the system prompt, each variant is a separate cache; the split ratio times TTL determines whether each variant achieves the reuse rate it needs to be net-positive.</p>
+
+    <p>The design move that recovers most of the loss on short TTLs is to make the cached prefix an <em>immutable identity</em> — versioned, hashed, referenced by ID — so the cache picks up wherever traffic converges even without a rolling window guaranteeing density.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What actually gets cached: order matters.</h3>
+
+    <p>Every vendor caches by <em>prefix match</em>: the request's tokens are compared against the cache from the start, and the cache hit ends at the first byte that differs. Reorder your prompt and the cache loses. This has one hard consequence: put everything cacheable first, put everything variable last. The canonical order in a well-shaped request is (1) system prompt, (2) tool definitions, (3) long stable context (a codebase, a document, the user's memory), (4) the volatile turn — recent messages, current question. Reverse that and you get no cache hits.</p>
+
+    <p>On Anthropic specifically, you get up to four <code class="inline">cache_control</code> breakpoints per request. Placing them at boundaries — end of system, end of tools, end of the shared long context — lets partial hits work even when the last section changes. A request that shares system + tools with the previous one but has a fresh document still saves on the first two blocks. If you use <a href="/deep-dives/memory-and-context/context-budgeting" class="xref">explicit context budgeting</a>, put the budgets on the boundaries and cache along the same lines.</p>
+
+<pre class="standalone"><span class="c-cm"># Anthropic messages request with cache_control at two boundaries</span>
+<span class="c-kw">import</span> anthropic
+client = anthropic.Anthropic()
+
+resp = client.messages.create(
+    model=<span class="c-st">"claude-opus-4-7"</span>,
+    max_tokens=<span class="c-st">1024</span>,
+    system=[
+        {<span class="c-st">"type"</span>: <span class="c-st">"text"</span>, <span class="c-st">"text"</span>: SYSTEM_PROMPT,
+         <span class="c-st">"cache_control"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"ephemeral"</span>}},   <span class="c-cm"># boundary 1</span>
+    ],
+    tools=[
+        {<span class="c-st">"name"</span>: <span class="c-st">"search"</span>,   <span class="c-st">"input_schema"</span>: SEARCH_SCHEMA},
+        {<span class="c-st">"name"</span>: <span class="c-st">"fetch"</span>,    <span class="c-st">"input_schema"</span>: FETCH_SCHEMA,
+         <span class="c-st">"cache_control"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"ephemeral"</span>}},   <span class="c-cm"># boundary 2</span>
+    ],
+    messages=[
+        {<span class="c-st">"role"</span>: <span class="c-st">"user"</span>, <span class="c-st">"content"</span>: user_turn},   <span class="c-cm"># volatile, not cached</span>
+    ],
+)
+<span class="c-cm"># resp.usage.cache_read_input_tokens vs cache_creation_input_tokens</span>
+<span class="c-cm"># tells you the actual hit rate for this request</span></pre>
+
+    <p>The usage fields on the response — <code class="inline">cache_read_input_tokens</code> vs <code class="inline">cache_creation_input_tokens</code> — are your on-line hit-rate meter. Aggregate them per prefix version to see whether a rollout is caching. Every vendor exposes an equivalent field; if you cannot tell your hit rate from your telemetry, the cache is not part of your unit economics, only your marketing slides.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Stacking caching with batch: the 95%-off path.</h3>
+
+    <p>The advertised savings compound when you combine cache with the batch API. Anthropic's Message Batches API and OpenAI's Batch API both discount input and output tokens by 50% for asynchronous processing with a 24-hour SLA. Turn on caching inside a batch job — same <code class="inline">cache_control</code> markers, same prefix discipline — and the discounts multiply: a cached read at 0.1× base, then 50% off through batch, lands the read at ~0.05× of the list price. For workloads where a large stable context (a document, a codebase, a rubric) is being applied to a stream of variable inputs — eval runs, enrichment jobs, bulk classification — this is the shape that shifts a five-figure monthly bill into a four-figure one.</p>
+
+    <p>The concrete math for a common shape:</p>
+
+<pre class="trace"><span class="c-out">Workload: 100k-token system+context, 500 evaluations, 1k tokens output each.
+Vendor: Anthropic Claude Opus 4.7 (illustrative rates, base = $15/M input, $75/M output).
+
+No cache, no batch:
+  input : 100k * 500 = 50M tokens * $15 = $750
+  output: 500 *  1k  =  0.5M tokens * $75 = $37.50   -> total $787.50
+
+Cache only (1 write at 1.25x, 499 reads at 0.1x):
+  write : 100k * 1.25 * $15/M                       = $1.875
+  reads : 100k * 499 * 0.1 * $15 = ~$74.85
+  output: same $37.50                                -> total $114.23  (14.5% of list)
+
+Cache + batch (50% off both):
+  cache math halved: writes $0.94, reads $37.43
+  output halved: $18.75                              -> total ~$57.12   (7.3% of list)
+
+Savings vs list: 92.7%.  Reuse threshold met (499 reads / 1 write &gt;&gt; break-even).
+</span></pre>
+
+    <p>Two conditions have to hold for the math to land. First, the workload has to tolerate the batch SLA — up to 24 hours. Second, the reuse rate has to clear the write-premium break-even, which for Anthropic is around three reads per cached write within TTL. Interactive traffic almost never gets this right without help; batch traffic almost always does.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When caching costs you money.</h3>
+
+    <p>The list of shapes where caching loses is short and worth memorizing. High cardinality per user with low reuse: every user has a different profile in their system prompt, TTL expires between their sessions, each cache write pays 1.25× and gets read once. Frequently changing prompts: an experimenting team rolls system-prompt tweaks daily; each roll invalidates the cache and the next several minutes of traffic pay the write premium again. Short-lived prefixes: a request whose only stable portion is 800 tokens is under Gemini's minimum block size and will not cache; on Anthropic, the write premium on 800 tokens can eat the read savings from a handful of hits.</p>
+
+    <p>The rule that catches most of these: <em>if the reuse rate on a candidate cache block is below three within TTL, don't cache it — write it in the position where variation would happen anyway.</em> That is the invariant. It sounds like accounting because it is accounting. Turning on <code class="inline">cache_control</code> for every block "because it might help" is how teams end up with a bill that is higher than the uncached version and no obvious culprit in their traces.</p>
+
+    <p>The audit that catches all four failure modes takes an hour: sample a day of traffic per prefix version, compute reads-per-write, cross-check against the vendor's write-premium multiplier, and drop any cache block that doesn't clear the bar. That is where advertised savings become real ones.</p>
+  </div>
+</section>
