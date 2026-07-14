@@ -1,0 +1,104 @@
+<section class="phase">
+  <div class="phase-num">S2</div>
+  <div class="week">Deep Dive · Agent Security</div>
+  <h2>Policy-as-code moves the "may this agent do this" decision out of the prompt and into a policy engine that gates every tool call at the boundary — and the 2026 tooling (Cedar in Bedrock AgentCore, Microsoft's Agent Governance Toolkit) makes it a solved engineering problem, not a research one.</h2>
+  <p class="goal">The instruction hierarchy tells the model what to prioritize; policy-as-code decides what the model is actually allowed to do, in code the model cannot argue with. In 2026 this is a gateway pattern: a policy decision point (PDP) — OPA with Rego, or Cedar — intercepts every tool call before it executes and returns a structured verdict, not a vibe. Microsoft's Agent Governance Toolkit returns a <code class="inline">PolicyDecision</code> with <code class="inline">allowed</code>, <code class="inline">matched_rule</code>, an <code class="inline">action</code>, and a human-readable <code class="inline">reason</code>; AWS put Cedar inside Bedrock AgentCore at the tool-call boundary. This essay is where the PDP lives, the failure-open-versus-failure-closed choice that decides your blast radius, and why the structured decision is the primitive everything downstream depends on.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The gateway pattern.</h3>
+
+    <p>The previous essay in this group, on <a href="/deep-dives/agent-security/prompt-injection-defense-2026" class="xref">prompt-injection defense</a>, ended on a load-bearing move: constrain the model to a typed schema so an injected instruction has nowhere to land, then check even the schema-valid action against rules the model cannot argue with. Policy-as-code is that second half. It takes the authorization decision — <em>may this agent perform this action, with these arguments, in this context</em> — out of the prompt, where a persuasive attacker can renegotiate it, and puts it in a policy engine that runs deterministically outside the model's reach.</p>
+
+    <p>The architecture is a gateway. Every tool call the agent proposes is routed through a policy decision point (PDP) before it executes; the PDP evaluates the request against a policy and returns allow or deny; only an allowed call reaches the actual tool. Nothing about this is novel — it is the same policy-enforcement-point / policy-decision-point split that has fronted APIs for a decade — but pointing it at an agent's tool calls is what turns a probabilistic system into a bounded one. The model can want anything; the gateway decides what happens. The critical property is that the check is <strong>mandatory and pre-execution</strong>: the gateway calls the PDP <em>before</em> invoking the tool, not after logging the intent, so a denied action never runs rather than running and being flagged. An agent that asks the PDP for permission and then does the thing regardless is not gated — it is narrating.</p>
+
+    <p>What makes 2026 different from earlier hand-rolled allowlists is that the tooling is real and off-the-shelf. AWS put Cedar inside Amazon Bedrock AgentCore, intercepting every agent tool call at the gateway, with policies written in Cedar or generated from natural language. Microsoft shipped the Agent Governance Toolkit (AGT), which evaluates tool calls, message sends, and delegations against policy. This is no longer a research question about whether agents can be governed; it is an engineering question about which engine, where it sits, and how it fails. The <a href="/operations/safety-and-security/agentic-threat-model" class="xref">agentic threat model</a> gives the reason the gateway has to exist at all: autonomy plus tool access widens the attack surface to the union of everything the agent can reach, and the gateway is the one chokepoint where you can narrow it back down deterministically.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>OPA/Rego vs Cedar for agent workloads.</h3>
+
+    <p>Two policy engines dominate the agent-gating conversation, and they optimize for different things. Open Policy Agent (OPA) uses <strong>Rego</strong>, a general-purpose policy language with the expressiveness to encode almost any rule you can describe — joins across data, quantifiers, computed conditions, arbitrary logic over the request and its context. That power is the selling point and also the cost: an expressive Rego policy is harder to reason about mechanically, and "what does this policy actually permit" can require running it rather than analyzing it.</p>
+
+    <p><strong>Cedar</strong> (the engine AWS embedded in Bedrock AgentCore) makes the opposite trade. It is a purpose-built authorization language, deliberately less expressive than Rego, in exchange for <em>verifiability</em>: because the language is constrained, Cedar policies can be analyzed statically — you can ask "is there any request this policy set allows that it shouldn't" and get an answer without exhaustively testing inputs. For agent workloads, where a single over-permissive rule can hand an injected agent a write it should never have had, that analyzability is worth more than the expressiveness you give up. The rule of thumb: reach for Rego when your policy genuinely needs general computation, and for Cedar when you want to <em>prove</em> the policy does only what you think it does.</p>
+
+    <p>You do not always have to choose the engine yourself. Microsoft's Agent Governance Toolkit is MIT-licensed and entered public preview in April 2026, and it deliberately supports multiple policy backends — plain YAML for simple allow/deny rules, OPA Rego for expressive logic, and Cedar for analyzable authorization — behind one evaluation interface. That matters for adoption: a team can start with declarative YAML for the obvious rules ("this agent may never call the payments tool") and drop to Rego or Cedar only where a rule actually needs it, without rebuilding the gateway. Whichever backend you pick, the shape of the integration is the same — a request goes in, a structured decision comes out — which is what Step 5 is about.</p>
+
+    <p>One more thing the toolkit clarifies: the gate is not only for tool calls. AGT evaluates tool calls, message sends, and delegations, which is the right scope for an agent that can hand work to other agents. In a multi-agent system the dangerous action is often not a single tool call but a <em>delegation</em> — one agent asking another, with different tools and privileges, to do something the first is not allowed to do directly. If your PDP only sees leaf tool calls it will miss that laundering path entirely. Governing the message-send and delegation edges, not just the tool-call leaves, is what keeps a policy that says "this agent may not touch payments" from being trivially bypassed by delegating to an agent that can. The engine you pick matters less than pointing it at every edge where authority crosses a boundary.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Where the PDP lives (and the latency budget).</h3>
+
+    <p>The PDP can sit in three places, and the choice is mostly a latency-versus-blast-radius trade. It can live <strong>in-process</strong> as SDK middleware inside the agent runtime; at the <strong>gateway / MCP proxy</strong> as a separate hop that every tool call transits; or as a <strong>remote policy service</strong> the gateway calls over the network. In-process is fastest and has no network dependency, but the policy runs inside the same trust boundary as the code it is supposed to constrain — if the runtime is compromised, so is the check. A separate gateway or proxy hop puts the decision outside the agent's process, which is the property you want when the agent itself is the thing you distrust.</p>
+
+    <p>The latency numbers decide how you deploy OPA specifically, and here the marketing and the manual disagree — use the manual. Invoking the OPA <strong>CLI as a subprocess</strong> per decision carries roughly <strong>50–200 ms</strong> of process-startup overhead, which is fine for a batch check but far too slow to sit in front of every tool call in an interactive loop. Running OPA as a <strong>long-lived remote server</strong> (or the local sidecar of one) brings per-decision evaluation into the <strong>sub-millisecond</strong> range, because the process and its compiled policies are already warm. The practical consequence is direct: <em>do not shell out to the OPA CLI on the hot path.</em> Stand up OPA as a server and query it over a local socket, or embed the evaluator in-process, so the policy check costs a sub-millisecond lookup rather than a fifth-of-a-second fork. (Cedar, evaluated in-process, is faster still; its cost is closer to a function call than a network round-trip.)</p>
+
+    <p>The dominant deployment for OPA is the <strong>sidecar</strong>: an OPA server running alongside the tool gateway, in the same pod or host, so the gateway queries it over the loopback interface with no external network hop. That gives you the trust-boundary separation of an out-of-process PDP and the latency of a warm local server at the same time, which is why it is the pattern most references land on. Wherever the PDP sits, pair it with least-privilege credentials so a permitted action still cannot exceed the token it runs under — the <a href="/operations/safety-and-security/scoped-credentials-for-agents" class="xref">scoped-credentials essay</a> covers the short-lived, narrowly-scoped tokens that make the policy layer and the credential layer reinforce each other instead of duplicating work.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Failure-open vs failure-closed.</h3>
+
+    <p>The most consequential line in your gateway is what happens when the PDP does not return a clean allow — it is unreachable, it times out, it errors, or it returns a verdict your code does not recognize. There are two defaults. <strong>Failure-closed</strong> denies the action when the decision is anything other than an explicit allow: no answer means no. <strong>Failure-open</strong> permits the action when the PDP cannot be reached, on the theory that availability matters more than the marginal risk of one unchecked call. The choice is not stylistic; it is the line that sets your blast radius when the policy layer itself has a bad day.</p>
+
+    <p>The correct default for anything with side effects is <strong>failure-closed</strong>. If the PDP is down and the agent wants to write a file, send an email, execute code, or move money, the safe answer is to refuse and surface an error, not to wave the action through because the check happened to be unavailable. Failure-open on a write path means an attacker who can degrade or knock over your PDP has just disabled your entire authorization layer — the denial-of-service becomes a privilege escalation. That is precisely backwards: the moment your defenses are impaired is the moment you want them strictest, not slackest.</p>
+
+    <p>Make the failure mode concrete. Suppose an agent has been steered by an injected instruction toward exfiltrating a secret, and at that exact moment the PDP sidecar is mid-restart or the policy service is timing out under load. Failure-closed: the write is refused, the agent surfaces an error, and the worst outcome is a stalled task. Failure-open: the write goes through unchecked, and the incident you were one policy evaluation away from preventing now happens during the one window where you had no coverage. The asymmetry is the whole argument — a failure-closed default costs you availability on the rare occasions the PDP is unreachable, while a failure-open default costs you your authorization layer at precisely the moments it is under stress, which is when a real attacker is most likely to be pushing on it. You are choosing which failure you would rather explain in the post-incident review.</p>
+
+    <p>Failure-open is defensible only in a narrow band: <strong>read-only, low-consequence</strong> actions where a brief window of unchecked reads is genuinely less harmful than an outage, and where you have separately bounded what those reads can expose. Even there, the honest posture is to make the choice per tool rather than globally — tag each tool with its failure mode so the payments tool fails closed while a read-only status lookup may fail open — and to alert loudly whenever the gateway takes the failure-open path, because a PDP that is quietly unreachable is a gap you are shipping blind. Decide the default deliberately, default it to closed, and treat every failure-open exception as a documented risk acceptance, not a convenience.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The structured PolicyDecision.</h3>
+
+    <p>The payoff of the whole pattern is not the allow/deny bit — it is the <strong>structured decision object</strong> the PDP returns. A gateway that only answered "yes" or "no" would gate the action but tell you nothing you could act on afterward. Microsoft's Agent Governance Toolkit returns a <code class="inline">PolicyDecision</code> that carries the decision plus its justification: <code class="inline">allowed</code> (the boolean), <code class="inline">matched_rule</code> (which rule fired), <code class="inline">action</code> (allow / deny / audit / block), <code class="inline">reason</code> (a human-readable explanation), and an <code class="inline">audit_entry</code> (the policy, rule, timestamp, and context). Structured, enumerated refusal reasons are already the norm in the 2026 tooling, not an aspiration.</p>
+
+    <p>Here is a Rego policy gating a <code class="inline">write_file</code> tool — deny by default, allow only writes that stay inside an approved workspace and target no sensitive path — and below it the <code class="inline">PolicyDecision</code> the gateway emits when the model proposes writing outside that boundary.</p>
+
+<pre class="standalone">package agent.tools.write_file
+
+# Failure-closed: default deny, allow only what a rule explicitly permits.
+default decision := {"allowed": false, "matched_rule": "default_deny",
+                     "action": "deny", "reason": "no rule permitted this action"}
+
+approved_root := "/workspace"
+sensitive := ["/workspace/.git", "/workspace/.env", "/workspace/secrets"]
+
+# Allow a write only if it stays under the approved root and touches
+# no sensitive path. `input` is the proposed tool call.
+decision := {"allowed": true, "matched_rule": "write_within_workspace",
+             "action": "allow", "reason": "path within approved workspace"} {
+    startswith(input.args.path, approved_root)
+    not sensitive_path(input.args.path)
+}
+
+sensitive_path(p) {
+    some s in sensitive
+    startswith(p, s)
+}</pre>
+
+    <p>When the agent — perhaps steered by an injected instruction — proposes writing to <code class="inline">/workspace/.env</code>, no allow rule matches, the default fires, and the gateway returns a decision that a human and a machine can both read:</p>
+
+<pre class="trace">{
+  "allowed": false,
+  "matched_rule": "default_deny",
+  "action": "deny",
+  "reason": "no rule permitted this action; path targets a sensitive location",
+  "tool_call": { "tool": "write_file", "args": { "path": "/workspace/.env" } },
+  "audit_entry": {
+    "policy": "agent.tools.write_file",
+    "rule": "default_deny",
+    "evaluated_at": "2026-04-30T14:07:22Z",
+    "policy_version": "v3",
+    "context": { "agent": "repo-triage", "session": "s-8842" }
+  }
+}</pre>
+
+    <p>The <code class="inline">reason</code> field is the primitive the rest of this group builds on. A structured refusal reason is what turns a bare "denied" into an explanation a downstream layer can act on — and two later essays extend it in specific directions. One takes the enumerated reason and pairs it with a why-trail that records exactly which rule fired against which input, so a refusal is legible to a forensic investigator rather than just to the user; that is the subject of a later essay in this group on structured refusal and why-trails. The other takes the whole decision — <code class="inline">reason</code>, <code class="inline">audit_entry</code>, policy version, timestamp — and signs and hash-chains it into a tamper-evident record you can replay, which is the subject of the group's essay on decision receipts and audit. Both depend on the same thing: a PDP that returns a structured decision rather than a bit. Get the gateway returning a real <code class="inline">PolicyDecision</code> and you have not just gated the action — you have produced the machine-readable justification that accountability, forensics, and audit all read from downstream.</p>
+  </div>
+</section>

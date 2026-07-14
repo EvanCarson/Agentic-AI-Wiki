@@ -10,6 +10,7 @@ const group: Group = {
   ),
   entries: [
     { page: 'prompt-injection-defense-2026', slug: 'prompt-injection-defense-2026', title: L('Prompt-Injection Defense in 2026','2026 年的提示注入防御'), summary: L("Prompt injection is an unsolved frontier problem, not a bug you patch — the instruction hierarchy, defense-in-depth layers, and why the Gemini CLI CVSS-10 incident proves single-model defenses fail.",'提示注入是尚未解决的前沿问题，不是能打补丁的 bug——指令层级、纵深防御分层，以及 Gemini CLI CVSS-10 事件为何证明单模型防御会失败。') },
+    { page: 'policy-as-code-for-agents', slug: 'policy-as-code-for-agents', title: L('Policy-as-Code for Agents','面向智能体的策略即代码'), summary: L('OPA/Rego and Cedar gating every tool call at the boundary — where the PDP lives, failure-open vs failure-closed, and the structured PolicyDecision that makes refusals machine-readable.','用 OPA/Rego 与 Cedar 在边界处对每次工具调用做门控——PDP 放在哪里、失败放行还是失败拦截，以及让拒绝可被机器读取的结构化 PolicyDecision。') },
   ],
 };
 export default group;
