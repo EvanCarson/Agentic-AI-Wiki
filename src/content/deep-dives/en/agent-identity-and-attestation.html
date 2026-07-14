@@ -1,0 +1,100 @@
+<section class="phase">
+  <div class="phase-num">S3</div>
+  <div class="week">Deep Dive · Agent Security</div>
+  <h2>"Which agent is calling me" has three answers in 2026 — a signed Agent Card proves who published it, runtime attestation proves who is calling right now, and a Verifiable Credential proves what a third party vouches for — and they are complementary, not competing.</h2>
+  <p class="goal">Once agents call other agents' tools, "which agent is this" stops being rhetorical and becomes an authorization question with real money attached. Three mechanisms answer it at different layers: signed Agent Cards prove a card's static authenticity (the open A2A <code class="inline">#1672</code> proposal), runtime attestation binds a specific request to a specific agent instance (the OATR proposal — Ed25519 JWTs, RFC 8785 canonical JSON, request-hash replay protection), and Verifiable Credentials let a third party vouch for an agent across trust domains (W3C DID/VC, used by Google's AP2 for auditable consent). Visa's Trusted Agent Protocol adds RFC 9421 HTTP Message Signatures that lock each request to a merchant page. This essay is the taxonomy, the minimum viable identity for an internal versus a cross-org agent, and why none of these is a ratified standard yet.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The three questions hiding in "which agent".</h3>
+
+    <p>The <a href="/deep-dives/agent-security/policy-as-code-for-agents" class="xref">policy-as-code</a> essay assumed the gateway already knows which agent is asking. That assumption breaks the moment an agent calls another agent's tools across an organizational boundary. "Which agent is this" sounds like one question, but it is really three, each with different answers and different failure modes — and conflating them is how you end up trusting a request you should have refused.</p>
+
+    <p>The first is <em>who published this thing</em> — the static identity of the agent as advertised, before any request is made. The second is <em>who is calling me right now</em> — the runtime identity of the specific instance making this specific call, which a static credential cannot prove because a leaked card can be replayed by anyone. The third is <em>what does a third party vouch for</em> — a claim asserted not by the agent itself but by an issuer a relying party already trusts, the only way to establish trust across domains with no shared identity provider. Card authenticity, runtime attestation, and third-party attestation answer these in turn, and they are complementary: you compose them by threat model, not choose one.</p>
+
+    <p>One caution runs through every section below: <strong>none of these is a ratified standard.</strong> The A2A pieces are open proposals, the W3C work is community-group and academic, and only the transport signatures rest on published RFCs. Treat them as directions the ecosystem is converging on, not shelves to build load-bearing trust on today.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Signed Agent Cards (static authenticity).</h3>
+
+    <p>An <a href="/deep-dives/protocols-and-interop/agent-cards-and-discovery" class="xref">Agent Card</a> is the metadata document describing what an <a href="/deep-dives/protocols-and-interop/a2a-v1-deep-dive" class="xref">A2A</a> agent is and can do — name, skills, endpoints, capabilities — and it is what a client fetches during discovery before deciding whether to talk to the agent at all. If that card is unsigned, anyone who can serve you a document can claim to be any agent, which is a problem the moment discovery crosses a boundary you do not control. Card signing answers the first question: it lets a client verify the card it fetched was published by the party it claims to be, unmodified in transit.</p>
+
+    <p>The concrete mechanism under discussion is an <strong>open proposal</strong>, and it matters to say so precisely. A2A issue <code class="inline">#1672</code> proposes adding an optional <code class="inline">verifiedIdentity</code> field to the Agent Card so a card can carry a cryptographic proof of its publisher. As of writing it is an open GitHub issue — no merged pull request, no adopted labels — and the specific "AgentID / ECDSA P-256" signing scheme people point to traces to a third-party project, getagentid.dev, not to anything the A2A project has ratified. So the honest framing is: card signing is the right idea and there is an active proposal for it, but there is no A2A-adopted card-signing standard yet. If you sign cards today you are picking a scheme that may not be the one that lands.</p>
+
+    <p>Even fully adopted, a signed card only answers the static question. It proves the card is authentic; it does not prove that the entity making a live request is the one the card describes. A signed card is a leakable, replayable artifact — copy it and you can present a valid signature without being the agent. That gap between "this card is genuine" and "this caller is that agent right now" is what the next layer closes, and it is why card signing is a necessary floor rather than a sufficient answer for anything with side effects.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Runtime attestation: OATR.</h3>
+
+    <p>Runtime attestation binds a single request to a single agent instance, so a relying party can tell not just that a valid card exists but that <em>this call</em> came from the agent holding the corresponding key, right now. The proposal in the A2A discussions is OATR — an Open Agent Trust Registry — and, like <code class="inline">#1672</code>, it is a <strong>proposal, not a ratified spec</strong>. It is worth studying anyway, because its shape is where per-request agent identity is heading.</p>
+
+    <p>OATR builds an attestation as an Ed25519-signed JWT with a distinguishing type header (<code class="inline">typ: agent-attestation+jwt</code>). The claims canonicalize the JSON using JCS — the RFC 8785 JSON Canonicalization Scheme — so signer and verifier hash byte-identical bytes regardless of key ordering or whitespace. Critically, the attestation binds three things: the card fingerprint (which card this instance is asserting), the agent instance id (which running instance), and a hash of the request itself. That last binding defeats replay — because the signature covers a hash of the specific request, a captured attestation cannot be re-attached to a different request, and a nonce plus timestamp bound the window in which even the same request can be re-sent. OATR v1.2.0 (late March 2026) also shipped enumerated rejection reason codes, so a verifier that refuses an attestation returns a machine-readable reason rather than an opaque failure.</p>
+
+    <p>Here is the shape of an OATR attestation — a JWT header and claims — that a caller would present alongside its request:</p>
+
+<pre class="trace">{
+  "typ": "agent-attestation+jwt",
+  "alg": "EdDSA"
+}
+.
+{
+  "iss": "did:web:agents.acme.example",
+  "sub": "urn:agent:repo-triage",
+  "instance_id": "inst-7f3a91c2",
+  "card_fingerprint": "sha256:9b1c…e40d",
+  "request_hash": "sha256:c7a2…18ff",
+  "nonce": "n-4471aa02",
+  "iat": 1777650442,
+  "exp": 1777650502
+}</pre>
+
+    <p>The <code class="inline">request_hash</code> and <code class="inline">nonce</code> are the load-bearing fields: they make this attestation usable exactly once, for exactly this request, from exactly this instance. A signed card answers "is this a real agent"; an OATR attestation answers "is this real agent the one calling me on this request" — the question authorization actually needs. It is the runtime complement to the static card, and neither replaces the other.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Verifiable Credentials (cross-domain trust).</h3>
+
+    <p>Signed cards and runtime attestation both let an agent make claims about itself, which is worth nothing when the party you are talking to has no prior relationship and no shared identity provider — the cross-organization case, where "trust me, I signed my own card" carries no weight. Verifiable Credentials address exactly that: a claim is asserted by an <em>issuer</em> the relying party already trusts, about a <em>subject</em> (the agent), and the relying party verifies the issuer's signature rather than the agent's self-assertion.</p>
+
+    <p>The building blocks are W3C standards-track and community work rather than agent-specific. A Decentralized Identifier (DID) gives each agent a self-owned, ledger-anchored identifier that no central registry can revoke out from under it, and Verifiable Credentials let third parties issue signed claims about that DID — "operated by an accredited organization," "authorized to transact up to a limit." The academic proposal here anchors each agent's DID and layers third-party-issued VCs on top precisely so cross-domain trust needs no central identity provider, and a W3C Agent Identity Community Group is working the problem — which is exactly the status to convey: real, active, community-group stage, <strong>not a finished, ratified standard</strong>. Google's AP2 is the notable production consumer, using W3C Verifiable Credentials to capture auditable user consent for agent-initiated transactions; the <a href="/deep-dives/protocols-and-interop/ap2-and-agent-commerce" class="xref">AP2 and agent commerce</a> essay covers how that consent chain works in a payment flow.</p>
+
+    <p>The distinction to hold onto is direction of trust. Card signing and attestation are the agent asserting things about itself, only ever as trustworthy as the agent. A Verifiable Credential is a trusted third party asserting things about the agent, which is what lets a relying party in a different trust domain accept the claim at all. For anything that crosses an organizational boundary with consequences attached, self-assertion is not enough — you need someone the relying party already trusts to have vouched.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Commerce: Visa TAP and RFC 9421.</h3>
+
+    <p>Payments are where identity stops being abstract, and it is also the one layer here that rests on a <strong>published RFC</strong> rather than a proposal. Visa's Trusted Agent Protocol uses RFC 9421 HTTP Message Signatures to sign each request an agent makes to a merchant, so the merchant can verify that the request came from a registered, trusted agent and was not forged or replayed. Unlike the A2A card and attestation proposals, RFC 9421 is a ratified IETF standard for signing HTTP messages; TAP is Visa's application of it to agent commerce.</p>
+
+    <p>What TAP adds on top of the raw signature is binding. A signature covers a set of chosen components — method, path, selected headers, a created timestamp, a key id, and a session identifier — and TAP uses those to lock each request to a specific merchant site and page, so a signed request captured on one page cannot be replayed against another, and the timestamp plus session id bound it to single use. The launch had partners on board and Akamai joined in 2026 — the useful signal being that this is the identity layer with actual production commerce weight behind it, because it solves a problem merchants feel directly: telling a legitimate buying agent apart from a bot.</p>
+
+    <p>Here is the shape of the RFC 9421 signature input that locks a request to its target — the covered components and the metadata that make the signature single-use:</p>
+
+<pre class="standalone">Signature-Input: sig1=("@method" "@authority" "@path" \
+    "content-digest" "@query-param";name="page"); \
+    created=1777650442; keyid="visa-agent-8f2a"; \
+    nonce="req-90c14e"; tag="tap-v1"
+Signature: sig1=:MEUCIQD…snip…kQ2gc=:</pre>
+
+    <p>The covered components are the point: because <code class="inline">@authority</code>, <code class="inline">@path</code>, and the <code class="inline">page</code> query parameter are inside the signature, the signature is only valid for that exact merchant, path, and page — move it anywhere else and verification fails. That is request-locking, and it is the commerce-grade version of the replay protection OATR builds with a request hash.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Minimum viable identity.</h3>
+
+    <p>You do not deploy all four layers everywhere — you match the mechanism to the boundary the request crosses. The organizing question is how far trust has to travel, and how much money rides on getting it wrong.</p>
+
+    <p>For an <strong>internal agent</strong> calling another inside a network you control, the minimum viable identity is modest: a signed card so the caller's static identity is verifiable, plus network policy — mutual TLS, a service mesh, allowlisted routes — to constrain who can reach whom at all. You already own the runtime and the network, so the residual risk a signed card leaves is bounded by controls you hold; runtime attestation is a reasonable addition for high-value internal actions, but it is not the thing standing between you and disaster.</p>
+
+    <p>For a <strong>cross-organization</strong> agent, and especially one transacting money, the floor is much higher, because none of the ambient network controls apply and the counterparty is not in your trust domain. There you want request signing so each call is bound and non-replayable — RFC 9421 in the commerce case, or OATR-style runtime attestation more generally — <em>plus</em> a Verifiable Credential so a third party the counterparty trusts has vouched for the agent. Signed cards alone are not enough: a leaked card replays, and a card no one vouches for proves nothing to a stranger.</p>
+
+    <p>Whatever combination you choose, the signed identity does not stop at the door — it becomes part of the durable record. Whose key signed a request, which card fingerprint it asserted, which credential it presented: those are inputs to the tamper-evident receipt an agent run produces, so an action can later be attributed to a specific, verified identity rather than an anonymous "the agent did it." That is the province of this group's essay on <a href="/deep-dives/agent-security/decision-receipts-and-audit" class="xref">decision receipts and audit</a>, where signed identity lands downstream. And the caution that opened this essay is the one to close on: build for the direction — card signing, runtime attestation, third-party credentials, request-locked transport — but track it as moving ground, because in 2026 the mechanisms are proposals and community drafts, not settled standards, and the one you wire in today may not be the one that wins.</p>
+  </div>
+</section>

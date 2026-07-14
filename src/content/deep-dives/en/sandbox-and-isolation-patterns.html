@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">S5</div>
+  <div class="week">Deep Dive · Agent Security</div>
+  <h2>Treat agent-generated code as hostile: shared-kernel containers stopped being sufficient in 2026, and the real choice is microVM versus gVisor versus remote-only, decided by the blast radius you can tolerate.</h2>
+  <p class="goal">The moment an agent runs code it wrote — or a tool it was told to trust — you are executing untrusted input, and a shared-kernel Docker container is one kernel exploit away from your host. The 2026 consensus is to treat agent-generated code as hostile by default and pick isolation by blast radius: microVMs (Firecracker, E2B) give a separate kernel and sub-150ms startup, gVisor intercepts syscalls in userspace at near-container speed, and remote-only execution removes local exec entirely. This essay is the tier comparison with real startup and threat-model numbers, where computer-use and browser isolation change the calculus (screen plus network egress, not just code), and when remote-only is the right default.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Agent code is untrusted input.</h3>
+
+    <p>Every other essay in this group treats data that flows <em>into</em> the model as untrusted — a tool description, a retrieved document, a GitHub issue. Executable output that flows <em>out</em> of the model deserves exactly the same suspicion, and it usually gets less. When an agent writes a Python snippet to transform a file, calls a code-interpreter tool, or runs a shell command a poisoned tool description told it to run, the thing about to execute on your machine was authored by a system that a <a href="/deep-dives/agent-security/red-teaming-agents" class="xref">red-team benchmark</a> shows complies with hostile instructions at a meaningful rate. The generated code is not a trusted artifact of your codebase; it is untrusted input that happens to be executable.</p>
+
+    <p>That reframing is the whole argument. If you would not run an attacker's binary on your laptop, you should not run agent-generated code with your host's kernel, filesystem, and network reachable — because a prompt injection two hops upstream can make the agent generate precisely that attacker's binary. The 2026 consensus, drawn across multiple sandboxing vendors, is blunt: assume any code an agent produces or is steered into running is hostile, and let the isolation boundary — not the model's good behavior — be the thing that contains it.</p>
+
+    <p>Isolation does not replace the other layers; it bounds them. A policy gate can refuse a dangerous <em>tool call</em>, but once code is executing inside an interpreter, the policy engine is no longer in the loop for the syscalls that code makes. The sandbox is what confines the blast radius when every earlier control has already been bypassed — which, on the tool-poisoning axis, you should assume will happen. The useful framing from the field: sandboxing confines the blast radius; defense-in-depth closes the loop.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The isolation tiers.</h3>
+
+    <p>There are three tiers worth knowing, and they differ on one axis that decides everything: whether the untrusted code shares your host's kernel. A shared kernel means a single kernel-level vulnerability is a full host escape; a separate kernel means the same exploit only owns a throwaway guest.</p>
+
+    <p><strong>Shared-kernel containers</strong> (Docker, runc) are the default nearly everyone reaches for first. They start in well under a second and are cheap, but every container on a host shares that host's kernel. Namespaces and cgroups isolate the process view, not the kernel attack surface — so a kernel exploit from inside the container is a host compromise. For untrusted, agent-generated code, that shared kernel is the exposure the 2026 posture rejects as no longer sufficient on its own.</p>
+
+    <p><strong>microVMs</strong> (Firecracker, and E2B built on it) run the untrusted code inside a real, minimal virtual machine with its <em>own</em> kernel behind a hardware virtualization boundary. A kernel exploit inside the guest escapes into a guest that owns nothing. The historic objection to VMs — slow to boot — is what Firecracker was built to erase: vendors report microVM startup in the sub-150ms range, close enough to container latency that a fresh VM per task becomes practical. Attribution matters here: these startup figures come from the microVM vendors (Firecracker's maintainers, E2B), not from a neutral benchmark, so treat them as the vendor's stated numbers rather than settled fact.</p>
+
+    <p><strong>gVisor</strong> sits between the two. It is a userspace kernel: a sandbox process intercepts the guest's syscalls and services most of them itself, so the untrusted code rarely touches the real host kernel directly. That shrinks the kernel attack surface without a full VM, and it starts at close to container speed. The cost is a compatibility and performance tax on syscall-heavy workloads, and the boundary is a large userspace codebase rather than a hardware one. Again, the near-container-speed characterization traces to the sandboxing vendors surveying the space, not to an independent measurement you can cite as neutral.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>microVM vs gVisor vs container.</h3>
+
+    <p>Put the three side by side against the questions a security review actually asks — does it share the host kernel, how fast does a fresh instance start, and what is the blast radius of a kernel exploit — and the choice stops being a matter of taste.</p>
+
+<pre class="trace">tier          kernel        cold start    kernel-exploit blast radius
+────────────  ────────────  ───────────   ────────────────────────────
+container     SHARED host   &lt;1s           HOST COMPROMISE (namespaces
+(Docker/runc)                             isolate view, not the kernel)
+gVisor        userspace     ~container    userspace escape, then host;
+                            speed         smaller kernel surface
+microVM       SEPARATE      &lt;150ms *      throwaway guest only; real
+(Firecracker) guest kernel  (* vendor)    virtualization boundary
+────────────  ────────────  ───────────   ────────────────────────────
+2026 default for UNTRUSTED agent code: microVM; relax to
+gVisor / container only when the threat model allows.</pre>
+
+    <p>Read the table as a default-and-relax rule, not a ranking to always max out. The 2026 default for untrusted agent-generated code is the microVM, because the separate kernel is the only tier where a kernel exploit does not reach your host. You relax <em>downward</em> to gVisor or a plain container only when the threat model genuinely allows it — for example, code you generated and reviewed yourself, running against no secrets and no network, where the cost of the stronger boundary buys little. The mistake the consensus is correcting is the reverse habit: starting at a shared-kernel container and treating the microVM as an exotic upgrade. For hostile-by-default code, the microVM is the baseline and the container is the exception that needs justifying.</p>
+
+    <p>The other design decision the table implies is lifecycle. Because a microVM is cheap to start and owns nothing, the strong pattern is one fresh sandbox per task — or per tool call — torn down immediately after. A long-lived sandbox accumulates state an attacker can use across invocations; an ephemeral one that dies after a single call gives a successful exploit almost nothing to hold onto and nothing to persist into the next request.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Computer-use and browser isolation.</h3>
+
+    <p>Code execution is the tidy case because the untrusted surface is one thing: syscalls. Computer-use and browser agents widen the surface, and the isolation calculus has to widen with it. A computer-use agent does not just run code — it drives a screen, reads whatever is on it, and reaches the network the way a human operator would. The sandbox now has to bound three things at once: what the code can do to the host, what the agent can see on the screen, and where it can send bytes.</p>
+
+    <p>Network egress is the surface teams most often forget. A perfectly isolated microVM that still has open outbound internet is a fine exfiltration channel: a prompt injection that lands inside a browsing agent can read a secret from the current session and simply POST it out, and the kernel boundary never mattered because nothing crossed it. Egress control — default-deny outbound, an allowlist of destinations the task genuinely needs — is a first-class part of the isolation boundary for anything that browses, not an afterthought bolted on for compliance. The specific ways a browsing agent gets steered into doing this are the subject of the <a href="/deep-dives/architectures-and-patterns/browser-agent-failure-modes" class="xref">browser-agent failure modes</a> essay; the point here is that the sandbox has to assume it will happen.</p>
+
+    <p>The screen itself is state that leaks. A computer-use agent that shares a display, a clipboard, or a browser profile with anything else can read and write across that shared surface, so the same ephemeral, one-session-per-task discipline that governs the kernel boundary should govern the visual and session boundary too: a fresh, disposable browser profile with no ambient logged-in cookies, discarded when the task ends. The <a href="/field-guide/computer-use-in-production" class="xref">computer-use in production</a> field guide covers the operational shape of running these safely; the isolation point is that for computer-use, "the sandbox" means kernel plus screen plus egress, and leaving any one of the three open reopens the whole thing.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When remote-only wins.</h3>
+
+    <p>The strongest isolation is the code that never runs on your infrastructure at all. Remote-only execution hands the untrusted workload to a provider whose entire product is running hostile code in disposable microVMs — you get a sandbox-per-call API, and the blast radius of a successful escape is the provider's throwaway guest, not your host, your network, or your secrets. When the code comes from a source you cannot vet — a tool from an untrusted MCP server, a snippet the agent wrote against an attacker-influenced prompt — remote-only is a sound default precisely because it moves the boundary off your machine entirely.</p>
+
+    <p>The pattern is a sandbox created per tool call and destroyed after it. Only the minimum inputs cross into the sandbox, only the declared result comes back, and the credentials that reach the sandbox are scoped down to nothing the task does not need — the same <a href="/operations/safety-and-security/scoped-credentials-for-agents" class="xref">scoped-credentials</a> discipline that limits what any tool call can touch, applied at the sandbox boundary so a compromised guest holds a key that expires with it.</p>
+
+<pre class="standalone"># one fresh microVM sandbox per tool call, torn down after
+async def run_untrusted(code: str, task_inputs: dict) -> Result:
+    sbx = await Sandbox.create(          # remote microVM, own kernel
+        template="code-interpreter",
+        timeout=30,                      # hard wall-clock cap
+        egress="deny",                   # default-deny outbound
+        env=scoped_secrets(task_inputs), # only what THIS task needs
+    )
+    try:
+        return await sbx.run(code, inputs=task_inputs)
+    finally:
+        await sbx.kill()                 # ephemeral: nothing persists</pre>
+
+    <p>Remote-only is not free — it adds a network hop, a dependency, and data leaving your perimeter, so for code you generate and review against no secrets it can be overkill, and a local microVM or gVisor sandbox is the right relax. But the decision rule is the same one this essay opened with: pick the boundary by the blast radius you can tolerate, assume the code is hostile until a boundary proves otherwise, and let that boundary — not the model — be the thing you trust. The mechanics of standing these sandboxes up in a real agent loop are the subject of the <a href="/playbooks/coding-and-computer-use-agents/sandboxing-and-execution" class="xref">sandboxing and execution</a> playbook; the posture is what this essay asks you to fix first.</p>
+  </div>
+</section>

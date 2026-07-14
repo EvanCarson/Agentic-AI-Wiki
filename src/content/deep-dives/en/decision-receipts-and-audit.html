@@ -1,0 +1,63 @@
+<section class="phase">
+  <div class="phase-num">S8</div>
+  <div class="week">Deep Dive · Agent Security</div>
+  <h2>A decision receipt — a signed action envelope per tool call, hash-chained into a tamper-evident journal — turns an agent run into a record you can replay and prove, which is exactly what SR 26-2 and the EU AI Act now require.</h2>
+  <p class="goal">When an agent does something expensive or wrong, "check the logs" is not enough — logs can be edited, and they rarely let you replay the exact run. A decision receipt is the stronger primitive: a signed action envelope emitted per tool call, hash-chained into a journal so any tampering breaks the chain, capturing the prompt, the reasoning, the tool inputs and outputs, the policy version that was in force, and precise timestamps. That record supports deterministic replay and non-repudiation, and it is no longer optional — SR 26-2 (April 2026) and EU AI Act Article 12 (high-risk obligations landing August 2026) both expect automatic, tamper-evident event recording. This short essay is what to sign and hash-chain, per-call versus per-session, and the hard question of who holds the key if the runtime itself is compromised.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Logs vs receipts.</h3>
+
+    <p>A log is a stream of events you write to reconstruct what a system did. It answers "what happened at 14:07," and it is exactly the right tool for that. But a log has two properties that fail an examiner. First, it is <em>editable</em>: whoever can write to the log store can, in principle, change or delete an entry after the fact, and nothing in an ordinary log proves it wasn't. Second, it is <em>lossy for replay</em> — a log line records that a tool was called, but rarely the complete inputs, the model output, and the surrounding state needed to run the exact decision again and get the same result.</p>
+
+    <p>A decision receipt is built to fix both. It is a self-contained record of one agent action, cryptographically sealed so a later edit is detectable, and complete enough that the action can be replayed deterministically. The relationship to the rest of this group is a clean division of labor: <a href="/deep-dives/agent-security/policy-as-code-for-agents" class="xref">policy-as-code</a> decides whether an action is allowed and emits the structured verdict, the <a href="/deep-dives/agent-security/structured-refusal-and-why-trails" class="xref">why-trail</a> explains why that verdict fired, and the receipt is what <em>signs and stores</em> the whole thing so it survives contact with an adversary. The general engineering of what to retain — the four-strand model, prompt, tools and data provenance — lives in the operations <a href="/operations/governance-compliance/audit-trails" class="xref">audit-trails</a> material; this essay is the agent-specific signing and chaining on top of it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The signed action envelope.</h3>
+
+    <p>The unit is one envelope per tool call. It wraps the payload that makes the action reconstructable — the initiating prompt (or a hash of it, if it is large or sensitive), the reasoning chain that led to the call, the tool name with its exact inputs, the tool's outputs, the <strong>policy version</strong> in force, any human override, and precise timestamps — and then it is signed. The signature is what upgrades a log entry into a receipt: it binds the payload to a key, so a verifier can confirm both that the entry is unmodified and which identity produced it. That identity is the same key-bound identity <a href="/deep-dives/agent-security/agent-identity-and-attestation" class="xref">attestation</a> establishes — the receipt is where a runtime attestation stops being a request check and becomes a durable, after-the-fact claim about who acted.</p>
+
+    <p>Capturing the policy version matters more than it looks. A replay is only faithful if you know which rules were in force <em>at the time</em>; a receipt that records "denied" without the policy version cannot be re-evaluated against the deployment that actually ran, only against whatever policy exists today. Sign the version alongside the decision, and you can prove a refusal was correct under the rules that governed it — even after those rules change.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Hash-chaining for tamper-evidence.</h3>
+
+    <p>Signing each envelope proves an individual entry wasn't altered, but it does not stop someone from deleting an entry, reordering entries, or truncating the tail. Hash-chaining closes that gap: each receipt includes the hash of the previous receipt, so the journal is a linked list where every entry commits to all of its history. Change or drop any receipt and every hash downstream no longer matches — the break is localized and visible. A periodic signed checkpoint over the head hash defends the tail, so an attacker cannot simply delete the most recent entries and re-chain from an earlier point.</p>
+
+<pre class="trace">{
+  "seq": 118,
+  "prev_hash": "sha256:6b1e…c4",
+  "agent_id": "did:agent:orders-svc#7a",
+  "tool": "refund.issue",
+  "args": { "order": "A-9931", "amount_cents": 4200 },
+  "result": { "status": "ok", "txn": "rf_5521" },
+  "policy_version": "v3",
+  "decided_at": "2026-05-02T14:07:22.114Z",
+  "entry_hash": "sha256:9f2a…d7",
+  "sig": "ed25519:MEUCIQ…"
+}
+{ "seq": 119, "prev_hash": "sha256:9f2a…d7", "tool": "email.send", … }</pre>
+
+    <p>Two design choices govern cost. The first is <strong>per-call versus per-session</strong>: a receipt per tool call gives the finest replay granularity but the most volume, while a per-session receipt that commits to a Merkle root over its calls keeps the chain short and still lets you prove any single call on demand. The second is what you store inline versus by reference — large tool outputs live in content-addressed storage, and the receipt carries their hash, so the chain stays small without losing the ability to verify the payload.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>What regulators expect.</h3>
+
+    <p>This is no longer an internal nicety. In April 2026 the U.S. banking regulators (OCC, Federal Reserve, FDIC) issued <strong>SR 26-2</strong>, superseding the long-standing SR 11-7 model-risk guidance, with expectations that reach the automated, agentic decisions banks now deploy. In the EU, <strong>Article 12 of the AI Act</strong> (Regulation (EU) 2024/1689) requires high-risk systems to automatically record events over their lifecycle in a way that supports traceability, with the high-risk obligations landing in <strong>August 2026</strong>. Both point at the same primitive: automatic, tamper-evident event recording that can reconstruct a decision after the fact. A hash-chained journal of signed receipts is a direct implementation of that requirement, which is why the pattern is worth building before an auditor asks for it rather than after.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The key-custody problem.</h3>
+
+    <p>Here is the honest limit of the whole scheme. A receipt's guarantees rest entirely on the signing key, and the uncomfortable question is: <strong>who holds it, and what does the signature prove if the runtime itself is compromised?</strong> If the agent process signs its own receipts with a key it can read, then an attacker who owns the process owns the key — and can forge perfectly valid receipts for actions that never happened, or re-sign a doctored history. Non-repudiation quietly degrades into "non-repudiation, assuming the thing doing the signing was honest," which is exactly the assumption an incident breaks.</p>
+
+    <p>There are partial answers, none complete. Signing in a hardware-backed key store (a TPM or HSM) means the process can request signatures but never extract the key, so a compromise cannot exfiltrate it — though a live-compromised process can still ask it to sign lies while it has access. Streaming the head hash to an external, append-only witness (a separate trust domain, or a public transparency log) means a compromised runtime can stop writing but cannot silently rewrite what the witness already saw. Co-signing high-value actions with a separate policy service splits the trust. Each raises the bar; none delivers unconditional non-repudiation against a fully compromised runtime. That gap is the open frontier of agent auditability — worth stating plainly, because a receipt system sold as tamper-proof rather than tamper-<em>evident</em> is a promise the cryptography does not keep.</p>
+  </div>
+</section>
