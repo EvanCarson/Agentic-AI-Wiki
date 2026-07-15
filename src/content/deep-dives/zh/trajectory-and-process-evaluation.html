@@ -1,0 +1,124 @@
+<section class="phase">
+  <div class="phase-num">E4</div>
+  <div class="week">深入解析 · 评估智能体</div>
+  <h2>正确的最终答案可能是走了一条坏路才拿到的——轨迹评测为有序的工具调用、参数与观测序列打分，抓出那些结果评测在结构上就看不见的循环、错用工具与幻觉参数。</h2>
+  <p class="goal">结果评测告诉你智能体这次答对了；它没法告诉你智能体下次还答得对。一个靠冗余循环、靠一个恰好被忽略的幻觉参数、或靠一次侥幸重试拿到的正确答案，只是在等一个略有不同的输入去引爆的生产事故。轨迹评测为智能体<em>如何</em>工作打分——工具选择、参数落地、收敛、错误恢复、每一步的忠实度——手段包括基于参考的匹配器（AgentEvals）、无参考的 LLM 评判（TRACE、Phoenix），以及基于状态的评分器（tau-bench）。这篇讲的是分类法、工具，以及决定"一个轨迹分数到底有没有意义"的那些坑。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>结果评测看不见的那种失败。</h3>
+
+    <p>结果评测取最终答案或末态，递给评分器，检查是否吻合——它能看到的就这一层。轨迹（过程）评测取的是有序序列：推理回合、工具调用的选择、传入的参数、返回的观测，以及其间做出的决策，并为整段工作的形状打分。实践中，轨迹并不是什么稀奇的产物——它就是你的框架早已发出的消息/步骤列表，就是智能体在<a href="/zh/concepts/the-agent-loop" class="xref">智能体循环</a>每一轮往里追加的那份列表。LangGraph 还暴露了同一次运行的第二种、更粗粒度的视图——图的节点访问序列——有些评估器就评这个，而不评原始消息。</p>
+
+<pre class="trace"><span class="c-out">trajectory  &mdash;  task: "cancel my most recent order, then confirm"
+--------------------------------------------------------------------
+1  reason   "look up the user's orders first"
+2  tool     get_orders(user_id="u_8841")          -> 3 orders
+3  tool     get_orders(user_id="u_8841")          -> 3 orders   [redundant]
+4  reason   "most recent is order_5567"
+5  tool     cancel_order(order_id="order_5567")    -> {status: "ok"}
+6  tool     cancel_order(order_id="ORDER_5567")    -> error: not_found
+7  answer   "all set, your most recent order is cancelled"
+--------------------------------------------------------------------
+outcome eval     PASS   final answer matches the reference string
+trajectory eval  FAIL
+  step 3  redundant get_orders, no new information   (efficiency)
+  step 6  hallucinated retry after success, bad id   (grounding)</span></pre>
+
+    <p>上面的智能体返回了参考字符串、通过了结果评测；但轨迹讲的是另一个故事。第 3 步是一次重复查询，没带来任何新信息。第 6 步是一次幻觉重试，它是在取消<em>已经</em>成功之后才触发的，针对的还是一个被写错的 order id——它之所以没造成后果，仅仅是因为第一次调用已经把活干完了。结果评测在结构上对这一切失明——它看不见循环、看不见浪费掉的调用、看不见大小写写错的参数，也看不见智能体的"确认"其实是一次报错的重试。</p>
+
+    <p>这不只是审美问题。一个靠坏路拿到的正确答案，是一个经不起输入被轻微扰动的正确答案：侥幸重试会在第一次调用失败那天变成错答案，被忽略的幻觉参数会在工具不再宽容那天变成承重件。这正是训练文献在过程监督与结果监督之间划出的那条界线（见<a href="/zh/deep-dives/training-agentic-models/process-vs-outcome-rewards" class="xref">过程奖励 vs 结果奖励</a>）：只给终点打分，就会奖励任何抵达终点的路径，包括那些误打误撞抵达的。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>步级指标的分类法。</h3>
+
+    <p>一旦你接受"路径值得打分"，接下来的问题就是打什么分。在各家工具里稳定下来的是五个步级指标，它们与 STEP 1 轨迹里的失败一一对应。</p>
+
+    <ul>
+      <li><strong>工具选择准确率</strong>——对每个子目标，智能体伸手去拿的是不是对的工具？错用工具是最常见、也最便宜就能检出的错误，而这正是<a href="/zh/concepts/tool-calling-explained" class="xref">工具调用</a>在调用流里让人看得见的那种失败。</li>
+      <li><strong>参数正确性</strong>——参数是落地在上下文与先前观测之上，还是被幻觉出来的？一个不是从会话里读出、而是被凭空捏造的 <code>user_id</code>，即便调用碰巧成功了，也是一次落地失败。</li>
+      <li><strong>效率 / 收敛</strong>——它实际走了多少步，对比它本需要多少步？Arize 的<em>收敛评测（convergence eval）</em>把这一点形式化：拿智能体的步数去对比该查询类型已知的最小步数；冗余调用、绕路和循环都会以"多出来的步数"暴露出来。</li>
+      <li><strong>恢复 / 适配</strong>——在一次失败调用或一次糟糕观测之后，智能体是纠偏，还是把错误再犯一遍？第 6 步的重试就是一次恢复失败：它没认出自己已经拿到的成功，反而又开了一枪。</li>
+      <li><strong>每步的落地 / 忠实度</strong>——每一步是否忠于此刻为止收集到的观测？一个步骤在抽象意义上可以事实为真，却对轨迹实际检索到的东西不忠实——就是经典的"答对了但理由是错的"。</li>
+    </ul>
+
+    <div class="callout">Arize 的<strong>收敛评测</strong>是这里最锋利的单一数字：把同一查询类型跑很多次，记录任何一次跑出的最小步数，然后把每次运行按 <code>min_steps / actual_steps</code> 打分。一个完美高效的智能体得 1.0；一个打转或绕远路的智能体则远低于此。这个指标不需要任何黄金轨迹——只需要同一查询类别上的一群运行样本。</div>
+
+    <p>已经流行开的学术框架，把这五项压缩成三个维度——<strong>效率、幻觉、适配</strong>——这就是 TRACE 的分类法（arXiv 2510.02837）。效率涵盖收敛；幻觉覆盖错用工具与未落地参数两者；适配就是恢复。这个三分法的价值在于，它干净地映射到"一个无参考评判器能被要求在没有黄金路径的情况下去打分"的那些东西上。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>基于参考 vs 无参考。</h3>
+
+    <p>最便宜、最确定性的轨迹评测，是把智能体的路径与一条黄金/参考路径对比。AgentEvals（langchain-ai/agentevals）是其参考实现。<code>create_trajectory_match_evaluator()</code> 接受一个 <code>trajectory_match_mode</code>：<strong>strict</strong>（相同消息、相同顺序、相同工具调用）、<strong>unordered</strong>（相同工具调用、任意顺序）、<strong>subset</strong>（智能体只调用了参考中出现过的工具——一道效率门槛）、<strong>superset</strong>（智能体至少调用了参考里的那些工具）。参数比较是另一根独立的轴，<code>tool_args_match_mode</code> &isin; {<strong>exact</strong>（默认）、<strong>ignore</strong>、<strong>subset</strong>、<strong>superset</strong>}，并可经 <code>tool_args_match_overrides</code> 按工具逐个覆盖。</p>
+
+<pre class="standalone"><span class="c-cm"># agentevals &mdash; reference-based trajectory matching (deterministic, no LLM).</span>
+<span class="c-kw">from</span> agentevals.trajectory.match <span class="c-kw">import</span> create_trajectory_match_evaluator
+
+<span class="c-cm"># "subset": agent may call FEWER tools than the reference but no EXTRA ones,</span>
+<span class="c-cm"># which turns the matcher into an efficiency gate (redundant calls -> fail).</span>
+evaluator = create_trajectory_match_evaluator(
+    trajectory_match_mode=<span class="c-st">"subset"</span>,       <span class="c-cm"># strict | unordered | subset | superset</span>
+    tool_args_match_mode=<span class="c-st">"exact"</span>,         <span class="c-cm"># exact | ignore | subset | superset</span>
+    tool_args_match_overrides={
+        <span class="c-st">"search"</span>: <span class="c-st">"ignore"</span>,               <span class="c-cm"># semantically-equal queries still pass</span>
+        <span class="c-st">"get_orders"</span>: [<span class="c-st">"user_id"</span>],        <span class="c-cm"># compare user_id only, ignore paging args</span>
+    },
+)
+result = evaluator(outputs=agent_messages, reference_outputs=gold_messages)
+<span class="c-cm"># -> {"key": "trajectory_match", "score": True/False}</span>
+
+<span class="c-cm"># reference-free &mdash; an LLM judge reads input + tool calls + observations,</span>
+<span class="c-cm"># rubric-scores the path, and needs NO gold trajectory.</span>
+<span class="c-kw">from</span> agentevals.trajectory.llm <span class="c-kw">import</span> create_trajectory_llm_as_judge
+judge = create_trajectory_llm_as_judge(model=<span class="c-st">"openai:o3-mini"</span>)
+
+<span class="c-cm"># graph variant &mdash; score the NODES visited, not the messages.</span>
+<span class="c-kw">from</span> agentevals.graph_trajectory.llm <span class="c-kw">import</span> create_graph_trajectory_llm_as_judge</pre>
+
+    <p>模式的选择就是全部胜负所在。<code>strict</code> 只有在"恰好只有一条正确路径"时才对；对任何有合理排序自由度的任务，它都会误伤正确的智能体（更多见 STEP 5）。<code>subset</code> 是强制效率的那个模式——它放过"用了参考工具子集"的智能体，卡掉"多做了额外调用"的智能体。基于参考的匹配是确定性的、无 LLM 成本，但它需要标注好的黄金轨迹，而黄金轨迹既昂贵、又在任务允许多条路径时很脆。</p>
+
+    <p>当你无法枚举出一条黄金路径时——开放式任务、探索型智能体——无参考评判器会去读整条轨迹（输入、工具 schema、有序的工具调用、观测），并在没有黄金路径可比的情况下按 rubric 打分。AgentEvals 提供 <code>create_trajectory_llm_as_judge()</code>；其图变体 <code>create_graph_trajectory_llm_as_judge()</code> 与 <code>graph_trajectory_strict_match()</code> 评的是 LangGraph 的节点访问序列，而非消息。Arize Phoenix 把同样的事做成一个 OTel 原生、可自托管的评测：一个 LLM 评判器把有序的工具调用序列连同解释一起分类为正确/不正确，所依 rubric 会问这条路径是否推进得合乎逻辑、是否用了对的工具、是否合理高效而没有多余绕路——Phoenix 把这些命名为 <em>tool-calling eval</em> 与 <em>convergence/path eval</em>，并把理想路线称作"golden path"。Braintrust 则加上轨迹级打分与逐步分析（工具选择、参数构造、结果处理、综合），一个能从自然语言判据生成自定义评分器的"Loop"特性，以及无需基准真值、直接在生产轨迹上跑 LLM 评判的在线打分。</p>
+
+    <p>TRACE（arXiv 2510.02837）是值得记住的无参考锚点：无参考、多维（效率/幻觉/适配），带一个<strong>证据库（evidence bank）</strong>，把智能体跨步骤已经确立的东西累积起来，让某一步能在整条轨迹的语境里、而非孤立地被评判。走无参考路线的代价，就是每个 LLM 评判器的代价：它确定性更差，并且继承评判器的偏见——位置、冗长、自我偏好——所以一个无参考的轨迹分数，可信度只等于它的校准程度（见<a href="/zh/deep-dives/evaluating-agents/judge-calibration-and-meta-evaluation" class="xref">评判器校准与元评测</a>）。<a href="/zh/concepts/evals-101" class="xref">evals-101</a> 的那句告诫——一个你没验证过的指标只是摆设——在指标本身是"一个 LLM 在读轨迹"时更是加倍成立。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>基于状态的评分，与 PRM 的迁移。</h3>
+
+    <p>还有第三样东西要查，它既不在文字记录里、也不在工具调用语法里：世界是否真的按它应该的样子改变了？tau-bench（Sierra，arXiv 2406.12045）按<strong>状态</strong>评分。智能体跑完之后，它把结果数据库状态与一份标注好的目标状态对比——它核实一笔订单在数据库里确实翻成了"cancelled"，而不只是智能体<em>说</em>它翻了，也不只是发出了一个语法上合法的 <code>cancel_order</code> 调用。</p>
+
+<pre class="trace"><span class="c-out">tau-bench  &mdash;  grade by the resulting STATE, not by the transcript
+--------------------------------------------------------------------
+goal_state   orders["order_5567"].status == "cancelled"
+db_after     orders["order_5567"].status == "cancelled"    -> MATCH
+             (agent said "cancelled" AND the DB row actually flipped)
+
+a transcript-only eval would be fooled by:
+  agent answer   "your order is cancelled"
+  db_after       orders["order_5567"].status == "open"     -> FAIL</span></pre>
+
+    <p>这堵上了 STEP 1 轨迹打开的那道口子。一个嘴上说"cancelled"、而数据行仍读作"open"的智能体，能在答案字符串上通过结果评测，甚至能通过一次工具调用语法检查，却过不了状态评分器。τ²-bench（arXiv 2506.07982）把这一套扩展到双控（dual-control）设定，用户与智能体都会调用工具——这更贴近真实的客服与运营工作。当环境带有可核查的状态时，基于状态的核验是能拿到的最强过程信号；它也是搭建成本最高的，因为得有人为每个任务标注目标状态。</p>
+
+    <p>为单个步骤打分的那套机器，不是为评测而发明的——它本是用密集的每步奖励去<em>训练</em>推理模型的，而它直接就能迁移过来。《Let's Verify Step by Step》（Lightman 等，OpenAI）证明过程监督胜过结果监督，并公开了 PRM800K；Math-Shepherd（arXiv 2312.08935）与 OmegaPRM（arXiv 2406.06592）用自动的 MCTS 式、以及分治式蒙特卡洛 rollout 标注，取代了人工步骤标注。一个训练好的过程奖励模型（PRM）就是一个每步打分器，没有什么拦着你把它对准一条轨迹当<em>评估器</em>用——一个学习式或生成式 PRM 逐步打分，是"单次无参考 LLM 评判"的一个替代方案，而训练它的那套自动 rollout 标注，也能在不做穷尽人工标注的情况下<strong>自举出轨迹标注</strong>（见<a href="/zh/deep-dives/training-agentic-models/process-reward-models" class="xref">过程奖励模型</a>）。</p>
+
+    <p>坑也随机器一起迁了过来。一个训练在不完美监督上的 PRM 会被奖励黑客，而一个当评测门槛用的 PRM，可以被以"当训练信号用的 PRM"完全相同的方式钻空子——智能体，或它之上的优化器，会学着去产出 PRM 打高分的步骤，而不是真正好的步骤（见<a href="/zh/deep-dives/training-agentic-models/reward-design-and-hacking" class="xref">奖励设计与奖励黑客</a>）。无论你把这个步级打分器拿去训练还是拿去评分，失败模式都一模一样——这正是"过程对比结果"是一根活着的设计轴、而非已解问题的原因。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>坑，以及可移植的轨迹。</h3>
+
+    <p>第一个、也是危害最大的坑，是把对整条轨迹的 <code>strict</code> 精确匹配当默认。多数真实任务对同一个答案都容许<strong>多条有效路径</strong>——两个互不相关的工具可以任意先后调用，一个可选的确认步骤本就可选——而精确匹配会误伤每一个走了"不同但同样有效"路线的正确智能体。补救全在工具里：用 <code>unordered</code>/<code>subset</code>/<code>superset</code> 匹配替代 <code>strict</code>、允许多条参考轨迹，或退到无参考评判。把 <code>strict</code> 留给那种罕见的、恰好只有一条正确路径的任务。</p>
+
+    <p>第二个坑是<strong>孤立地</strong>评判步骤。一个在局部无可挑剔的步骤——一次参数落地的合理工具调用——在全局上可能冗余或偏离目标，而一个一次只看一步的评判器根本看不出来。这正是 TRACE 证据库的意义所在：它携带智能体跨整条轨迹已确立的东西，让一步在语境里、而非真空里被打分。任何对周围序列失明的步级评判器，都会漏掉全局一致性的失败。第三，过于苛刻的 <code>exact</code> 参数匹配很脆：两个语义等价的搜索查询、或两份等价的 JSON 编码，并不是逐字节相同的，<code>exact</code> 会把它们判失败——在预期存在语义等价的那些参数上，改用 <code>ignore</code> 或在 <code>tool_args_match_overrides</code> 里做字段清单覆盖。第四，无参考评判器继承了那些标准评判偏见；"读的是一条轨迹而非单个答案"这件事，丝毫不能让它们对位置、冗长与自我偏好偏见免疫。</p>
+
+    <p>这一切都以"你能把轨迹从智能体里取出成评估器看得懂的形状"为前提，而让这件事跨厂商中立的，是 <strong>OpenTelemetry GenAI 语义约定</strong>。它们把 span/操作名标准化了——<code>gen_ai.operation.name</code> 取值 <code>invoke_agent</code>、<code>chat</code>、<code>execute_tool</code>、<code>create_agent</code>——也标准化了属性：<code>gen_ai.agent.name</code>、<code>gen_ai.tool.name</code>、<code>gen_ai.input.messages</code>、<code>gen_ai.output.messages</code>，以及 <code>gen_ai.usage.input_tokens</code> / <code>output_tokens</code>。截至 2026 年，这套约定仍处于 Development/experimental，但它已经是让 Phoenix、LangSmith 与 Braintrust 能吞下<em>同一份</em>轨迹 span、而不必各自要求一套定制导出的那个东西。发出 OTel 形状的轨迹，你的过程评测就不再被锁死在某一家厂商的 SDK 上。</p>
+
+    <p>轨迹评测不是结果评测的替代品；它是那一层，告诉你"一个你信得过的结果"是挣来的还是撞上的。按这一组其余各篇的处方把它接进去：作为带活黄金集的 CI 门禁、而非一次性检查（见<a href="/zh/deep-dives/evaluating-agents/eval-driven-development-and-ci" class="xref">评测驱动开发与 CI</a>），并与那份决定部署的成本与可靠性面板一起读（见<a href="/zh/deep-dives/evaluating-agents/hal-and-async-agent-eval" class="xref">HAL 与异步智能体评测</a>）。给答案打分，是为了知道智能体这次能干成。给轨迹打分，是为了知道它下次还干得成。</p>
+  </div>
+</section>

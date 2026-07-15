@@ -1,0 +1,138 @@
+<section class="phase">
+  <div class="phase-num">E5</div>
+  <div class="week">Deep Dive · Evaluating Agents</div>
+  <h2>Evals earn their keep only when they gate &mdash; a regression is a red build, the golden set is versioned source, and the CI gate is a paired significance test against a pinned baseline, never a threshold on one noisy run.</h2>
+  <p class="goal">An eval suite you run by hand before a launch tells you nothing the following week, when a silent provider update or a swapped retriever quietly regresses the agent and not one infra metric moves. The discipline that catches this is Eval-Driven Development: treat evals as tests, the golden dataset as versioned source, a regression as a build failure. But agents are non-deterministic, so a single run's pass/fail is noise &mdash; the gate has to be a paired significance test over multiple samples, cost and latency have to be first-class budgets, and it has to keep running online after deploy because the model beneath you drifts. This essay is the wiring.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Evals as tests: the living golden set.</h3>
+
+    <p>The load-bearing move of Eval-Driven Development (EDD) is that an eval only earns its cost when it <em>gates</em>. A dashboard nobody blocks a deploy on is decoration; an eval wired into CI the way unit tests gate code is a control. The mechanics are the same three lines as a test suite &mdash; treat evals as tests, treat the eval dataset as source-controlled, treat a regression as a build failure &mdash; adjusted for two things unit tests do not have to reckon with: cost (you cannot run ten thousand graded cases on every keystroke) and noise (a single run can flake for reasons unrelated to the change). The framing is corroborated across the practitioner literature, from Braintrust's release-gating posts to arXiv 2411.13768, <em>Evaluation-Driven Development and Operations of LLM applications</em>. The <a href="/concepts/evals-101" class="xref">evals-101 primer</a> is the foundation this builds on.</p>
+
+    <p>The dataset that does the gating is the <strong>golden set</strong>: curated, human-labeled input&rarr;expected pairs, held fixed as a stable baseline across model, prompt, and vendor changes. It is also a living artifact &mdash; the discipline is to continuously pull interesting and failing traces out of production, put them through human review, and add the validated ones back. The best source of new cases is not synthetic padding; it is your own production failures. Mine them from the signals you already collect:</p>
+
+    <ul>
+      <li>thumbs-down and explicit user corrections;</li>
+      <li>abandoned or restarted sessions;</li>
+      <li>escalations to a human agent;</li>
+      <li>low-confidence or self-flagged outputs.</li>
+    </ul>
+
+    <div class="callout">
+      <p><strong>Add a case for every bug.</strong> The regression-test analogy is exact: when a failure is found and fixed, the fix is not done until a case reproducing it lives in the golden set. That is the only mechanism that guarantees the same failure can never silently return &mdash; the eval, not your memory, becomes the institution that remembers it.</p>
+    </div>
+
+    <p>There is a real tension here: a dataset that grows every week cannot double as a stable baseline, because scores computed against a moving target are not comparable across time. You resolve it the way every serious test corpus is resolved &mdash; version the golden set rigorously (<code>golden-v14</code>, not "the golden set"), and pin the exact version each comparison runs against. A private, versioned golden set has a second advantage over a public benchmark, and it is one the <a href="/deep-dives/evaluating-agents/benchmark-landscape-2026" class="xref">benchmark-landscape essay</a> spends its length on: it cannot leak into a training corpus and contaminate the score. Your production failures are yours.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Non-determinism and the paired significance gate.</h3>
+
+    <p>The hard problem that separates agent CI from code CI is that agents and the models under them vary run-to-run, so a single run's pass/fail is a coin flip you have mistaken for a measurement. The first defense is samples: run <em>k</em> trials per case and reason over the distribution, not the point. Two summaries of that distribution matter, and they answer different questions. <strong>pass@k</strong> &mdash; the probability that at least one of k attempts succeeds &mdash; is a capability ceiling: it tells you whether the agent <em>can</em> do the task. <strong>pass^k</strong> ("pass hat k") &mdash; the probability that <em>all</em> k attempts succeed &mdash; is reliability, and it is the number production cares about. It comes from &tau;-bench (Yao et al.), estimated as E[ C(c,k)/C(n,k) ] over c successes in n trials. The gap between them is brutal and worth internalizing: on &tau;-bench an agent can average above 60% (a pass@1-flavored number) while its pass^8 falls below 25% &mdash; reliability collapses under repetition even when average competence looks fine. This is the same property HAL surfaces as its <a href="/deep-dives/evaluating-agents/hal-and-async-agent-eval" class="xref">consistency dimension</a>, and the <a href="/concepts/reading-benchmarks" class="xref">reading-benchmarks primer</a> is the place to internalize why pass@k and pass^k are not interchangeable.</p>
+
+    <p>Samples fix the measurement; they do not yet make a gate. A threshold on one candidate's noisy score will flake &mdash; some builds pass, some fail, on the same code. The gate that holds is <em>paired and statistical</em>: re-run both the candidate and a pinned baseline on the same cases with the same seeds, and fail the build only on a change that is statistically significant, not one that is inside the run-to-run band. The pairing is what makes it cheap and sharp &mdash; because both variants see identical cases, case-difficulty variance cancels and you are left measuring the delta the change actually caused. Say it once and put it on the wall: <strong>the CI gate is a significance test, not a threshold on one noisy number.</strong> For graded (non-binary) outputs, compare against a tolerance band rather than exact match.</p>
+
+<pre class="trace"><span class="c-out">eval-ci · paired regression gate — candidate vs pinned baseline
+----------------------------------------------------------------
+dataset: golden-v14 (218 cases)   samples/case: k=5   n=1090 runs
+baseline: prod@2026-06 (pinned)   candidate: pr-3921
+
+metric             baseline   candidate    delta
+task_completion     0.842      0.851       +0.009
+tool_correctness    0.910      0.888       -0.022
+pass^5              0.612      0.549       -0.063
+p95_latency_ms      4120       4890        +770
+cost_per_task_usd   0.031      0.034       +0.003
+
+paired bootstrap (10k resamples), same cases, same seeds:
+  task_completion   +0.009   95% CI [-0.011, +0.028]   n.s.   -> ok
+  pass^5            -0.063   95% CI [-0.101, -0.026]   p=0.004
+----------------------------------------------------------------
+GATE: FAIL — pass^5 regressed (significant), not one noisy run
+      cost/latency within budget; task_completion delta is n.s.</span></pre>
+
+    <p>Read the gate top to bottom. The headline <code>task_completion</code> went <em>up</em> nine thousandths &mdash; and the paired bootstrap says that delta is not significant (its confidence interval straddles zero), so it is not evidence of anything. The build fails on <code>pass^5</code>: a 6.3-point reliability drop whose interval sits entirely below zero (p=0.004). That is exactly the failure a single-run threshold on average score would have waved through &mdash; average competence held while consistency cracked. Cost and latency moved but stayed inside budget, so they are reported, not gated. One noisy number would have shipped this regression; the paired test caught it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Wiring it into CI: promptfoo and DeepEval.</h3>
+
+    <p>Run the evals on every PR and push; gate the deploy on the significance test above. Two tools have the strongest pure-CI story. <strong>promptfoo</strong> is the most CI-native of the field: declarative YAML configs, assert-style checks, and an official GitHub Action (<code>promptfoo/promptfoo-action</code>) that evaluates on pull requests and posts a pass/fail summary comment straight onto the PR, with red-teaming built in. The whole gate is a file you review like code.</p>
+
+<pre class="standalone"><span class="c-cm"># promptfooconfig.yaml — declarative, assert-style; runs on every PR</span>
+prompts: [<span class="c-st">file://prompts/agent.txt</span>]
+providers: [<span class="c-st">openai:gpt-5.1</span>, <span class="c-st">anthropic:claude-opus-4-8</span>]
+tests: <span class="c-st">file://golden/*.yaml</span>        <span class="c-cm"># the golden set — source-controlled</span>
+defaultTest:
+  assert:
+    - type: <span class="c-st">llm-rubric</span>
+      value: <span class="c-st">resolves the ticket, invents no refund policy</span>
+    - type: <span class="c-st">latency</span>
+      threshold: <span class="c-nb">6000</span>            <span class="c-cm"># ms — a gate-able budget, not an afterthought</span>
+    - type: <span class="c-st">cost</span>
+      threshold: <span class="c-nb">0.04</span>            <span class="c-cm"># USD/task</span>
+
+<span class="c-cm"># .github/workflows/evals.yml — the official action gates the PR</span>
+steps:
+  - uses: <span class="c-st">promptfoo/promptfoo-action@v1</span>
+    with:
+      config: <span class="c-st">promptfooconfig.yaml</span>
+      <span class="c-cm"># evaluates the diff, posts a pass/fail summary comment</span></pre>
+
+    <p><strong>DeepEval</strong> (<code>confident-ai/deepeval</code>) takes the other CI-native route: it is pytest-shaped. You write <code>assert_test()</code> against your cases and run <code>deepeval test run</code>, so the evals execute in CI in exactly the invocation you use locally &mdash; no second harness to keep in sync. It ships 40-plus metrics (G-Eval, task completion, tool-use, answer relevancy, hallucination, conversational, RAG) and integrates with the Confident AI platform for storage and dashboards.</p>
+
+<pre class="standalone"><span class="c-cm"># test_agent.py — pytest-native; `deepeval test run` executes it in CI</span>
+<span class="c-kw">from</span> deepeval <span class="c-kw">import</span> assert_test
+<span class="c-kw">from</span> deepeval.metrics <span class="c-kw">import</span> TaskCompletionMetric, ToolCorrectnessMetric
+
+<span class="c-kw">def</span> <span class="c-fn">test_refund_flow</span>(case):
+    metrics = [TaskCompletionMetric(threshold=<span class="c-nb">0.8</span>),
+               ToolCorrectnessMetric()]
+    assert_test(case, metrics)          <span class="c-cm"># identical call locally and in CI</span></pre>
+
+    <p>Two adjustments keep this from either bankrupting you or flaking. Budget the sample grid: run a small k on a representative subset per PR for fast feedback, and reserve the full n-samples-over-the-whole-golden-set run for a nightly or pre-release job. And keep assertions graded where the output is graded &mdash; a rubric or tolerance band, not string equality &mdash; because exact-match on a path or a paraphrase fails agents that were correct, a trap the <a href="/deep-dives/evaluating-agents/trajectory-and-process-evaluation" class="xref">trajectory-and-process essay</a> unpacks in full.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Offline, online, canary, and the budgets.</h3>
+
+    <p>Offline and online eval are not competitors; a mature 2026 team runs both. <strong>Offline</strong> is pre-deploy: batch runs against the golden set that gate releases with granular per-case metrics, so a problem is caught before any user meets it. <strong>Online</strong> is production monitoring: it adds the axes you cannot fake in a sandbox &mdash; real latency, throughput, cost, and user feedback &mdash; and it surfaces regressions live, on traffic the offline set never anticipated. The first stops bad releases; the second is the only thing that catches a release whose badness only appears against real inputs.</p>
+
+    <p><strong>Guardrails</strong> are the online eval that runs in-band: pre-response scorers that block or deflect before an answer reaches the user &mdash; toxicity, bias, PII, hallucination checks that sit inside the agent loop as an interception step (see <a href="/concepts/the-agent-loop" class="xref">the-agent-loop</a> for where they fit). <strong>Canary</strong> is the online eval that governs rollout: route a small percentage of traffic to the new version, run online eval on just those sessions, compare against the control cohort, and promote to 100% only if quality holds or improves &mdash; with auto-rollback the instant a regression trips. It is the significance gate from STEP 2, moved from CI to live traffic.</p>
+
+    <p>When you compare two versions for real &mdash; an A/B or a canary-vs-control &mdash; prefer <strong>pairwise</strong> ("arena") judging over absolute scoring. Handing the judge both outputs and asking which is better anchors it on the comparison and sidesteps the drift of an absolute grader whose internal scale wanders over weeks. The known failure mode is position bias, so guard every pairwise verdict with a position-swap consistency check; the <a href="/deep-dives/evaluating-agents/judge-calibration-and-meta-evaluation" class="xref">judge-calibration essay</a> is the full protocol for keeping the judge honest.</p>
+
+    <div class="callout warn">
+      <p><strong>Cost and latency are gate-able axes, not an afterthought.</strong> By 2026 the major frameworks emit cost as a first-class signal alongside correctness &mdash; per-task dollar cost, p50/p95 latency, token consumption. Wire them into the gate as budgets: an agent that is 3x slower or 2x more expensive for the same quality should fail CI, exactly as a correctness regression would. HAL made the same argument at the benchmark layer with its <a href="/deep-dives/evaluating-agents/hal-and-async-agent-eval" class="xref">cost-per-solve</a> number.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Drift detection and the tool landscape.</h3>
+
+    <p>The reason online eval is non-negotiable is <strong>silent model drift</strong>. Providers update hosted models with little notice &mdash; the November-2024 snapshot is not the March-2025 snapshot &mdash; and the quality shift can land on a slice of request categories while every infrastructure metric stays flat: latency flat, error rate flat, quality quietly worse. Static pre-launch tests cannot catch a change that arrives after launch, so the only defense is post-launch monitoring plus a scheduled re-run of the golden set. The pitfall is assuming a pinned model version buys you stability; it does not, because the weights behind the name can move under you. Schedule re-baselines the way you schedule dependency updates. <strong>Dependency drift</strong> is the same threat one layer out: a changed tool, API, retriever, or upstream prompt can regress the agent without touching its own code, so re-baseline whenever any dependency changes.</p>
+
+    <p>The 2026 tooling has settled into recognizable lanes &mdash; pick by where your gate lives:</p>
+
+    <ul>
+      <li><strong>promptfoo</strong> &mdash; CLI plus GitHub Action; the strongest pure-CI story, red-teaming included.</li>
+      <li><strong>DeepEval / Confident AI</strong> &mdash; pytest-native local-and-CI parity; 40+ metrics.</li>
+      <li><strong>LangSmith</strong> &mdash; experiments, datasets, evaluator templates, online eval.</li>
+      <li><strong>Braintrust</strong> &mdash; experiments, autoevals, online scoring, explicit release-gating framing.</li>
+      <li><strong>Arize Phoenix</strong> &mdash; open-source, OTel-native, self-hostable.</li>
+      <li><strong>Inspect / Inspect AI</strong> (UK AISI) &mdash; Task = Dataset + Solver + Scorer, sandboxed; adopted by METR and Apollo Research &mdash; the safety- and eval-lab-oriented option.</li>
+      <li><strong>Weights &amp; Biases Weave</strong> &mdash; observability plus eval plus Guardrails.</li>
+    </ul>
+
+    <div class="callout">
+      <p><strong>Read the OpenAI Evals news precisely.</strong> The <em>hosted product / UI</em> is being deprecated &mdash; announced around June 2026, read-only from Oct 31 2026, shut down Nov 30 2026. That is <em>not</em> the same thing as the open-source <code>openai/evals</code> repo and the Evals API graders, which are a separate offering and remain. "The hosted Evals dashboard is sunsetting" is true; "OpenAI Evals is dead" is not &mdash; do not let the shorthand cost you a working grader.</p>
+    </div>
+
+    <p>The failure modes cluster, and each has a named fix. Gating on a single noisy run gives you flaky CI &mdash; use samples plus a paired significance test. An un-versioned "living" dataset gives you scores that are not comparable across time &mdash; version and pin the baseline. Judge drift corrupts online and A/B eval &mdash; go pairwise with position-swap checks. Cost and latency treated as an afterthought ship agents that pass quality and blow the budget &mdash; gate them. And a pinned model number lulls you into assuming stability that silent provider updates erode &mdash; schedule re-baselines. None of this is exotic; it is the ordinary discipline of continuous integration, applied to a system that happens to answer differently every time you ask. The teams that ship reliable agents in 2026 are the ones that stopped running evals by hand and started letting them fail the build.</p>
+  </div>
+</section>
