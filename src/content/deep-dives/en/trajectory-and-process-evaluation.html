@@ -1,0 +1,124 @@
+<section class="phase">
+  <div class="phase-num">E4</div>
+  <div class="week">Deep Dive · Evaluating Agents</div>
+  <h2>A correct final answer can be reached by a broken path &mdash; trajectory evaluation scores the ordered sequence of tool calls, arguments, and observations, and catches the loops, wrong tools, and hallucinated arguments that outcome-only scoring is structurally blind to.</h2>
+  <p class="goal">Outcome eval tells you the agent got the right answer; it cannot tell you the agent will get it again. A right answer reached through a redundant loop, a hallucinated argument that happened to be ignored, or a lucky retry is a production incident waiting for a slightly different input. Trajectory evaluation scores <em>how</em> the agent worked &mdash; tool selection, argument grounding, convergence, error recovery, per-step faithfulness &mdash; with reference-based matchers (AgentEvals), reference-free LLM judges (TRACE, Phoenix), and state-based graders (tau-bench). This essay is the taxonomy, the tools, and the pitfalls that decide whether a trajectory score means anything.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The failure outcome eval is blind to.</h3>
+
+    <p>Outcome eval takes the final answer or end state, hands it to a grader, and checks whether it matches &mdash; that is the entire surface it sees. Trajectory (process) eval takes the ordered sequence instead: the reasoning turns, the tool-call selections, the arguments passed, the observations returned, and the decisions made in between, and it scores the shape of the work. In practice a trajectory is not an exotic artifact &mdash; it is the message/step list your framework already emits, the same list the agent appends to on every iteration of <a href="/concepts/the-agent-loop" class="xref">the agent loop</a>. LangGraph exposes a second, coarser view of the same run &mdash; the graph's node-visit sequence &mdash; and some evaluators score that instead of the raw messages.</p>
+
+<pre class="trace"><span class="c-out">trajectory  &mdash;  task: "cancel my most recent order, then confirm"
+--------------------------------------------------------------------
+1  reason   "look up the user's orders first"
+2  tool     get_orders(user_id="u_8841")          -> 3 orders
+3  tool     get_orders(user_id="u_8841")          -> 3 orders   [redundant]
+4  reason   "most recent is order_5567"
+5  tool     cancel_order(order_id="order_5567")    -> {status: "ok"}
+6  tool     cancel_order(order_id="ORDER_5567")    -> error: not_found
+7  answer   "all set, your most recent order is cancelled"
+--------------------------------------------------------------------
+outcome eval     PASS   final answer matches the reference string
+trajectory eval  FAIL
+  step 3  redundant get_orders, no new information   (efficiency)
+  step 6  hallucinated retry after success, bad id   (grounding)</span></pre>
+
+    <p>The agent above returns the reference string and passes outcome eval; the trajectory tells a different story. Step 3 is a duplicate lookup that adds no information. Step 6 is a hallucinated retry that fired <em>after</em> the cancellation had already succeeded, against a mangled order id that happened not to matter only because the first call did the work. Outcome eval is structurally blind to all of it &mdash; it cannot see the loop, the wasted call, the wrong-cased argument, or the fact that the agent's "confirmation" was a retry that errored.</p>
+
+    <p>This matters beyond aesthetics. A right answer reached through a broken path is a right answer that will not survive a small perturbation of the input: the lucky retry becomes a wrong answer the day the first call fails, and the ignored hallucinated argument becomes load-bearing the day the tool stops being forgiving. It is the same distinction the training literature draws between process and outcome supervision (see <a href="/deep-dives/training-agentic-models/process-vs-outcome-rewards" class="xref">process vs outcome rewards</a>): scoring only the endpoint rewards any path that reaches it, including the ones that reached it by accident.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The step-level metric taxonomy.</h3>
+
+    <p>Once you accept that the path is worth scoring, the question is what to score. Five step-level metrics have stabilized across the tooling, and they line up one-to-one with the failures in the STEP 1 trace.</p>
+
+    <ul>
+      <li><strong>Tool-selection accuracy</strong> &mdash; for each sub-goal, did the agent reach for the right tool? Wrong-tool errors are the most common and the cheapest to detect, and they are the failure that <a href="/concepts/tool-calling-explained" class="xref">tool calling</a> makes visible in the call stream.</li>
+      <li><strong>Argument / parameter correctness</strong> &mdash; were the arguments grounded in the context and prior observations, or hallucinated? A <code>user_id</code> invented rather than read from the session is a grounding failure even when the call happens to succeed.</li>
+      <li><strong>Efficiency / convergence</strong> &mdash; how many steps did it take against how few it needed? Arize's <em>convergence eval</em> formalizes this: measure the agent's step count against a known minimum step count for that query type; redundant calls, detours, and loops show up as excess steps.</li>
+      <li><strong>Recovery / adaptivity</strong> &mdash; after a failed call or a bad observation, does the agent correct course or repeat the mistake? The step-6 retry is a recovery failure: it re-fired instead of recognizing the success it already had.</li>
+      <li><strong>Per-step grounding / faithfulness</strong> &mdash; is each step faithful to the observations gathered so far? A step can be factually true in the abstract yet unfaithful to what the trajectory actually retrieved &mdash; the classic "right for the wrong reason."</li>
+    </ul>
+
+    <div class="callout">Arize's <strong>convergence eval</strong> is the sharpest single number here: run the same query type many times, record the minimum step count any run achieved, and score every run as <code>min_steps / actual_steps</code>. A perfectly efficient agent scores 1.0; an agent that loops or takes scenic detours scores well below it. The metric needs no gold trajectory &mdash; only a population of runs on the same query class.</div>
+
+    <p>The academic framing that has caught on compresses these five into three dimensions &mdash; <strong>efficiency, hallucination, and adaptivity</strong> &mdash; which is the TRACE taxonomy (arXiv 2510.02837). Efficiency subsumes convergence; hallucination covers both wrong tools and ungrounded arguments; adaptivity is recovery. The value of the three-way cut is that it maps cleanly onto what a reference-free judge can be asked to score without a gold path.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Reference-based vs reference-free.</h3>
+
+    <p>The cheapest, most deterministic trajectory eval compares the agent's path to a gold/reference path. AgentEvals (langchain-ai/agentevals) is the reference implementation. <code>create_trajectory_match_evaluator()</code> takes a <code>trajectory_match_mode</code>: <strong>strict</strong> (same messages, same order, same tool calls), <strong>unordered</strong> (same tool calls, any order), <strong>subset</strong> (agent called only tools that appear in the reference &mdash; an efficiency gate), and <strong>superset</strong> (agent called at least the reference tools). Argument comparison is a separate axis, <code>tool_args_match_mode</code> &isin; {<strong>exact</strong> (default), <strong>ignore</strong>, <strong>subset</strong>, <strong>superset</strong>}, with per-tool overrides via <code>tool_args_match_overrides</code>.</p>
+
+<pre class="standalone"><span class="c-cm"># agentevals &mdash; reference-based trajectory matching (deterministic, no LLM).</span>
+<span class="c-kw">from</span> agentevals.trajectory.match <span class="c-kw">import</span> create_trajectory_match_evaluator
+
+<span class="c-cm"># "subset": agent may call FEWER tools than the reference but no EXTRA ones,</span>
+<span class="c-cm"># which turns the matcher into an efficiency gate (redundant calls -> fail).</span>
+evaluator = create_trajectory_match_evaluator(
+    trajectory_match_mode=<span class="c-st">"subset"</span>,       <span class="c-cm"># strict | unordered | subset | superset</span>
+    tool_args_match_mode=<span class="c-st">"exact"</span>,         <span class="c-cm"># exact | ignore | subset | superset</span>
+    tool_args_match_overrides={
+        <span class="c-st">"search"</span>: <span class="c-st">"ignore"</span>,               <span class="c-cm"># semantically-equal queries still pass</span>
+        <span class="c-st">"get_orders"</span>: [<span class="c-st">"user_id"</span>],        <span class="c-cm"># compare user_id only, ignore paging args</span>
+    },
+)
+result = evaluator(outputs=agent_messages, reference_outputs=gold_messages)
+<span class="c-cm"># -> {"key": "trajectory_match", "score": True/False}</span>
+
+<span class="c-cm"># reference-free &mdash; an LLM judge reads input + tool calls + observations,</span>
+<span class="c-cm"># rubric-scores the path, and needs NO gold trajectory.</span>
+<span class="c-kw">from</span> agentevals.trajectory.llm <span class="c-kw">import</span> create_trajectory_llm_as_judge
+judge = create_trajectory_llm_as_judge(model=<span class="c-st">"openai:o3-mini"</span>)
+
+<span class="c-cm"># graph variant &mdash; score the NODES visited, not the messages.</span>
+<span class="c-kw">from</span> agentevals.graph_trajectory.llm <span class="c-kw">import</span> create_graph_trajectory_llm_as_judge</pre>
+
+    <p>The mode choice is the whole game. <code>strict</code> is right only when there is exactly one correct path; for anything with legitimate ordering freedom it fails correct agents (more in STEP 5). <code>subset</code> is the efficiency-enforcing mode &mdash; it passes an agent that used a subset of the reference's tools and fails one that made extra calls. Reference-based matching is deterministic and free of LLM cost, but it needs annotated gold trajectories, which are expensive to produce and brittle when the task admits many paths.</p>
+
+    <p>When you cannot enumerate a gold path &mdash; open-ended tasks, exploratory agents &mdash; a reference-free judge reads the trajectory (the input, the tool schemas, the ordered tool calls, the observations) and rubric-scores it with no gold path to compare against. AgentEvals ships <code>create_trajectory_llm_as_judge()</code>; the graph variants <code>create_graph_trajectory_llm_as_judge()</code> and <code>graph_trajectory_strict_match()</code> score the LangGraph node-visit sequence instead of messages. Arize Phoenix does the same as an OTel-native, self-hostable eval: an LLM judge classifies the ordered tool-call sequence as correct or incorrect with an explanation, against a rubric that asks whether the path progresses logically, uses the right tools, and stays reasonably efficient with no unnecessary detours &mdash; Phoenix names these the <em>tool-calling eval</em> and the <em>convergence/path eval</em>, and calls the ideal route the "golden path." Braintrust adds trajectory-level scoring with step-by-step analysis (tool choice, argument construction, result processing, synthesis), a "Loop" feature that generates a custom scorer from a natural-language criterion, and online scoring that runs an LLM judge on production traces with no ground truth.</p>
+
+    <p>TRACE (arXiv 2510.02837) is the reference-free anchor to know: reference-free, multi-dimensional (efficiency/hallucination/adaptivity), with an <strong>evidence bank</strong> that accumulates what the agent has established across steps so a step can be judged in the context of the whole trajectory rather than in isolation. The cost of going reference-free is the cost of every LLM judge: it is less deterministic and it inherits the judge's biases &mdash; position, verbosity, self-preference &mdash; so a reference-free trajectory score is only as trustworthy as its calibration (see <a href="/deep-dives/evaluating-agents/judge-calibration-and-meta-evaluation" class="xref">judge calibration &amp; meta-evaluation</a>). The <a href="/concepts/evals-101" class="xref">evals-101</a> warning &mdash; that a metric you have not validated is decoration &mdash; is doubly true when the metric is an LLM reading a trajectory.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>State-based grading and the PRM crossover.</h3>
+
+    <p>There is a third thing to check that neither the transcript nor the tool-call syntax captures: did the world actually change the way it was supposed to? tau-bench (Sierra, arXiv 2406.12045) grades by <strong>state</strong>. After the agent runs, it compares the resulting database state against an annotated goal state &mdash; it confirms an order actually flipped to "cancelled" in the DB, not merely that the agent <em>said</em> it did, and not merely that a syntactically valid <code>cancel_order</code> call was emitted.</p>
+
+<pre class="trace"><span class="c-out">tau-bench  &mdash;  grade by the resulting STATE, not by the transcript
+--------------------------------------------------------------------
+goal_state   orders["order_5567"].status == "cancelled"
+db_after     orders["order_5567"].status == "cancelled"    -> MATCH
+             (agent said "cancelled" AND the DB row actually flipped)
+
+a transcript-only eval would be fooled by:
+  agent answer   "your order is cancelled"
+  db_after       orders["order_5567"].status == "open"     -> FAIL</span></pre>
+
+    <p>This closes the gap the STEP 1 trace opened. An agent that says "cancelled" while the row still reads "open" passes outcome eval on the answer string and can even pass a tool-call-syntax check, but fails a state grader. τ²-bench (arXiv 2506.07982) extends this to dual-control settings where both the user and the agent call tools, which is closer to real support and operations work. State-based verification is the strongest process signal available when the environment has a checkable state; it is also the most expensive to set up, because someone has to annotate the goal state for every task.</p>
+
+    <p>The machinery for scoring individual steps was not invented for evaluation &mdash; it was built to <em>train</em> reasoning models with dense per-step reward, and it transfers directly. "Let's Verify Step by Step" (Lightman et al., OpenAI) showed process supervision beats outcome supervision and released PRM800K; Math-Shepherd (arXiv 2312.08935) and OmegaPRM (arXiv 2406.06592) replaced human step labels with automatic MCTS-style and divide-and-conquer Monte Carlo rollout labeling. A trained process reward model is a per-step scorer, and nothing stops you from pointing it at a trajectory as an <em>evaluator</em> &mdash; a learned or generative PRM scoring each step is an alternative to a single reference-free LLM-judge pass, and the same auto-rollout labeling that trains it can <strong>bootstrap trajectory annotations</strong> without exhaustive human labeling (see <a href="/deep-dives/training-agentic-models/process-reward-models" class="xref">process reward models</a>).</p>
+
+    <p>The pitfall crosses over with the machinery. A PRM trained on imperfect supervision can be reward-hacked, and a PRM used as an eval gate can be gamed exactly like a PRM used as a training signal &mdash; the agent, or the optimizer above it, learns to produce steps the PRM scores highly rather than steps that are actually good (see <a href="/deep-dives/training-agentic-models/reward-design-and-hacking" class="xref">reward design &amp; hacking</a>). Whether you use the step scorer to train or to grade, the failure mode is identical, which is why process-versus-outcome is a live design axis rather than a solved question.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Pitfalls, and portable trajectories.</h3>
+
+    <p>The first and most damaging pitfall is treating <code>strict</code> exact-match on the full trajectory as the default. Most real tasks admit <strong>many valid paths</strong> to the same answer &mdash; two independent tools can be called in either order, an optional confirmation step is legitimately optional &mdash; and exact-match fails every correct agent that took a different-but-valid route. The fixes are all in the tooling: use <code>unordered</code>/<code>subset</code>/<code>superset</code> matching instead of <code>strict</code>, allow multiple reference trajectories, or drop to reference-free judging. Reserve <code>strict</code> for the rare task with exactly one correct path.</p>
+
+    <p>The second pitfall is judging steps <strong>in isolation</strong>. A step that is locally fine &mdash; a reasonable tool call with grounded arguments &mdash; can be globally redundant or off-goal, and a judge that sees only one step at a time cannot tell. This is why TRACE's evidence bank matters: it carries what the agent has established across the whole trajectory so a step is scored in context, not in a vacuum. Any step-level judge blind to the surrounding sequence will miss global-coherence failures. Third, over-strict <code>exact</code> argument matching is brittle: two semantically-equivalent search queries, or two equivalent JSON encodings, are not byte-identical, and <code>exact</code> will fail them &mdash; reach for <code>ignore</code> or a field-list override in <code>tool_args_match_overrides</code> on the arguments where semantic equivalence is expected. Fourth, reference-free judges inherit the standard judge biases; nothing about reading a trajectory instead of a single answer immunizes them against position, verbosity, and self-preference bias.</p>
+
+    <p>All of this presupposes you can get the trajectory out of your agent in a shape the evaluator understands, and the thing that makes that vendor-neutral is the <strong>OpenTelemetry GenAI semantic conventions</strong>. They standardize the span/operation names &mdash; <code>gen_ai.operation.name</code> takes values <code>invoke_agent</code>, <code>chat</code>, <code>execute_tool</code>, <code>create_agent</code> &mdash; and the attributes: <code>gen_ai.agent.name</code>, <code>gen_ai.tool.name</code>, <code>gen_ai.input.messages</code>, <code>gen_ai.output.messages</code>, and <code>gen_ai.usage.input_tokens</code> / <code>output_tokens</code>. The conventions are still Development/experimental as of 2026, but they are already what lets Phoenix, LangSmith, and Braintrust ingest the <em>same</em> trajectory spans instead of each demanding a bespoke export. Emit OTel-shaped trajectories and your process evals stop being locked to one vendor's SDK.</p>
+
+    <p>Trajectory eval is not a replacement for outcome eval; it is the layer that tells you whether an outcome you trust was earned or lucky. Wire it in the way the rest of this group prescribes: as a CI gate with a living golden set rather than a one-off (see <a href="/deep-dives/evaluating-agents/eval-driven-development-and-ci" class="xref">eval-driven development &amp; CI</a>), and read alongside the cost-and-reliability panel that decides deployment (see <a href="/deep-dives/evaluating-agents/hal-and-async-agent-eval" class="xref">HAL &amp; asynchronous agent eval</a>). Score the answer to know the agent worked once. Score the trajectory to know it will work again.</p>
+  </div>
+</section>
