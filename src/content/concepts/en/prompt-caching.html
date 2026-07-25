@@ -1,0 +1,79 @@
+<section class="phase">
+  <div class="phase-num">B14</div>
+  <div class="week">Concepts · Core Building Blocks</div>
+  <h2>Prompt caching.</h2>
+  <p class="goal">The same 20,000-token system prompt gets re-read and re-billed on every single turn of a conversation — unless you cache it, in which case that span costs roughly a tenth as much and arrives faster. This entry explains the one rule that governs prompt caching (it is a <em>prefix</em> match), why a single stray timestamp silently destroys it, and how to tell whether yours is working.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What is actually being cached.</h3>
+
+    <p>Before a model generates anything, it processes your entire prompt — every instruction, every retrieved document, every prior turn — into internal state. That step is real compute, and you pay for it in <a class="xref" href="/concepts/tokens-and-tokenization">input tokens</a> and in latency, on every request.</p>
+
+    <p>Prompt caching lets the provider keep that internal state around and reuse it when the next request starts with the same text. Nothing about the model changes; no data is "learned." It is a compute cache, and it has exactly one rule everything else follows from:</p>
+
+    <div class="callout">
+      <p><strong>Caching is a prefix match.</strong> The cache is keyed on the exact bytes of your prompt from the beginning up to a marked point. A single byte that differs at position N invalidates the cache for everything from N onward. Content before the change is still reusable; everything after it is not.</p>
+    </div>
+
+    <p>So the design question is never "should I turn caching on." It is: <strong>is my prompt ordered so that the stable parts come first?</strong> Providers assemble the prompt in a fixed order — typically tool definitions, then the system prompt, then the conversation — and that order is the order the prefix is built in.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The economics, and when it does not pay.</h3>
+
+    <p>Cached tokens are not free, and the asymmetry is the whole story:</p>
+
+    <ul>
+      <li><strong>Writing to the cache costs <em>more</em> than a normal request</strong> — commonly around 1.25× the base input price for a short-lived entry, and roughly 2× for a longer-lived one.</li>
+      <li><strong>Reading from the cache costs far <em>less</em></strong> — typically on the order of a tenth of base input price.</li>
+    </ul>
+
+    <p>That gives a break-even: with a short time-to-live, roughly the second request already pays for the first one's write premium; with a long TTL, you need about three. Entries expire — a short TTL is measured in minutes — so the question is whether your traffic re-hits the same prefix before it lapses. A longer TTL survives quiet gaps but costs more to write, which makes it a bet on bursty traffic rather than a free upgrade.</p>
+
+    <p>Cases where caching is the wrong tool:</p>
+
+    <ul>
+      <li><strong>The prompt differs from the very first token.</strong> No shared prefix, nothing to reuse — you would pay the write premium for zero reads.</li>
+      <li><strong>The prefix is too short.</strong> Providers set a minimum cacheable length, and it is model-specific — often somewhere between a few hundred and a few thousand tokens. Below it, nothing caches and <em>no error is raised</em>. This is the most common cause of "I enabled caching and nothing happened."</li>
+      <li><strong>Traffic is too sparse.</strong> If requests arrive further apart than the TTL, every one of them is a cache write.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The silent invalidators.</h3>
+
+    <p>Nothing fails loudly when caching breaks — you simply keep paying full price. Each of these puts something volatile early in the prefix, and thereby invalidates everything after it:</p>
+
+    <ul>
+      <li><strong>A timestamp or request ID in the system prompt.</strong> "Current date and time: …" at the top of a prompt makes every single request a unique prefix. If the model needs the date, put it in the latest message, not the system prompt.</li>
+      <li><strong>Non-deterministic serialization.</strong> Serializing a dictionary without sorting keys, or iterating an unordered set, produces different bytes for the same logical content on different runs.</li>
+      <li><strong>A per-user or per-session value spliced into shared instructions.</strong> Interpolating a user ID into the system prompt gives every user a private prefix and kills all cross-user sharing.</li>
+      <li><strong>A tool list that varies.</strong> Tool definitions render at the very front. Adding, removing, or reordering a tool mid-conversation invalidates the entire cache — sort tools deterministically and keep the set stable.</li>
+      <li><strong>Conditional sections.</strong> <code>if flag: system += …</code> turns every combination of flags into a separate prefix, each with its own cold start.</li>
+      <li><strong>Switching models.</strong> Caches are per-model. A "cheap model for the easy sub-task" optimization can cost more than it saves once you account for the cold cache on both sides.</li>
+    </ul>
+
+    <p>The fix in every case is the same shape: <strong>stable content first, volatile content last.</strong> Freeze the system prompt, make serialization deterministic, and inject anything that changes per-request after the cached span rather than before it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Verify it, and why agents care most.</h3>
+
+    <p>Providers report cache activity in the response's usage figures — typically a count of tokens written to cache, a count read from cache, and a count processed at full price. That is your instrument:</p>
+
+    <ul>
+      <li><strong>Repeated requests with an identical prefix should show a non-zero cache-read count.</strong> If it stays at zero, a silent invalidator is at work — diff the rendered prompt bytes between two consecutive requests and look for what moved.</li>
+      <li><strong>Do not read the full-price token count as "total prompt size."</strong> It is the uncached remainder only. An agent that ran for an hour can show a small uncached figure precisely because the rest was served from cache.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>Agents are where caching stops being an optimization and becomes structural. An <a class="xref" href="/concepts/the-agent-loop">agent loop</a> re-sends the entire growing transcript on every step, so a 30-step task re-processes the same instructions and tool definitions thirty times. Uncached, cost grows roughly with the square of the number of steps. This is why <a class="xref" href="/concepts/context-engineering">context engineering</a> and cache design are the same discipline: where you put a piece of content determines not just whether the model attends to it, but what the run costs.</p>
+    </div>
+
+    <p>The takeaway: caching is not a flag you flip, it is a property of how you order your prompt. Put the frozen instructions and tool definitions first, put retrieved documents and conversation history next, put the per-request question last — then check the usage numbers to confirm the cache is actually being read. The <a class="xref" href="/deep-dives/architectures-and-patterns/context-caching-economics">context-caching economics</a> deep-dive works the break-even math for real workloads, and the <a class="xref" href="/operations/agentops/cost-control-in-the-loop">cost control in the loop</a> and <a class="xref" href="/operations/economics-roi/unit-economics">unit economics</a> chapters put it alongside the other levers on <a class="xref" href="/concepts/cost-quality-latency">cost, quality, and latency</a>.</p>
+  </div>
+</section>
