@@ -37,6 +37,7 @@
 | `src/layouts/BaseLayout.astro` | font loading; imports `tokens.css` | 2 |
 | `src/layouts/BlogLayout.astro` | blog-scoped styles | 4,8 |
 | `src/components/*.astro` | scoped styles only | 4,8 |
+| `src/pages/*.astro` | **inline `style` attrs** — privacy pages hardcode fonts; no stylesheet can override them | 4 |
 | `src/content/changelog/entries/…` | release note | 11 |
 
 `tokens.css` is new because the token block currently lives at the top of `guide.css`, mixed with content styles. Extracting it is what lets Task 1's test and every later task reference one authoritative source.
