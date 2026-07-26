@@ -189,6 +189,39 @@ describe('design system', () => {
     assert.deepEqual(small, [], `header controls under 44px: ${JSON.stringify(small)}`);
   });
 
+  test('header labels are not squeezed onto multiple lines', async () => {
+    // The header height and single-row checks both pass while individual
+    // items compress: flex children default to `flex-shrink: 1`, so under
+    // `flex-wrap: nowrap` the nav links shrank to min-content and wrapped
+    // their own labels internally instead of keeping natural width and
+    // letting the nav scroll. Nothing about the header's outer box changes,
+    // which is exactly why this needs its own assertion.
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    const page = await ctx.newPage();
+    await page.goto(server.url + '/concepts/prompt-caching/', { waitUntil: 'load' });
+    const squeezed = await page.evaluate(() => {
+      const measure = document.createElement('canvas').getContext('2d');
+      return [...document.querySelectorAll('.site-header .brand, .site-header nav a, .lang-switch a')]
+        .map((el) => {
+          const cs = getComputedStyle(el);
+          measure.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+          const text = (el.innerText || '').trim();
+          // Canvas ignores letter-spacing; add it back or every spaced label
+          // looks like it fits when it does not.
+          const tracking = (parseFloat(cs.letterSpacing) || 0) * text.length;
+          const needed = measure.measureText(text).width + tracking
+            + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+          const actual = el.getBoundingClientRect().width;
+          return { t: text.slice(0, 20), needed: Math.round(needed), actual: Math.round(actual) };
+        })
+        // 2px tolerance for sub-pixel rounding and canvas-vs-layout drift.
+        .filter((x) => x.actual < x.needed - 2);
+    });
+    await ctx.close();
+    assert.deepEqual(squeezed, [],
+      `header labels compressed below their text width: ${JSON.stringify(squeezed)}`);
+  });
+
   test('prose measure is 60-75 characters', async () => {
     const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
     const page = await ctx.newPage();
