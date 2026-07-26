@@ -31,7 +31,7 @@ const PAGES = [
   '/changelog/',
   '/zh/concepts/prompt-caching/',
 ];
-const VIEWPORTS = [{ w: 390, h: 844 }, { w: 1280, h: 900 }];
+const VIEWPORTS = [{ w: 390, h: 844 }, { w: 768, h: 1024 }, { w: 1280, h: 900 }];
 const THEMES = ['light', 'dark'];
 
 let server, browser;
@@ -104,6 +104,23 @@ describe('design system', () => {
     assert.deepEqual(bad, [], `pages scroll horizontally: ${bad.join(', ')}`);
   });
 
+  // 768px sits inside the >640px "desktop" band the header CSS used to leave
+  // unguarded: nav's overflow-x only applied ≤640px, so between ~641-1063px
+  // the un-shrunk nav forced the whole page to scroll horizontally (a real
+  // regression measured on this exact viewport during Task 6 review).
+  test('no horizontal overflow at 768px', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 768, height: 1024 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+      if (over) bad.push(path);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `pages scroll horizontally: ${bad.join(', ')}`);
+  });
+
   test('mobile header is a single row', async () => {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
     const page = await ctx.newPage();
@@ -124,8 +141,14 @@ describe('design system', () => {
     await page.goto(server.url + '/concepts/prompt-caching/', { waitUntil: 'load' });
     const small = await page.evaluate(() =>
       [...document.querySelectorAll('.site-header a, .site-header button')]
-        .map((el) => ({ t: (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 24), h: Math.round(el.getBoundingClientRect().height) }))
-        .filter((x) => x.h > 0 && x.h < 44));
+        .map((el) => {
+          const r = el.getBoundingClientRect();
+          return { t: (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 24), h: Math.round(r.height), w: Math.round(r.width) };
+        })
+        // height-only checking let a control pass with a squeezed width (an
+        // icon-only flex item can be tall enough but shrink to ~18px wide) —
+        // check both dimensions.
+        .filter((x) => x.h > 0 && (x.h < 44 || x.w < 44)));
     await ctx.close();
     assert.deepEqual(small, [], `header controls under 44px: ${JSON.stringify(small)}`);
   });
