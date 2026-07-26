@@ -48,23 +48,59 @@ after(async () => {
 /** Collect every text-bearing leaf with its computed colour + composited bg. */
 async function auditPage(page) {
   return page.evaluate(() => {
-    const out = [];
-    document.querySelectorAll('body *').forEach((el) => {
-      const text = (el.innerText || '').trim();
-      if (!text || el.children.length) return;
-      const cs = getComputedStyle(el);
+    // Shared by both the real-text walk and the pseudo-element walk below —
+    // walks up from `el` collecting every ancestor's own background-color
+    // (skipping fully transparent ones) so contrast.mjs's composite() can
+    // flatten them in paint order.
+    function bgLayers(el) {
       const layers = [];
       for (let n = el; n; n = n.parentElement) {
         const bg = getComputedStyle(n).backgroundColor;
         if (bg && bg !== 'rgba(0, 0, 0, 0)') layers.push(bg);
       }
+      return layers;
+    }
+    const out = [];
+    document.querySelectorAll('body *').forEach((el) => {
+      const text = (el.innerText || '').trim();
+      if (!text || el.children.length) return;
+      const cs = getComputedStyle(el);
       out.push({
         label: (el.className || el.tagName).toString().slice(0, 40),
         color: cs.color,
-        layers,
+        layers: bgLayers(el),
         px: parseFloat(cs.fontSize),
         weight: cs.fontWeight,
       });
+    });
+    // ::before / ::after content never enters the DOM, so the walk above
+    // never sees it — and getComputedStyle(el) with no second argument
+    // never returns pseudo-element styles either. This is precisely how
+    // three real AA failures on .callout badge labels (::before content)
+    // shipped invisibly behind "12/12 green, zero contrast failures":
+    // Lighthouse skips pseudo content the same way. Check every element's
+    // ::before/::after explicitly, the same way, with the same helpers.
+    document.querySelectorAll('body *').forEach((el) => {
+      for (const pseudo of ['::before', '::after']) {
+        const cs = getComputedStyle(el, pseudo);
+        const content = cs.content;
+        if (!content || content === 'none' || content === '""' || content === "''") continue;
+        out.push({
+          label: `${(el.className || el.tagName).toString().slice(0, 30)}${pseudo}`,
+          color: cs.color,
+          // The pseudo has its OWN box with its own background-color (e.g.
+          // `.callout.tip::before { background: var(--badge-tip-bg) }`) —
+          // that is the nearest layer, painted on top of `el`'s own
+          // background, then el's ancestors. `bgLayers(el)` already starts
+          // its walk at `el` itself, so prepending the pseudo's own bg is
+          // the only change needed vs. the real-text case above.
+          layers: [cs.backgroundColor, ...bgLayers(el)].filter(
+            (bg) => bg && bg !== 'rgba(0, 0, 0, 0)'
+          ),
+          px: parseFloat(cs.fontSize),
+          weight: cs.fontWeight,
+        });
+      }
     });
     return out;
   });
@@ -230,5 +266,53 @@ describe('design system', () => {
       }
     }
     assert.deepEqual(bad, [], `syntax tokens below 4.5:1: ${bad.join(', ')}`);
+  });
+
+  // Permanent regression test for the ::before/::after extension to
+  // auditPage() (added 2026-07-26 after three real AA failures on
+  // .callout badge labels shipped invisibly behind "12/12 green" — see the
+  // header comment). Deliberately independent of real site content: a
+  // synthetic fixture with a known-failing and a known-passing pseudo
+  // exercises the exact same auditPage() + contrast.mjs helpers the six
+  // "contrast AA" tests above use, so this can't itself go vacuously green
+  // the way the syntax-class test above once did. The one-time proof that
+  // the REAL suite actually catches a REAL reverted badge (temporarily
+  // un-fixing .callout.tip::before, confirming the named failure, then
+  // restoring it) was performed manually and is reported in
+  // final-fix-report.md, not encoded here — a permanently-reverted badge
+  // can't ship.
+  test('pseudo-element content is included in the contrast audit', async () => {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await page.setContent(`<!doctype html><html><body style="background:#fff">
+      <style>
+        .good::before { content: 'OK'; color: #000000; background: #ffffff; font-size: 14px; }
+        .bad::before  { content: 'BAD'; color: #ffffff; background: #ffffff; font-size: 14px; }
+        .empty::before { content: ''; }
+        .suppressed::before { content: none; }
+      </style>
+      <div class="good">real text</div>
+      <div class="bad">real text</div>
+      <div class="empty">real text</div>
+      <div class="suppressed">real text</div>
+    </body></html>`);
+    const rows = await auditPage(page);
+    await ctx.close();
+
+    const good = rows.find((r) => r.label === 'good::before');
+    const bad = rows.find((r) => r.label === 'bad::before');
+    assert.ok(good, 'pseudo audit did not find the passing ::before fixture at all');
+    assert.ok(bad, 'pseudo audit did not find the failing ::before fixture at all');
+    assert.ok(
+      !rows.some((r) => r.label === 'empty::before' || r.label === 'suppressed::before'),
+      `pseudo audit should skip empty/none content, found: ${rows.map((r) => r.label).join(', ')}`
+    );
+
+    // Same helpers, same rules as every other test in this file — this is
+    // what "reuse the existing helpers, do not fork the contrast logic" means.
+    const goodRatio = contrastRatio(parseColor(good.color).slice(0, 3), composite(good.layers));
+    const badRatio = contrastRatio(parseColor(bad.color).slice(0, 3), composite(bad.layers));
+    assert.ok(goodRatio >= requiredRatio(good.px, good.weight), `expected black-on-white fixture to pass AA, got ${goodRatio}`);
+    assert.ok(badRatio < requiredRatio(bad.px, bad.weight), `expected white-on-white fixture to fail AA, got ${badRatio}`);
   });
 });

@@ -187,9 +187,14 @@ reference them from the fragment with a normal `<img src="/blogs/<slug>/foo.svg"
 — `BlogLayout` then **inlines them at build time** before `set:html`, so
 the rendered HTML contains the SVG markup directly inside the article.
 The inlining means each SVG inherits the page's CSS custom properties
-(`--ink`, `--paper-2`, `--accent`, etc.) and the document's color
+(`--ink`, `--surface`, `--accent`, etc.) and the document's color
 cascade for `currentColor`. That's why these SVGs can theme-adapt in
 dark mode without any per-file `@media` rules.
+
+Note: `--paper-2` below is the same colour as `--surface` — it's a
+back-compat alias kept in `tokens.css` because dozens of already-shipped
+diagrams reference it. It still resolves correctly; **new diagrams should
+use `var(--surface)` directly** rather than adding fresh `--paper-2` usages.
 
 Mechanics: `inlineSvgs()` in `BlogLayout.astro` scans the body string,
 finds every `<img src="/blogs/…\.svg" …>` reference, reads the file
@@ -205,13 +210,13 @@ Authoring rules — all enforced visually and by review, not by tests:
   `viewBox="0 0 900 300"` (three columns at x=160 / x=450 / x=750); logos use
   `viewBox="0 0 32 32"`; data charts use `viewBox="0 0 900 400"`.
 - **Themeable colors only.** Every fill, stroke, and text color uses a CSS
-  variable: `var(--ink)`, `var(--paper)`, `var(--paper-2)`, `var(--accent, #d4421e)`,
+  variable: `var(--ink)`, `var(--paper)`, `var(--surface)`, `var(--accent, #d4421e)`,
   `var(--accent-soft)`, `var(--muted)`, `var(--border-soft)`. **Never** a bare
   hex literal (except as the fallback inside the `var(...)` call). Because
   SVGs are inlined into the page, these vars resolve to the active theme's
   values — no per-SVG `@media` block is needed.
 - **Color hierarchy.** Solid `var(--accent)` for the hero / main box;
-  `var(--accent-soft)` for accent-adjacent secondary boxes; `var(--paper-2)`
+  `var(--accent-soft)` for accent-adjacent secondary boxes; `var(--surface)`
   for neutral / muted boxes; `currentColor` for arrows and strokes.
 - **Accessibility.** Every SVG: `role="img"` + a `<title>` child + a `<desc>`
   child + `aria-labelledby="t d"` (or matching IDs) so screen readers get a
@@ -229,7 +234,7 @@ Skeleton you can paste and customize:
   <title id="t">[Subject] architecture</title>
   <desc id="d">[1–2 sentence description of what the diagram shows.]</desc>
   <style>
-    .box    { fill: var(--paper-2); stroke: var(--ink); stroke-width: 1.25; rx: 8; ry: 8; }
+    .box    { fill: var(--surface); stroke: var(--ink); stroke-width: 1.25; rx: 8; ry: 8; }
     .hero   { fill: var(--accent, #d4421e); }
     .adj    { fill: var(--accent-soft); stroke: var(--ink); stroke-width: 1.25; rx: 8; ry: 8; }
     .label  { font-family: 'Inter', system-ui, sans-serif; font-size: 14px; fill: var(--ink); }
@@ -252,12 +257,12 @@ Two patterns proven in the first post:
 
 - **Horizontal bar chart** for a single objective numeric axis (e.g. star
   counts). Use accent fill for the leader; `var(--accent-soft)` for the
-  middle; `var(--paper-2)` for the trailing entry. Light dotted gridlines
+  middle; `var(--surface)` for the trailing entry. Light dotted gridlines
   every quartile. Numeric labels at the right edge of each bar in the same
   fill as the bar (accent / accent-ink for visibility). Filename pattern:
   `data-<dimension>.svg`. See `data-stars-comparison.svg`.
 - **Feature heatmap matrix** for multi-axis qualitative comparison. Rows =
-  projects, columns = axes. 3 levels: weak (`var(--paper-2)`), medium
+  projects, columns = axes. 3 levels: weak (`var(--surface)`), medium
   (`var(--accent-soft)`), strong (`var(--accent)`). Cells contain a short
   label inside (`Strong (eBPF)`, `Medium`, `Weak`). Legend at the bottom.
   See `data-feature-matrix.svg`.
@@ -270,30 +275,46 @@ just like architecture diagrams.
 Do not fight these — they are the design system. If you want to override one
 you are probably doing it wrong; ask for a design conversation instead.
 
+Fraunces is gone from the system (`BaseLayout.astro` no longer requests it) —
+every row below is `var(--font-display)` (Space Grotesk), `var(--font-body)`
+(Inter), or `var(--font-mono)` (JetBrains Mono), never a literal font name.
+Space Grotesk ships with **no italic cut**, so anywhere the old design used
+italic display type (the h2 counter prefix, blockquotes, the hook lede),
+the layout deliberately routes to `var(--font-body)` italic instead — do not
+reintroduce `font-style: italic` on a `var(--font-display)` element, it will
+synthesize a fake oblique.
+
 | Element | Style | Set in |
 |---|---|---|
-| Body paragraphs | Inter sans 17px line-height 1.65 | inherited from `body` in `guide.css` |
-| Hook lede (`<p class="lede">` in body) | Fraunces italic 19px, 3px accent left border, 8/28px margins | `BlogLayout.astro` |
-| Section h2 (`<section><h2>`) | Fraunces 28px weight 400, margin 0/24px, **counter-numbered prefix** (`01`, `02`, …) in italic Fraunces accent at 30px on the left | `BlogLayout.astro` |
-| Subsection h3 | Fraunces 22px weight 600, margin 36/14px, **32×2px accent underline tab** anchored to the heading's bottom-left | `BlogLayout.astro` |
+| Body paragraphs | Inter (`var(--font-body)`) 16px (`--t-base`) / line-height 1.65 | inherited from `body` in `guide.css` |
+| Post title `h1` | Space Grotesk (`var(--font-display)`) weight 400, 36px (`--t-2xl`), 28px (`--t-xl`) at ≤600px | `BlogLayout.astro` |
+| Hook lede (`<p class="lede">` in body) | Inter italic (`var(--font-body)`) 18px (`--t-md`), 3px accent left border, 8/24px margins | `BlogLayout.astro` |
+| Section h2 (`<section><h2>`) | Space Grotesk 28px (`--t-xl`) weight 400, margin 0/24px, **counter-numbered prefix** (`01`, `02`, …) in italic Inter (`var(--font-body)`, weight 300) accent colour, same 28px size, on the left | `BlogLayout.astro` |
+| Subsection h3 | Space Grotesk 22px (`--t-lg`) weight 600, margin 32/12px, **32×2px accent underline tab** anchored to the heading's bottom-left | `BlogLayout.astro` |
 | FAQ h3 (`<section class="faq"><h3>`) | Same as subsection h3 but **underline tab suppressed** so the Q→A rhythm stays dense | `BlogLayout.astro` |
-| Inline `<code>` | JetBrains Mono 0.9em, paper-2 background | `BlogLayout.astro` |
+| Inline `<code>` | JetBrains Mono (`var(--font-mono)`) 0.9em, `var(--paper-2)` background | `BlogLayout.astro` |
 | Body link `<a>` | accent-ink, underlined | `BlogLayout.astro` |
-| Block `<blockquote>` | Fraunces italic 19px, 3px accent left border | `BlogLayout.astro` |
-| Bullet `<ul>` / `<ol>` | 20px bottom, 8px between items | `BlogLayout.astro` |
+| Block `<blockquote>` | Inter italic (`var(--font-body)`) 18px (`--t-md`), 3px accent left border | `BlogLayout.astro` |
+| Bullet `<ul>` / `<ol>` | 16px bottom (`--s-4`), 8px between items (`--s-2`) | `BlogLayout.astro` |
 | `<figure>` | 32px above/below; 8px after a direct heading | `BlogLayout.astro` |
-| `<figcaption>` | Inter 13px italic muted | `BlogLayout.astro` |
-| Tables | paper-2 header bg, uppercase JetBrains Mono `<th>`, 10/12px cell padding, hover row | `BlogLayout.astro` |
+| `<figcaption>` | Inter (`var(--font-body)`) 13px italic muted | `BlogLayout.astro` |
+| Tables | `var(--paper-2)` header bg, uppercase JetBrains Mono (`var(--font-mono)`) `<th>`, 8/12px cell padding, hover row | `BlogLayout.astro` |
+
+`var(--paper-2)` above is a **back-compat alias for `var(--surface)`**
+(see `tokens.css`) — it's what `BlogLayout.astro`'s own internal CSS still
+uses for code/table backgrounds. Fine to leave as-is where it already
+appears, but **new work should reference `var(--surface)` directly**; do
+not add fresh `var(--paper-2)` usages.
 
 **Heading hierarchy at a glance:**
 
 ```
-h1            Fraunces 34px       (post title)
-.lede         Fraunces italic 19  (hook lede with 3px accent LEFT border)
-h2            Fraunces 28px       (with "01" / "02" / … italic accent COUNTER prefix)
-h3            Fraunces 22px w600  (with 32×2px accent UNDERLINE tab below)
-FAQ h3        Fraunces 22px w600  (no underline — keeps Q→A dense)
-body          Inter 17px          (inherited)
+h1            Space Grotesk 36px (28px ≤600px)   (post title)
+.lede         Inter italic 18px                  (hook lede, 3px accent LEFT border)
+h2            Space Grotesk 28px                 (with "01" / "02" / … italic Inter COUNTER prefix)
+h3            Space Grotesk 22px w600             (with 32×2px accent UNDERLINE tab below)
+FAQ h3        Space Grotesk 22px w600             (no underline — keeps Q→A dense)
+body          Inter 16px                          (inherited)
 ```
 
 The accent palette (lede border / h2 counter / h3 underline) gives the
