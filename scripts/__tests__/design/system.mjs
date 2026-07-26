@@ -174,27 +174,61 @@ describe('design system', () => {
     assert.deepEqual(bad, [], `measure out of range:\n${bad.join('\n')}`);
   });
 
+  // Keep this list in sync with the `.c-*` rules in guide.css — every
+  // syntax class styled there belongs here too, or a future syntax colour
+  // can regress below AA with this test still reporting green (exactly how
+  // .c-err's 4.43:1 shipped unguarded before this list covered it).
+  const SYNTAX_CLASSES = ['c-kw', 'c-st', 'c-fn', 'c-cm', 'c-out', 'c-err', 'c-atk'];
+  // No single page's first <pre> carries all seven, so this can't just add
+  // classes to the original single-page/first-<pre> check: the MCP page
+  // has c-cm/c-kw/c-st/c-out but no c-fn, c-err, or c-atk anywhere in it;
+  // field-guide's "the-loop" and "safety" pages between them carry the
+  // rest. Scans every <pre> on every listed page (not just the first) and
+  // fails loudly if any of the seven is never found at all — a class
+  // silently absent from every checked page would mean this test verified
+  // nothing for it, the same failure mode that let .c-err ship unguarded.
+  const SYNTAX_PAGES = [
+    '/deep-dives/mcp/mcp-building-servers-in-practice/',
+    '/field-guide/the-loop/',
+    '/field-guide/safety/',
+  ];
   test('syntax colours meet AA against the code background', async () => {
     const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
     const page = await ctx.newPage();
-    await page.goto(server.url + '/deep-dives/mcp/mcp-building-servers-in-practice/', { waitUntil: 'load' });
-    const tokens = await page.evaluate(() => {
-      const pre = document.querySelector('pre');
-      if (!pre) return null;
-      const bg = getComputedStyle(pre).backgroundColor;
-      const out = [{ name: 'pre', color: getComputedStyle(pre).color, bg }];
-      for (const cls of ['c-kw', 'c-st', 'c-fn', 'c-cm', 'c-out']) {
-        const el = pre.querySelector('.' + cls);
-        if (el) out.push({ name: cls, color: getComputedStyle(el).color, bg });
+    const found = new Map(); // class name -> [{ color, bg }]
+    for (const path of SYNTAX_PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const rows = await page.evaluate((classes) => {
+        const out = [];
+        document.querySelectorAll('pre').forEach((pre) => {
+          const bg = getComputedStyle(pre).backgroundColor;
+          out.push({ name: 'pre', color: getComputedStyle(pre).color, bg });
+          for (const cls of classes) {
+            pre.querySelectorAll('.' + cls).forEach((el) => {
+              out.push({ name: cls, color: getComputedStyle(el).color, bg });
+            });
+          }
+        });
+        return out;
+      }, SYNTAX_CLASSES);
+      for (const r of rows) {
+        if (!found.has(r.name)) found.set(r.name, []);
+        found.get(r.name).push(r);
       }
-      return out;
-    });
+    }
     await ctx.close();
-    if (!tokens) return; // page has no code block
-    const bad = tokens
-      .map((t) => ({ ...t, ratio: contrastRatio(parseColor(t.color).slice(0, 3), parseColor(t.bg).slice(0, 3)) }))
-      .filter((t) => t.ratio < 4.5)
-      .map((t) => `${t.name} ${t.ratio}`);
+    if (found.size === 0) return; // none of the pages built with a code block
+
+    const missing = SYNTAX_CLASSES.filter((cls) => !found.has(cls));
+    assert.deepEqual(missing, [], `syntax classes never found on any checked page — test verified nothing for: ${missing.join(', ')}`);
+
+    const bad = [];
+    for (const [name, rows] of found) {
+      for (const r of rows) {
+        const ratio = contrastRatio(parseColor(r.color).slice(0, 3), parseColor(r.bg).slice(0, 3));
+        if (ratio < 4.5) bad.push(`${name} ${ratio}`);
+      }
+    }
     assert.deepEqual(bad, [], `syntax tokens below 4.5:1: ${bad.join(', ')}`);
   });
 });
