@@ -27,6 +27,8 @@ export interface UIStrings {
   next: string;
   tocHeading: string;
   toc: { heading: string };
+  /** Index-page group navigator: label + accessible name for the landmark. */
+  groupNav: { label: string; aria: string };
   chapterWord: { one: string; many: string };
   home: { kicker: string; h1Html: string; lede: string;
           featuredKicker: string; featuredTitle: string;
@@ -98,6 +100,7 @@ export const ui: Record<Locale, UIStrings> = {
     next: 'next →',
     tocHeading: 'The whole path',
     toc: { heading: 'On this page' },
+    groupNav: { label: 'Jump to', aria: 'Jump to a group' },
     chapterWord: { one: 'chapter', many: 'chapters' },
     home: {
       kicker: 'A Living Knowledge Base',
@@ -226,6 +229,7 @@ export const ui: Record<Locale, UIStrings> = {
     next: '下一章 →',
     tocHeading: '完整路径',
     toc: { heading: '本页目录' },
+    groupNav: { label: '跳转至', aria: '跳转到某个分组' },
     chapterWord: { one: '章', many: '章' },
     home: {
       kicker: '持续更新的知识库',
