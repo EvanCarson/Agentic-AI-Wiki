@@ -16,7 +16,8 @@
 - **Bilingual:** every change must hold for `/` and `/zh/`. Chinese pages use a system CJK stack.
 - **Both themes:** every colour change must be verified in light *and* dark.
 - **Contrast floor:** WCAG AA — 4.5:1 for text under 24px (or under 18.66px bold), 3:1 at or above.
-- **Gates before PR:** `npm run build` (no new warnings) · `npm run verify` · `npm test` · `npm run search:index && npm run test:search`.
+- **Gates before PR:** `npm run build` (no new warnings) · `npm run verify` · `npm test` · `npm run search:index && npm run test:search` · **`npm run test:design`**.
+- **`npm test` must stay fast and browser-free.** The design guard lives at `scripts/__tests__/design/system.mjs` — deliberately outside the `scripts/__tests__/*.mjs` glob — and runs only via `npm run test:design`. Do not move it into the glob: a gate that silently skips on a clean checkout is worse than one you must run explicitly.
 - **Changelog is mandatory:** one new file at `src/content/changelog/entries/<YYYY-MM-DD>-<slug>.ts`, bilingual, date == merge date. This is the one permitted `src/content/` write.
 - **Vendor brand colours `--tab-anthropic` / `--tab-openai` must not change.**
 - **Work in a worktree** under `.worktrees/`, never the main checkout.
@@ -29,7 +30,7 @@
 |---|---|---|
 | `scripts/lib/contrast.mjs` | **new** — colour maths: parse, composite alpha, ratio | 1 |
 | `scripts/lib/static-server.mjs` | **new** — serve `dist/` for browser-based tests | 1 |
-| `scripts/__tests__/design-system.test.mjs` | **new** — the permanent guard | 1 |
+| `scripts/__tests__/design/system.mjs` | **new** — the permanent guard | 1 |
 | `src/styles/tokens.css` | **new** — the whole token layer, extracted from `guide.css` | 2 |
 | `src/styles/guide.css` | content-surface styles; tokens removed, scale applied | 2,3,5,7,9 |
 | `src/styles/site.css` | chrome styles; scale applied; header fix | 4,5,6,8 |
@@ -49,7 +50,7 @@ Build the guard first. Some assertions pass today (contrast — fixed 2026-07-25
 **Files:**
 - Create: `scripts/lib/contrast.mjs`
 - Create: `scripts/lib/static-server.mjs`
-- Create: `scripts/__tests__/design-system.test.mjs`
+- Create: `scripts/__tests__/design/system.mjs`
 - Modify: `package.json` (add `test:design` script)
 
 **Interfaces:**
@@ -178,26 +179,28 @@ export async function startStaticServer(root) {
 - [ ] **Step 3: Write the design-system test**
 
 ```javascript
-// scripts/__tests__/design-system.test.mjs
+// scripts/__tests__/design/system.mjs
 // Permanent guard for the visual system. Runs against BUILT HTML in a real
 // browser, because two near-misses on 2026-07-25 were invisible in CSS
 // source: a rule declaring 28px that computed to 17px, and a colour set by
 // an inline style attribute that no stylesheet could override.
 //
-// Requires `npm run build` first. Skips (does not fail) when dist/ is absent
-// so `npm test` stays runnable on a clean checkout.
+// Requires `npm run build` first — `npm run test:design` does that for you.
+// dist/ absent is a hard failure, not a skip: this script is only ever invoked
+// explicitly, so a missing build means the caller made a mistake worth hearing
+// about rather than a green run that checked nothing.
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
-import { startStaticServer } from '../lib/static-server.mjs';
-import { parseColor, composite, contrastRatio, requiredRatio } from '../lib/contrast.mjs';
+import { startStaticServer } from '../../lib/static-server.mjs';
+import { parseColor, composite, contrastRatio, requiredRatio } from '../../lib/contrast.mjs';
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const DIST = resolve(ROOT, 'dist');
-const HAS_DIST = existsSync(DIST);
+if (!existsSync(DIST)) throw new Error('dist/ not found — run `npm run build` (or use `npm run test:design`)');
 
 const PAGES = [
   '/', '/concepts/', '/field-guide/',
@@ -215,7 +218,6 @@ const THEMES = ['light', 'dark'];
 let server, browser;
 
 before(async () => {
-  if (!HAS_DIST) return;
   server = await startStaticServer(DIST);
   browser = await chromium.launch();
 });
@@ -249,7 +251,7 @@ async function auditPage(page) {
   });
 }
 
-describe('design system', { skip: HAS_DIST ? false : 'run `npm run build` first' }, () => {
+describe('design system', () => {
   for (const theme of THEMES) {
     for (const vp of VIEWPORTS) {
       test(`contrast AA — ${theme} @ ${vp.w}px`, async () => {
@@ -339,7 +341,7 @@ The measure upper bound is 78, not 75 — the canvas average-glyph estimate runs
 In `package.json` `scripts`, add:
 
 ```json
-"test:design": "npm run build && node --test --experimental-strip-types scripts/__tests__/design-system.test.mjs"
+"test:design": "npm run build && node --test --experimental-strip-types scripts/__tests__/design/system.mjs"
 ```
 
 - [ ] **Step 5: Run it against the current site to establish the baseline**
@@ -369,7 +371,7 @@ Note `serve` must run **without** `-s`; the SPA flag rewrites real paths to `ind
 
 ```bash
 git add scripts/lib/contrast.mjs scripts/lib/static-server.mjs \
-        scripts/__tests__/design-system.test.mjs package.json \
+        scripts/__tests__/design/system.mjs package.json \
         docs/superpowers/screenshots/redesign-before
 git commit -m "test: design-system harness (contrast, measure, header, tap targets)"
 ```
@@ -520,7 +522,22 @@ Replace the Google Fonts `<link>` (currently line 58) with:
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
 ```
 
-Fraunces is gone; Space Grotesk replaces it. Keep both `preconnect` lines unchanged. Then ensure `tokens.css` is imported **before** `guide.css` wherever stylesheets are pulled in.
+Fraunces is gone; Space Grotesk replaces it. Keep both `preconnect` lines unchanged.
+
+Then import the token file. `BaseLayout.astro` lines 4–5 currently read:
+
+```js
+import '../styles/guide.css';
+import '../styles/site.css';
+```
+
+Insert `tokens.css` **first**, so the custom properties are defined before any rule consumes them:
+
+```js
+import '../styles/tokens.css';
+import '../styles/guide.css';
+import '../styles/site.css';
+```
 
 - [ ] **Step 4: Point the base families at the tokens**
 
@@ -802,7 +819,7 @@ In `guide.css`, `pre`, `code`, and `.c-*` spans use `var(--font-mono)`.
 
 - [ ] **Step 2: Write a contrast check for the syntax palette**
 
-Add to `scripts/__tests__/design-system.test.mjs`, inside the `describe` block:
+Add to `scripts/__tests__/design/system.mjs`, inside the `describe` block:
 
 ```javascript
 test('syntax colours meet AA against the code background', async () => {
@@ -843,7 +860,7 @@ Expected: "code blocks identical".
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/styles src/styles/tokens.css scripts/__tests__/design-system.test.mjs
+git add src/styles src/styles/tokens.css scripts/__tests__/design/system.mjs
 git commit -m "feat(design): retune syntax palette for the cool system, with a contrast test"
 ```
 
