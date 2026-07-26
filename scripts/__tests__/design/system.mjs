@@ -173,4 +173,28 @@ describe('design system', () => {
     await ctx.close();
     assert.deepEqual(bad, [], `measure out of range:\n${bad.join('\n')}`);
   });
+
+  test('syntax colours meet AA against the code background', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const page = await ctx.newPage();
+    await page.goto(server.url + '/deep-dives/mcp/mcp-building-servers-in-practice/', { waitUntil: 'load' });
+    const tokens = await page.evaluate(() => {
+      const pre = document.querySelector('pre');
+      if (!pre) return null;
+      const bg = getComputedStyle(pre).backgroundColor;
+      const out = [{ name: 'pre', color: getComputedStyle(pre).color, bg }];
+      for (const cls of ['c-kw', 'c-st', 'c-fn', 'c-cm', 'c-out']) {
+        const el = pre.querySelector('.' + cls);
+        if (el) out.push({ name: cls, color: getComputedStyle(el).color, bg });
+      }
+      return out;
+    });
+    await ctx.close();
+    if (!tokens) return; // page has no code block
+    const bad = tokens
+      .map((t) => ({ ...t, ratio: contrastRatio(parseColor(t.color).slice(0, 3), parseColor(t.bg).slice(0, 3)) }))
+      .filter((t) => t.ratio < 4.5)
+      .map((t) => `${t.name} ${t.ratio}`);
+    assert.deepEqual(bad, [], `syntax tokens below 4.5:1: ${bad.join(', ')}`);
+  });
 });
