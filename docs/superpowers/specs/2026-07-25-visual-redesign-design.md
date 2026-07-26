@@ -137,6 +137,48 @@ tuned `font-family` stack naming good system CJK faces in preference order
 Loading a real CJK webfont is a separate performance decision requiring its own
 measurement; it is explicitly deferred, not forgotten.
 
+#### 3.5.1 CJK webfont — measured 2026-07-26, decided against
+
+The deferred measurement was done. **Closed as won't-do.** Numbers, all
+measured rather than estimated, on `/zh/concepts/prompt-caching` (516 unique
+CJK characters):
+
+| Option | Payload | Detail |
+|---|---:|---|
+| System fallback (current) | **0 KB** | resolves to PingFang SC / YaHei / Noto CJK |
+| Google Fonts, Noto Sans SC | **2,193 KB** | 2 weights; 38 of 202 unicode-range slices, ~57.7 KB each |
+| Self-hosted corpus subset | **~639 KB** | 2 weights × 2,161 glyphs @ 152 B/glyph measured |
+| Full font | ~5,829 KB | per weight |
+
+The whole zh corpus uses only **2,161 unique CJK glyphs** across 769,644
+characters in 375 files, which is what makes the subset option viable at all.
+
+Reasons for declining, in order of weight:
+
+1. **The benefit is consistency no reader experiences.** Nobody views a page
+   on four operating systems. Each reader sees one CJK face, and PingFang SC,
+   Microsoft YaHei and Noto Sans CJK are all screen-optimised faces built by
+   the platform vendor. We would spend 0.6–2.2 MB to replace a good font with
+   a different good font.
+2. **`font-display: swap` makes first visits strictly worse.** The reader gets
+   the system font, waits on a large download, then takes a reflow — ending
+   where they started, having paid for it.
+3. **The subset route adds a maintenance trap.** It must be regenerated on
+   every content change. On a site shipping several updates a day, the first
+   zh page using an unseen glyph renders tofu or silently falls back — a new
+   bug class on the locale that is half the corpus.
+
+Reopen only if the premise changes: a brand requirement for a specific
+typeface, or a measured complaint about how a particular platform renders.
+Payload alone will not get cheaper.
+
+**Found while measuring, fixed separately (PR #111):** 17 rules declared font
+weights that were never loaded — leftovers from Fraunces (300/400/600) that
+survived the swap to Space Grotesk (500/600/700), because the typography
+conversion mapped size, line-height and family but not weight. They rendered
+at the nearest available face, so nothing looked wrong. `npm test` now guards
+declared-vs-loaded weight pairs.
+
 ---
 
 ## 4. Components
@@ -246,4 +288,4 @@ the old one did. Two requirements, both learned from real failures on
 
 - **Concepts index findability** — 9.6 screens on mobile, 55 links, no filter.
   Needs an IA decision, not a restyle. Recorded in memory; still open.
-- **CJK webfont** — see §3.5.
+- **CJK webfont** — measured 2026-07-26 and **closed as won't-do**; see §3.5.1.
