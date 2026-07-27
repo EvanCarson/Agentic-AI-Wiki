@@ -10,7 +10,7 @@
 // about rather than a green run that checked nothing.
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
@@ -21,7 +21,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const DIST = resolve(ROOT, 'dist');
 if (!existsSync(DIST)) throw new Error('dist/ not found — run `npm run build` (or use `npm run test:design`)');
 
-const PAGES = [
+/** One page per section, hand-picked — the routing/layout coverage. */
+const CURATED = [
   '/', '/concepts/', '/field-guide/',
   // A real chapter, not just the index: .deliverable and .page-nav-btn only
   // exist here, and they are two of the five emphasis surfaces.
@@ -34,6 +35,67 @@ const PAGES = [
   '/changelog/',
   '/zh/concepts/prompt-caching/',
 ];
+
+/**
+ * Components that must be audited somewhere, identified by a marker that
+ * appears in the built HTML.
+ *
+ * A hand-picked page list audits the pages someone thought of. Three separate
+ * defects this cycle hid in components that no listed page happened to carry
+ * — most recently `.code-tab.active[data-api="anthropic"]` at 4.20:1 against
+ * a 4.5:1 floor, live on 20 pages, while the suite ran green. Worse, the list
+ * *looked* like it covered it: /field-guide/prompts/ matches a grep for
+ * "code-tab" because the inline switchTab() script mentions the class, but it
+ * renders no tab buttons at all.
+ *
+ * So the list is derived instead: for each marker below, find a real page in
+ * dist/ that actually contains it and audit that page. A component cannot be
+ * added to the site without landing in the audit, and a marker that stops
+ * matching anything is a hard failure rather than silent under-coverage.
+ */
+const COMPONENT_MARKERS = [
+  'class="code-tab',        // API tab strip — the 2026-07-27 miss
+  'class="deliverable"',    // emphasis surface, end of chapter
+  'class="callout start"',  // reading-path box
+  'class="threat-row',      // threat table, inverse header row
+  'class="qa"',             // Q&A block (--q-ink)
+  'class="diagram"',        // ASCII figure, scroll affordance
+  'class="blog-card"',      // post preview
+  'changelog-detail',       // collapsible changelog entry
+  'home-feature-figure',    // inlined lead diagram
+  'class="page-meta"',      // reading time
+  // 'shell-banner' was listed here and matched nothing: the stub-chapter
+  // banner is no longer rendered anywhere. Removed rather than left to rot —
+  // a marker that matches nothing is under-coverage pretending to be coverage,
+  // which is what the new assertion below exists to surface.
+];
+
+/** Walk dist/ once and map each marker to a page that really contains it. */
+function pagesForComponents() {
+  const pages = [];
+  const missing = [];
+  const files = [];
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = resolve(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name === 'index.html') files.push(p);
+    }
+  };
+  walk(DIST);
+  files.sort();
+
+  for (const marker of COMPONENT_MARKERS) {
+    const hit = files.find((f) => readFileSync(f, 'utf8').includes(marker));
+    if (!hit) { missing.push(marker); continue; }
+    const route = hit.slice(DIST.length).replace(/index\.html$/, '') || '/';
+    if (!pages.includes(route)) pages.push(route);
+  }
+  return { pages, missing };
+}
+
+const { pages: COMPONENT_PAGES, missing: MISSING_MARKERS } = pagesForComponents();
+const PAGES = [...new Set([...CURATED, ...COMPONENT_PAGES])];
 const VIEWPORTS = [{ w: 390, h: 844 }, { w: 768, h: 1024 }, { w: 1280, h: 900 }];
 const THEMES = ['light', 'dark'];
 
@@ -164,6 +226,14 @@ async function auditPage(page) {
 }
 
 describe('design system', () => {
+  // Under-coverage must be loud. If a marker stops matching, the component was
+  // renamed or dropped and the audit silently shrank — which is exactly how
+  // the .code-tab failure survived.
+  test('every audited component still exists in the build', () => {
+    assert.deepEqual(MISSING_MARKERS, [],
+      `component markers matched no page in dist/ — rename them or drop them:\n${MISSING_MARKERS.join('\n')}`);
+  });
+
   for (const theme of THEMES) {
     for (const vp of VIEWPORTS) {
       test(`contrast AA — ${theme} @ ${vp.w}px`, async () => {
