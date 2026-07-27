@@ -23,6 +23,9 @@ if (!existsSync(DIST)) throw new Error('dist/ not found — run `npm run build` 
 
 const PAGES = [
   '/', '/concepts/', '/field-guide/',
+  // A real chapter, not just the index: .deliverable and .page-nav-btn only
+  // exist here, and they are two of the five emphasis surfaces.
+  '/field-guide/prompts/',
   '/concepts/prompt-caching/',
   '/deep-dives/mcp/mcp-building-servers-in-practice/',
   '/operations/agentops/kill-switches/',
@@ -44,6 +47,60 @@ after(async () => {
   await browser?.close();
   await server?.close();
 });
+
+/**
+ * Collect every element painted with the emphasis surface (--surface-inverse),
+ * along with what it sits on and what edge it draws.
+ *
+ * Resolves the token through a probe element rather than string-matching
+ * getPropertyValue('--surface-inverse'): the custom property returns the
+ * AUTHORED text ('#24261F') while backgroundColor returns used values
+ * ('rgb(36, 38, 31)'), so a direct comparison silently matches nothing and
+ * the test goes vacuously green — the exact failure mode the syntax-class
+ * test hit once already.
+ */
+async function collectEmphasisSurfaces(page) {
+  return page.evaluate(() => {
+    const probe = document.createElement('div');
+    probe.style.backgroundColor = 'var(--surface-inverse)';
+    document.body.appendChild(probe);
+    const target = getComputedStyle(probe).backgroundColor;
+    probe.remove();
+
+    function bgLayers(el) {
+      const layers = [];
+      for (let n = el; n; n = n.parentElement) {
+        const bg = getComputedStyle(n).backgroundColor;
+        if (bg && bg !== 'rgba(0, 0, 0, 0)') layers.push(bg);
+      }
+      return layers;
+    }
+
+    const out = [];
+    document.querySelectorAll('body *').forEach((el) => {
+      const cs = getComputedStyle(el);
+      if (cs.backgroundColor !== target) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return;
+      const under = el.parentElement ? bgLayers(el.parentElement) : [];
+      // A nested element repainting the same surface has no edge to check —
+      // it is not a panel boundary, it is the inside of one.
+      if (!under.length || under[0] === target) return;
+      out.push({
+        label: (el.className || el.tagName).toString().slice(0, 40),
+        ownBg: cs.backgroundColor,
+        under,
+        borders: ['Top', 'Right', 'Bottom', 'Left']
+          .map((side) => ({
+            width: parseFloat(cs[`border${side}Width`]) || 0,
+            color: cs[`border${side}Color`],
+          }))
+          .filter((b) => b.width > 0),
+      });
+    });
+    return out;
+  });
+}
 
 /** Collect every text-bearing leaf with its computed colour + composited bg. */
 async function auditPage(page) {
@@ -347,5 +404,89 @@ describe('design system', () => {
     const badRatio = contrastRatio(parseColor(bad.color).slice(0, 3), composite(bad.layers));
     assert.ok(goodRatio >= requiredRatio(good.px, good.weight), `expected black-on-white fixture to pass AA, got ${goodRatio}`);
     assert.ok(badRatio < requiredRatio(bad.px, bad.weight), `expected white-on-white fixture to fail AA, got ${badRatio}`);
+  });
+
+  // ---- Non-text contrast: the emphasis surface -------------------------
+  //
+  // Everything above this line audits TEXT. That limit is what let a real
+  // defect ship on 2026-07-26: dark --surface-inverse was #08090A against a
+  // #101110 --paper — 1.05:1 — so .deliverable (777px tall, on all 26
+  // chapters) and .callout.start had no visible extent in dark mode. Every
+  // text-contrast assertion passed the whole time, because the TEXT on those
+  // blocks was fine; it was the block that was gone.
+  //
+  // guide.css distinguishes the four annotation types by surface, and the
+  // two emphasis blocks deliberately carry no left rule, so for them the
+  // separation IS the component. Hence WCAG 1.4.11's 3:1 non-text threshold,
+  // satisfied by fill or by edge — dark separates on the edge because a
+  // raised dark fill tops out around 1.24:1 before it stops reading as a
+  // surface. Ordinary card borders (--border-soft) are deliberately NOT held
+  // to this: a light-mode card outline at 3:1 would be ~#949790, which reads
+  // as a boxed-in table rather than the site's hairline vocabulary.
+  const NON_TEXT_MIN = 3;
+
+  /** Best separation an element achieves from what it sits on: fill or any edge. */
+  function separation(row) {
+    const under = composite(row.under);
+    const fill = contrastRatio(composite([row.ownBg, ...row.under]), under);
+    // A border paints over the element's own background, at the boundary
+    // with the parent — so it composites on top of both, and is compared
+    // against the parent alone.
+    const edges = row.borders.map((b) =>
+      contrastRatio(composite([b.color, row.ownBg, ...row.under]), under)
+    );
+    return Math.max(fill, ...edges, 0);
+  }
+
+  for (const theme of THEMES) {
+    test(`emphasis surfaces separate from the page — ${theme}`, async () => {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, colorScheme: theme });
+      const page = await ctx.newPage();
+      const failures = [];
+      let seen = 0;
+      for (const path of PAGES) {
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        for (const row of await collectEmphasisSurfaces(page)) {
+          seen++;
+          const sep = separation(row);
+          if (sep < NON_TEXT_MIN) failures.push(`${path} ${row.label} ${sep}<${NON_TEXT_MIN}`);
+        }
+      }
+      await ctx.close();
+      // Without this, a renamed token or a broken probe reports success while
+      // checking nothing — the failure mode the syntax-class test hit once.
+      assert.ok(seen > 0, 'found no element painted with --surface-inverse: the probe or the token name is wrong, not the design');
+      assert.deepEqual(failures, [], `emphasis surfaces that vanish into the page:\n${failures.join('\n')}`);
+    });
+  }
+
+  // Proves the check above can actually fail, using the exact colour pair
+  // that shipped, so it cannot go vacuously green if a selector drifts.
+  test('the emphasis-surface check catches a panel that vanishes into the page', async () => {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await page.setContent(`<!doctype html><html><head><style>
+        :root { --surface-inverse: #08090A; }
+        body { background: #101110; margin: 0; }
+        .panel { background: var(--surface-inverse); width: 300px; height: 100px; }
+        .edged { border: 1px solid #666961; }
+      </style></head><body>
+      <div class="panel vanishes"></div>
+      <div class="panel edged"></div>
+    </body></html>`);
+    const rows = await collectEmphasisSurfaces(page);
+    await ctx.close();
+
+    const vanishes = rows.find((r) => r.label.includes('vanishes'));
+    const edged = rows.find((r) => r.label.includes('edged'));
+    assert.ok(vanishes && edged, `fixture panels not collected, got: ${rows.map((r) => r.label).join(', ') || '(none)'}`);
+    assert.ok(
+      separation(vanishes) < NON_TEXT_MIN,
+      `expected the borderless #08090A-on-#101110 panel to be flagged, scored ${separation(vanishes)}`
+    );
+    assert.ok(
+      separation(edged) >= NON_TEXT_MIN,
+      `expected the edged panel to pass, scored ${separation(edged)}`
+    );
   });
 });
