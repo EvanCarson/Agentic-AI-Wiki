@@ -658,6 +658,54 @@ describe('design system', () => {
     assert.deepEqual(failures, [], `Chinese text set in a synthesised oblique:\n${failures.join('\n')}`);
   });
 
+  // Chinese is drawn on a fixed em grid: the space between characters is
+  // already part of the glyph, so the positive tracking that opens up Latin
+  // caps prises CJK characters apart instead. Measured 1.32px between every
+  // character of 实战指南 at 11px — 12% of the em — across the whole mono
+  // label register (nav, brand, kickers, meta lines).
+  //
+  // Expressed in em, not px, so it holds at every font size. 0.04em is the
+  // ceiling: --track-mul leaves the labels at ~0.018em on zh, and the
+  // pre-fix values were 0.08-0.2em.
+  const MAX_CJK_TRACKING_EM = 0.04;
+
+  test('Chinese text is not tracked out like Latin caps', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const page = await ctx.newPage();
+    const failures = [];
+    let seen = 0;
+    for (const path of ZH_PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const rows = await page.evaluate((cjkSource) => {
+        const cjk = new RegExp(cjkSource);
+        const out = [];
+        document.querySelectorAll('body *').forEach((el) => {
+          if (el.children.length) return;
+          const text = (el.innerText || '').trim();
+          if (!text || !cjk.test(text)) return;
+          const cs = getComputedStyle(el);
+          const px = parseFloat(cs.fontSize) || 16;
+          const ls = parseFloat(cs.letterSpacing);
+          out.push({
+            label: (el.className || el.tagName).toString().slice(0, 34),
+            em: Number.isFinite(ls) ? +(ls / px).toFixed(4) : 0,
+            sample: text.slice(0, 14),
+          });
+        });
+        return out;
+      }, CJK.source);
+      for (const r of rows) {
+        seen++;
+        if (r.em > MAX_CJK_TRACKING_EM) {
+          failures.push(`${path} ${r.label} ${r.em}em "${r.sample}"`);
+        }
+      }
+    }
+    await ctx.close();
+    assert.ok(seen > 0, 'found no CJK text on the zh pages — the pages or the CJK range are wrong, not the design');
+    assert.deepEqual(failures, [], `Chinese tracked out beyond ${MAX_CJK_TRACKING_EM}em:\n${failures.join('\n')}`);
+  });
+
   // Proves the check above can actually fail, using the exact colour pair
   // that shipped, so it cannot go vacuously green if a selector drifts.
   test('the emphasis-surface check catches a panel that vanishes into the page', async () => {
