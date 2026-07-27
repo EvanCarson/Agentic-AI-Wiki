@@ -1,0 +1,210 @@
+<p class="lede">The most instructive fact about local vector stores in 2026 is that the highest-volume retrieval systems in production deleted theirs: Claude Code shipped with a local vector database, removed it, and retrieves with <code>grep</code>. If your corpus still needs an index — and prose corpora do — then these four are not four competing products but four different architectures, and picking the wrong shape costs more than picking the wrong brand.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>All four run inside your process on hardware you own. That is where the similarity ends: one is a library with no storage at all, one is a file format, one is an extension to a database you probably already ship, and one is an engine with a write-ahead log.</p>
+
+  <table>
+    <thead>
+      <tr><th>Project</th><th>Since</th><th>What it actually is</th><th>Where the data lives</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/logos/faiss.svg" width="24" height="24" alt="FAISS logo" style="vertical-align:middle;margin-right:8px;" />FAISS</td>
+        <td>2017</td>
+        <td>A similarity-search library — C++ with Python bindings, CPU and GPU.</td>
+        <td>Nowhere. You choose and manage storage yourself.</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/logos/chroma.svg" width="24" height="24" alt="Chroma logo" style="vertical-align:middle;margin-right:8px;" />Chroma</td>
+        <td>2022</td>
+        <td>An embedded vector database with a Rust core since 1.0.</td>
+        <td>A persistent directory the engine owns.</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/logos/lancedb.svg" width="24" height="24" alt="LanceDB logo" style="vertical-align:middle;margin-right:8px;" />LanceDB</td>
+        <td>2023</td>
+        <td>A retrieval engine over the Lance columnar format.</td>
+        <td>Lance files on local disk or object storage.</td>
+      </tr>
+      <tr>
+        <td><img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/logos/sqlite-vec.svg" width="24" height="24" alt="sqlite-vec logo" style="vertical-align:middle;margin-right:8px;" />sqlite-vec</td>
+        <td>2024</td>
+        <td>A pure-C SQLite extension adding <code>vec0</code> virtual tables.</td>
+        <td>Inside the SQLite file you already have.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>Licensing is not a differentiator here — FAISS is MIT, the other three are Apache 2.0, and all four are genuinely self-hostable with no phone-home. Popularity is worth one glance and no more, because it measures three different things at once: FAISS has eight years of research users, sqlite-vec is two years old and still pre-1.0.</p>
+
+  <figure>
+    <img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/data-stars-comparison.svg" alt="Bar chart of GitHub stars: FAISS 40.6k, Chroma 28.9k, LanceDB 11.0k, sqlite-vec 7.9k" width="900" height="400" loading="lazy" />
+    <figcaption>Age and audience, not quality — FAISS has been the reference ANN library since 2017, and sqlite-vec has existed for two years.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/data-feature-matrix.svg" alt="Capability matrix across storage, ANN index, metadata filtering, hybrid search, and larger-than-RAM handling" width="900" height="400" loading="lazy" />
+    <figcaption>Read the weak cells as design decisions, not gaps: FAISS omits storage on purpose, and sqlite-vec omits ANN indexing to stay a small C file with no dependencies.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>The question before the question</h2>
+  <p>Before comparing stores, it is worth knowing that the best-resourced agent teams looked at this pipeline and walked away from it. Anthropic's Claude Code shipped an early version backed by a local vector database and replaced the whole thing — embedding model, index, chunking heuristics — with live <code>ripgrep</code> calls. Cursor, Codex, and Cline all lean on grep-shaped, scriptable retrieval for code. The reasoning is structural: exact match is <em>correct</em> when you are looking for <code>PaymentRetryPolicy</code>, an index over files being edited is stale between the write and the re-index, and a search the agent can narrow into another search is a plan rather than a single shot.</p>
+
+  <p>The best measurement so far is a May 2026 arXiv paper from PwC, <em>Is Grep All You Need? How Agent Harnesses Reshape Agentic Search</em>. Across 116 LongMemEval questions and several harness/model pairs, lexical search beat vector retrieval uniformly when results were injected <strong>inline</strong> into the context — 93.1% against 83.6% on one Claude Opus configuration, with the narrowest margin at 76.7% against 75.0%. But when the same results were written to <strong>files</strong> for the agent to read instead of being spliced into the prompt, the ordering reversed on half the configurations tested.</p>
+
+  <p>That reversal is the finding worth carrying. Retrieval quality is not a property of the retriever alone; the harness and the delivery mechanism move the number as much as the algorithm does. So the honest framing for the rest of this piece is narrow: <strong>you want an index when the corpus is large, prose-heavy, and queried by meaning rather than by string</strong> — support histories, contracts, research, policy — and you want grep when the corpus is code-shaped and on local disk. Most real systems end up with both.</p>
+</section>
+
+<section>
+  <h2>FAISS — deep dive</h2>
+  <figure>
+    <img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/arch-faiss.svg" alt="FAISS as a library inside your process, with persistence, metadata, and lifecycle written by you around it" width="900" height="500" loading="lazy" />
+    <figcaption>FAISS returns integer IDs and distances. Everything that makes those IDs useful is code you write.</figcaption>
+  </figure>
+
+  <h3>How it stores</h3>
+  <p>It does not. This is the single most important thing to understand about FAISS and the reason half of all comparisons involving it are miscategorised. There is no file format, no collection concept, no metadata, no persistence layer — you build an index in memory, and serializing it, reloading it, and deciding what happens after a crash are your problems. The library never sees your text; it sees float arrays and hands back integers.</p>
+
+  <h3>How it searches</h3>
+  <p>Extremely well, and with more control than anything else on this list. Flat gives exact brute-force search; IVF partitions the space into clusters and probes a few; HNSW builds a navigable graph; PQ compresses vectors into codes so billions of them fit in memory. You compose these — <code>IVF4096,PQ64</code> is a real index description — and you tune the recall-latency-memory triangle by hand. GPU search is native, which no database on this list matches.</p>
+
+  <h3>What it makes hard</h3>
+  <p>Filtering, which is the query shape production actually has. "Top-k where <code>tenant_id = 7</code> and <code>lang = 'en'</code>" is not something FAISS models; the escape hatch is an ID bitmask you construct from a separate metadata table, which means an indirection per candidate and a synchronisation problem between two stores that must never disagree. Deletes are similarly manual. If your answer to "where does the metadata live?" is "in Postgres, and I'll join," you have just described most of a vector database, and you should ask whether you wanted one.</p>
+</section>
+
+<section>
+  <h2>sqlite-vec — deep dive</h2>
+  <figure>
+    <img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/arch-sqlite-vec.svg" alt="sqlite-vec adding vec0 virtual tables inside one ordinary SQLite file, joined with FTS5 and application tables" width="900" height="500" loading="lazy" />
+    <figcaption>The whole knowledge base is a file you can copy, ship inside an app, or open in the browser.</figcaption>
+  </figure>
+
+  <h3>How it stores</h3>
+  <p>As rows, in the SQLite file you already have. <code>CREATE VIRTUAL TABLE … USING vec0(…)</code> gives you a table holding float, <code>int8</code>, or binary vectors alongside up to sixteen typed metadata columns you can filter on, up to four partition keys that physically shard the index, and auxiliary columns that carry payload without being indexed. It is pure C with no dependencies, which is why it runs on Linux, macOS, Windows, a Raspberry Pi, and in the browser via WASM — the only option here that ships inside a client application.</p>
+
+  <h3>How it searches</h3>
+  <p>By scanning. The default is brute-force KNN over every vector in the partition, which sounds like a flaw and is mostly a feature: recall is exact, there is no index to build or tune, and freshly inserted rows are immediately searchable with no compaction lag. Partition keys are the scaling lever — if every query is scoped to one tenant, you are scanning that tenant's vectors, not the corpus. The documented advice is to keep hundreds of vectors per partition value rather than a handful, since over-sharding costs more than it saves.</p>
+
+  <h3>What it makes hard</h3>
+  <p>Growth. Linear scan is fine into the low hundreds of thousands of vectors and painful at ten million — benchmarks that put it two or three orders of magnitude behind ANN indexes are measuring exactly this, and they are fair. The project is also still explicitly pre-1.0 with breaking changes expected, which is an acceptable risk for a file you control and a poor one for a schema you cannot easily migrate. What you get in exchange is the best hybrid-retrieval story here for free: FTS5 is already in SQLite, so BM25 plus vector plus a join against your permissions table is one statement.</p>
+</section>
+
+<section>
+  <h2>Chroma — deep dive</h2>
+  <figure>
+    <img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/arch-chroma.svg" alt="Chroma's log-structured architecture: writes append to a WAL, compaction materializes HNSW segments, reads query the segments" width="900" height="500" loading="lazy" />
+    <figcaption>Writes and reads are decoupled by design — which is why ingest is fast and freshly written rows are briefly not yet searchable.</figcaption>
+  </figure>
+
+  <h3>How it stores</h3>
+  <p>In a persistent directory it manages, using a log-structured design that the 1.0 Rust rewrite made explicit. Writes append to an immutable write-ahead log and acknowledge immediately; a background compaction process materializes the log into segments; reads query the segments. The rewrite brought a claimed 3–5× improvement in both writes and queries over the previous Python implementation, plus native bindings for JavaScript, Ruby, and Swift and a WASM build for the browser.</p>
+
+  <h3>How it searches</h3>
+  <p>HNSW — a navigable small-world graph, held in memory, which is the standard choice for good reason: excellent recall at low latency when the index fits. Metadata <code>where</code> filters are applied in the same query path against segment metadata rather than a separate store, and there is substring matching on document text. There is no BM25 ranking, so "hybrid search" in a Chroma stack means you brought your own keyword index. Note also that SPANN, the disk-friendly index in Chroma's distributed offering, is not available in the single-node embedded mode this article is about.</p>
+
+  <h3>What it makes hard</h3>
+  <p>Scaling past memory, and knowing when you have. HNSW is memory-resident, so the practical ceiling on one machine is roughly a million vectors before pressure starts showing in latency, and the answer past that is distributed Chroma — which is a service to operate, not a directory. The compaction lag is the other sharp edge: a row you just wrote is durable but not necessarily indexed yet, which is invisible in a notebook and confusing in an agent loop that writes and immediately searches.</p>
+</section>
+
+<section>
+  <h2>LanceDB — deep dive</h2>
+  <figure>
+    <img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/arch-lancedb.svg" alt="LanceDB reading Lance columnar files by memory map, with IVF-PQ, full-text and scalar indexes beside the data, and zero-copy access from Arrow tools" width="900" height="500" loading="lazy" />
+    <figcaption>Data, metadata, and indexes are the same files — so there is no second store to keep in sync, and no sync job to get wrong.</figcaption>
+  </figure>
+
+  <h3>How it stores</h3>
+  <p>In the Lance columnar format, built on Apache Arrow, on local disk or object storage. This is the architectural bet that distinguishes it: the engine reads columns from memory-mapped files rather than holding an index in RAM, so a corpus larger than memory is the normal case rather than the failure case. Every write produces a new version you can read back, which makes "what did retrieval look like before I re-chunked everything?" an answerable question. Columns can hold text, vectors, images, audio, or arbitrary blobs, which is why the project markets itself around multimodal data.</p>
+
+  <h3>How it searches</h3>
+  <p>IVF-PQ by default — inverted-file partitioning with product quantization, an approximate index that compresses vectors and scales to very large collections on modest hardware. Alongside the vector index sit a full-text index and scalar indexes, and the query API composes vector search, full-text search, SQL-style filters, and reranking into a single hybrid call. That is the most complete out-of-the-box retrieval story of the four, and it matters more than raw QPS: hybrid plus reranking is the single largest quality lever in most stacks.</p>
+
+  <h3>What it makes hard</h3>
+  <p>Two things, both real. IVF-PQ is approximate and quantized, so recall is a tuning parameter rather than a given, and independent benchmarks show throughput dipping under tight metadata filters — the post-filtering behaviour that catches most partitioned ANN indexes. And the community is smaller than Chroma's or Qdrant's: fewer tutorials, fewer answered questions, and multi-process concurrent access has documented limitations. Buying a disk-native format means buying its ecosystem too.</p>
+</section>
+
+<section>
+  <h2>Cross-cutting comparison</h2>
+
+  <h3>How much of the database you write yourself</h3>
+  <figure>
+    <img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/compare-what-you-write.svg" alt="Four columns comparing the surrounding code each store leaves you to write" width="900" height="300" loading="lazy" />
+    <figcaption>The weak spots differ in kind: FAISS omits the database, Chroma omits the keyword half, sqlite-vec omits the index.</figcaption>
+  </figure>
+  <p>The four occupy a clean gradient. FAISS hands you an index and leaves persistence, metadata, collections, and deletes entirely to you — perhaps four hundred lines of glue that you will then own forever. sqlite-vec inherits storage, transactions, joins, and BM25 from SQLite for free, so the surrounding code nearly vanishes, but hands you the scan budget in exchange. Chroma supplies storage, index, and filters with the shortest possible on-ramp and then quietly leaves the keyword half of hybrid retrieval as an exercise. LanceDB supplies the most in one call — vector, full-text, filters, reranking — and asks you to adopt a storage format and a smaller support community in return.</p>
+
+  <h3>Where each one stops</h3>
+  <figure>
+    <img src="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss/compare-scale-ceiling.svg" alt="Four columns comparing comfortable working range: sqlite-vec ~100k, Chroma ~1M, FAISS billions, LanceDB disk-bound" width="900" height="300" loading="lazy" />
+    <figcaption>Three of these ceilings are about memory. Only LanceDB's is about disk.</figcaption>
+  </figure>
+  <p>Scale limits here are set by where the index lives, not by how fast the code is. sqlite-vec's brute-force scan is linear, so its ceiling arrives earliest — comfortable into the low hundreds of thousands, extendable when partition keys mean each query touches one tenant's slice. Chroma's ceiling is RAM: HNSW is memory-resident and degrades once the machine is under pressure, which lands around a million vectors on typical hardware. FAISS technically goes furthest with quantization and GPU search, but its ceiling is operational rather than algorithmic — billions of vectors is a system you are now running. LanceDB is the only one whose limit is storage rather than memory, which is the whole point of the columnar bet, paid for with approximate recall.</p>
+
+  <h3>Freshness, and the agent-loop consequence</h3>
+  <p>The four behave differently in the seconds after a write, and agents notice this in a way batch pipelines do not. sqlite-vec has no index to update, so a row is searchable the instant the transaction commits — the strongest freshness guarantee of the four, and an underrated advantage when an agent writes a note and then searches for it. Chroma acknowledges the write to its log immediately but only makes it searchable after compaction, so a write-then-read loop can miss. FAISS requires you to add to the index explicitly and rebuild periodically, so freshness is whatever your code implements. LanceDB versions on every write and indexes incrementally, but newly added rows are searched by brute force until the index catches up, which is a graceful degradation rather than a miss.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <p>Pick by where the data has to live and how much of it there is — not by a QPS chart from a benchmark that did not run your filters.</p>
+  <table>
+    <thead>
+      <tr><th>If this describes you</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Your corpus is code, config, or a docs tree on local disk</td><td>None of them</td><td>Give the agent <code>glob</code>, <code>grep</code>, and <code>read</code>. Exact match, zero index maintenance, never stale.</td></tr>
+      <tr><td>Your app already ships a SQLite file, or runs on a device or in a browser</td><td>sqlite-vec</td><td>The knowledge base becomes rows in a file you already back up, with FTS5 hybrid search and permission joins for free.</td></tr>
+      <tr><td>You want working retrieval this afternoon and will decide later</td><td>Chroma</td><td>Shortest path from nothing to a working index, and the default in most framework tutorials, so examples match your code.</td></tr>
+      <tr><td>The corpus is bigger than RAM, or multimodal, or you want hybrid + reranking without assembling it</td><td>LanceDB</td><td>Disk-native columnar storage with vector, full-text, and scalar indexes over the same files, in one query.</td></tr>
+      <tr><td>Search itself is the hard problem — GPU, billions of vectors, custom index tuning</td><td>FAISS</td><td>Nothing else gives you this much control over the recall–latency–memory triangle. Budget for the database you will write around it.</td></tr>
+      <tr><td>You already operate Postgres</td><td>pgvector</td><td>A local knowledge base does not have to mean a new dependency. Vectors on the same rows, one transaction, one backup story.</td></tr>
+    </tbody>
+  </table>
+  <p>One caveat worth stating plainly: whichever you choose, the store is rarely what limits answer quality. Parsing, chunking, and reranking are. A team that picks the "wrong" store and adds a local cross-encoder reranker will beat a team that picks the "right" one and retrieves dense-only top-k.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>Do I need a vector database at all if my agent can just grep?</h3>
+  <p>Not for code, config, or logs — the leading coding agents removed theirs and got better results. You need an index when the corpus is prose-heavy and queried by meaning, because the user's words will never match the document's words. Most production systems run both and route between them.</p>
+
+  <h3>Which of these four is fastest?</h3>
+  <p>The question is under-specified in a way that makes benchmarks misleading. FAISS wins raw ANN throughput, especially on GPU. sqlite-vec is two to three orders of magnitude slower on large collections because brute force is linear, and exactly right on small ones because there is no index overhead. LanceDB is fast on large disk-resident corpora and dips under tight metadata filters. Chroma is fast until the index no longer fits in memory. Benchmark with your filters and your corpus size or do not benchmark at all.</p>
+
+  <h3>Can I start with one and move to another later?</h3>
+  <p>Yes, and it is cheaper than it sounds — but only because you keep the chunks and re-embed. Vectors do not transfer meaningfully between stores unless the embedding model is identical, and the metadata schema always needs reshaping. Keep your parsed, chunked corpus as the source of truth in a durable format, and treat the index as derived data you can rebuild. That single discipline makes every store decision reversible.</p>
+
+  <h3>Is sqlite-vec's brute-force search a dealbreaker?</h3>
+  <p>Only above your scale threshold. At fifty thousand chunks a full scan is milliseconds and gives exact recall with no tuning; at ten million it is unusable. Partition keys move the line considerably when queries are naturally scoped to one tenant or one project. Check the number of vectors you will actually have in a year, not the number in the benchmark.</p>
+
+  <h3>What about pgvector, Qdrant, or Milvus Lite?</h3>
+  <p>All reasonable, and pgvector is the honest default for any team already running Postgres — see our <a href="/blogs/pgvector-vs-pinecone-vs-weaviate-vs-qdrant">pgvector vs Pinecone vs Weaviate vs Qdrant</a> comparison for the server-side market. This article is about the embedded case: no server process, data as files, retrieval in the same process as the agent.</p>
+
+  <h3>Which embedding model should I pair with these?</h3>
+  <p>Local, in almost every case — open-weight embedding models lead the public leaderboards outright. Qwen3-Embedding tops multilingual MTEB above the major hosted endpoints, BGE-M3 is the MIT-licensed multilingual workhorse producing dense, sparse, and multi-vector output in one pass, and EmbeddingGemma or <code>nomic-embed-text</code> fit in well under a gigabyte. Pin the version: changing embedding models invalidates every vector you have stored.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/local-knowledge-bases">Local knowledge bases</a> — the three dials of "local," and what owning the pipeline costs.</li>
+    <li><a href="/deep-dives/retrieval-and-rag/local-first-retrieval">Local-first retrieval</a> — the end-to-end build: ingest quality, hardware sizing, serving to an agent over MCP.</li>
+    <li><a href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">Choosing a vector database</a> — the constraint-first selection procedure for the server-side market.</li>
+    <li><a href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">Hybrid search &amp; reranking</a> — why one retriever is structurally not enough.</li>
+    <li><a href="/concepts/small-and-local-models">Small &amp; local models</a> — which jobs in your stack never needed a frontier model.</li>
+    <li><a href="/concepts/chunking-and-vector-search">Chunking &amp; vector search intuition</a> — the mental model underneath all four stores.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://github.com/facebookresearch/faiss">FAISS repository</a></li>
+    <li><a href="https://github.com/chroma-core/chroma">Chroma repository</a></li>
+    <li><a href="https://github.com/lancedb/lancedb">LanceDB repository</a></li>
+    <li><a href="https://github.com/asg017/sqlite-vec">sqlite-vec repository</a></li>
+    <li><a href="https://arxiv.org/abs/2605.15184">Is Grep All You Need? How Agent Harnesses Reshape Agentic Search</a> — Sen et al., PwC, May 2026</li>
+  </ul>
+</section>

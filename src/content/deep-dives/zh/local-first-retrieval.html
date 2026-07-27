@@ -1,0 +1,146 @@
+<section class="phase">
+  <div class="phase-num">R9</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>本地优先检索：在自己的硬件上搭一个知识库。</h2>
+  <p class="goal">几乎每一篇"如何搭建本地知识库"的指南都从同一个地方开始——分块、嵌入、存进向量数据库——而 2026 年最值得先知道的一件事是：今天出货的最能干的那批智能体，基本上不这么做。Claude Code、Cursor 与 Codex 是用 <code class="inline">glob</code>、<code class="inline">grep</code> 和 <code class="inline">read</code> 在源码树上检索的；嵌入流水线被试过，然后被拿掉了。本条目诚实地把这个决定走一遍：索引在什么情况下值回票价、如何在单机上真正把它建好、需要什么样的硬件、如何把它交给智能体而不捅出窟窿，以及什么时候干脆全都跳过、直接跑一个成品平台。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>先决定你到底需不需要索引。</h3>
+
+    <p>反对"条件反射式建索引"的最有力证据来自编程智能体，因为它们是生产环境中调用量最大的检索系统。Anthropic 的 Claude Code 早期版本带过一个本地向量数据库，后来把它换成了实时 <code class="inline">ripgrep</code> 调用；Cursor、Codex 与 Cline 在代码检索上也都倚重 grep 形态、可脚本化的检索。其原因是结构性的，而非偶然的：</p>
+
+    <ul>
+      <li><strong>精确性。</strong>当你在找 <code class="inline">PaymentRetryPolicy</code> 时，精确匹配不只是"够用"，它就是<em>正确</em>。语义相似度带来的是自信满满的擦肩而过。</li>
+      <li><strong>新鲜度。</strong>建在正被编辑的文件之上的索引，在写入与重建索引之间是陈旧的。grep 读的是文件此刻的样子。</li>
+      <li><strong>没有构建步骤。</strong>不用开资源、不用维护，换嵌入模型时也没有东西会作废。</li>
+      <li><strong>可组合性。</strong>智能体可以把一次搜索接进一次更窄的搜索，这是一个计划；top-<em>k</em> 相似度只有一发。</li>
+    </ul>
+
+    <p>但这笔交易并非一边倒，而普华永道 2026 年 5 月的一篇 arXiv 论文——<em>《Is Grep All You Need? How Agent Harnesses Reshape Agentic Search》</em>——是迄今最有用的一次测量。在 116 道 LongMemEval 题目与若干"外壳/模型"组合上，当结果被<strong>内联</strong>注入上下文时，词法搜索一致胜过向量检索（某个 Claude Opus 配置下为 93.1% 对 83.6%，差距最小的一组是 76.7% 对 75.0%）。然而当同样的结果被写进<strong>文件</strong>让智能体自己去读、而不是拼接进提示词时，一半的配置上排序发生了反转。这里的教训不是"grep 赢了"，而是：<strong>检索质量并不只是检索器自己的属性</strong>——外壳与结果投递方式对结果的影响，与算法本身一样大。</p>
+
+    <div class="callout">
+      <p>一条能用的分界线。当语料在本地磁盘上、是文本、具备智能体可导航的结构、并且按标识符查询时——代码、配置、日志、一棵文档树——<strong>跳过索引</strong>。当语料庞大、以散文为主、且用户的措辞永远不会与文档措辞重合时——支持工单历史、合同、论文、政策——<strong>建索引</strong>。任何严肃的系统<strong>两者都建</strong>，因为二者失手的查询彼此不相交。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>摄取那一半决定了你的天花板。</h3>
+
+    <p>检索质量的上限由"被索引进去的是什么"决定，而在本地方案里，没有哪个厂商在背后悄悄替你跑一个调校过的版面解析器。这正是多数本地知识库丢掉大部分质量的地方，而且丢得悄无声息：</p>
+
+    <ul>
+      <li><strong>做版面感知的解析，而不是文本抽取。</strong>朴素的 PDF 转文本会把双栏论文变成交错的胡话，把表格变成永远匹配不上任何查询的词汤。保留结构的解析器，以及对付难缠文档时把整页当图像来读的视觉模型，才是"可被搜索的语料"与"只是存在的语料"之间的分水岭。</li>
+      <li><strong>按结构分块，而不是按字符数。</strong>在标题、章节、函数边界或对话轮次处切分。一个把句子从中间切断的固定 512 token 窗口，产出的分块其嵌入其实什么都没代表。</li>
+      <li><strong>从一开始就带上元数据。</strong>来源路径、标题、标题层级链、时间戳、作者、租户、权限范围。事后补元数据意味着重新摄取；而按元数据过滤带来的质量提升，通常比调向量索引更大。</li>
+      <li><strong>给每个分块加上上下文前缀。</strong>在嵌入之前，把文档标题与标题层级链写在分块文本的开头，是一项廉价而显著的改进——一个孤立的段落，往往在不知道它是<em>什么东西的</em>段落时根本无法解读。</li>
+      <li><strong>保留回到原文的指针。</strong>检索出一个分块，引用一个文件与一段行号范围。没有回溯路径的答案无法验证，而那正好抵消了接地的意义。</li>
+    </ul>
+
+    <p><a class="xref" href="/zh/deep-dives/retrieval-and-rag/document-parsing-for-rag">文档解析与摄取质量</a>条目深入讲了这一半。在本地方案里，给它留出比本页其他任何环节都多的时间。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>先选嵌入模型，再定机器规格。</h3>
+
+    <p>这是唯一一个"本地不等于将就"的组件。开源权重的嵌入模型在公开榜单上是直接领先的——Qwen3-Embedding 位居多语言 MTEB 榜首，高于主流托管接口；BGE-M3 是 MIT 许可的多语言主力，一次前向即产出稠密、稀疏与多向量三种表示，等于用一个模型就拿到了混合检索。在小的一端，EmbeddingGemma 与 <code class="inline">nomic-embed-text</code> 占用远不到 1 GB，而 <code class="inline">all-MiniLM</code> 是一个 46 MB 的兜底选项，给完全腾不出资源的硬件用。</p>
+
+    <p>三个数字定下这套搭建的规格：</p>
+
+    <ul>
+      <li><strong>模型内存。</strong>4 位量化下大约每十亿参数 0.6 GB——所以一个 8B 嵌入模型常驻占用约 5 GB，而一个 0.6B 的到哪儿都装得下。</li>
+      <li><strong>索引内存。</strong>原始 <code class="inline">float32</code> 向量每条耗费<em>维度 × 4</em> 字节。一百万个分块、1024 维，在任何索引开销之前就约是 4 GB。这个数字决定了你的存储能否常驻内存；标量或二值量化能把它压掉 4 倍或 32 倍，代价是一些召回。</li>
+      <li><strong>摄取耗时。</strong>嵌入极易批处理、对 GPU 友好；大语料的第一次全量建索引是一个几小时的批处理作业，而之后每次增量更新都是秒级。要为第一次跑做计划，而不是为稳态做计划。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>把嵌入模型的版本钉死，并记录在索引旁边。两个模型产出的向量之间不可比较，所以一次升级等于把你存过的一切重新嵌入一遍——而一个迁移到一半的索引不会报错，它会安静地返回垃圾。请把"这些向量由哪个模型产出"当成一个 schema 字段，而不是一段记忆。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>按架构形态选存储，而不是按跑分。</h3>
+
+    <p>在单机上，有意思的区分不是哪个产品最快，而是它是什么形状，因为形状决定了你的运维故事。四种形状覆盖了整个领域：</p>
+
+    <ul>
+      <li><strong>一个库，不带存储。</strong>FAISS：提供索引结构（Flat、IVF、HNSW、PQ）与 GPU 搜索，没有持久化、没有元数据、没有集合管理。序列化与元数据关联都由你自己写。当"搜索"就是全部问题、而数据已经有地方放时，它是对的选择。</li>
+      <li><strong>一个 SQL 扩展。</strong><code class="inline">sqlite-vec</code>：纯 C、零依赖，SQLite 能跑的地方它都能跑，包括浏览器里的 WASM。向量变成 <code class="inline">vec0</code> 虚拟表，带类型化元数据列、用于多租户的分区键，以及承载负载的辅助列。默认搜索是暴力 KNN——在数十万向量以内这恰恰正确，远超之后就很不合适了。目前仍是 1.0 之前的版本。</li>
+      <li><strong>一个嵌入式引擎。</strong>Chroma：自 1.0 起是 Rust 内核，采用日志结构——写入追加进 WAL，后台压实把日志物化成 HNSW 段，读取查询这些段。一次 import、一个持久化目录、不用起服务。它是许多框架教程里的默认项，也是从零到跑通检索最短的一条路。</li>
+      <li><strong>一个列式格式，上面架着搜索。</strong>LanceDB：数据以 Lance 列式格式存放在磁盘（或对象存储）上，在进程内通过内存映射文件上的 IVF-PQ 查询，另有全文检索、版本化，以及与 Arrow、Pandas、Polars、DuckDB 之间的零拷贝访问。它是为大于内存的语料和多模态数据设计的。</li>
+    </ul>
+
+    <p>真正站得住的选型规则是：<strong>按"数据必须放在哪里"和"数据有多少"来选</strong>，而不是按 QPS 图表。如果你的应用本来就带一个 SQLite 文件，就把向量放进去。如果语料涨过了内存，你要的是磁盘原生的列式方案。如果你在做原型，就挑那个 import 最短的。而如果答案是"我们本来就在跑 Postgres"，那么诚实的建议是 <code class="inline">pgvector</code>，外加一个通往<a class="xref" href="/zh/deep-dives/retrieval-and-rag/choosing-a-vector-database">选向量数据库</a>的链接——本地知识库并不必然意味着一个新依赖。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>两个检索器加一个重排序器，而不是一次向量搜索。</h3>
+
+    <p>最常见的本地方案是纯稠密 top-<em>k</em>，而它也是本地知识库跑不过托管方案最常见的原因。关键词与向量搜索会在互不相交的查询上失手——BM25 抓不住同义改写，稠密检索抓不住精确标识符、罕见词、产品编号与报错字符串。两个都跑再把排名融合，只多一个索引的代价，就补回了这道差距中很大的一部分。</p>
+
+    <p>单机上的生产形态：</p>
+
+    <ul>
+      <li><strong>从两个来源宽召回。</strong>BM25（SQLite FTS5、Tantivy，或你的存储自带的方案）与稠密向量，各取大约 50 个候选。</li>
+      <li><strong>融合。</strong>倒数排名融合不需要在两套系统之间做分数校准，实现只要十几行代码。</li>
+      <li><strong>重排序。</strong>一个本地交叉编码器对融合后的候选与查询做真正的打分，而不是靠余弦邻近度。这是可用的单点收益最高的一次质量升级，而且它小到可以在 CPU 上跑。</li>
+      <li><strong>狠狠地截断。</strong>把前 5–10 条交给模型。上下文不是免费的，而真正改变答案的是列表顶端的精确率。</li>
+    </ul>
+
+    <p>然后去量它，因为上面这些盲做都不值得做。二十到五十组"问题—应命中文档"配对，取自真实问题，按 recall@k 打分，就足以告诉你一次改动是否有帮助。没有它，你会凭感觉调一整周的分块大小。参见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索与重排序</a>和<a class="xref" href="/zh/deep-dives/retrieval-and-rag/evaluating-rag">评估 RAG</a>。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>把它交到智能体手里。</h3>
+
+    <p>知识库成为智能体基础设施，是在它被暴露为一个工具的那一刻；而接口设计的重要性，与检索质量本身相当：</p>
+
+    <ul>
+      <li><strong>暴露搜索，而不是数据库。</strong>一个叫 <code class="inline">search_docs(query, filters, k)</code> 的工具是一份你能评测、能限流的契约。一个能对索引执行任意 SQL 的工具，则是用极少的额外能力换来大得多的爆炸半径。</li>
+      <li><strong>永远返回引用。</strong>每条结果都带来源路径与位置。这既让答案可核查，也让智能体在片段不够用时能去读完整文档。</li>
+      <li><strong>让智能体不止搜一次。</strong>迭代式检索——搜索、阅读、细化、再搜索——在难题上胜过单发 top-<em>k</em>，这正是<a class="xref" href="/zh/deep-dives/retrieval-and-rag/agentic-retrieval">智能体式检索</a>的核心论点。给它一个预算与一条停止规则，免得它原地打转。</li>
+      <li><strong>考虑用文件投递而非内联注入。</strong>第 1 步里普华永道的结果提示：把结果写进一个供智能体阅读的临时文件，可能改变哪种检索器胜出。如果你两种都支持，这是一次很便宜的 A/B。</li>
+      <li><strong>MCP 是那个可移植的外壳。</strong>一个 <a class="xref" href="/zh/concepts/what-is-mcp">MCP</a> 服务器能把同一个知识库同时接到 Claude Code、IDE 与你自己的外壳背后，而不用做三套集成。Chroma 与 Qdrant 都提供官方服务器；在你自己的搜索函数之上薄薄包一层自建服务器只需少量代码，还能让工具面保持在你设计的那个宽度上。</li>
+    </ul>
+
+    <div class="callout danger">
+      <p>两条本地存储解决不了的安全事实。第一，被检索出的文档是不可信输入：任何来自团队之外的文档都是一个<a class="xref" href="/zh/concepts/prompt-injection-101">提示词注入</a>载体，而知识库正是那个把攻击者文本直接送进模型上下文的投递机制。第二，一个面向所有人提供服务的扁平索引一定会泄露：请在检索调用<em>内部</em>、用你在摄取时就索引好的元数据，按请求者的权限过滤，而绝不要靠请求模型"嘴严一点"。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>让它活下去。</h3>
+
+    <p>不那么光鲜的那一半。没人维护的知识库会变成一个自信满满地提供去年答案的信源，而且这种失败是无声的——因为检索总会返回<em>点什么</em>：</p>
+
+    <ul>
+      <li><strong>按内容哈希做增量更新。</strong>只有当文档哈希变化时才重新嵌入它。在本地磁盘上，一个文件监听器能让更新近乎瞬时，这相对于依赖上传的平台是一项实打实的结构性优势。</li>
+      <li><strong>删除必须真的删掉。</strong>重命名与移动会留下孤儿分块；只删了行的删除会把向量留在索引里。请定期把索引与源目录树做一次对账，否则语料会悄悄攒下一堆幽灵。</li>
+      <li><strong>盯住索引漂移。</strong>为每个分块存下摄取时间戳与嵌入模型版本。任何混用了两个模型向量的查询路径都是坏的，而你会希望这是一个可被检测的状态，而不是一桩悬案。</li>
+      <li><strong>记录失败的问题。</strong>把没返回有用结果的查询记下来，每周读一遍。这是最廉价的评测集生成器，也是弄清"你的问题出在解析、分块还是排序"最快的路径。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 8</div>
+    <h3>什么时候这些都不用建。</h3>
+
+    <p>上面的一切都假设你想要一个从解析到排序都由自己掌控的检索层。很多时候你并不想要；而自托管平台市场已经足够成熟，以至于对一个"这个季度就要一个能用的内部知识库、而不是下个季度要一个调校好的"的团队来说，自己攒流水线才是错误的默认。大致分三层：</p>
+
+    <ul>
+      <li><strong>带界面与连接器的成品平台。</strong>RAGFlow 在处理格式混乱文档的深度理解上领先；AnythingLLM 是最容易自托管的 MIT 许可方案，带文档管理与团队功能；Onyx 面向企业场景，提供连接器与权限感知的搜索；kotaemon 与 Khoj 则更靠近个人一端。它们都能对着本地模型完全离线运行。</li>
+      <li><strong>需要你自己拼装的框架。</strong>LlamaIndex 与 Haystack 给你流水线组件而不给你产品，当你的摄取或排序确实不寻常时，这才是合适的那一层。</li>
+      <li><strong>图形态的知识库。</strong>LightRAG 与 Cognee 在向量索引之外再建一张<a class="xref" href="/zh/concepts/knowledge-graphs">知识图谱</a>，可本地运行——只有当你答不上来的问题是关系型或全局型时才值得，因为抽取那一遍是每个分块一次 LLM 调用。</li>
+    </ul>
+
+    <p>这个决定与你对任何基础设施做的决定一样：在你的需求确实特殊的那一层自己建，其余地方直接拿成品。对多数团队而言，这意味着通用文档语料交给平台，而那个结构特殊、平台处理得很差的语料，交给一个自己手写的小检索器——或者干脆就是 grep。</p>
+
+    <p>相关阅读：<a class="xref" href="/zh/concepts/local-knowledge-bases">本地知识库</a>是概念层版本，<a class="xref" href="/zh/concepts/small-and-local-models">小模型与本地模型</a>讲模型规格问题，而 <a class="xref" href="/zh/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss">LanceDB vs Chroma vs sqlite-vec vs FAISS</a> 详细比较了存储选型。</p>
+  </div>
+</section>

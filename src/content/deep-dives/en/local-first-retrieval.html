@@ -1,0 +1,146 @@
+<section class="phase">
+  <div class="phase-num">R9</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Local-first retrieval: building a knowledge base on hardware you own.</h2>
+  <p class="goal">Almost every guide to building a local knowledge base starts at the same place — chunk, embed, store in a vector database — and the first thing worth knowing in 2026 is that the most capable agents shipping today mostly do not do that. Claude Code, Cursor, and Codex retrieve over source trees with <code class="inline">glob</code>, <code class="inline">grep</code>, and <code class="inline">read</code>; the embedding pipeline was tried and removed. This entry works the decision honestly: when an index earns its keep, how to build one that is actually good on a single machine, what hardware it takes, how to hand it to an agent without opening a hole, and when to skip all of it and run a finished platform instead.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>First decide whether you need an index at all.</h3>
+
+    <p>The strongest evidence against reflexive indexing comes from the coding agents, because they are the highest-volume retrieval systems in production. Anthropic's Claude Code shipped an early version with a local vector database and removed it in favor of live <code class="inline">ripgrep</code> calls; Cursor, Codex, and Cline all lean on grep-shaped, scriptable retrieval for code. The reasons are structural rather than incidental:</p>
+
+    <ul>
+      <li><strong>Precision.</strong> When you are looking for <code class="inline">PaymentRetryPolicy</code>, exact match is not merely adequate, it is <em>correct</em>. Semantic similarity introduces confident near-misses.</li>
+      <li><strong>Freshness.</strong> An index over files that are being edited is stale between the write and the re-index. Grep reads the file as it is now.</li>
+      <li><strong>No build step.</strong> Nothing to provision, nothing to maintain, nothing to invalidate when you change embedding models.</li>
+      <li><strong>Composability.</strong> The agent can chain a search into a narrower search, which is a plan; top-<em>k</em> similarity is a single shot.</li>
+    </ul>
+
+    <p>But the trade is not one-sided, and a May 2026 arXiv paper from PwC — <em>"Is Grep All You Need? How Agent Harnesses Reshape Agentic Search"</em> — is the most useful measurement to date. Across 116 LongMemEval questions and several harness/model pairs, lexical search beat vector retrieval uniformly when results were injected <strong>inline</strong> into the context (93.1% versus 83.6% on one Claude Opus configuration, with the narrowest margin at 76.7% versus 75.0%). Yet when the same results were written to <strong>files</strong> for the agent to read rather than spliced into the prompt, the ordering reversed on half the configurations. The lesson is not "grep wins"; it is that <strong>retrieval quality is not a property of the retriever alone</strong> — the harness and the delivery mechanism move the result as much as the algorithm does.</p>
+
+    <div class="callout">
+      <p>A working dividing line. <strong>Skip the index</strong> when the corpus is on local disk, is text, has structure an agent can navigate, and is queried by identifier — code, config, logs, a docs tree. <strong>Build the index</strong> when the corpus is large and prose-heavy and the user's words will never match the document's words — support histories, contracts, papers, policy. <strong>Build both</strong> for anything serious, because the two fail on disjoint queries.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The ingest half decides your ceiling.</h3>
+
+    <p>Retrieval quality is capped by what got indexed, and on a local build there is no vendor quietly running a tuned layout parser for you. This is where most local knowledge bases lose most of their quality, invisibly:</p>
+
+    <ul>
+      <li><strong>Parse with layout awareness, not text extraction.</strong> A naive PDF-to-text pass turns a two-column paper into interleaved nonsense and a table into a word salad that will never match any query. Structure-preserving parsers, and for hard documents a vision model that reads the page as an image, are the difference between a corpus that is searchable and one that merely exists.</li>
+      <li><strong>Chunk on structure, not on character count.</strong> Split at headings, sections, function boundaries, or turn boundaries. A fixed 512-token window cutting mid-sentence produces chunks whose embedding represents nothing in particular.</li>
+      <li><strong>Carry metadata from the start.</strong> Source path, title, heading trail, timestamp, author, tenant, permission scope. Retrofitting metadata means re-ingesting; and filtering by metadata is usually a bigger quality win than tuning the vector index.</li>
+      <li><strong>Prepend context to each chunk.</strong> Storing the document title and heading path at the top of the chunk text before embedding is a cheap, large improvement — an isolated paragraph is often uninterpretable without knowing what it is a paragraph <em>of</em>.</li>
+      <li><strong>Keep a pointer to the original.</strong> Retrieve a chunk, cite a file and a line range. Answers without a path back to the source are unverifiable, which defeats the point of grounding.</li>
+    </ul>
+
+    <p>The <a class="xref" href="/deep-dives/retrieval-and-rag/document-parsing-for-rag">document parsing and ingestion quality</a> entry covers this half in depth. On a local build, budget more time for it than for anything else on this page.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Pick the embedding model, then size the machine.</h3>
+
+    <p>This is the one component where local is not a compromise. Open-weight embedding models lead the public leaderboards outright — Qwen3-Embedding tops multilingual MTEB above the major hosted endpoints, and BGE-M3 is the MIT-licensed multilingual workhorse that produces dense, sparse, and multi-vector representations in a single pass, which gives you hybrid retrieval from one model. At the small end, EmbeddingGemma and <code class="inline">nomic-embed-text</code> run in well under a gigabyte, and <code class="inline">all-MiniLM</code> is a 46 MB fallback for hardware that has nothing to spare.</p>
+
+    <p>Three numbers size the build:</p>
+
+    <ul>
+      <li><strong>Model memory.</strong> At 4-bit quantization, roughly 0.6 GB per billion parameters — so an 8B embedding model is about a 5 GB resident footprint, and a 0.6B one fits anywhere.</li>
+      <li><strong>Index memory.</strong> Raw <code class="inline">float32</code> vectors cost <em>dimensions × 4</em> bytes each. A million chunks at 1024 dimensions is about 4 GB before any index overhead. This is the number that decides whether your store can be memory-resident; scalar or binary quantization cuts it by 4× or 32× at some recall cost.</li>
+      <li><strong>Ingest time.</strong> Embedding is embarrassingly batchable and GPU-friendly; a first full index of a large corpus is an hours-long batch job, and every subsequent incremental update is seconds. Plan the first run, not the steady state.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>Pin the embedding model version and record it next to the index. Vectors from two models are not comparable, so an upgrade is a full re-embed of everything you have ever stored — and a partially-migrated index silently returns garbage rather than failing. Treat "which model produced these vectors" as a schema field, not a memory.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Pick the store by architecture, not by benchmark.</h3>
+
+    <p>On a single machine, the interesting distinction is not which product is fastest but what shape it is, because the shape decides your operational story. Four shapes cover the field:</p>
+
+    <ul>
+      <li><strong>A library, no storage.</strong> FAISS: index structures (Flat, IVF, HNSW, PQ) and GPU search, with no persistence, no metadata, no collections. You write the serialization and the metadata join yourself. Right when search is the whole problem and you already have somewhere to put the data.</li>
+      <li><strong>A SQL extension.</strong> <code class="inline">sqlite-vec</code>: pure C, no dependencies, runs anywhere SQLite runs, including WASM in a browser. Vectors become <code class="inline">vec0</code> virtual tables with typed metadata columns, partition keys for multi-tenancy, and auxiliary columns for payloads. Default search is brute-force KNN, which is exactly right up to the low hundreds of thousands of vectors and a poor fit far beyond it. Still pre-1.0.</li>
+      <li><strong>An embedded engine.</strong> Chroma: a Rust core since 1.0, log-structured — writes append to a WAL, background compaction materializes HNSW segments, reads query the segments. One import, a persistent directory, no server. The default in many framework tutorials, and the fastest path from nothing to working retrieval.</li>
+      <li><strong>A columnar format with search on top.</strong> LanceDB: data lives in the Lance columnar format on disk (or on object storage), queried in-process with IVF-PQ over memory-mapped files, plus full-text search, versioning, and zero-copy access from Arrow, Pandas, Polars, and DuckDB. Designed for corpora larger than RAM and for multimodal data.</li>
+    </ul>
+
+    <p>The selection rule that actually holds: <strong>choose by where the data has to live and how much of it there is</strong>, not by a QPS chart. If your app already ships a SQLite file, put the vectors in it. If the corpus outgrows memory, you want disk-native columnar. If you are prototyping, take the shortest import. And if the answer is "we already run Postgres," the honest recommendation is <code class="inline">pgvector</code> and a link to <a class="xref" href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">choosing a vector database</a> — a local knowledge base does not have to mean a new dependency.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Two retrievers and a reranker, not one vector search.</h3>
+
+    <p>The most common local build is dense-only top-<em>k</em>, and it is the most common reason a local knowledge base underperforms a hosted one. Keyword and vector search fail on disjoint queries — BM25 misses paraphrase, dense retrieval misses exact identifiers, rare tokens, product codes, and error strings. Running both and fusing the rankings costs one extra index and recovers a large fraction of the gap.</p>
+
+    <p>The production shape on a single machine:</p>
+
+    <ul>
+      <li><strong>Retrieve wide from two sources.</strong> BM25 (SQLite FTS5, Tantivy, or whatever your store ships) and dense vectors, roughly 50 candidates each.</li>
+      <li><strong>Fuse.</strong> Reciprocal rank fusion needs no score calibration between the two systems and is a dozen lines of code.</li>
+      <li><strong>Rerank.</strong> A local cross-encoder scores the fused candidates against the query properly, rather than by cosine proximity. This is the single highest-leverage quality upgrade available, and it is small enough to run on CPU.</li>
+      <li><strong>Cut hard.</strong> Pass the top 5–10 to the model. Context is not free, and precision at the top of the list is what changes the answer.</li>
+    </ul>
+
+    <p>Then measure it, because none of the above is worth doing blind. Twenty to fifty question-and-expected-document pairs, drawn from real questions, scored as recall@k, is enough to tell you whether a change helped. Without it you will tune chunk size by vibes for a week. See <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a> and <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">evaluating RAG</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Handing it to the agent.</h3>
+
+    <p>A knowledge base becomes agent infrastructure at the moment it is exposed as a tool, and the interface design matters as much as the retrieval quality:</p>
+
+    <ul>
+      <li><strong>Expose search, not the database.</strong> A tool called <code class="inline">search_docs(query, filters, k)</code> is a contract you can evaluate and rate-limit. A tool that executes arbitrary SQL against the index is a much larger blast radius for very little extra capability.</li>
+      <li><strong>Return citations, always.</strong> Every result carries source path and location. This is what makes an answer checkable and what lets the agent read the full document when the snippet is not enough.</li>
+      <li><strong>Let the agent search more than once.</strong> Iterative retrieval — search, read, refine, search again — beats a single top-<em>k</em> shot on hard questions, which is the whole thesis of <a class="xref" href="/deep-dives/retrieval-and-rag/agentic-retrieval">agentic retrieval</a>. Give it a budget and a stopping rule so it does not loop.</li>
+      <li><strong>Consider file delivery over inline injection.</strong> The PwC result in Step 1 suggests writing results to a scratch file the agent reads can change which retriever wins. If you support both, it is a cheap thing to A/B.</li>
+      <li><strong>MCP is the portable wrapper.</strong> An <a class="xref" href="/concepts/what-is-mcp">MCP</a> server puts the same knowledge base behind Claude Code, an IDE, and your own harness without three integrations. Chroma and Qdrant ship official servers; a thin custom server over your own search function is a small amount of code and keeps the tool surface exactly as narrow as you designed it.</li>
+    </ul>
+
+    <div class="callout danger">
+      <p>Two security facts that local storage does not fix. First, retrieved documents are untrusted input: any document that came from outside your team is a <a class="xref" href="/concepts/prompt-injection-101">prompt-injection</a> vector, and a knowledge base is a delivery mechanism that puts attacker text directly into the model's context. Second, one flat index served to everyone leaks: filter by the requesting user's permissions <em>inside</em> the retrieval call, using metadata you indexed at ingest time, and never by asking the model to be discreet.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>Keeping it alive.</h3>
+
+    <p>The unglamorous half. A knowledge base nobody maintains becomes a confident source of last year's answers, and the failure is silent because retrieval always returns <em>something</em>:</p>
+
+    <ul>
+      <li><strong>Incremental updates keyed by content hash.</strong> Re-embed a document only when its hash changes. On local disk a file watcher makes updates near-instant, which is a genuine structural advantage over upload-based platforms.</li>
+      <li><strong>Deletion must actually delete.</strong> Renames and moves orphan chunks; deletes that only remove the row leave the vector in the index. Reconcile the index against the source tree on a schedule, or the corpus quietly accumulates ghosts.</li>
+      <li><strong>Watch for index drift.</strong> Store the ingest timestamp and the embedding model version per chunk. Any query path that mixes vectors from two models is broken, and you want that to be a detectable condition rather than a mystery.</li>
+      <li><strong>Track the questions that failed.</strong> Log queries that returned nothing useful, and read them weekly. This is the cheapest possible eval-set generator and the fastest route to knowing whether your problem is parsing, chunking, or ranking.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 8</div>
+    <h3>When to build none of this.</h3>
+
+    <p>Everything above assumes you want a retrieval layer you control from parse to rank. Often you do not, and the self-hosted platform market is mature enough that assembling the pipeline yourself is the wrong default for a team that needs a working internal knowledge base this quarter rather than a tuned one next quarter. Broadly three tiers:</p>
+
+    <ul>
+      <li><strong>Turnkey platforms with a UI and connectors.</strong> RAGFlow leads on deep document understanding for messy formats; AnythingLLM is the easiest MIT-licensed self-host with document management and team features; Onyx targets the enterprise case with connectors and permission-aware search; kotaemon and Khoj sit closer to the personal end. All run fully offline against local models.</li>
+      <li><strong>Frameworks you assemble.</strong> LlamaIndex and Haystack give you the pipeline components without the product, which is the right layer when your ingestion or ranking is genuinely unusual.</li>
+      <li><strong>Graph-shaped knowledge bases.</strong> LightRAG and Cognee build a <a class="xref" href="/concepts/knowledge-graphs">knowledge graph</a> alongside the vector index and run locally — worth it only if your unanswered questions are relational or whole-corpus, since the extraction pass costs an LLM call per chunk.</li>
+    </ul>
+
+    <p>The decision is the same one you make about any infrastructure: build the layer where your requirements are genuinely specific, and take the finished product everywhere else. For most teams that means a platform for the general document corpus, and a small hand-built retriever — or plain grep — for the one corpus with unusual structure that the platform handles badly.</p>
+
+    <p>Related: <a class="xref" href="/concepts/local-knowledge-bases">local knowledge bases</a> for the concept-level version, <a class="xref" href="/concepts/small-and-local-models">small and local models</a> for the model-sizing question, and <a class="xref" href="/blogs/lancedb-vs-chroma-vs-sqlite-vec-vs-faiss">LanceDB vs Chroma vs sqlite-vec vs FAISS</a> for the store comparison in detail.</p>
+  </div>
+</section>
