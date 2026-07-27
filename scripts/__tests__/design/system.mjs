@@ -460,6 +460,58 @@ describe('design system', () => {
     });
   }
 
+  // ---- Chinese typography: no synthesised oblique -----------------------
+  //
+  // No CJK face has an italic cut — the style does not exist in Chinese
+  // typography — so `font-style: italic` on Chinese text makes the browser
+  // shear the glyphs off the fixed em grid they are drawn on. It reads as a
+  // rendering fault rather than as emphasis, and it was live on every zh
+  // lede, callout, blockquote, figcaption and <em> until 2026-07-26.
+  //
+  // tokens.css already reasoned exactly this way for Space Grotesk and
+  // JetBrains Mono ("has no italic"), and guide.css for .c-cm; it was never
+  // extended to --font-cjk. Guarding the *rendered result* rather than the
+  // rule means a new fragment, a new layout, or an inline style attribute
+  // all get caught the same way.
+  const ZH_PAGES = [
+    '/zh/', '/zh/concepts/prompt-caching/', '/zh/field-guide/prompts/',
+    '/zh/deep-dives/mcp/mcp-building-servers-in-practice/',
+  ];
+  const CJK = /[㐀-䶿一-鿿豈-﫿]/;
+
+  test('Chinese text is never rendered in a synthesised oblique', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const page = await ctx.newPage();
+    const failures = [];
+    let seen = 0;
+    for (const path of ZH_PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const rows = await page.evaluate((cjkSource) => {
+        const cjk = new RegExp(cjkSource);
+        const out = [];
+        document.querySelectorAll('body *').forEach((el) => {
+          if (el.children.length) return;
+          const text = (el.innerText || '').trim();
+          if (!text || !cjk.test(text)) return;
+          const cs = getComputedStyle(el);
+          out.push({
+            label: (el.className || el.tagName).toString().slice(0, 40),
+            style: cs.fontStyle,
+            sample: text.slice(0, 18),
+          });
+        });
+        return out;
+      }, CJK.source);
+      for (const r of rows) {
+        seen++;
+        if (r.style !== 'normal') failures.push(`${path} ${r.label} font-style:${r.style} "${r.sample}"`);
+      }
+    }
+    await ctx.close();
+    assert.ok(seen > 0, 'found no CJK text on the zh pages — the pages or the CJK range are wrong, not the design');
+    assert.deepEqual(failures, [], `Chinese text set in a synthesised oblique:\n${failures.join('\n')}`);
+  });
+
   // Proves the check above can actually fail, using the exact colour pair
   // that shipped, so it cannot go vacuously green if a selector drifts.
   test('the emphasis-surface check catches a panel that vanishes into the page', async () => {
