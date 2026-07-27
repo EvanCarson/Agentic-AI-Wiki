@@ -460,6 +460,53 @@ describe('design system', () => {
     });
   }
 
+  // ---- Horizontally scrollable content advertises itself ----------------
+  //
+  // "No horizontal overflow" (above) proves the PAGE never scrolls sideways.
+  // It says nothing about the containers that are supposed to: on
+  // /field-guide/deployment/, 9 of 25 <pre> overflowed at 1440px and 23 of
+  // 25 at 390px, worst by 355px, with no edge treatment at all. macOS and
+  // iOS paint no scrollbar until you are already scrolling, so a line cut
+  // mid-word reads as a typo rather than as more content.
+  //
+  // Checks the rendered result, not a class list, so a new scrollable
+  // component is held to the same rule. background-image is the proxy for
+  // "has an affordance" because every one of them — .site-header nav,
+  // .blog-article table, pre, .diagram — uses the same local/scroll
+  // gradient technique.
+  for (const vp of [{ w: 390 }, { w: 1280 }]) {
+    test(`horizontally scrollable containers show a scroll affordance @ ${vp.w}px`, async () => {
+      const ctx = await browser.newContext({ viewport: { width: vp.w, height: 900 } });
+      const page = await ctx.newPage();
+      const failures = [];
+      let seen = 0;
+      for (const path of PAGES) {
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const rows = await page.evaluate(() => {
+          const out = [];
+          document.querySelectorAll('body *').forEach((el) => {
+            if (el.scrollWidth <= el.clientWidth + 1) return;
+            const cs = getComputedStyle(el);
+            if (!/auto|scroll/.test(cs.overflowX)) return;
+            out.push({
+              label: (el.className || el.tagName).toString().slice(0, 40),
+              over: el.scrollWidth - el.clientWidth,
+              bgImage: cs.backgroundImage === 'none' ? 'none' : 'present',
+            });
+          });
+          return out;
+        });
+        for (const r of rows) {
+          seen++;
+          if (r.bgImage === 'none') failures.push(`${path} ${r.label} overflows by ${r.over}px with no affordance`);
+        }
+      }
+      await ctx.close();
+      assert.ok(seen > 0, `found no horizontally scrollable container at ${vp.w}px — the walk is wrong, not the design`);
+      assert.deepEqual(failures, [], `content scrolls sideways with nothing to say so:\n${failures.join('\n')}`);
+    });
+  }
+
   // ---- Chinese typography: no synthesised oblique -----------------------
   //
   // No CJK face has an italic cut — the style does not exist in Chinese
