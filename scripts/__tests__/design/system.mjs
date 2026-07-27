@@ -184,6 +184,22 @@ describe('design system', () => {
     }
   }
 
+  // 375px added when the nav became a panel: the header lost its shrink
+  // absorber (the scroller), so "fits at 390" stopped implying "fits on an
+  // iPhone SE". 390 alone would have shipped a 15px overflow there.
+  test('no horizontal overflow at 375px', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 375, height: 812 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const over = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
+      if (over) bad.push(path);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `pages scroll horizontally: ${bad.join(', ')}`);
+  });
+
   test('no horizontal overflow at 390px', async () => {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
     const page = await ctx.newPage();
@@ -220,11 +236,29 @@ describe('design system', () => {
     await page.goto(server.url + '/concepts/prompt-caching/', { waitUntil: 'load' });
     const h = await page.evaluate(() => {
       const el = document.querySelector('.site-header');
-      const rows = new Set([...el.querySelectorAll('nav a')].map((a) => Math.round(a.getBoundingClientRect().top)));
-      return { height: Math.round(el.getBoundingClientRect().height), rows: rows.size };
+      // Count rows only among links that are IN the header's flow. The
+      // disclosure panel is position:absolute — it is stacked by design and
+      // costs the header no height, so counting its 8 links as 8 header rows
+      // measures the wrong thing. What this test exists to catch is the
+      // header BOX growing (the 155px wrapped nav of 2026-07-25), and the
+      // height assertion below plus the in-flow row count still catch it.
+      // Reachability of the panel's links is asserted separately, at five
+      // widths, by "every primary nav link is reachable".
+      const inFlow = [...el.querySelectorAll('nav a')].filter(
+        (a) => getComputedStyle(a.closest('nav')).position !== 'absolute'
+      );
+      const rows = new Set(inFlow.map((a) => Math.round(a.getBoundingClientRect().top)));
+      return {
+        height: Math.round(el.getBoundingClientRect().height),
+        rows: rows.size,
+        inFlow: inFlow.length,
+      };
     });
     await ctx.close();
     assert.ok(h.height <= 60, `header is ${h.height}px, expected <= 60`);
+    // At 390px the primary nav is a panel, so the only in-flow nav links are
+    // the language switcher's. Zero would mean the selector stopped matching.
+    assert.ok(h.inFlow > 0, 'no in-flow header nav links found — selector is wrong, not the design');
     assert.equal(h.rows, 1, `header nav wraps to ${h.rows} rows, expected 1`);
   });
 
@@ -259,6 +293,13 @@ describe('design system', () => {
     const squeezed = await page.evaluate(() => {
       const measure = document.createElement('canvas').getContext('2d');
       return [...document.querySelectorAll('.site-header .brand, .site-header nav a, .lang-switch a')]
+        // A control that is not rendered cannot be squeezed. innerText falls
+        // back to textContent for display:none, so without this the hidden
+        // language link reports "needed 40, actual 0" and fails on an element
+        // nobody can see. getClientRects() is the check that distinguishes
+        // "not displayed" from "displayed at zero width" — the latter is a
+        // real squeeze and still fails.
+        .filter((el) => el.getClientRects().length > 0)
         .map((el) => {
           const cs = getComputedStyle(el);
           measure.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
@@ -458,6 +499,64 @@ describe('design system', () => {
       assert.ok(seen > 0, 'found no element painted with --surface-inverse: the probe or the token name is wrong, not the design');
       assert.deepEqual(failures, [], `emphasis surfaces that vanish into the page:\n${failures.join('\n')}`);
     });
+  }
+
+  // ---- Primary nav reachability -----------------------------------------
+  //
+  // The gap that let a broken nav ship green. "mobile header is a single
+  // row", "header height <= 60px" and "tap targets >= 44px" were all
+  // satisfied by making .site-header nav an unconditional overflow-x
+  // scroller — while nav content is 747px wide (525px zh) and only fully
+  // visible at >=1180px. At 390px, 40px of nav was on screen: the letters
+  // "FIEL". Not one assertion asked whether a link could be reached.
+  //
+  // Asserts the behaviour, not the mechanism: either every link is fully
+  // inside the nav's box, or a toggle exists that puts them there. A future
+  // redesign is free to change the pattern and stays honest.
+  for (const w of [390, 768, 1024, 1280, 1440]) {
+    for (const path of ['/concepts/prompt-caching/', '/zh/concepts/prompt-caching/']) {
+      test(`every primary nav link is reachable @ ${w}px ${path.startsWith('/zh') ? 'zh' : 'en'}`, async () => {
+        const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+        const page = await ctx.newPage();
+        await page.goto(server.url + path, { waitUntil: 'load' });
+
+        const collapsed = await page.evaluate(() => {
+          const b = document.getElementById('nav-toggle');
+          return !!b && getComputedStyle(b).display !== 'none';
+        });
+
+        // Closed disclosure must actually conceal its links, or the "panel"
+        // is just an unstyled list sitting over the page.
+        if (collapsed) {
+          const leaking = await page.evaluate(() =>
+            [...document.querySelectorAll('#site-nav a')]
+              .filter((a) => getComputedStyle(a).visibility !== 'hidden').length
+          );
+          assert.equal(leaking, 0, `${w}px: ${leaking} nav links visible while the menu is closed`);
+          await page.click('#nav-toggle');
+        }
+
+        const unreachable = await page.evaluate((vw) => {
+          const nav = document.getElementById('site-nav');
+          const box = nav.getBoundingClientRect();
+          const out = [];
+          nav.querySelectorAll('a').forEach((a) => {
+            const r = a.getBoundingClientRect();
+            const cs = getComputedStyle(a);
+            const clipped = r.left < box.left - 0.5 || r.right > box.right + 0.5;
+            const offscreen = r.left < -0.5 || r.right > vw + 0.5;
+            if (cs.visibility === 'hidden' || r.width < 1 || clipped || offscreen) {
+              out.push(`${a.textContent.trim()} [${Math.round(r.left)}..${Math.round(r.right)}] in nav [${Math.round(box.left)}..${Math.round(box.right)}]`);
+            }
+          });
+          return out;
+        }, w);
+
+        await ctx.close();
+        assert.deepEqual(unreachable, [],
+          `nav links not reachable at ${w}px (collapsed=${collapsed}):\n${unreachable.join('\n')}`);
+      });
+    }
   }
 
   // ---- Horizontally scrollable content advertises itself ----------------
