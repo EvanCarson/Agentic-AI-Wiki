@@ -35,7 +35,9 @@ export interface UIStrings {
   home: { kicker: string; h1Html: string; lede: string;
           featuredKicker: string; featuredTitle: string;
           parts: string; chapters: string; startReading: string;
-          latest: string };
+          latest: string;
+          entries: string; updated: string; exploreKicker: string;
+          seeAllChapters: string; browseAll: string };
   fg: { metaTitle: string; metaDesc: string };
   concepts: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
               readingPath: { badge: string; intro: string; escapePrefix: string; escapeLinkLabel: string } };
@@ -114,6 +116,8 @@ export const ui: Record<Locale, UIStrings> = {
       featuredTitle: 'The Agentic AI Field Guide',
       parts: 'parts', chapters: 'chapters', startReading: 'Start reading →',
       latest: 'Latest',
+      entries: 'entries', updated: 'Updated', exploreKicker: 'Everything else',
+      seeAllChapters: 'See all chapters →', browseAll: 'Browse all →',
     },
     fg: { metaTitle: 'The Agentic AI Field Guide',
           metaDesc: "A working engineer's guide to building agentic systems, end to end." },
@@ -245,6 +249,8 @@ export const ui: Record<Locale, UIStrings> = {
       featuredTitle: 'Agentic AI 实战指南',
       parts: '部分', chapters: '章', startReading: '开始阅读 →',
       latest: '最新',
+      entries: '条', updated: '更新于', exploreKicker: '其余内容',
+      seeAllChapters: '查看全部章节 →', browseAll: '浏览全部 →',
     },
     fg: { metaTitle: 'Agentic AI 实战指南',
           metaDesc: '一线工程师的智能体系统构建全程指南。' },
