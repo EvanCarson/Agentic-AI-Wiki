@@ -3,8 +3,10 @@ import type { Locale } from './index';
 export interface UIStrings {
   brand: string;
   tagline: string;
-  nav: { fieldGuide: string; concepts: string; deepDives: string; playbooks: string; operations: string; blog: string; changelog: string; about: string };
+  nav: { fieldGuide: string; concepts: string; deepDives: string; playbooks: string; operations: string; blog: string; changelog: string; about: string;
+         menu: string; menuOpen: string; menuClose: string };
   switcher: { en: string; zh: string; aria: string };
+  footer: { sections: string; project: string; language: string; privacy: string; nav: string };
   search: {
     open: string;        // accessible label / tooltip for the trigger button
     label: string;       // visible short label next to the icon
@@ -76,8 +78,10 @@ export const ui: Record<Locale, UIStrings> = {
   en: {
     brand: 'Agentic AI Wiki',
     tagline: 'Agentic AI Wiki — knowledge, written to last.',
-    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', blog: 'AI Blog', changelog: 'Changelog', about: 'About' },
+    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', blog: 'AI Blog', changelog: 'Changelog', about: 'About',
+           menu: 'Menu', menuOpen: 'Open navigation menu', menuClose: 'Close navigation menu' },
     switcher: { en: 'EN', zh: '中文', aria: 'Language' },
+    footer: { sections: 'Sections', project: 'Project', language: 'Language', privacy: 'Privacy', nav: 'Site' },
     search: {
       open: 'Search the wiki',
       label: 'Search',
@@ -205,8 +209,10 @@ export const ui: Record<Locale, UIStrings> = {
   zh: {
     brand: 'Agentic AI 维基',
     tagline: 'Agentic AI 维基 — 沉淀长期有效的知识。',
-    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', blog: 'AI 博客', changelog: '更新日志', about: '关于' },
+    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', blog: 'AI 博客', changelog: '更新日志', about: '关于',
+           menu: '菜单', menuOpen: '打开导航菜单', menuClose: '关闭导航菜单' },
     switcher: { en: 'EN', zh: '中文', aria: '语言' },
+    footer: { sections: '内容板块', project: '关于本站', language: '语言', privacy: '隐私政策', nav: '站点导航' },
     search: {
       open: '搜索本维基',
       label: '搜索',
