@@ -37,7 +37,8 @@ export interface UIStrings {
           parts: string; chapters: string; startReading: string;
           latest: string;
           entries: string; updated: string; exploreKicker: string;
-          seeAllChapters: string; browseAll: string };
+          seeAllChapters: string; browseAll: string;
+          fromTheBlog: string; readPost: string; morePosts: string };
   fg: { metaTitle: string; metaDesc: string };
   concepts: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
               readingPath: { badge: string; intro: string; escapePrefix: string; escapeLinkLabel: string } };
@@ -70,7 +71,7 @@ export interface UIStrings {
            coveredH: string; coveredHtml: string;
            maintainerH: string; maintainerHtml: string;
            contactH: string; contactHtml: string };
-  changelog: { kicker: string; metaTitle: string; metaDesc: string; h1: string; intro: string };
+  changelog: { kicker: string; metaTitle: string; metaDesc: string; h1: string; intro: string; jumpTo: string };
   og: { tagline: string };
   theme: { ariaLight: string; ariaDark: string; ariaAuto: string };
   seriesTitle: string;
@@ -118,6 +119,7 @@ export const ui: Record<Locale, UIStrings> = {
       latest: 'Latest',
       entries: 'entries', updated: 'Updated', exploreKicker: 'Everything else',
       seeAllChapters: 'See all chapters →', browseAll: 'Browse all →',
+      fromTheBlog: 'From the blog', readPost: 'Read the post →', morePosts: 'All posts →',
     },
     fg: { metaTitle: 'The Agentic AI Field Guide',
           metaDesc: "A working engineer's guide to building agentic systems, end to end." },
@@ -198,7 +200,7 @@ export const ui: Record<Locale, UIStrings> = {
       maintainerHtml: 'Built and maintained by <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">Chen Qian</a> as an independent, open project.',
       contactH: 'Contributing & contact',
       contactHtml: 'Corrections, suggestions, and new entries are welcome — open an issue or pull request on <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a>, or reach out via <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a>.' },
-    changelog: { kicker: 'Changelog', metaTitle: 'Changelog — Agentic AI Wiki',
+    changelog: { jumpTo: 'Jump to', kicker: 'Changelog', metaTitle: 'Changelog — Agentic AI Wiki',
       metaDesc: 'What changed on the Agentic AI Wiki, newest first.',
       h1: 'Changelog',
       intro: 'Notable changes to this site — new sections, content, and improvements.' },
@@ -251,6 +253,7 @@ export const ui: Record<Locale, UIStrings> = {
       latest: '最新',
       entries: '条', updated: '更新于', exploreKicker: '其余内容',
       seeAllChapters: '查看全部章节 →', browseAll: '浏览全部 →',
+      fromTheBlog: '博客精选', readPost: '阅读全文 →', morePosts: '全部文章 →',
     },
     fg: { metaTitle: 'Agentic AI 实战指南',
           metaDesc: '一线工程师的智能体系统构建全程指南。' },
@@ -331,7 +334,7 @@ export const ui: Record<Locale, UIStrings> = {
       maintainerHtml: '由 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">Chen Qian</a> 独立构建与维护的开放项目。',
       contactH: '贡献与联系',
       contactHtml: '欢迎纠错、建议与新增词条 — 在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a> 提交 issue 或 pull request，或通过 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a> 联系。' },
-    changelog: { kicker: '更新日志', metaTitle: '更新日志 — Agentic AI 维基',
+    changelog: { jumpTo: '快速跳转', kicker: '更新日志', metaTitle: '更新日志 — Agentic AI 维基',
       metaDesc: '本站的变更记录，按时间倒序。',
       h1: '更新日志',
       intro: '本站的重要变更 — 新板块、新内容与改进。' },
