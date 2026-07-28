@@ -343,7 +343,7 @@ No geometry changes. This alone fixes 768px (80ch → 70ch) and every index page
 **Files:**
 - Modify: `src/styles/guide.css` (`.outro p` at ~line 856; new block appended near the phase body rules)
 - Modify: `src/styles/site.css` (index-page prose)
-- Modify: `src/layouts/BlogLayout.astro` (scoped block — a global rule cannot reach it)
+- Not modified: `src/layouts/BlogLayout.astro` — it already carries its own measured 58ch cap (see Step 5)
 - Test: `scripts/__tests__/design/system.mjs`
 
 **Interfaces:**
@@ -375,6 +375,7 @@ In `scripts/__tests__/design/system.mjs`, replace the whole existing `test('pros
     '/changelog/',
     '/blogs/',
     '/about/',
+    '/privacy/',
     '/zh/concepts/prompt-caching/',
   ];
 
@@ -498,8 +499,13 @@ Then append this block to `src/styles/guide.css`, immediately before the `/* ===
  * widening: 768px measured 80 characters, and no index page had a max-width
  * at all (97-108 characters).
  *
- * Deliberately NOT applied to pre, table, .diagram, .threat-grid, .callout,
- * .deliverable, .qa or .code-tabs. Those are the reason for the extra width. */
+ * Applies to prose wherever it sits, including inside .callout, .deliverable,
+ * .qa and .observe — those are prose boxes whose SURFACE spans the column
+ * while their content is ordinary running text, and an uncapped .deliverable p
+ * measured 82 characters at 768px. What is exempt is the non-prose content
+ * that the extra column width exists for in the first place: pre, table,
+ * .diagram, .threat-grid and .code-tabs are never selected here, so they are
+ * exempt by construction rather than by reset. */
 .phase p,
 .step p,
 .step ul li,
@@ -520,7 +526,15 @@ Append to `src/styles/site.css`, at the end of the file:
    97 characters, changelog entries 98, blog card summaries 108, About ledes
    87 and home card taglines 102. Capping them shortens lines that were
    already too long, and it is what lets .wrap widen in a later commit without
-   the extra width turning into extra line length. */
+   the extra width turning into extra line length.
+
+   `.lede` is deliberately bare rather than `.hero .lede`. It started as
+   `.hero .lede`, which never matched the About page (AboutView puts the lede
+   inside `<section class="wrap">`, not inside the hero). Unscoping it also
+   reaches /privacy/ and /zh/privacy/, which use the class on nine body
+   elements — two of them `<ul>`s — not just on a hero lede. That is intended:
+   those paragraphs were running ~82 characters. /privacy/ is in the design
+   suite's MEASURE_PAGES so the wider reach stays tested. */
 .lede,
 .toc-desc,
 .home-card-tagline,
@@ -533,20 +547,9 @@ Append to `src/styles/site.css`, at the end of the file:
 
 `.entry-summary` does not exist yet — it is the class Task 7 gives the entry summary that is currently an inline-styled `<div>` in `SectionIndexView.astro`. Declaring it here now is deliberate: the rule is inert until Task 7 lands, and the alternative (adding it in Task 7) splits one concept across two commits. The `/concepts/` measure assertion therefore still fails after this task and passes after Task 7.
 
-- [ ] **Step 5: Cap blog prose inside BlogLayout's own style block**
+- [ ] **Step 5: Blog prose — no rule to add**
 
-A rule in `site.css` is (0,1,1); Astro appends an `.astro-XXXX` class to every selector in a component `<style>` block, making its rules (0,2,1). A global `.blog-article p` cap would lose. Add this inside `src/layouts/BlogLayout.astro`'s existing `<style is:global>` block, immediately after the `.blog-article { padding: 0 var(--s-4); }` rule:
-
-```css
-  /* Capped here rather than in site.css: Astro scopes this block, so its
-     rules outrank any global selector of the same shape. A cap written in
-     site.css would compute as if it were never declared. */
-  .blog-article p,
-  .blog-article > section > ul li,
-  .blog-article > section > ol li {
-    max-width: var(--w-measure);
-  }
-```
+`BlogLayout.astro` already carries its own measure cap, predating this branch: `.blog-article p, ul, ol, blockquote, h2, h3, .blog-header-summary { max-width: 58ch; }`, with its own in-browser provenance in the comment above it (`ch` is the width of "0", wider than the average lowercase glyph, so 58ch lands at ~70 real characters). This task adds **no** blog rule. A `var(--w-measure)` rule was added here originally and removed as dead code: it sat earlier in the same scoped block at identical specificity, so the 58ch rule won and the token rule never applied. Swapping the 58ch rule to the token is a separate change — it would move every post from ~70 to ~74 characters — and is out of scope here.
 
 - [ ] **Step 6: Run the guard**
 
@@ -568,36 +571,49 @@ intermediate state, not a permanent exemption). This is the expected
 intermediate state; record it so the next task's reviewer knows what is
 outstanding.
 
-- [ ] **Step 7: Confirm the blog cap took effect, from computed styles not source**
+- [ ] **Step 7: Assert the blog measure as an outcome, from computed styles not source**
 
-The article and index caps are proven by Step 6's numbers — 768px cannot move from 80 to ≤78 characters unless the cap computed. The blog cap is the one at risk, because it depends on Astro scoping resolving the way this plan claims. Assert it directly by appending to `scripts/__tests__/design/system.mjs`, inside the `describe` block:
+The article and index caps are proven by Step 6's numbers — 768px cannot move from 80 to ≤78 characters unless the cap computed. The blog is measured separately because its cap lives in `BlogLayout.astro` rather than in either stylesheet. Assert the **character count**, not the presence of a `max-width`: an earlier version of this test asserted only `maxW !== 'none'` and `width <= 700px`, which passed identically whether the token rule applied or the pre-existing 58ch rule did — and the 58ch rule was in fact the one winning, so the assertion verified a mechanism it could not see. Append to `scripts/__tests__/design/system.mjs`, inside the `describe` block:
 
 ```js
-  // The blog cap lives in BlogLayout's scoped <style is:global> block rather
-  // than site.css, because Astro appends a scope class to every selector
-  // there and a global rule of the same shape would lose. That reasoning is
-  // only correct if the computed value says so.
-  test('blog prose is capped by --w-measure', async () => {
+  // Renamed from "blog prose is capped by --w-measure", which asserted only
+  // that a max-width existed. It passed identically whether this branch's
+  // token rule applied or the pre-existing 58ch rule did — and in fact the
+  // 58ch rule won, later in the same scoped block at equal specificity, so
+  // the assertion verified a mechanism it could not see. Assert the outcome.
+  test('blog prose measures 60-78 characters', async () => {
     const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await ctx.newPage();
-    await page.goto(server.url + '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/', { waitUntil: 'load' });
-    const got = await page.evaluate(() => {
-      const p = [...document.querySelectorAll('.blog-article p')].find((x) => x.innerText.trim().length > 250);
-      return p ? { maxW: getComputedStyle(p).maxWidth, w: Math.round(p.getBoundingClientRect().width) } : null;
-    });
+    const bad = [];
+    for (const path of [
+      '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+      '/zh/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+    ]) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const got = await page.evaluate(() => {
+        const el = [...document.querySelectorAll('.blog-article p')].find((x) => x.innerText.trim().length > 250);
+        if (!el) return null;
+        const cs = getComputedStyle(el);
+        const c = document.createElement('canvas').getContext('2d');
+        c.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+        const ab = 'abcdefghijklmnopqrstuvwxyz ';
+        const w = el.getBoundingClientRect().width;
+        return { chars: Math.round(w / (c.measureText(ab).width / ab.length)), w: Math.round(w) };
+      });
+      if (!got) { bad.push(`${path} found no .blog-article p over 250 chars`); continue; }
+      if (got.chars < 60 || got.chars > 78) bad.push(`${path} = ${got.chars} chars (${got.w}px)`);
+    }
     await ctx.close();
-    assert.ok(got, 'found no .blog-article p over 250 chars — the selector is stale');
-    assert.notEqual(got.maxW, 'none', 'blog prose has no max-width — the scoped cap did not apply');
-    assert.ok(got.w <= 700, `blog prose is ${got.w}px, want <=700px`);
+    assert.deepEqual(bad, [], `blog measure out of range:\n${bad.join('\n')}`);
   });
 ```
 
-Run `npm run test:design 2>&1 | grep -A3 "blog prose is capped"`. Expected: PASS. If `maxW` computes to `none`, the cap was written in the wrong file — move it into `BlogLayout.astro`'s own `<style is:global>` block and re-run before continuing.
+Run `npm run test:design 2>&1 | grep -A3 "blog prose measures"`. Expected: PASS, at 69 characters (en) and 70 (zh).
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/styles/guide.css src/styles/site.css src/layouts/BlogLayout.astro scripts/__tests__/design/system.mjs
+git add src/styles/guide.css src/styles/site.css scripts/__tests__/design/system.mjs
 git commit -m "fix(design): cap running text at the measure; widen the guard
 
 The measure guard ran at one viewport against three article pages, so three
@@ -605,8 +621,8 @@ defects shipped green: 30 characters at 901px, 80 at 768px, and 97-108 on
 every index page, none of which had a max-width at all. The guard now runs
 at ten viewports across article and index pages in both locales.
 
-The blog cap lives in BlogLayout's scoped block because Astro scoping makes
-its rules outrank any global selector of the same shape.
+The blog needs no rule: BlogLayout already carries its own measured 58ch cap,
+asserted here as a character count rather than as the presence of a max-width.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01XQpNvBzrE9ueMsrK72nw4A"
@@ -1067,7 +1083,7 @@ Expected: `safe to remove` after the two edits above.
 npm run build && npm run test:design 2>&1 | grep -E "blog shell uses|prose measure"
 ```
 
-Expected: `blog shell uses` PASS, reporting a 1056px article column. `prose measure` unchanged from Task 5 — the blog's prose is capped by `--w-measure` from Task 3, so widening its column gives the wide tables room without touching the line length.
+Expected: `blog shell uses` PASS, reporting a 1056px article column. `prose measure` unchanged from Task 5 — the blog's prose is capped at 58ch by `BlogLayout.astro`'s own pre-existing rule (Task 3 Step 5), so widening its column gives the wide tables room without touching the line length.
 
 - [ ] **Step 6: Commit**
 
