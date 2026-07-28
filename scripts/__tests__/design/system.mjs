@@ -926,4 +926,60 @@ describe('design system', () => {
       `expected the edged panel to pass, scored ${separation(edged)}`
     );
   });
+
+  // The reported bug: at 1728px the shell froze at 1180px and spent 274px per
+  // side — 15.9% of the viewport — on dead margin, while the article carried
+  // 536px of prose. No reference documentation site measured caps at 1180.
+  for (const w of [1440, 1728]) {
+    test(`article shell leaves no dead gutter @ ${w}px`, async () => {
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      const bad = [];
+      for (const path of ['/field-guide/llm-mental-model/', '/concepts/prompt-caching/', '/zh/concepts/prompt-caching/']) {
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const pct = await page.evaluate(() => {
+          const el = document.querySelector('.chapter-shell');
+          if (!el) return null;
+          return Math.round((el.getBoundingClientRect().left / window.innerWidth) * 1000) / 10;
+        });
+        if (pct === null) { bad.push(`${path} has no .chapter-shell`); continue; }
+        if (pct > 12) bad.push(`${path} gutter ${pct}% of viewport`);
+      }
+      await ctx.close();
+      assert.deepEqual(bad, [], `dead gutter over 12% @ ${w}px:\n${bad.join('\n')}`);
+    });
+  }
+
+  // Both rails switched on at 901px against a shell that had no width to give
+  // them, leaving the article 353px and the prose 257px — 30 characters. The
+  // ladder below is derived: the TOC rail plus its gap costs 296px, so below
+  // ~1290px the remaining column cannot hold 60 characters at 16px.
+  test('rails only appear where the column can still hold 60 characters', async () => {
+    const bad = [];
+    for (const [w, wantNav, wantToc] of [
+      [900, false, false], [1023, false, false],
+      [1024, true, false], [1359, true, false],
+      [1360, true, true], [1728, true, true],
+    ]) {
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      await page.goto(server.url + '/field-guide/llm-mental-model/', { waitUntil: 'load' });
+      const got = await page.evaluate(() => {
+        const railed = (sel) => {
+          const el = document.querySelector(sel);
+          if (!el) return false;
+          const cs = getComputedStyle(el);
+          if (cs.display === 'none') return false;
+          // A rail is a rail only while it is beside the article. The TOC
+          // below 1360px is in flow above it at full width, which is not a rail.
+          return el.getBoundingClientRect().width < window.innerWidth * 0.5;
+        };
+        return { nav: railed('.chapter-side'), toc: railed('.chapter-toc') };
+      });
+      await ctx.close();
+      if (got.nav !== wantNav) bad.push(`@${w}px nav rail ${got.nav}, want ${wantNav}`);
+      if (got.toc !== wantToc) bad.push(`@${w}px toc rail ${got.toc}, want ${wantToc}`);
+    }
+    assert.deepEqual(bad, [], `breakpoint ladder wrong:\n${bad.join('\n')}`);
+  });
 });

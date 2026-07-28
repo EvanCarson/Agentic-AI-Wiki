@@ -830,7 +830,7 @@ with:
 npm run build && npm run test:design 2>&1 | grep -E "dead gutter|breakpoint ladder|prose measure"
 ```
 
-Expected: `dead gutter` PASS at both widths. `breakpoint ladder` PASS. `prose measure` now passes at 390, 430, 768, 901, 1024, 1152, 1280 — and **fails at 1360, 1440, 1728**, reporting ~79 characters, because the column is now wide but the type has not stepped up yet. That failure is Task 5's job and is expected here.
+Expected: `dead gutter` PASS at both widths. `breakpoint ladder` PASS. `prose measure` PASSES at all ten widths — 390, 430, 768, 901, 1024, 1152, 1280, 1360, 1440, 1728 — because the measure cap (`--w-measure`, already wired into `guide.css`, `site.css` and `BlogLayout.astro` by an earlier task) bounds the widened column at 62ch regardless of the raw column width; expect roughly 74 characters at the capped widths and 64 at 1024. `every audited page is measured at some width` still fails, naming `/concepts/` only — its entry summaries get their class in a later task, not this one.
 
 - [ ] **Step 6: Verify the numbers against the plan's reference table**
 
@@ -1843,6 +1843,6 @@ BODY
 
 **Spec coverage.** §4 tokens → Task 2. §4.1 `--w-measure` → Tasks 2, 3. §4.2 `--t-prose` → Tasks 2, 5. §5 shell → Task 4. §5.1 ladder → Task 4. §5.3 TOC accordion → Task 4. §5.4 blog → Task 6. §6 index pages → Tasks 7, 8. §7 guard → assertions distributed across Tasks 3–8, proof-of-failure in Task 9. §8 phone safety → Tasks 1, 9. §9 gates → Task 10. §10 out of scope → nothing in any task touches the 320px overflow, Field Guide dates, or `.callout.tip`.
 
-**Known intermediate red states**, deliberate and called out where they occur: Task 3 leaves `prose measure` failing at 901 and 1024 only, on the four article pages (shell not yet widened), plus the separate coverage test failing on `/concepts/` (`.entry-summary` not yet emitted). Task 4 leaves it failing at 1360–1728 (type not yet stepped). Task 5 leaves `/concepts/` failing until Task 7. Every other task ends green.
+**Known intermediate red states**, deliberate and called out where they occur: Task 3 leaves `prose measure` failing at 901 and 1024 only, on the four article pages (shell not yet widened), plus the separate coverage test failing on `/concepts/` (`.entry-summary` not yet emitted). Task 4 widens the shell but, because the measure cap already bounds the column at 62ch, `prose measure` passes at every width once Task 4 lands — the `/concepts/` coverage failure is the only one that survives, until Task 7. Every other task ends green.
 
 **Names used consistently across tasks:** `--w-shell`, `--w-wrap`, `--w-rail-nav`, `--w-rail-toc`, `--w-measure`, `--t-prose`, `.entry-list`, `.entry-item`, `.entry-link`, `.entry-title`, `.entry-summary`, `.group-card-grid`, `.wrap--prose`, `.about-body`, `.privacy-body`, `MEASURE_WIDTHS`, `MEASURE_PAGES`, `measureChars`.
