@@ -430,7 +430,12 @@ In `scripts/__tests__/design/system.mjs`, replace the whole existing `test('pros
         await page.goto(server.url + path, { waitUntil: 'load' });
         const { max, worst, seen } = await page.evaluate(measureChars);
         total += seen;
-        if (seen === 0) { bad.push(`${path} matched no measurable text block`); continue; }
+        // A page with no multi-line prose at this width is not a failure —
+        // /changelog/ below 900px is entirely inside a collapsed <details>
+        // and its hero lede is 74 characters, so nothing on it can wrap.
+        // Coverage is enforced across widths by the assertion below instead,
+        // so a page cannot silently drop out of the audit.
+        if (seen === 0) continue;
         if (max < floor || max > ceiling) bad.push(`${path} = ${max} chars (${worst})`);
       }
       await ctx.close();
@@ -438,6 +443,27 @@ In `scripts/__tests__/design/system.mjs`, replace the whole existing `test('pros
       assert.deepEqual(bad, [], `measure outside ${floor}-${ceiling} @ ${w}px:\n${bad.join('\n')}`);
     });
   }
+
+  // Per-width vacuity is legitimate; permanent vacuity is not. Every page in
+  // the audit must yield a real measurement at at least one width, or it is
+  // being listed as covered while contributing nothing — the "coverage
+  // pretending to be coverage" failure this suite already guards elsewhere.
+  test('every audited page is measured at some width', async () => {
+    const uncovered = [];
+    for (const path of MEASURE_PAGES) {
+      let covered = false;
+      for (const w of MEASURE_WIDTHS) {
+        const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+        const page = await ctx.newPage();
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const { seen } = await page.evaluate(measureChars);
+        await ctx.close();
+        if (seen > 0) { covered = true; break; }
+      }
+      if (!covered) uncovered.push(path);
+    }
+    assert.deepEqual(uncovered, [], `measured at no width — listed as covered, contributes nothing:\n${uncovered.join('\n')}`);
+  });
 ```
 
 - [ ] **Step 2: Run it to verify it fails, and record which widths fail**
@@ -528,7 +554,19 @@ A rule in `site.css` is (0,1,1); Astro appends an `.astro-XXXX` class to every s
 npm run build && npm run test:design 2>&1 | grep -E "prose measure"
 ```
 
-Expected: passes at 390, 430, 768 and 901. Fails 1024 through 1728 — on `/concepts/` only (`.entry-summary` not emitted until Task 7), and, at 1024 and 1152, additionally the article-shell narrowing that Task 4 fixes. `/changelog/` and `/about/` are fully resolved at every width. This is the expected intermediate state; record it so the next task's reviewer knows what is outstanding.
+Expected: `prose measure` PASSES at 390, 430, 768, 1152, 1280, 1360, 1440 and 1728. It FAILS at 901 and 1024 only, and only on the four article pages, reporting roughly 30 and 45 characters — the starved article column that Task 4 widens. `/changelog/` and `/about/` are fully resolved at every width.
+
+A page with no multi-line prose at a given width (e.g. `/changelog/` below
+900px, entirely inside a collapsed `<details>`, hero lede 74 characters) is
+**not** a per-width failure — a block shorter than the measure can never
+produce a long line, so there is nothing to check. Silently dropping the
+check per-width would let a page fall out of coverage unnoticed, so coverage
+is enforced separately, across widths, by `every audited page is measured at
+some width`: that test FAILS, naming `/concepts/` only (its entry summaries
+aren't measurable until Task 7's `.entry-summary` class lands — a documented
+intermediate state, not a permanent exemption). This is the expected
+intermediate state; record it so the next task's reviewer knows what is
+outstanding.
 
 - [ ] **Step 7: Confirm the blog cap took effect, from computed styles not source**
 

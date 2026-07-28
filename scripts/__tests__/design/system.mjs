@@ -465,7 +465,12 @@ describe('design system', () => {
         await page.goto(server.url + path, { waitUntil: 'load' });
         const { max, worst, seen } = await page.evaluate(measureChars);
         total += seen;
-        if (seen === 0) { bad.push(`${path} matched no measurable text block`); continue; }
+        // A page with no multi-line prose at this width is not a failure —
+        // /changelog/ below 900px is entirely inside a collapsed <details>
+        // and its hero lede is 74 characters, so nothing on it can wrap.
+        // Coverage is enforced across widths by the assertion below instead,
+        // so a page cannot silently drop out of the audit.
+        if (seen === 0) continue;
         if (max < floor || max > ceiling) bad.push(`${path} = ${max} chars (${worst})`);
       }
       await ctx.close();
@@ -473,6 +478,27 @@ describe('design system', () => {
       assert.deepEqual(bad, [], `measure outside ${floor}-${ceiling} @ ${w}px:\n${bad.join('\n')}`);
     });
   }
+
+  // Per-width vacuity is legitimate; permanent vacuity is not. Every page in
+  // the audit must yield a real measurement at at least one width, or it is
+  // being listed as covered while contributing nothing — the "coverage
+  // pretending to be coverage" failure this suite already guards elsewhere.
+  test('every audited page is measured at some width', async () => {
+    const uncovered = [];
+    for (const path of MEASURE_PAGES) {
+      let covered = false;
+      for (const w of MEASURE_WIDTHS) {
+        const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+        const page = await ctx.newPage();
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const { seen } = await page.evaluate(measureChars);
+        await ctx.close();
+        if (seen > 0) { covered = true; break; }
+      }
+      if (!covered) uncovered.push(path);
+    }
+    assert.deepEqual(uncovered, [], `measured at no width — listed as covered, contributes nothing:\n${uncovered.join('\n')}`);
+  });
 
   // The blog cap lives in BlogLayout's scoped <style is:global> block rather
   // than site.css, because Astro appends a scope class to every selector
