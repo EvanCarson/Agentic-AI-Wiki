@@ -410,6 +410,7 @@ describe('design system', () => {
     '/changelog/',
     '/blogs/',
     '/about/',
+    '/privacy/',
     '/zh/concepts/prompt-caching/',
   ];
 
@@ -500,22 +501,35 @@ describe('design system', () => {
     assert.deepEqual(uncovered, [], `measured at no width — listed as covered, contributes nothing:\n${uncovered.join('\n')}`);
   });
 
-  // The blog cap lives in BlogLayout's scoped <style is:global> block rather
-  // than site.css, because Astro appends a scope class to every selector
-  // there and a global rule of the same shape would lose. That reasoning is
-  // only correct if the computed value says so.
-  test('blog prose is capped by --w-measure', async () => {
+  // Renamed from "blog prose is capped by --w-measure", which asserted only
+  // that a max-width existed. It passed identically whether this branch's
+  // token rule applied or the pre-existing 58ch rule did — and in fact the
+  // 58ch rule won, later in the same scoped block at equal specificity, so
+  // the assertion verified a mechanism it could not see. Assert the outcome.
+  test('blog prose measures 60-78 characters', async () => {
     const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await ctx.newPage();
-    await page.goto(server.url + '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/', { waitUntil: 'load' });
-    const got = await page.evaluate(() => {
-      const p = [...document.querySelectorAll('.blog-article p')].find((x) => x.innerText.trim().length > 250);
-      return p ? { maxW: getComputedStyle(p).maxWidth, w: Math.round(p.getBoundingClientRect().width) } : null;
-    });
+    const bad = [];
+    for (const path of [
+      '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+      '/zh/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+    ]) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const got = await page.evaluate(() => {
+        const el = [...document.querySelectorAll('.blog-article p')].find((x) => x.innerText.trim().length > 250);
+        if (!el) return null;
+        const cs = getComputedStyle(el);
+        const c = document.createElement('canvas').getContext('2d');
+        c.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+        const ab = 'abcdefghijklmnopqrstuvwxyz ';
+        const w = el.getBoundingClientRect().width;
+        return { chars: Math.round(w / (c.measureText(ab).width / ab.length)), w: Math.round(w) };
+      });
+      if (!got) { bad.push(`${path} found no .blog-article p over 250 chars`); continue; }
+      if (got.chars < 60 || got.chars > 78) bad.push(`${path} = ${got.chars} chars (${got.w}px)`);
+    }
     await ctx.close();
-    assert.ok(got, 'found no .blog-article p over 250 chars — the selector is stale');
-    assert.notEqual(got.maxW, 'none', 'blog prose has no max-width — the scoped cap did not apply');
-    assert.ok(got.w <= 700, `blog prose is ${got.w}px, want <=700px`);
+    assert.deepEqual(bad, [], `blog measure out of range:\n${bad.join('\n')}`);
   });
 
   // Keep this list in sync with the `.c-*` rules in guide.css — every

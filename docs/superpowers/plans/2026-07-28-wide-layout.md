@@ -1827,6 +1827,6 @@ BODY
 
 **Spec coverage.** §4 tokens → Task 2. §4.1 `--w-measure` → Tasks 2, 3. §4.2 `--t-prose` → Tasks 2, 5. §5 shell → Task 4. §5.1 ladder → Task 4. §5.3 TOC accordion → Task 4. §5.4 blog → Task 6. §6 index pages → Tasks 7, 8. §7 guard → assertions distributed across Tasks 3–8, proof-of-failure in Task 9. §8 phone safety → Tasks 1, 9. §9 gates → Task 10. §10 out of scope → nothing in any task touches the 320px overflow, Field Guide dates, or `.callout.tip`.
 
-**Known intermediate red states**, deliberate and called out where they occur: Task 3 leaves `prose measure` failing at 1024–1728 (shell not yet widened) and on `/concepts/` (`.entry-summary` not yet emitted). Task 4 leaves it failing at 1360–1728 (type not yet stepped). Task 5 leaves `/concepts/` failing until Task 7. Every other task ends green.
+**Known intermediate red states**, deliberate and called out where they occur: Task 3 leaves `prose measure` failing at 901 and 1024 only, on the four article pages (shell not yet widened), plus the separate coverage test failing on `/concepts/` (`.entry-summary` not yet emitted). Task 4 leaves it failing at 1360–1728 (type not yet stepped). Task 5 leaves `/concepts/` failing until Task 7. Every other task ends green.
 
 **Names used consistently across tasks:** `--w-shell`, `--w-wrap`, `--w-rail-nav`, `--w-rail-toc`, `--w-measure`, `--t-prose`, `.entry-list`, `.entry-item`, `.entry-link`, `.entry-title`, `.entry-summary`, `.group-card-grid`, `.wrap--prose`, `.about-body`, `.privacy-body`, `MEASURE_WIDTHS`, `MEASURE_PAGES`, `measureChars`.
