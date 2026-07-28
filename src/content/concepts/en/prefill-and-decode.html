@@ -1,0 +1,74 @@
+<section class="phase">
+  <div class="phase-num">F13</div>
+  <div class="week">Concepts · AI Foundations</div>
+  <h2>Prefill, decode &amp; the KV cache.</h2>
+  <p class="goal">One model call is two machines with opposite bottlenecks, and nearly every latency question you have dissolves the moment you separate them — why the first token takes a second while the rest arrive steadily, why doubling your prompt barely changes generation speed, why prompt caching is possible at all. Prefill reads the whole prompt at once and is limited by compute; decode writes the answer one token at a time and is limited by memory bandwidth.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Two phases, two bottlenecks.</h3>
+
+    <p><strong>Prefill</strong> pushes your entire prompt — system instructions, tool definitions, retrieved documents, conversation history — through the network in a single parallel pass. It produces the first output token and, more importantly, the internal state needed to produce all the rest. It is <em>compute-bound</em>: the GPU's arithmetic units are the constraint, and attention cost grows with the square of prompt length.</p>
+
+    <p><strong>Decode</strong> then generates the answer one token at a time. Each step must read the full model weights and all the stored state from memory to produce a single token, which is then fed back in for the next step. It is <em>memory-bandwidth-bound</em>: the GPU spends most of its time moving bytes, not computing. It is also strictly sequential — token <em>n+1</em> cannot begin before token <em>n</em> exists.</p>
+
+    <ul>
+      <li><strong>Time to first token (TTFT)</strong> is essentially prefill. It scales with how much you sent.</li>
+      <li><strong>Inter-token latency</strong> is decode. It is roughly flat per token and barely notices how long your prompt was.</li>
+      <li>Total wall-clock ≈ TTFT + (output tokens × inter-token latency). Two independent terms, two different fixes.</li>
+    </ul>
+
+    <div class="callout">
+      <p>"The model is slow" is not a diagnosis. A request that waits two seconds and then streams smoothly and a request that starts instantly and dribbles for thirty seconds have nothing in common except the total. One is a context problem; the other is an output-length problem. No model swap reliably fixes both.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The KV cache is the state between tokens.</h3>
+
+    <p>Attention requires every token to look at every earlier token — specifically at their <em>keys</em> and <em>values</em>, two vectors each layer computes per token (see <a class="xref" href="/concepts/transformers-overview">transformers</a>). Recomputing those for the whole history at every generation step would be ruinous, so they are computed once and kept. That store is the KV cache, and prefill's real product is a fully populated one.</p>
+
+    <ul>
+      <li><strong>It grows linearly with sequence length</strong> — every token added, whether yours or the model's, adds a permanent row for the rest of the request.</li>
+      <li><strong>It is per-request.</strong> Ten concurrent conversations mean ten caches resident in GPU memory simultaneously. Serving many users is largely a KV-cache capacity problem, not a weights problem.</li>
+      <li><strong>It explains a common local-model surprise.</strong> The weights fit in your VRAM and the model still runs out of memory at long context, because the cache is what overflowed — which is why <a class="xref" href="/concepts/small-and-local-models">small local models</a> are often constrained by context, not by parameter count.</li>
+      <li><strong>Long context has a memory price, not only a token price.</strong> This is the physical reason a 200K-token window is not simply a bigger number in a config file.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What this one split explains.</h3>
+
+    <p>Several behaviours that look unrelated are the same fact viewed from different angles:</p>
+
+    <ul>
+      <li><strong>Why prompt caching is a prefix match.</strong> <a class="xref" href="/concepts/prompt-caching">Caching a prompt</a> means storing the KV cache that prefill produced and reusing it next time. Because a token's keys and values depend on every token before it, the reuse must start at position zero and stop at the first difference — one changed byte early invalidates everything after it. That constraint is not a vendor policy; it falls straight out of the mechanism.</li>
+      <li><strong>Why output tokens cost several times more than input tokens.</strong> Input is processed in one amortised parallel pass. Each output token is its own pass over the entire model. The price difference is the work difference.</li>
+      <li><strong>Why a server batching many users gets throughput almost for free.</strong> Decode is bandwidth-bound, so weights loaded once can advance many sequences in the same step. This is also why your own single-stream latency does not improve when the provider adds capacity.</li>
+      <li><strong>Why reasoning models feel slow out of proportion to their answers.</strong> Thinking tokens are decode tokens, generated one at a time at full cost, and most are never shown — see <a class="xref" href="/concepts/reasoning-models">reasoning models</a>.</li>
+      <li><strong>Why streaming works at all.</strong> Tokens genuinely become available one by one; <a class="xref" href="/concepts/streaming-and-partial-output">streaming</a> is exposing the decode loop rather than simulating progress.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Optimising the half that is actually slow.</h3>
+
+    <p>Once you can name the phase, the interventions stop competing:</p>
+
+    <ul>
+      <li><strong>Prefill-heavy</strong> — long retrieved context, short answer. Cache the stable prefix, cut retrieved documents, keep volatile content at the end so the cacheable region stays intact. Sending less is the only thing that reliably helps.</li>
+      <li><strong>Decode-heavy</strong> — long generation, reasoning, verbose formats. Ask for less output: a schema instead of prose, a table instead of a narrative, a lower thinking budget. Output length is a latency dial that most teams never touch.</li>
+      <li><strong>Throughput-limited</strong> — many concurrent users on fixed hardware. Cap per-request context, because concurrency is bounded by KV memory, and every long-context request you allow costs you several short ones.</li>
+      <li><strong>Neither</strong> — if the wait is queueing rather than either phase, none of the above matters and the answer is capacity.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Before arguing about a faster model, measure TTFT and inter-token latency separately on one real request. If TTFT dominates, your project is context and caching, and a model swap will disappoint. If generation dominates, your project is asking for fewer output tokens. It is one measurement, and it points at two completely different pieces of work — which is why teams that skip it so often optimise the half that was already fast.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/context-windows">context windows</a> for the budget this all runs inside, <a class="xref" href="/concepts/tokens-and-tokenization">tokens</a> for what is being counted, and <a class="xref" href="/concepts/cost-quality-latency">cost, quality &amp; latency</a> for the trade-off these mechanics produce.</p>
+  </div>
+</section>
