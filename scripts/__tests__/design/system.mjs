@@ -390,25 +390,93 @@ describe('design system', () => {
       `header labels compressed below their text width: ${JSON.stringify(squeezed)}`);
   });
 
-  test('prose measure is 60-75 characters', async () => {
-    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-    const page = await ctx.newPage();
-    const bad = [];
-    for (const path of ['/concepts/prompt-caching/', '/deep-dives/mcp/mcp-building-servers-in-practice/', '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/']) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
-      const chars = await page.evaluate(() => {
-        const p = [...document.querySelectorAll('main p')].find((x) => x.innerText.trim().length > 250);
-        if (!p) return null;
-        const cs = getComputedStyle(p);
-        const c = document.createElement('canvas').getContext('2d');
-        c.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
-        const ab = 'abcdefghijklmnopqrstuvwxyz ';
-        return Math.round(p.getBoundingClientRect().width / (c.measureText(ab).width / ab.length));
-      });
-      if (chars !== null && (chars < 60 || chars > 78)) bad.push(`${path} = ${chars} chars`);
+  // The shipped guard ran at ONE viewport (1280px) against THREE article
+  // pages, which is why three separate measure defects shipped green: 30
+  // characters at 901px (both rails switching on with no width to hold them),
+  // 80 characters at 768px, and 97-108 characters on every index page, none
+  // of which has ever had a max-width.
+  //
+  // The window is 60-78 at >=768px. Below 700px it is 35-78: 60 characters at
+  // 16px needs 510px of column, which does not exist in a 390px viewport, so
+  // asserting 60 there would demand a font size no phone should use.
+  const MEASURE_WIDTHS = [390, 430, 768, 901, 1024, 1152, 1280, 1360, 1440, 1728];
+  const MEASURE_PAGES = [
+    '/field-guide/llm-mental-model/',
+    '/concepts/prompt-caching/',
+    '/deep-dives/mcp/mcp-building-servers-in-practice/',
+    '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+    '/',
+    '/concepts/',
+    '/changelog/',
+    '/blogs/',
+    '/about/',
+    '/zh/concepts/prompt-caching/',
+  ];
+
+  /**
+   * Width in characters of every substantial run of text on the page, using
+   * the average advance of the lowercase alphabet plus space in each block's
+   * own computed font. Returns {max, worst} plus `seen` so a selector that
+   * stops matching cannot pass vacuously.
+   */
+  const measureChars = () => {
+    const c = document.createElement('canvas').getContext('2d');
+    const ab = 'abcdefghijklmnopqrstuvwxyz ';
+    let max = 0, worst = null, seen = 0;
+    for (const el of document.querySelectorAll('main p, main li, .hero .lede, .toc-desc')) {
+      const text = el.innerText.trim();
+      if (text.length < 120) continue;
+      const b = el.getBoundingClientRect();
+      if (b.width < 1 || b.height < 1) continue;
+      const cs = getComputedStyle(el);
+      if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+      seen++;
+      c.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+      const chars = Math.round(b.width / (c.measureText(ab).width / ab.length));
+      if (chars > max) {
+        max = chars;
+        worst = `${el.tagName.toLowerCase()}.${(el.className || '').toString().split(' ')[0]} ${Math.round(b.width)}px @${cs.fontSize}`;
+      }
     }
+    return { max, worst, seen };
+  };
+
+  for (const w of MEASURE_WIDTHS) {
+    test(`prose measure is 60-78 characters (35-78 below 700px) @ ${w}px`, async () => {
+      const [floor, ceiling] = w < 700 ? [35, 78] : [60, 78];
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      const bad = [];
+      let total = 0;
+      for (const path of MEASURE_PAGES) {
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const { max, worst, seen } = await page.evaluate(measureChars);
+        total += seen;
+        if (seen === 0) { bad.push(`${path} matched no measurable text block`); continue; }
+        if (max < floor || max > ceiling) bad.push(`${path} = ${max} chars (${worst})`);
+      }
+      await ctx.close();
+      assert.ok(total > 0, 'measured nothing on any page — the selector list is stale');
+      assert.deepEqual(bad, [], `measure outside ${floor}-${ceiling} @ ${w}px:\n${bad.join('\n')}`);
+    });
+  }
+
+  // The blog cap lives in BlogLayout's scoped <style is:global> block rather
+  // than site.css, because Astro appends a scope class to every selector
+  // there and a global rule of the same shape would lose. That reasoning is
+  // only correct if the computed value says so.
+  test('blog prose is capped by --w-measure', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const page = await ctx.newPage();
+    await page.goto(server.url + '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/', { waitUntil: 'load' });
+    const got = await page.evaluate(() => {
+      const p = [...document.querySelectorAll('.blog-article p')].find((x) => x.innerText.trim().length > 250);
+      return p ? { maxW: getComputedStyle(p).maxWidth, w: Math.round(p.getBoundingClientRect().width) } : null;
+    });
     await ctx.close();
-    assert.deepEqual(bad, [], `measure out of range:\n${bad.join('\n')}`);
+    assert.ok(got, 'found no .blog-article p over 250 chars — the selector is stale');
+    assert.notEqual(got.maxW, 'none', 'blog prose has no max-width — the scoped cap did not apply');
+    assert.ok(got.w <= 700, `blog prose is ${got.w}px, want <=700px`);
   });
 
   // Keep this list in sync with the `.c-*` rules in guide.css — every
