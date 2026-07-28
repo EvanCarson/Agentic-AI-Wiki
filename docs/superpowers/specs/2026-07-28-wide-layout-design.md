@@ -138,13 +138,38 @@ New in `src/styles/tokens.css`:
 
 ### 4.1 Why `--w-measure` is 62ch and not 72ch
 
-CSS `ch` is the advance width of the `0` glyph. In Inter that is `0.6em`, while
-the average character the guard measures is `0.531em` — `ch` is ~13% wider.
-Measured: at 18px, `1ch` = 10.79px and one guard-character = 9.56px.
+CSS `ch` is the advance width of the `0` glyph. Measured in-browser, Inter's is
+**~0.631em** — not the ~0.6em this section originally assumed — against a
+guard-character (the design guard's own canvas average of a-z plus space) at
+~0.531em, so `ch` runs **~19% wider, not ~13%**. Measured at 18px: `1ch` =
+11.36px and one guard-character = 9.56px.
 
-So **`62ch` = 70 guard-characters**, and because both units scale linearly with
-font size, that equivalence holds at every size. A token named for the classic
-72-character measure would silently deliver 81.
+So **`62ch` delivers about 74 guard-characters, not 70**, and because both
+units scale linearly with font size, that holds at every size. The section's
+actual point survives the correction: a token set to the classic
+72-character measure would still deliver far more than 72 characters — just
+more like 88, not 81. `58ch` is what actually lands at ~70 — independently
+confirmed by `BlogLayout`'s own separate, pre-existing 58ch cap, which
+measures ~70 characters in-browser by the same method. Two independent
+measurements landing on the same ~1.19–1.2 ratio, against this section's own
+~1.13, is what makes the correction conclusive rather than a second guess.
+
+**Consequence.** 74 sits only 4 characters below the guard's 78-character
+ceiling — real headroom, but thin, wherever `--w-measure` alone (not a
+narrower article column) is the binding constraint. This does not touch the
+widths the design was reviewed and approved at: 1440px and above never bind
+against the cap — the column itself is the constraint there — and measure 69
+characters, so the approved reading experience is unaffected.
+
+**Available follow-up, not applied here.** Dropping `--w-measure` to 58ch
+would restore the originally intended ~70 characters, widen the margin to
+the ceiling from 4 to 8, and let `BlogLayout`'s hardcoded `58ch` become
+`var(--w-measure)` — unifying the site on one measure token instead of two
+numbers that presently just happen to coincide. Deliberately not done now:
+it would change a rendered value inside the shell-widening's own reviewed
+range, and this branch's phone-parity proof (375/390/430px byte-identical,
+both themes) was established against the shipped 62ch value — changing it
+would need that proof re-run before it could be trusted again.
 
 `--w-measure` applies to running text only. The families it is applied to:
 
