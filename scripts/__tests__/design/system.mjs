@@ -428,14 +428,17 @@ describe('design system', () => {
       const cs = getComputedStyle(el);
       return cs.visibility !== 'hidden' && cs.display !== 'none';
     };
-    // Candidates are blocks that can carry a line of running text. A wrapper
-    // like li.changelog-entry has no text of its own — <time>, <summary> and
-    // a nested <ul> do — but innerText concatenates its descendants, so
-    // measuring it reads a CONTAINER's width as a line length and reports a
-    // failure no CSS change could fix. Dropping any candidate that contains
-    // another candidate leaves the innermost block that really sets the line.
+    // A block carries a line of text only if it has no block-level child.
+    // Length-based rules are not enough: li.changelog-entry wraps <time> and
+    // <details>, and BOTH ways of having no long child defeat them — below
+    // 900px Chromium reports empty innerText for content inside a closed
+    // <details>, and above it an entry whose bullets are each under the
+    // threshold produces no qualifying child either. Either way the wrapper
+    // survives as a "leaf" and its column width is read as a line length,
+    // reporting a failure no CSS change could fix.
+    const BLOCK_CHILD = 'p, li, ul, ol, div, section, table, pre, details, summary, figure, blockquote, h1, h2, h3, h4, h5, h6, time, nav, aside';
     const cands = [...document.querySelectorAll('main p, main li, .lede, .toc-desc, .entry-summary')]
-      .filter((el) => el.innerText.trim().length >= 120 && visible(el));
+      .filter((el) => el.innerText.trim().length >= 120 && visible(el) && !el.querySelector(BLOCK_CHILD));
     const leaves = cands.filter((el) => !cands.some((o) => o !== el && el.contains(o)));
     let max = 0, worst = null, seen = 0;
     for (const el of leaves) {

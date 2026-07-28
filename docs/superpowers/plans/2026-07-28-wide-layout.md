@@ -393,14 +393,17 @@ In `scripts/__tests__/design/system.mjs`, replace the whole existing `test('pros
       const cs = getComputedStyle(el);
       return cs.visibility !== 'hidden' && cs.display !== 'none';
     };
-    // Candidates are blocks that can carry a line of running text. A wrapper
-    // like li.changelog-entry has no text of its own — <time>, <summary> and
-    // a nested <ul> do — but innerText concatenates its descendants, so
-    // measuring it reads a CONTAINER's width as a line length and reports a
-    // failure no CSS change could fix. Dropping any candidate that contains
-    // another candidate leaves the innermost block that really sets the line.
+    // A block carries a line of text only if it has no block-level child.
+    // Length-based rules are not enough: li.changelog-entry wraps <time> and
+    // <details>, and BOTH ways of having no long child defeat them — below
+    // 900px Chromium reports empty innerText for content inside a closed
+    // <details>, and above it an entry whose bullets are each under the
+    // threshold produces no qualifying child either. Either way the wrapper
+    // survives as a "leaf" and its column width is read as a line length,
+    // reporting a failure no CSS change could fix.
+    const BLOCK_CHILD = 'p, li, ul, ol, div, section, table, pre, details, summary, figure, blockquote, h1, h2, h3, h4, h5, h6, time, nav, aside';
     const cands = [...document.querySelectorAll('main p, main li, .lede, .toc-desc, .entry-summary')]
-      .filter((el) => el.innerText.trim().length >= 120 && visible(el));
+      .filter((el) => el.innerText.trim().length >= 120 && visible(el) && !el.querySelector(BLOCK_CHILD));
     const leaves = cands.filter((el) => !cands.some((o) => o !== el && el.contains(o)));
     let max = 0, worst = null, seen = 0;
     for (const el of leaves) {
@@ -525,7 +528,7 @@ A rule in `site.css` is (0,1,1); Astro appends an `.astro-XXXX` class to every s
 npm run build && npm run test:design 2>&1 | grep -E "prose measure"
 ```
 
-Expected: passes at 390, 430, 768 and 901; still fails 1024 through 1728 (shell not yet widened) and on `/concepts/` (`.entry-summary` not emitted until Task 7). This is the expected intermediate state; record it so the next task's reviewer knows what is outstanding.
+Expected: passes at 390, 430, 768 and 901. Fails 1024 through 1728 — on `/concepts/` only (`.entry-summary` not emitted until Task 7), and, at 1024 and 1152, additionally the article-shell narrowing that Task 4 fixes. `/changelog/` and `/about/` are fully resolved at every width. This is the expected intermediate state; record it so the next task's reviewer knows what is outstanding.
 
 - [ ] **Step 7: Confirm the blog cap took effect, from computed styles not source**
 
