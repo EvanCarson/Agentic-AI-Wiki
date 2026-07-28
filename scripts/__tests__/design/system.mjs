@@ -300,6 +300,35 @@ describe('design system', () => {
     assert.deepEqual(bad, [], `pages scroll horizontally: ${bad.join(', ')}`);
   });
 
+  // The in-flow TOC accordion (introduced in an earlier task) is a distinct
+  // layout mode that exists from 900px to 1359px, and nothing above checked
+  // overflow anywhere inside that band.
+  test('no horizontal overflow at 1024px', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1024, height: 900 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+      if (over) bad.push(path);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `pages scroll horizontally: ${bad.join(', ')}`);
+  });
+
+  test('no horizontal overflow at 1280px', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+      if (over) bad.push(path);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `pages scroll horizontally: ${bad.join(', ')}`);
+  });
+
   test('mobile header is a single row', async () => {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
     const page = await ctx.newPage();
@@ -1094,5 +1123,56 @@ describe('design system', () => {
     assert.ok(seen > 0, 'found no inline style attributes at all — the walk is broken');
     assert.deepEqual([...new Set(bad)].slice(0, 20), [],
       `layout properties in inline style attributes:\n${[...new Set(bad)].slice(0, 20).join('\n')}`);
+  });
+
+  // Every index grid moves from auto-fit to explicit column counts. auto-fit
+  // derives its column count from a minmax floor against a container that is
+  // about to change width, which is exactly how a widening turns the
+  // homepage's clean 3+2 into a 4+1 orphan without anyone editing the grid.
+  // Explicit counts are the thing that can be asserted.
+  test('index grids hold their column counts across the widening', async () => {
+    const bad = [];
+    const cases = [
+      ['/', '.home-grid', [[390, 1], [600, 2], [768, 3], [1728, 3]]],
+      ['/blogs/', '.blog-list', [[390, 1], [768, 1], [1024, 2], [1728, 2]]],
+      ['/deep-dives/', '.group-card-grid', [[390, 1], [768, 2], [1728, 2]]],
+    ];
+    for (const [path, sel, expectations] of cases) {
+      for (const [w, want] of expectations) {
+        const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+        const page = await ctx.newPage();
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const cols = await page.evaluate((s) => {
+          const el = document.querySelector(s);
+          if (!el) return null;
+          return getComputedStyle(el).gridTemplateColumns.split(/\s+/).filter(Boolean).length;
+        }, sel);
+        await ctx.close();
+        if (cols === null) bad.push(`${path} has no ${sel}`);
+        else if (cols !== want) bad.push(`${path} ${sel} @${w}px = ${cols} cols, want ${want}`);
+      }
+    }
+    assert.deepEqual(bad, [], `grid column counts wrong:\n${bad.join('\n')}`);
+  });
+
+  // The reported complaint was about the whole web view, not only article
+  // pages: at 1728px the 860px .wrap left 434px per side.
+  test('index pages leave no dead gutter @ 1728px', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1728, height: 900 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of ['/', '/concepts/', '/blogs/', '/changelog/', '/zh/concepts/']) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const pct = await page.evaluate(() => {
+        const els = [...document.querySelectorAll('.wrap')].filter((e) => !e.classList.contains('wrap--prose'));
+        if (!els.length) return null;
+        const left = Math.min(...els.map((e) => e.getBoundingClientRect().left));
+        return Math.round((left / window.innerWidth) * 1000) / 10;
+      });
+      if (pct === null) { bad.push(`${path} has no .wrap`); continue; }
+      if (pct > 20) bad.push(`${path} gutter ${pct}%`);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `index gutter over 20% @ 1728px:\n${bad.join('\n')}`);
   });
 });
