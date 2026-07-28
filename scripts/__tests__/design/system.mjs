@@ -996,22 +996,25 @@ describe('design system', () => {
       for (const path of ['/field-guide/llm-mental-model/', '/zh/field-guide/llm-mental-model/']) {
         await page.goto(server.url + path, { waitUntil: 'load' });
         const got = await page.evaluate(() => {
-          // Chinese text is naturally shorter in character count: the longest <p> in
-          // zh/f1.html is 231 characters. A flat 250-char threshold would match nothing
-          // in zh and the assertion would pass vacuously in the locale it exists to
-          // protect. Use 150+ for zh, 250+ for en; both ensure substantial content.
-          const minChars = window.location.pathname.startsWith('/zh') ? 150 : 250;
-          // Check both .step p (article body) and .callout p (emphasis component)
-          // to catch source-order reordering bugs that affect only one selector.
-          const selectors = ['.step p', '.callout p'];
-          for (const sel of selectors) {
-            const p = [...document.querySelectorAll(sel)].find((x) => x.innerText.trim().length > minChars);
-            if (p) return getComputedStyle(p).fontSize;
+          // No length threshold: computed font-size does not depend on text
+          // length, and a floor tuned for the measure test would never match a
+          // .callout p, which is short by nature — the assertion would report
+          // "found none" rather than checking the selector it was added for.
+          // Check both .step p and .callout p, reporting both independently.
+          const out = {};
+          for (const sel of ['.step p', '.callout p']) {
+            const el = [...document.querySelectorAll(sel)].find((x) => {
+              const b = x.getBoundingClientRect();
+              return b.width > 0 && b.height > 0;
+            });
+            out[sel] = el ? getComputedStyle(el).fontSize : null;
           }
-          return null;
+          return out;
         });
-        if (got === null) bad.push(`@${w}px ${path} found no .step/.callout p over threshold`);
-        else if (got !== want) bad.push(`@${w}px ${path} = ${got}, want ${want}`);
+        for (const [sel, size] of Object.entries(got)) {
+          if (size === null) bad.push(`@${w}px ${path} found no visible ${sel}`);
+          else if (size !== want) bad.push(`@${w}px ${path} ${sel} = ${size}, want ${want}`);
+        }
       }
       await ctx.close();
     }
