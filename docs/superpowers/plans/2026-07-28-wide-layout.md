@@ -821,6 +821,13 @@ with:
     padding-right: var(--s-4);
     margin-bottom: var(--s-4);
   }
+  /* The rail was always narrow enough to wrap by itself, so nothing ever
+     capped it. In flow at full width it is the first place a TOC entry can
+     run long: /deep-dives/mcp/mcp-building-servers-in-practice/ carries a
+     190-character sentence-style h2 that rendered as a single unbroken line
+     at 1280px, against a 78-character ceiling. Capping the item rather than
+     the list keeps the h3 indent working. */
+  .chapter-toc-item { max-width: var(--w-measure); }
 }
 ```
 
@@ -830,7 +837,7 @@ with:
 npm run build && npm run test:design 2>&1 | grep -E "dead gutter|breakpoint ladder|prose measure"
 ```
 
-Expected: `dead gutter` PASS at both widths. `breakpoint ladder` PASS. `prose measure` PASSES at all ten widths — 390, 430, 768, 901, 1024, 1152, 1280, 1360, 1440, 1728 — because the measure cap (`--w-measure`, already wired into `guide.css`, `site.css` and `BlogLayout.astro` by an earlier task) bounds the widened column at 62ch regardless of the raw column width; expect roughly 74 characters at the capped widths and 64 at 1024. `every audited page is measured at some width` still fails, naming `/concepts/` only — its entry summaries get their class in a later task, not this one.
+Expected: `dead gutter` PASS at both widths. `breakpoint ladder` PASS. `prose measure` PASSES at all ten widths — 390, 430, 768, 901, 1024, 1152, 1280, 1360, 1440, 1728 — because the measure cap (`--w-measure`, already wired into `guide.css`, `site.css` and `BlogLayout.astro` by an earlier task) bounds the widened column at 62ch regardless of the raw column width; expect roughly 74 characters at the capped widths and 64 at 1024. This requires the `.chapter-toc-item { max-width: var(--w-measure); }` rule inside the 900–1359.98px accordion block above — without it, the accordion is the first context that ever lays the TOC out full-width, and a long sentence-style `<h2>` (e.g. the 190-character heading on `/deep-dives/mcp/mcp-building-servers-in-practice/`) renders as a single unbroken line at 1280px, failing `prose measure` at 901, 1024, 1152 and 1280 with no other change to explain it. `every audited page is measured at some width` still fails, naming `/concepts/` only — its entry summaries get their class in a later task, not this one.
 
 - [ ] **Step 6: Verify the numbers against the plan's reference table**
 
