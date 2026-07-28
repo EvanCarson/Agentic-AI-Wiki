@@ -996,13 +996,21 @@ describe('design system', () => {
       for (const path of ['/field-guide/llm-mental-model/', '/zh/field-guide/llm-mental-model/']) {
         await page.goto(server.url + path, { waitUntil: 'load' });
         const got = await page.evaluate(() => {
-          // Chinese text is naturally shorter in character count, so check for
-          // 150+ chars for zh, 250+ for en. Both ensure substantial paragraph content.
+          // Chinese text is naturally shorter in character count: the longest <p> in
+          // zh/f1.html is 231 characters. A flat 250-char threshold would match nothing
+          // in zh and the assertion would pass vacuously in the locale it exists to
+          // protect. Use 150+ for zh, 250+ for en; both ensure substantial content.
           const minChars = window.location.pathname.startsWith('/zh') ? 150 : 250;
-          const p = [...document.querySelectorAll('.step p')].find((x) => x.innerText.trim().length > minChars);
-          return p ? getComputedStyle(p).fontSize : null;
+          // Check both .step p (article body) and .callout p (emphasis component)
+          // to catch source-order reordering bugs that affect only one selector.
+          const selectors = ['.step p', '.callout p'];
+          for (const sel of selectors) {
+            const p = [...document.querySelectorAll(sel)].find((x) => x.innerText.trim().length > minChars);
+            if (p) return getComputedStyle(p).fontSize;
+          }
+          return null;
         });
-        if (got === null) bad.push(`@${w}px ${path} found no .step p over threshold`);
+        if (got === null) bad.push(`@${w}px ${path} found no .step/.callout p over threshold`);
         else if (got !== want) bad.push(`@${w}px ${path} = ${got}, want ${want}`);
       }
       await ctx.close();
