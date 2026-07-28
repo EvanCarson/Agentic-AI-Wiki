@@ -1363,6 +1363,10 @@ Claude-Session: https://claude.ai/code/session_01XQpNvBzrE9ueMsrK72nw4A"
 **Files:**
 - Modify: `src/styles/site.css` — `.wrap` (~line 215), `.home-grid` (~line 646), `.blog-list` (~line 783), `.changelog-entry` (~line 873), plus the new `.entry-list` and `.group-card-grid` from Task 7
 - Test: `scripts/__tests__/design/system.mjs`
+- **Added in the post-Step-9 fix round** (not in the original file list, see
+  the correction note after Step 5 and the one after Step 9): `src/layouts/
+  BlogLayout.astro` (delete the dead table breakout, ~lines 631-640) and
+  `src/styles/tokens.css` (`--w-wrap`'s comment, value unchanged).
 
 **Interfaces:**
 - Consumes: `--w-wrap`, `--w-measure`, and the classes from Task 7.
@@ -1551,8 +1555,18 @@ Append to `src/styles/site.css`:
 ```css
 /* The entry lists are the longest single-column runs on the site — 53
    Concepts in one column, at 97 characters before the measure cap. Two
-   columns at the widened .wrap uses the width the cap gives back. */
-@media (min-width: 900px) {
+   columns at the widened .wrap uses the width the cap gives back.
+   Breakpoint is --w-wrap itself (1080px), not an earlier value: activating
+   two-up any sooner opens a fluid gap where .wrap is still narrower than
+   its cap, so each column is narrower than the cap-based width too — at
+   900px (the value this used to be) that measured 56 characters, under the
+   60-character floor. Matching the breakpoint to the cap means .wrap has
+   already reached 1080px the moment two-up turns on, so a column is never
+   narrower than (1080 - 40px padding - 32px gap) / 2 = 504px — measured
+   68 characters at --t-sm in both en and zh (identical: the guard's canvas
+   measurement calibrates against the Latin alphabet, and Inter leads both
+   font stacks, so the CJK fallback fonts are never the ones measured). */
+@media (min-width: 1080px) {
   .entry-list {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1560,6 +1574,19 @@ Append to `src/styles/site.css`:
   }
 }
 ```
+
+**Correction (post-Step-9 fix round, same day):** the 900px breakpoint above
+shipped in the first commit and was wrong — it opens exactly the fluid gap
+the comment now describes. `prose measure … @ 901px` failed at 56 characters
+against a 60-character floor. Diagnosed as a real regression (not worked
+around) in the Step-8 report, then fixed by moving the breakpoint to match
+`--w-wrap` rather than by raising `--w-wrap` itself: measurement (not the
+original napkin arithmetic, which assumed 16px and was corrected to the
+actual `--t-sm`, 14px) showed the existing 1080px cap already clears a
+64-character target with real margin (68 measured) once the fluid gap is
+closed, so `--w-wrap` stays 1080px — see `src/styles/tokens.css`'s comment
+on the token for the full derivation table. Second commit:
+`fix(design): delete the dead blog table breakout; fix the entry-list floor gap`.
 
 - [ ] **Step 6: Give changelog entries their date column**
 
@@ -1590,6 +1617,25 @@ npm run build && npm run test:design
 
 Expected: the full suite PASSES, including every `prose measure` width, both gutter assertions, the grid counts, the ladder, the prose step, the blog shell and the inline-style sweep.
 
+**Correction: this was not what happened on first implementation, independent
+of the two added assertions below.** Step 5's 900px breakpoint (as originally
+written above, before the Step-5 correction) fails `prose measure … @ 901px`
+on its own — `/concepts/` `.entry-summary` measured 56 characters against
+the 60-character floor, because two-up activates while `.wrap` is still
+narrower than its 1080px cap. This is a real defect in the plan's own
+Step 5, not an artifact of anything added on top of it. The implementer also
+added two out-of-scope-but-authorised overflow assertions (1024px, 1280px —
+the guard checked overflow at 375/390/768 only, leaving the entire
+900-1359px in-flow-TOC-accordion band, introduced by an earlier task,
+unchecked) that surfaced a second, independent, pre-existing defect:
+`BlogLayout.astro`'s table breakout (`margin-right: -140px` at
+`min-width: 1000px`, written when the blog column was 884px) overflows the
+page in that band, where there is no rail providing the 140px of assumed
+slack. Both are documented in the Step-8 report
+(`.superpowers/sdd/2026-07-28-wide-layout/task-8-report.md`) rather than
+worked around, then fixed in a second commit — see the correction after
+Step 5 (entry-list) and after Step 9 (table breakout) below.
+
 - [ ] **Step 8: Confirm no card is left alone on a last row**
 
 ```bash
@@ -1616,6 +1662,49 @@ length — which the measure cap has already fixed at 97-108 characters.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01XQpNvBzrE9ueMsrK72nw4A"
+```
+
+**Correction (same day, second commit): delete the dead table breakout.**
+Both real findings named in the Step 7 correction above got root-cause
+fixes rather than workarounds. The `.entry-list` floor gap is fixed at Step
+5 above (breakpoint moved from 900px to `--w-wrap`'s own 1080px; `--w-wrap`
+itself stays 1080px, not raised — see that step's correction and
+`tokens.css`'s comment on the token for why measurement didn't justify
+raising it). The second finding needed a change outside this task's
+original file list: `src/layouts/BlogLayout.astro:631-640` —
+
+```css
+@media (min-width: 1000px) {
+  .blog-article table {
+    margin-left: 0;
+    margin-right: -140px;
+    width: calc(100% + 140px);
+  }
+}
+```
+
+— deleted outright, not adjusted. The rule dates from when the blog
+column was 884px; this plan takes it to 1056px, a 172px gain that exceeds
+the 140px the breakout was stealing, so every table across all 25 EN / 25
+ZH blog posts was measured (by simulating the deletion — neutralising the
+rule's own margin/width overrides back to the base rule's — and reading
+`scrollWidth` vs `clientWidth` on the live table) and **zero** overflow
+their column at 1440px/1728px (the rail band, where the column is the full
+1056px). In the 900-1359px in-flow-accordion band the column is narrower
+(608px at 1024px, 864px at 1280px) and 15/25 EN posts' tables (up to 303px)
+still need to scroll there — expected and already covered by the base
+`.blog-article table` rule's pre-existing `overflow-x: auto` plus its
+scroll-cue gradient (unaffected by this deletion, which only touches the
+breakout's margin/width) and by the guard's existing
+`horizontally scrollable containers show a scroll affordance` assertion.
+No overflow wrapper was added; measurement did not show one was needed
+beyond what already existed. Full per-post numbers in the fix report.
+
+```bash
+git add src/layouts/BlogLayout.astro src/styles/site.css src/styles/tokens.css
+git commit -m "fix(design): delete the dead blog table breakout; fix the entry-list floor gap
+
+..."
 ```
 
 ---
@@ -1830,6 +1919,18 @@ show more than 48px. This takes the latter shape.
   column goes 884px → 1056px.
 - Index pages had no `max-width` on any text block.
 - Layout properties set by inline `style` attributes are now in CSS.
+- `BlogLayout`'s comparison-table breakout (`margin-right: -140px` at
+  `min-width: 1000px`, sized for the 884px column this plan already
+  replaces) overflowed the page in the 900-1359px in-flow-TOC-accordion
+  band, where there is no rail providing the slack it assumed. Deleted; the
+  wider 1056px column absorbs it (172px gained vs. 140px stolen), and every
+  post's table was measured to confirm none needs a scroll wrapper beyond
+  the one the base rule already has.
+- The index `.entry-list`'s two-column breakpoint (900px) fired before
+  `.wrap` reached its own cap, narrowing `.entry-summary` to 56 characters
+  — under the 60-character floor. Moved to match `--w-wrap` (1080px)
+  exactly, so two-up never activates before the column is already at its
+  widest; measured 68 characters after, in both en and zh.
 
 ## Guard
 
