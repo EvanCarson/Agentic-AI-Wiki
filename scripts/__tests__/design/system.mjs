@@ -982,4 +982,31 @@ describe('design system', () => {
     }
     assert.deepEqual(bad, [], `breakpoint ladder wrong:\n${bad.join('\n')}`);
   });
+
+  // --t-prose is declared in :root and stepped in a @media at the foot of
+  // tokens.css. A same-specificity custom-property override loses to the base
+  // declaration on source order, and this repo has shipped that bug three
+  // times — so assert the COMPUTED size, at a width either side of the step.
+  // The source-level token test cannot see a reorder; this can.
+  test('article prose steps to 18px at 1360px and not before', async () => {
+    const bad = [];
+    for (const [w, want] of [[390, '16px'], [1280, '16px'], [1359, '16px'], [1360, '18px'], [1728, '18px']]) {
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      for (const path of ['/field-guide/llm-mental-model/', '/zh/field-guide/llm-mental-model/']) {
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const got = await page.evaluate(() => {
+          // Chinese text is naturally shorter in character count, so check for
+          // 150+ chars for zh, 250+ for en. Both ensure substantial paragraph content.
+          const minChars = window.location.pathname.startsWith('/zh') ? 150 : 250;
+          const p = [...document.querySelectorAll('.step p')].find((x) => x.innerText.trim().length > minChars);
+          return p ? getComputedStyle(p).fontSize : null;
+        });
+        if (got === null) bad.push(`@${w}px ${path} found no .step p over threshold`);
+        else if (got !== want) bad.push(`@${w}px ${path} = ${got}, want ${want}`);
+      }
+      await ctx.close();
+    }
+    assert.deepEqual(bad, [], `--t-prose step wrong:\n${bad.join('\n')}`);
+  });
 });
