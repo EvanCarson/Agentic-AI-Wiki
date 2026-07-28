@@ -1020,4 +1020,37 @@ describe('design system', () => {
     }
     assert.deepEqual(bad, [], `--t-prose step wrong:\n${bad.join('\n')}`);
   });
+
+  // BlogLayout carried `:global(.blog-shell) { max-width: 1080px }` whose
+  // comment claimed it widened the shell for wide comparison tables. It did
+  // neither: 1080 is narrower than the 1180 it meant to override, and the
+  // rule lost a same-specificity source-order tie to .chapter-shell anyway,
+  // computing 1180px. Sixth instance of that failure mode in this repo.
+  // Asserted on the COMPUTED value, which is the only thing that would have
+  // caught it.
+  test('the blog shell uses the standard shell width', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of [
+      '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+      '/zh/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+    ]) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const got = await page.evaluate(() => {
+        const shell = document.querySelector('.chapter-shell');
+        const main = document.querySelector('.chapter-main');
+        if (!shell || !main) return null;
+        return {
+          maxW: getComputedStyle(shell).maxWidth,
+          main: Math.round(main.getBoundingClientRect().width),
+        };
+      });
+      if (!got) { bad.push(`${path} has no .chapter-shell/.chapter-main`); continue; }
+      if (got.maxW !== '1440px') bad.push(`${path} shell max-width computed ${got.maxW}, want 1440px`);
+      if (got.main < 1000) bad.push(`${path} article column ${got.main}px, want >=1000px`);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `blog shell wrong:\n${bad.join('\n')}`);
+  });
 });
