@@ -1024,10 +1024,20 @@ describe('design system', () => {
   // BlogLayout carried `:global(.blog-shell) { max-width: 1080px }` whose
   // comment claimed it widened the shell for wide comparison tables. It did
   // neither: 1080 is narrower than the 1180 it meant to override, and the
-  // rule lost a same-specificity source-order tie to .chapter-shell anyway,
-  // computing 1180px. Sixth instance of that failure mode in this repo.
+  // rule never reached the browser at all. It sat inside a `<style is:global>`
+  // block, and `:global()` is a directive for Astro's SCOPING pass — a block
+  // that opts out of scoping never gets the rewrite, so the literal
+  // `:global(.blog-shell)` selector shipped into the compiled CSS and browsers
+  // discarded the rule as invalid syntax. Not a cascade contest it lost; a
+  // rule that did not exist as far as the browser was concerned. Seventh
+  // member of the "a reference hid where a CSS-source sweep cannot see it"
+  // family recorded in this repo's notes.
+  //
   // Asserted on the COMPUTED value, which is the only thing that would have
-  // caught it.
+  // caught it — and note the consequence: this assertion could not be proved
+  // red before the fix, because the defect was invisible to the browser. Its
+  // proof that it can fail is the deliberate-break check in the plan's
+  // verification task, not a pre-fix red run.
   test('the blog shell uses the standard shell width', async () => {
     const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await ctx.newPage();

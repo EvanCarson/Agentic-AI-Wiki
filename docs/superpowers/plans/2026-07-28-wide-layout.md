@@ -1099,6 +1099,9 @@ Expected: `blog shell uses` PASS, reporting a 1056px article column. `prose meas
 
 - [ ] **Step 6: Commit**
 
+(The message below is reproduced verbatim from the commit actually in
+history; its stated cause was corrected afterwards — see Step 2.)
+
 ```bash
 git add src/layouts/BlogLayout.astro scripts/__tests__/design/system.mjs
 git commit -m "fix(design): delete BlogLayout's dead shell override
