@@ -46,11 +46,19 @@ The whole band sits under the project's own 60-character floor. The measure
 guard runs at 1280px only, so it has never seen this.
 
 **B. `:global(.blog-shell) { max-width: 1080px }` is dead code.**
-`src/layouts/BlogLayout.astro:352` loses a same-specificity source-order tie to
-`.chapter-shell`; the computed value is 1180px. Its comment claims to widen the
-shell for wide tables, but 1080 < 1180, so it was wrong in both directions. This
-is the sixth instance of the same-specificity tie failure mode already recorded
-in the project's notes.
+`src/layouts/BlogLayout.astro:352` sits inside a `<style is:global>` block.
+`:global()` is a directive for Astro's *scoping* pass, and `is:global` opts
+the whole block out of scoping entirely — so the compiler never rewrites the
+wrapper, and the literal selector `:global(.blog-shell)` ships into the
+compiled CSS. That is not valid CSS selector syntax, so browsers discard the
+rule outright: it was never in a cascade contest with `.chapter-shell` at
+all, just absent from the browser's view of the stylesheet. The computed
+value is 1180px — `.chapter-shell`'s own, uncontested. Its comment claims to
+widen the shell for wide tables, but 1080 < 1180, so it was wrong in both
+directions even on its own terms. This is a seventh member of the "a
+reference hid where a CSS-source sweep cannot see it" family already
+recorded in the project's notes, not a same-specificity tie: the rule was
+not competing, it did not exist as far as the browser was concerned.
 
 **C. Index pages run long lines today.** Inside the 860px `.wrap`, with no
 `max-width` on any of them: `/concepts/` list items 97ch, changelog entries 98ch,

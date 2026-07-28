@@ -1008,8 +1008,13 @@ Append inside the `describe` block in `scripts/__tests__/design/system.mjs`:
   // BlogLayout carried `:global(.blog-shell) { max-width: 1080px }` whose
   // comment claimed it widened the shell for wide comparison tables. It did
   // neither: 1080 is narrower than the 1180 it meant to override, and the
-  // rule lost a same-specificity source-order tie to .chapter-shell anyway,
-  // computing 1180px. Sixth instance of that failure mode in this repo.
+  // rule sat inside a <style is:global> block, which Astro's scoping pass
+  // never touches — so :global() was never rewritten, the literal selector
+  // shipped into the compiled CSS, and browsers dropped the whole rule as
+  // invalid. It was never in a cascade contest with .chapter-shell at all;
+  // it just wasn't there. Computed value: 1180px, .chapter-shell's own.
+  // Seventh instance of "a reference hid where a CSS-source sweep cannot see
+  // it" in this repo — not a same-specificity tie, since nothing was tied.
   // Asserted on the COMPUTED value, which is the only thing that would have
   // caught it.
   test('the blog shell uses the standard shell width', async () => {
@@ -1045,7 +1050,7 @@ Append inside the `describe` block in `scripts/__tests__/design/system.mjs`:
 npm run test:design 2>&1 | grep -A3 "blog shell uses"
 ```
 
-Expected: FAIL — `shell max-width computed 1080px, want 1440px`. Note the number: after Task 4 the dead rule is *no longer* dead, because `.chapter-shell` now says `var(--w-shell)` and the source-order tie now resolves in `.blog-shell`'s favour in the built stylesheet. Whichever value it reports, it is not 1440px, and that is the failure.
+Expected: **PASS, before any code change.** This is the rare case where the guard cannot be proved red first: the `:global(.blog-shell)` rule sits inside a `<style is:global>` block, so Astro's scoping pass never rewrites the `:global()` wrapper, the literal (invalid) selector ships into the compiled CSS, and every browser drops the whole rule. `.chapter-shell`'s own value (`1440px` after Task 4) was already what computed, with or without the dead rule present — the defect is invisible to the browser, not merely invisible to a CSS-source read. Confirm this by running the command anyway and observing the pass; do not treat a pass here as a sign the test is wrong. The proof that the assertion is real is not a pre-fix red run — it is the deliberate-break check in Task 9 Step 4 (`check "blog shell" … 's/max-width: var(--w-shell)/max-width: 1180px/' "blog shell uses"`), which mutates `.chapter-shell` itself and confirms the assertion fails loudly when the shell actually changes.
 
 - [ ] **Step 3: Delete the rule**
 
@@ -1816,8 +1821,10 @@ show more than 48px. This takes the latter shape.
 
 - Both rails switched on at 901px against a shell with no width to hold
   them, leaving the article 30 characters wide from 901 to 1180.
-- `BlogLayout`'s `:global(.blog-shell)` was dead code losing a
-  same-specificity source-order tie; its column goes 884px → 1056px.
+- `BlogLayout`'s `:global(.blog-shell)` was dead code: the rule sat inside a
+  `<style is:global>` block, whose scoping pass never rewrites `:global()`, so
+  the literal selector shipped invalid and every browser dropped it; its
+  column goes 884px → 1056px.
 - Index pages had no `max-width` on any text block.
 - Layout properties set by inline `style` attributes are now in CSS.
 
