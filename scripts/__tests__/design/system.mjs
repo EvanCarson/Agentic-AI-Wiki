@@ -1063,4 +1063,36 @@ describe('design system', () => {
     await ctx.close();
     assert.deepEqual(bad, [], `blog shell wrong:\n${bad.join('\n')}`);
   });
+
+  // Inline style attributes are the first entry on this repo's list of
+  // recurring bug classes: a CSS-source sweep structurally cannot see them,
+  // and four separate font/colour defects have hidden there. Layout
+  // properties are the ones that matter for the 2026-07-28 widening, because
+  // a grid whose column count lives in an attribute cannot be changed by a
+  // breakpoint. Content-level inline styles (visibility on the page-nav
+  // spacer) are not layout and stay allowed.
+  test('no layout property is set by an inline style attribute', () => {
+    const banned = /(max-width|grid-template-columns|display\s*:\s*grid)/;
+    const bad = [];
+    let seen = 0;
+    const walk = (dir) => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const p = resolve(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.name === 'index.html') {
+          const html = readFileSync(p, 'utf8');
+          for (const m of html.matchAll(/\sstyle="([^"]*)"/g)) {
+            seen++;
+            if (banned.test(m[1])) {
+              bad.push(`${p.slice(DIST.length)} → ${m[1].slice(0, 90)}`);
+            }
+          }
+        }
+      }
+    };
+    walk(DIST);
+    assert.ok(seen > 0, 'found no inline style attributes at all — the walk is broken');
+    assert.deepEqual([...new Set(bad)].slice(0, 20), [],
+      `layout properties in inline style attributes:\n${[...new Set(bad)].slice(0, 20).join('\n')}`);
+  });
 });
