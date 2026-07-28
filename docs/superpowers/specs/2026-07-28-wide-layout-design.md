@@ -1,7 +1,7 @@
 # Wide layout: spend the screen on reading, not on margins
 
 **Date:** 2026-07-28
-**Status:** approved, not yet implemented
+**Status:** implemented, shipped 2026-07-28
 **Scope:** `src/styles/tokens.css`, `src/styles/site.css`, `src/styles/guide.css`,
 `src/layouts/BlogLayout.astro`, `src/components/pages/*.astro`,
 `scripts/__tests__/design/system.mjs`
@@ -150,25 +150,42 @@ font size, that equivalence holds at every size. A token named for the classic
 
 - article prose — `.phase p`, `.step p`, `.step ul li`, `.phase .goal`,
   `.shell-plan-section p`, `.outro p`
-- blog prose — `.blog-article p`, `.blog-article > section > ul li`
-- index prose — `.hero .lede`, `.toc-desc`, `.home-card-tagline`,
-  `.blog-card-summary`, `.changelog-items li`, `.concept-summary`
+- index prose — `.lede`, `.toc-desc`, `.home-card-tagline`,
+  `.blog-card-summary`, `.changelog-items li`, `.entry-summary`
 
-It is **not** applied to `pre`, `table`, `.diagram`, `.threat-grid`, `.callout`,
-`.deliverable`, `.qa`, `.code-tabs`, or any card container — those deliberately
-take the full column width, which is what the extra width is for.
+No blog rule ships here: `BlogLayout` already had its own pre-existing
+`max-width: 58ch` cap on article prose, and this branch deliberately leaves
+it alone. `.lede` (not `.hero .lede`) is deliberate too — the About page puts
+`p.lede` inside `section.wrap`, not inside the hero, so the scoped selector
+never matched it; the bare class reaches About and privacy as well. The class
+that ships for index entry summaries is `.entry-summary`, not
+`.concept-summary`.
+
+`.callout`, `.deliverable` and `.qa` are **not** exempt — they are prose boxes
+whose surface spans the column but whose content is ordinary running text: an
+uncapped `.deliverable p` measured 82 characters at 768px. `.phase p` reaches
+their nested paragraphs as a descendant selector wherever they sit inside
+article content, so they are capped by the same rule as everything else. What
+is actually exempt is the non-prose content the extra width exists for:
+`pre`, `table`, `.diagram`, `.threat-grid` and `.code-tabs` are never matched
+by any cap selector, so they are exempt by construction rather than by an
+explicit reset.
 
 ### 4.2 `--t-prose`
 
 ```css
-:root { --t-prose: 16px; }
-@media (min-width: 1360px) { :root { --t-prose: 18px; } }
+:root { --t-prose: var(--t-base); }
+@media (min-width: 1360px) { :root { --t-prose: var(--t-md); } }
 ```
 
-Replaces `--t-base` at exactly four article-prose declarations in `guide.css`:
-`.step p`, `.step ul li`, `.phase .goal`, `.shell-plan-section p` (plus
-`.shell-plan-section ul.outline li strong`). `body` keeps `--t-base` so cards,
-nav and chrome are untouched.
+Replaces `--t-base` at six article-prose declarations in `guide.css`: `.step p`,
+`.step ul li`, `.phase .goal`, `.shell-plan-section p`,
+`.shell-plan-section ul.outline li strong`, and `.callout p` — the last added
+because once the prose around a callout steps to 18px above 1360px, a
+`--t-base` callout would be smaller than the page again. `body` keeps
+`--t-base` so cards, nav and chrome are untouched. The token itself is
+declared as `var(--t-base)` stepping to `var(--t-md)` at the breakpoint, never
+as a literal `16px`/`18px`, so it tracks either token if they ever change.
 
 This also closes a judgement call the codebase recorded as blocked. The comment
 at `guide.css:314` reads: *".phase caps prose at 536px, where 18px measures 56 —
