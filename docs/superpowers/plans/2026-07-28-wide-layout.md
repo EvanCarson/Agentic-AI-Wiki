@@ -387,20 +387,30 @@ In `scripts/__tests__/design/system.mjs`, replace the whole existing `test('pros
   const measureChars = () => {
     const c = document.createElement('canvas').getContext('2d');
     const ab = 'abcdefghijklmnopqrstuvwxyz ';
-    let max = 0, worst = null, seen = 0;
-    for (const el of document.querySelectorAll('main p, main li, .hero .lede, .toc-desc')) {
-      const text = el.innerText.trim();
-      if (text.length < 120) continue;
+    const visible = (el) => {
       const b = el.getBoundingClientRect();
-      if (b.width < 1 || b.height < 1) continue;
+      if (b.width < 1 || b.height < 1) return false;
       const cs = getComputedStyle(el);
-      if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+      return cs.visibility !== 'hidden' && cs.display !== 'none';
+    };
+    // Candidates are blocks that can carry a line of running text. A wrapper
+    // like li.changelog-entry has no text of its own — <time>, <summary> and
+    // a nested <ul> do — but innerText concatenates its descendants, so
+    // measuring it reads a CONTAINER's width as a line length and reports a
+    // failure no CSS change could fix. Dropping any candidate that contains
+    // another candidate leaves the innermost block that really sets the line.
+    const cands = [...document.querySelectorAll('main p, main li, .lede, .toc-desc, .entry-summary')]
+      .filter((el) => el.innerText.trim().length >= 120 && visible(el));
+    const leaves = cands.filter((el) => !cands.some((o) => o !== el && el.contains(o)));
+    let max = 0, worst = null, seen = 0;
+    for (const el of leaves) {
       seen++;
+      const cs = getComputedStyle(el);
       c.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
-      const chars = Math.round(b.width / (c.measureText(ab).width / ab.length));
+      const chars = Math.round(el.getBoundingClientRect().width / (c.measureText(ab).width / ab.length));
       if (chars > max) {
         max = chars;
-        worst = `${el.tagName.toLowerCase()}.${(el.className || '').toString().split(' ')[0]} ${Math.round(b.width)}px @${cs.fontSize}`;
+        worst = `${el.tagName.toLowerCase()}.${(el.className || '').toString().split(' ')[0]} ${Math.round(el.getBoundingClientRect().width)}px @${cs.fontSize}`;
       }
     }
     return { max, worst, seen };
@@ -482,7 +492,7 @@ Append to `src/styles/site.css`, at the end of the file:
    87 and home card taglines 102. Capping them shortens lines that were
    already too long, and it is what lets .wrap widen in a later commit without
    the extra width turning into extra line length. */
-.hero .lede,
+.lede,
 .toc-desc,
 .home-card-tagline,
 .blog-card-summary,
@@ -515,7 +525,7 @@ A rule in `site.css` is (0,1,1); Astro appends an `.astro-XXXX` class to every s
 npm run build && npm run test:design 2>&1 | grep -E "prose measure"
 ```
 
-Expected: 390, 430, 768 and 901 now PASS. 1024 through 1728 still FAIL — the shell has not moved yet, so the article column is still starved above 900px. `/concepts/` still fails at every width, because `.entry-summary` does not exist until Task 7. This is the expected intermediate state; record it so the next task's reviewer knows what is outstanding.
+Expected: passes at 390, 430, 768 and 901; still fails 1024 through 1728 (shell not yet widened) and on `/concepts/` (`.entry-summary` not emitted until Task 7). This is the expected intermediate state; record it so the next task's reviewer knows what is outstanding.
 
 - [ ] **Step 7: Confirm the blog cap took effect, from computed styles not source**
 

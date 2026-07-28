@@ -422,20 +422,30 @@ describe('design system', () => {
   const measureChars = () => {
     const c = document.createElement('canvas').getContext('2d');
     const ab = 'abcdefghijklmnopqrstuvwxyz ';
-    let max = 0, worst = null, seen = 0;
-    for (const el of document.querySelectorAll('main p, main li, .hero .lede, .toc-desc')) {
-      const text = el.innerText.trim();
-      if (text.length < 120) continue;
+    const visible = (el) => {
       const b = el.getBoundingClientRect();
-      if (b.width < 1 || b.height < 1) continue;
+      if (b.width < 1 || b.height < 1) return false;
       const cs = getComputedStyle(el);
-      if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+      return cs.visibility !== 'hidden' && cs.display !== 'none';
+    };
+    // Candidates are blocks that can carry a line of running text. A wrapper
+    // like li.changelog-entry has no text of its own — <time>, <summary> and
+    // a nested <ul> do — but innerText concatenates its descendants, so
+    // measuring it reads a CONTAINER's width as a line length and reports a
+    // failure no CSS change could fix. Dropping any candidate that contains
+    // another candidate leaves the innermost block that really sets the line.
+    const cands = [...document.querySelectorAll('main p, main li, .lede, .toc-desc, .entry-summary')]
+      .filter((el) => el.innerText.trim().length >= 120 && visible(el));
+    const leaves = cands.filter((el) => !cands.some((o) => o !== el && el.contains(o)));
+    let max = 0, worst = null, seen = 0;
+    for (const el of leaves) {
       seen++;
+      const cs = getComputedStyle(el);
       c.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
-      const chars = Math.round(b.width / (c.measureText(ab).width / ab.length));
+      const chars = Math.round(el.getBoundingClientRect().width / (c.measureText(ab).width / ab.length));
       if (chars > max) {
         max = chars;
-        worst = `${el.tagName.toLowerCase()}.${(el.className || '').toString().split(' ')[0]} ${Math.round(b.width)}px @${cs.fontSize}`;
+        worst = `${el.tagName.toLowerCase()}.${(el.className || '').toString().split(' ')[0]} ${Math.round(el.getBoundingClientRect().width)}px @${cs.fontSize}`;
       }
     }
     return { max, worst, seen };
