@@ -12,12 +12,12 @@ const entry: ChangelogEntry = {
       '正文外框不再卡死在 1180px。现在它在 1440px 以内自适应，左侧导航与右侧目录贴近视口边缘，超过 1440px 后整体居中。在 1728px 的屏幕上，两侧闲置的空白从每边 274px 降到 144px，正文栏从 536px 加宽到 760px。',
     ),
     L(
-      'Body text on chapters and entries steps from 16px to 18px on wide screens, matching the blog. Line length is capped everywhere, so the extra width buys more columns and wider rails rather than longer lines.',
-      '在宽屏上，章节与条目的正文字号从 16px 提升到 18px，与博客一致。每一处正文的行宽都设了上限，因此多出来的宽度用于增加栏数、加宽侧栏，而不是把行拉长。',
+      'Body text on chapters and entries steps from 16px to 18px on wide screens, matching the blog — numbered lists included, which had been left behind at 16px inside 18px prose. Line length is capped everywhere: bulleted lists, numbered lists and deliverable checklists all sit inside the same measure as body text, so the extra width buys more columns and wider rails rather than longer lines.',
+      '在宽屏上，章节与条目的正文字号从 16px 提升到 18px，与博客一致——编号列表也包含在内，此前它们仍停留在 16px，夹在 18px 的正文之间。每一处正文的行宽都设了上限：无序列表、编号列表与交付物清单，都与正文行宽保持一致，因此多出来的宽度用于增加栏数、加宽侧栏，而不是把行拉长。',
     ),
     L(
-      'Fixed: between 901px and 1180px — a common split-screen and small-laptop width — both side rails appeared at once against a layout that had no room for them, squeezing the article to 30 characters a line. The contents rail now waits until there is room, and appears as a collapsible panel above the article below that.',
-      '修复：在 901px 到 1180px 之间——分屏与小尺寸笔记本常见的宽度——两侧栏会同时出现，而版面根本容纳不下，正文被挤到一行仅 30 个字符。现在目录栏会等到宽度足够才出现，在此之下则以可折叠面板的形式显示在正文上方。',
+      'Fixed: between 901px and 1180px — a common split-screen and small-laptop width — both side rails appeared at once against a layout that had no room for them, squeezing the article to 30 characters a line. The contents rail now waits until there is room, and between 900px and that point it appears as a collapsible panel above the article instead — on blog posts as well as on chapters. Phone widths are unchanged: no contents panel there, as before.',
+      '修复：在 901px 到 1180px 之间——分屏与小尺寸笔记本常见的宽度——两侧栏会同时出现，而版面根本容纳不下，正文被挤到一行仅 30 个字符。现在目录栏会等到宽度足够才出现；在 900px 到该宽度之间，则以可折叠面板的形式显示在正文上方——博客文章与章节页同样如此。手机宽度维持原样：与此前一致，不显示目录面板。',
     ),
     L(
       'Index pages widen too. Post lists and entry lists gain a second column, changelog entries move their date alongside the text, and the over-long lines on Concepts, the changelog and About are brought back within a comfortable measure.',

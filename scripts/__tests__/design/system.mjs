@@ -431,6 +431,14 @@ describe('design system', () => {
   const MEASURE_WIDTHS = [390, 430, 768, 901, 1024, 1152, 1280, 1360, 1440, 1728];
   const MEASURE_PAGES = [
     '/field-guide/llm-mental-model/',
+    // Carries the ordered lists and the checklist. The whole list family
+    // escaped the cap because `.step ul li` was capped and `.step ol li`
+    // matched nothing: this page's 473-character <ol> item ran 96 characters
+    // at 901px and 95 at 1280px against a 78 ceiling, live, while the suite
+    // was green — none of the ~8 affected pages was in this list. A guard
+    // that only audits pages built from the same three components is not
+    // auditing the CSS, it is auditing those three components.
+    '/field-guide/llm-as-judge/',
     '/concepts/prompt-caching/',
     '/deep-dives/mcp/mcp-building-servers-in-practice/',
     '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
@@ -1012,26 +1020,96 @@ describe('design system', () => {
     assert.deepEqual(bad, [], `breakpoint ladder wrong:\n${bad.join('\n')}`);
   });
 
+  // The ladder above runs on a chapter page only, and a chapter page's TOC is
+  // `.chapter-toc`. A blog post's is BlogPostTOC's `<nav class="blog-toc">`,
+  // which borrows the `.chapter-toc-*` CHILD classes but is not `.chapter-toc`
+  // — so raising `.chapter-side` to 1023.98px took the TOC off every blog post
+  // between 901 and 1023px while the compensating in-flow accordion, which
+  // targets `.chapter-toc`, replaced nothing. Posts here carry up to 40
+  // headings and the only fallback in that band was a "Browse all AI Blog"
+  // section link. Nothing caught it because no assertion looked at a blog
+  // post's TOC at all.
+  //
+  // This asserts the stronger property the chapter ladder only implies: above
+  // 900px a TOC is always REACHABLE — as a rail where the column can still
+  // hold 60 characters beside it, in flow above the article where it cannot.
+  // Below 900px it is absent by design (phone parity).
+  test('a blog post keeps a reachable table of contents at every width above 900px', async () => {
+    const bad = [];
+    for (const [w, wantVisible, wantRail] of [
+      [899, false, false],
+      [900, true, false], [960, true, false], [1023, true, false],
+      [1024, true, true], [1359, true, true], [1360, true, true], [1728, true, true],
+    ]) {
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      await page.goto(server.url + '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/', { waitUntil: 'load' });
+      const got = await page.evaluate(() => {
+        const el = document.querySelector('.blog-toc');
+        if (!el) return { present: false, visible: false, rail: false, items: 0 };
+        const b = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+        // Width 0 is the failure mode this test exists for: the nav itself
+        // stayed display:block while its `.chapter-side` parent went
+        // display:none, so a `display` check alone reported it as fine.
+        const visible = cs.display !== 'none' && cs.visibility !== 'hidden' && b.width >= 1 && b.height >= 1;
+        return {
+          present: true, visible, rail: visible && b.width < window.innerWidth * 0.5,
+          items: el.querySelectorAll('.chapter-toc-item').length,
+        };
+      });
+      await ctx.close();
+      if (!got.present) { bad.push(`@${w}px no .blog-toc in the document at all`); continue; }
+      // A TOC with no entries is not a TOC; the script builds them client-side.
+      if (wantVisible && got.items < 3) bad.push(`@${w}px .blog-toc rendered ${got.items} entries`);
+      if (got.visible !== wantVisible) bad.push(`@${w}px .blog-toc visible ${got.visible}, want ${wantVisible}`);
+      if (got.rail !== wantRail) bad.push(`@${w}px .blog-toc rail ${got.rail}, want ${wantRail}`);
+    }
+    assert.deepEqual(bad, [], `blog TOC ladder wrong:\n${bad.join('\n')}`);
+  });
+
   // --t-prose is declared in :root and stepped in a @media at the foot of
   // tokens.css. A same-specificity custom-property override loses to the base
   // declaration on source order, and this repo has shipped that bug three
   // times — so assert the COMPUTED size, at a width either side of the step.
   // The source-level token test cannot see a reorder; this can.
+  //
+  // EVERY live consumer of --t-prose is listed, not a sample. The assertion
+  // shipped checking `.step p` and `.callout p`, which is half of them:
+  // reverting `.step ul li` to var(--t-base) rendered every bulleted list on
+  // every Field Guide, Concepts and Deep-Dive page at 16px inside 18px prose
+  // above 1360px, in both locales, with this suite still green.
+  // `.shell-plan-section p` and `.shell-plan-section ul.outline li strong`
+  // also read --t-prose and are deliberately NOT listed: the class matches
+  // nothing in src/ or dist/ (a removed stub-chapter feature whose CSS was
+  // left behind), and a selector that can never be found is under-coverage
+  // pretending to be coverage — the same reason the shell-banner marker was
+  // removed from COMPONENT_MARKERS.
+  const PROSE_SELECTORS = ['.step p', '.step ul li', '.step ol li', '.phase .goal', '.callout p'];
+  // Two chapters, both locales. Neither chapter carries every selector —
+  // llm-mental-model has no <ol> inside a .step, llm-as-judge has seven — so
+  // "not on this page" cannot be a per-page failure. It is a failure only if a
+  // selector is found on NO page at NO width, which is asserted after the loop.
+  const PROSE_PAGES = [
+    '/field-guide/llm-mental-model/', '/zh/field-guide/llm-mental-model/',
+    '/field-guide/llm-as-judge/', '/zh/field-guide/llm-as-judge/',
+  ];
   test('article prose steps to 18px at 1360px and not before', async () => {
     const bad = [];
+    const everFound = new Set();
     for (const [w, want] of [[390, '16px'], [1280, '16px'], [1359, '16px'], [1360, '18px'], [1728, '18px']]) {
       const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
       const page = await ctx.newPage();
-      for (const path of ['/field-guide/llm-mental-model/', '/zh/field-guide/llm-mental-model/']) {
+      for (const path of PROSE_PAGES) {
         await page.goto(server.url + path, { waitUntil: 'load' });
-        const got = await page.evaluate(() => {
+        const got = await page.evaluate((sels) => {
           // No length threshold: computed font-size does not depend on text
           // length, and a floor tuned for the measure test would never match a
           // .callout p, which is short by nature — the assertion would report
           // "found none" rather than checking the selector it was added for.
-          // Check both .step p and .callout p, reporting both independently.
+          // Every selector is reported independently.
           const out = {};
-          for (const sel of ['.step p', '.callout p']) {
+          for (const sel of sels) {
             const el = [...document.querySelectorAll(sel)].find((x) => {
               const b = x.getBoundingClientRect();
               return b.width > 0 && b.height > 0;
@@ -1039,14 +1117,18 @@ describe('design system', () => {
             out[sel] = el ? getComputedStyle(el).fontSize : null;
           }
           return out;
-        });
+        }, PROSE_SELECTORS);
         for (const [sel, size] of Object.entries(got)) {
-          if (size === null) bad.push(`@${w}px ${path} found no visible ${sel}`);
-          else if (size !== want) bad.push(`@${w}px ${path} ${sel} = ${size}, want ${want}`);
+          if (size === null) continue;
+          everFound.add(sel);
+          if (size !== want) bad.push(`@${w}px ${path} ${sel} = ${size}, want ${want}`);
         }
       }
       await ctx.close();
     }
+    const never = PROSE_SELECTORS.filter((s) => !everFound.has(s));
+    assert.deepEqual(never, [],
+      `--t-prose consumers found on no tested page at any width — this assertion verifies nothing for: ${never.join(', ')}`);
     assert.deepEqual(bad, [], `--t-prose step wrong:\n${bad.join('\n')}`);
   });
 

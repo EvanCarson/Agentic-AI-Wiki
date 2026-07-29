@@ -171,12 +171,43 @@ range, and this branch's phone-parity proof (375/390/430px byte-identical,
 both themes) was established against the shipped 62ch value — changing it
 would need that proof re-run before it could be trusted again.
 
-`--w-measure` applies to running text only. The families it is applied to:
+`--w-measure` applies to running text only. The families it is applied to
+(**five** live article-prose selectors, not six — see the dead-CSS note below):
 
-- article prose — `.phase p`, `.step p`, `.step ul li`, `.phase .goal`,
-  `.shell-plan-section p`, `.outro p`
+- article prose — `.phase p`, `.step p`, `.step li`, `.phase .goal`,
+  `.deliverable .checklist li`
 - index prose — `.lede`, `.toc-desc`, `.home-card-tagline`,
   `.blog-card-summary`, `.changelog-items li`, `.entry-summary`
+
+**`.step li`, not `.step ul li`.** The cap first shipped as `.step ul li`, so an
+`<ol>` inside a `.step` matched nothing and ran **96 characters at 901px and 95
+at 1280px** against the 78-character ceiling, on at least 8 pages
+(`/field-guide/llm-as-judge/`, `/field-guide/first-eval-suite/`,
+`/field-guide/prompts/`, `/deep-dives/retrieval-and-rag/choosing-a-vector-database/`
+and their `/zh/` counterparts). Before the widening those items sat at 30–63
+characters, so the widening is what made them long. `.step li` is safe as a
+*cap* selector because it sets `max-width` alone: the arrow-marker box —
+`padding`, `position: relative`, the `::before` glyph — stays on `.step ul li`,
+where widening it to `.step li` would give a numbered item an arrow *and* a
+number at the wrong indent. Ordered items get their type from a separate
+`.step ol li { font-size: var(--t-prose); line-height: var(--lh-base) }`.
+
+`.deliverable .checklist li` needed its own entry because `.deliverable` is not
+nested inside `.step`. It ran **111–130 characters**. Only the cap is added — it
+keeps its deliberately smaller `--t-2xs` monospace type, and 62ch of a
+monospace face is ~62 characters, inside the 60–78 window.
+
+**Dead CSS, recorded so the next reader does not re-derive it.** `.outro` and
+`.shell-plan-section` belong to a removed stub-chapter feature:
+`grep -rl outro src/ dist/` and `grep -rl shell-plan-section src/ dist/` both
+return only the stylesheets themselves. Three selectors this branch touched
+therefore match nothing and are no-ops — `.outro p`'s cap, and the `--t-prose`
+swaps on `.shell-plan-section p` and `.shell-plan-section ul.outline li strong`.
+The two `.shell-plan-section` entries have been removed from the MEASURE cap
+block this branch added, per this project's own rule that a marker matching
+nothing is under-coverage pretending to be coverage. The dead *rules* are left
+in place: deleting them is unrelated cleanup, deliberately deferred to a
+separate change.
 
 No blog rule ships here: `BlogLayout` already had its own pre-existing
 `max-width: 58ch` cap on article prose, and this branch deliberately leaves
@@ -203,11 +234,16 @@ explicit reset.
 @media (min-width: 1360px) { :root { --t-prose: var(--t-md); } }
 ```
 
-Replaces `--t-base` at six article-prose declarations in `guide.css`: `.step p`,
-`.step ul li`, `.phase .goal`, `.shell-plan-section p`,
-`.shell-plan-section ul.outline li strong`, and `.callout p` — the last added
-because once the prose around a callout steps to 18px above 1360px, a
-`--t-base` callout would be smaller than the page again. `body` keeps
+Replaces `--t-base` at **five live** article-prose declarations in `guide.css`:
+`.step p`, `.step ul li`, `.step ol li`, `.phase .goal`, and `.callout p` — the
+last added because once the prose around a callout steps to 18px above 1360px, a
+`--t-base` callout would be smaller than the page again, and `.step ol li` added
+for exactly the same reason: an `<ol>` inside a `.step` had no font-size rule at
+all, inherited `--t-base` from `body`, and stayed 16px while the bulleted list
+beside it stepped to 18px. Two further declarations read `--t-prose` and are
+**not** counted as coverage — `.shell-plan-section p` and
+`.shell-plan-section ul.outline li strong` are dead CSS (§4.1), so the guard
+that checks this step deliberately does not list them. `body` keeps
 `--t-base` so cards, nav and chrome are untouched. The token itself is
 declared as `var(--t-base)` stepping to `var(--t-md)` at the breakpoint, never
 as a literal `16px`/`18px`, so it tracks either token if they ever change.
@@ -283,10 +319,50 @@ breakpoint to 1360px would remove the TOC from common laptop widths, so the
 accordion must now exist:
 
 Below 1360px, `.chapter-shell` wraps and `.chapter-toc` takes `order: -1` and
-`width: 100%`, rendering in flow above the article, collapsed. The markup is
-already there — `PageTOC.astro` ships the `aria-expanded` toggle and the list.
-Net effect at 1280px: no rail, but a 70ch article (up from 54ch) and a TOC that
-is reachable rather than absent.
+`width: 100%`, rendering in flow above the article. The markup is already there
+— `PageTOC.astro` ships the `aria-expanded` toggle and the list. Net effect at
+1280px: no rail, but a 70ch article (up from 54ch) and a TOC that is reachable
+rather than absent.
+
+**It renders expanded, not collapsed.** This section originally said
+"collapsed"; that is not what ships and was never implemented.
+`PageTOC.astro:13` sets `aria-expanded="true"` and nothing in the 900–1359px
+band collapses it, so the panel opens at full height and the article's top edge
+moves from y=115 to y=371 at 960–1359px. That is defensible for `.chapter-toc`
+— the worst case site-wide is 9 entries — and the component's behaviour is
+deliberately left alone. The spec is corrected to describe what ships.
+
+**Blog posts need the same compensation, and it is a separate rule.** A blog
+post's in-page TOC is `BlogPostTOC.astro`'s `<nav class="blog-toc">`, mounted
+inside `.chapter-side`. It borrows the `.chapter-toc-*` *child* classes but is
+not `.chapter-toc`, so the accordion above never matched it, while
+`.chapter-side { display: none }` at ≤1023.98px took it away — leaving posts
+with up to 40 headings no table of contents at all between 901 and 1023px, with
+only a "Browse all AI Blog →" section link as fallback. Pre-branch the rail was
+visible from 901px up, so that was a regression, and the argument at the top of
+this section (raising the breakpoint must not remove the TOC from common
+widths) applies to it verbatim.
+
+The fix mirrors the `.chapter-toc` treatment in a `900px–1023.98px` band, and
+above 1024px `.chapter-side` is already a visible rail holding the TOC, so the
+band ends where that one begins. Two implementation notes that are load-bearing:
+
+- The aside carries a `chapter-side-blogtoc` marker class and the rule is
+  written as the compound `.chapter-side.chapter-side-blogtoc` (0,2,0), so it
+  outranks `.chapter-side { display: none }` (0,1,0) on **specificity**, not on
+  source order. Moving the block cannot silently disable it.
+- The `.blog-toc` overrides themselves (drop the left-rail `border-right`, add
+  the gutters `.chapter-shell` stops providing below 1024px) live in
+  `BlogPostTOC.astro`'s own `<style>` block, **not** in `site.css`. Astro
+  appends the component's scope class to those selectors, making them
+  `.blog-toc[data-astro-cid-…]` (0,2,0); a `site.css` rule of shape `.blog-toc`
+  is (0,1,0) and would compute as if never declared. This branch has been bitten
+  by the scoped-vs-global cascade twice already.
+
+Cost, measured, and it is real: the panel is one entry per heading, so on a
+40-heading post the article's top edge moves from y=532 to y=1852 at 900–1023px
+(zh: 522 → 1843). Bounding or collapsing it needs a component change and is
+deliberately not done here.
 
 ### 5.4 Blog layout
 
@@ -358,6 +434,30 @@ Three changes to `scripts/__tests__/design/system.mjs`:
    97–108ch.
 3. **New assertion: no dead gutter.** On article pages at 1440px and 1728px, the
    outer gutter is ≤12% of the viewport per side. Fails today at 15.9%.
+
+Three further changes, added after the whole-branch review found each of the
+defects they now catch:
+
+4. **`MEASURE_PAGES` gains `/field-guide/llm-as-judge/`.** The list families
+   escaped the cap on ~8 pages and the suite stayed green because every audited
+   page happened to be built from the same three components. Proved to fail
+   before the fix at 768 (80ch), 901 (96ch), 1152 (80ch), 1280 (95ch), 1440
+   (79ch) and 1728px (79ch), all on the unclassed `li` of a `.step ol`.
+5. **The `--t-prose` assertion lists every live consumer** — `.step p`,
+   `.step ul li`, `.step ol li`, `.phase .goal`, `.callout p` — instead of two
+   of them, across `llm-mental-model` and `llm-as-judge` in both locales.
+   Neither page carries all five, so a selector missing from one page is not a
+   failure; a selector found on **no** page at **no** width is, which is what
+   makes "listed but never checked" impossible. Proved by reverting
+   `.step ul li` to `var(--t-base)`: 8 named failures at 1360 and 1728px.
+6. **New assertion: a blog post keeps a reachable table of contents above
+   900px** — a rail where the column can hold 60 characters beside it, in flow
+   above the article where it cannot, absent below 900px. The ladder assertion
+   ran on one chapter page and structurally could not see `.blog-toc`. It
+   checks rendered width, not just `display`: the failure mode was a
+   `display: block` nav inside a `display: none` parent, which a `display`
+   check alone reports as fine. Proved to fail before the fix at 900, 960 and
+   1023px.
 
 Per the project's standing rule, each new assertion is proved to fail before it
 is trusted: revert the fix, confirm the test names real elements and reports the
