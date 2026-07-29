@@ -324,13 +324,59 @@ Below 1360px, `.chapter-shell` wraps and `.chapter-toc` takes `order: -1` and
 1280px: no rail, but a 70ch article (up from 54ch) and a TOC that is reachable
 rather than absent.
 
-**It renders expanded, not collapsed.** This section originally said
-"collapsed"; that is not what ships and was never implemented.
-`PageTOC.astro:13` sets `aria-expanded="true"` and nothing in the 900–1359px
-band collapses it, so the panel opens at full height and the article's top edge
-moves from y=115 to y=371 at 960–1359px. That is defensible for `.chapter-toc`
-— the worst case site-wide is 9 entries — and the component's behaviour is
-deliberately left alone. The spec is corrected to describe what ships.
+**The chapter TOC renders expanded. The blog TOC renders collapsed. They
+deliberately differ, and the difference is the entry count.**
+
+This section originally said "collapsed" for both, which was wrong twice over —
+neither panel was collapsed when it was written, and the two do not want the
+same default.
+
+*`.chapter-toc` (PageTOC) — expanded, unchanged.* `PageTOC.astro:13` sets
+`aria-expanded="true"` and nothing in the 900–1359px band collapses it, so the
+panel opens at full height and the article's top edge moves from y=115 to y=371
+at 960–1359px. The worst case site-wide is **9 entries, ~350px** of
+displacement: the article still starts on the first screen, the reader sees the
+shape of the page for free, and a collapse would cost a click for no gain. Left
+exactly as it ships; the component is not touched.
+
+*`.blog-toc` (BlogPostTOC) — collapsed in the 900–1023.98px in-flow band.* One
+entry per heading, and posts here run to **40 headings**: expanded, the panel is
+**1289px** tall and pushes the article's top edge from y=532 to **y=1852**,
+roughly two screens of contents before the first paragraph. That is a different
+order of magnitude from 350px and it is not a matter of taste — it is an article
+the reader has to hunt for. Collapsed, the panel is a **55px** header and the
+article starts at **y=619** (zh: 1843 → 609), on the first screen, with the
+contents one click away. At 1024px and above it is a rail beside the article,
+where its height costs the reader nothing, and it stays open exactly as before.
+Below 900px it is not rendered at all.
+
+Three constraints on the mechanism, all load-bearing:
+
+- **`aria-expanded` stays truthful.** A single `setExpanded(open)` writes the
+  attribute *and* the list's visibility; nothing else writes either. A CSS-only
+  hide leaving `aria-expanded="true"` would tell a screen reader the list is
+  open while sighted readers see it closed — an accessibility defect, not a
+  shortcut. The chevron rotation is already keyed on `[aria-expanded="false"]`
+  in `site.css`, so it follows for free.
+- **One mechanism, not two.** The click handler and the breakpoint default both
+  drive `setExpanded`. The component already had a toggle; it is reused rather
+  than paralleled, because two writers for one state is how they drift.
+- **`matchMedia('(min-width: 900px) and (max-width: 1023.98px)')`, not a resize
+  listener.** `change` fires only when the 1024px boundary is actually crossed,
+  so dragging a window inside one band never touches the state and a reader who
+  opened the panel is never fought. Crossing re-applies the default for the band
+  being entered, which is what stops a rotated tablet landing on a collapsed
+  rail or an expanded 1289px panel. Verified by driving one live page instance:
+  open at 960 → drag to 1000 → drag to 940 stays open; cross to 1024 open;
+  cross back to 960 closed.
+
+**Phone safety of the added script path.** `setExpanded` returns early when the
+state already matches, so outside the in-flow band the script performs **no DOM
+write at all** — verified directly: at 375/390/430/899px and at 1024px the list
+carries no `style` attribute and `aria-expanded` is still the markup's `"true"`;
+only at 960px does it read `style="display: none;"` / `aria-expanded="false"`.
+The 42-screenshot SHA-256 phone-parity check is byte-identical against the
+pre-wave baseline.
 
 **Blog posts need the same compensation, and it is a separate rule.** A blog
 post's in-page TOC is `BlogPostTOC.astro`'s `<nav class="blog-toc">`, mounted
@@ -359,10 +405,8 @@ band ends where that one begins. Two implementation notes that are load-bearing:
   is (0,1,0) and would compute as if never declared. This branch has been bitten
   by the scoped-vs-global cascade twice already.
 
-Cost, measured, and it is real: the panel is one entry per heading, so on a
-40-heading post the article's top edge moves from y=532 to y=1852 at 900–1023px
-(zh: 522 → 1843). Bounding or collapsing it needs a component change and is
-deliberately not done here.
+The cost of restoring it — one entry per heading, y=532 → y=1852 on a
+40-heading post — is what forced the collapsed default described above.
 
 ### 5.4 Blog layout
 
@@ -458,6 +502,15 @@ defects they now catch:
    `display: block` nav inside a `display: none` parent, which a `display`
    check alone reports as fine. Proved to fail before the fix at 900, 960 and
    1023px.
+
+   It also pins the **open/closed state and the article's top edge**: closed at
+   900/960/1023, open at 1024 and above, `aria-expanded` and the list's rendered
+   visibility required to agree, and the article required to begin within the
+   first viewport at every width — the property the collapse exists to protect,
+   asserted directly instead of as a magic pixel number. Proved to fail by
+   forcing the panel expanded in that band:
+   `@960px .blog-toc aria-expanded true, want false (panel 1289px)` and
+   `@960px article starts at y=1852, below the first screen (viewport 900px, panel 1289px)`.
 
 Per the project's standing rule, each new assertion is proved to fail before it
 is trusted: revert the fix, confirm the test names real elements and reports the

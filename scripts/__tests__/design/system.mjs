@@ -1034,21 +1034,37 @@ describe('design system', () => {
   // 900px a TOC is always REACHABLE — as a rail where the column can still
   // hold 60 characters beside it, in flow above the article where it cannot.
   // Below 900px it is absent by design (phone parity).
+  //
+  // It also pins the OPEN/CLOSED state, which the reachability check alone does
+  // not: restoring the panel in flow at full width made it one entry per
+  // heading, and a 40-heading post rendered 1289px of contents that pushed the
+  // article's top edge to y=1852 — roughly two screens before the first
+  // paragraph, which is its own way of making an article unreadable. So the
+  // in-flow panel ships CLOSED (y=619, a 55px header) and the rail ships OPEN,
+  // unchanged. The chapter TOC deliberately differs — 9 entries worst case,
+  // ~350px — and is left expanded; see spec 5.3.
+  //
+  // aria-expanded is what is asserted, not a CSS-only "is the list visible":
+  // the two must agree, and asserting the attribute is what catches a hide that
+  // leaves a screen reader told the list is open.
   test('a blog post keeps a reachable table of contents at every width above 900px', async () => {
     const bad = [];
-    for (const [w, wantVisible, wantRail] of [
-      [899, false, false],
-      [900, true, false], [960, true, false], [1023, true, false],
-      [1024, true, true], [1359, true, true], [1360, true, true], [1728, true, true],
+    for (const [w, wantVisible, wantRail, wantExpanded] of [
+      [899, false, false, true],
+      [900, true, false, false], [960, true, false, false], [1023, true, false, false],
+      [1024, true, true, true], [1359, true, true, true], [1360, true, true, true], [1728, true, true, true],
     ]) {
       const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
       const page = await ctx.newPage();
       await page.goto(server.url + '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/', { waitUntil: 'load' });
       const got = await page.evaluate(() => {
         const el = document.querySelector('.blog-toc');
-        if (!el) return { present: false, visible: false, rail: false, items: 0 };
+        if (!el) return { present: false };
         const b = el.getBoundingClientRect();
         const cs = getComputedStyle(el);
+        const toggle = el.querySelector('.chapter-toc-toggle');
+        const list = el.querySelector('.chapter-toc-list');
+        const art = document.querySelector('.blog-article');
         // Width 0 is the failure mode this test exists for: the nav itself
         // stayed display:block while its `.chapter-side` parent went
         // display:none, so a `display` check alone reported it as fine.
@@ -1056,6 +1072,11 @@ describe('design system', () => {
         return {
           present: true, visible, rail: visible && b.width < window.innerWidth * 0.5,
           items: el.querySelectorAll('.chapter-toc-item').length,
+          expanded: toggle ? toggle.getAttribute('aria-expanded') === 'true' : null,
+          listShown: list ? getComputedStyle(list).display !== 'none' : null,
+          panelH: Math.round(b.height),
+          articleTop: art ? Math.round(art.getBoundingClientRect().top + window.scrollY) : null,
+          viewportH: window.innerHeight,
         };
       });
       await ctx.close();
@@ -1064,6 +1085,17 @@ describe('design system', () => {
       if (wantVisible && got.items < 3) bad.push(`@${w}px .blog-toc rendered ${got.items} entries`);
       if (got.visible !== wantVisible) bad.push(`@${w}px .blog-toc visible ${got.visible}, want ${wantVisible}`);
       if (got.rail !== wantRail) bad.push(`@${w}px .blog-toc rail ${got.rail}, want ${wantRail}`);
+      if (got.expanded !== wantExpanded) bad.push(`@${w}px .blog-toc aria-expanded ${got.expanded}, want ${wantExpanded} (panel ${got.panelH}px)`);
+      // The attribute and the rendering must agree, or a screen reader is told
+      // one thing and a sighted reader shown another.
+      if (got.listShown !== got.expanded) bad.push(`@${w}px .blog-toc aria-expanded ${got.expanded} but list shown ${got.listShown}`);
+      // The property the collapse exists to protect, asserted directly rather
+      // than as a magic pixel number: whatever sits above the article, the
+      // article still has to start on the first screen. Expanded in flow this
+      // reads 1852 against a 900px viewport.
+      if (got.articleTop >= got.viewportH) {
+        bad.push(`@${w}px article starts at y=${got.articleTop}, below the first screen (viewport ${got.viewportH}px, panel ${got.panelH}px)`);
+      }
     }
     assert.deepEqual(bad, [], `blog TOC ladder wrong:\n${bad.join('\n')}`);
   });

@@ -16,8 +16,8 @@ const entry: ChangelogEntry = {
       '在宽屏上，章节与条目的正文字号从 16px 提升到 18px，与博客一致——编号列表也包含在内，此前它们仍停留在 16px，夹在 18px 的正文之间。每一处正文的行宽都设了上限：无序列表、编号列表与交付物清单，都与正文行宽保持一致，因此多出来的宽度用于增加栏数、加宽侧栏，而不是把行拉长。',
     ),
     L(
-      'Fixed: between 901px and 1180px — a common split-screen and small-laptop width — both side rails appeared at once against a layout that had no room for them, squeezing the article to 30 characters a line. The contents rail now waits until there is room, and between 900px and that point it appears as a collapsible panel above the article instead — on blog posts as well as on chapters. Phone widths are unchanged: no contents panel there, as before.',
-      '修复：在 901px 到 1180px 之间——分屏与小尺寸笔记本常见的宽度——两侧栏会同时出现，而版面根本容纳不下，正文被挤到一行仅 30 个字符。现在目录栏会等到宽度足够才出现；在 900px 到该宽度之间，则以可折叠面板的形式显示在正文上方——博客文章与章节页同样如此。手机宽度维持原样：与此前一致，不显示目录面板。',
+      'Fixed: between 901px and 1180px — a common split-screen and small-laptop width — both side rails appeared at once against a layout that had no room for them, squeezing the article to 30 characters a line. The contents rail now waits until there is room, and between 900px and that point it appears as a collapsible panel above the article instead — on blog posts as well as on chapters. On chapters the panel starts open. On blog posts, where a long piece can run to forty headings, it starts closed and opens on a click, so the article itself is still on the first screen. Phone widths are unchanged: no contents panel there, as before.',
+      '修复：在 901px 到 1180px 之间——分屏与小尺寸笔记本常见的宽度——两侧栏会同时出现，而版面根本容纳不下，正文被挤到一行仅 30 个字符。现在目录栏会等到宽度足够才出现；在 900px 到该宽度之间，则以可折叠面板的形式显示在正文上方——博客文章与章节页同样如此。章节页的面板默认展开；博客长文最多可有四十个标题，面板默认折叠，点一下即可展开，正文本身仍留在第一屏。手机宽度维持原样：与此前一致，不显示目录面板。',
     ),
     L(
       'Index pages widen too. Post lists and entry lists gain a second column, changelog entries move their date alongside the text, and the over-long lines on Concepts, the changelog and About are brought back within a comfortable measure.',
