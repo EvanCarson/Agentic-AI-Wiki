@@ -1305,6 +1305,18 @@ describe('design system', () => {
   // clipped. Nothing checked SVG label geometry, so it shipped and stayed
   // live until someone looked at the rendered page.
   //
+  // The SAME defect has a second symptom the first pass of this guard could
+  // not see: a label re-centred by the CSS override does not always collide
+  // with ANOTHER label. On the feature-matrix diagrams (litellm and exa
+  // posts), `.body-text { text-anchor: middle }` beat the row labels'
+  // text-anchor="end" and the legend's text-anchor="start", so "LiteLLM" /
+  // "Portkey" / "Cloudflare" drifted right into the first column of boxes —
+  // rendering as "LiteLL", "Portke", "Cloudfla" — and "Strong" / "Partial" /
+  // "Not the job" drifted onto their own colour swatches. No two TEXT
+  // elements collided (the row label's neighbour is a <rect>, not another
+  // label) and nothing escaped the viewBox, so the two checks below both
+  // passed while the diagram was visibly broken. Caught on 2026-07-29 on a
+  // live preview of the litellm/portkey/cloudflare/kong post.
   // getBBox() reports a <text> element's box in the SVG's OWN user-unit
   // coordinate system — the same numbers regardless of viewport width or
   // how `.blog-article figure svg { max-width: 100%; height: auto; }` scales
@@ -1327,13 +1339,65 @@ describe('design system', () => {
   const BLOG_PAGES = BLOG_SLUGS.map((slug) => `/blogs/${slug}/`);
   const VERTICAL_OVERLAP_FLOOR = 0.6;
 
-  test('blog SVG text labels do not collide or escape their viewBox', async () => {
+  // Overlap threshold for the text-vs-rect check below: real horizontal
+  // overlap past 1px (sub-pixel rounding is not a defect) and vertical
+  // overlap past 50% of the TEXT's own height (not the shorter of the two,
+  // as in the collision check above — a rect is usually much taller than a
+  // label, so "50% of the shorter box" would almost always mean "50% of the
+  // label" anyway, but pinning it to the text explicitly is what the
+  // measurement this check implements actually specifies).
+  const RECT_V_OVERLAP_FLOOR = 0.5;
+
+  // The overlap+centre rule above is a coarse pre-filter, not a perfect
+  // defect detector: it also fires on captions that were AUTHORED
+  // text-anchor="middle" and centred on the connecting arrow between two
+  // boxes, where the arrow (and therefore the label) legitimately crosses
+  // the boundary into one or both boxes by a few percent. Every one of
+  // these was checked by hand — for each, the element's OWN text-anchor
+  // attribute already matches its rendered (computed) anchor, i.e. nothing
+  // is silently overriding it the way `.body-text { text-anchor: middle }`
+  // overrode the feature-matrix row/legend labels — and confirmed benign by
+  // screenshot: fully legible, no clipping, no unreadable overlap. Listed
+  // explicitly (not absorbed into a wider threshold) so a NEW instance of
+  // the real bug can't hide behind a loosened rule, and so a diagram
+  // redesign that removes one of these is forced to remove the line below
+  // too, rather than let the allowlist quietly rot (enforced by the
+  // "every allowlisted overlap is still real" assertion below).
+  const KNOWN_INTENTIONAL_BOXED_LABELS = [
+    // Two independent L-shaped arrow routes cross the boundary of E2B's
+    // hero microVM box; each caption sits centred on its own route,
+    // grazing the boundary it's labelling by design.
+    { svg: 'E2B architecture', text: 'SDK RPC', reason: 'centred on the SDK→daemon arrow where it crosses into the hero box' },
+    { svg: 'E2B architecture', text: 'stdout · files', reason: 'centred on the daemon→SDK return arrow where it crosses the same boundary' },
+    { svg: 'Modal architecture', text: 'function call', reason: 'same cross-boundary arrow-label pattern as the E2B diagram' },
+    { svg: 'Daytona architecture', text: 'SSH · IDE', reason: 'centred on an arrow crossing the developer/agent boundary' },
+    { svg: 'Daytona architecture', text: 'SDK calls', reason: 'centred on an arrow crossing the developer/agent boundary' },
+    { svg: 'Anthropic Code Execution architecture', text: 'POST /v1/messages', reason: 'centred on the request arrow, which crosses two box boundaries en route' },
+    { svg: 'Anthropic Code Execution architecture', text: 'response · SSE', reason: 'centred on the response arrow crossing the same boundary' },
+    // Every "vs" comparison's four architecture diagrams caption the arrow
+    // between "your app" and the product's hero box the same way.
+    { svg: 'LangSmith architecture', text: 'traces', reason: 'centred on the app→LangSmith arrow, grazes the hero box edge' },
+    { svg: 'Braintrust architecture', text: 'push run', reason: 'centred on the CI→Braintrust arrow, grazes the hero box edge' },
+    { svg: 'Helicone architecture', text: 'response', reason: 'centred on the provider→gateway return arrow' },
+    { svg: 'Arize Phoenix architecture', text: 'OTLP spans', reason: 'centred on the rotated exporter→collector arrow' },
+    { svg: 'Pinecone architecture', text: 'matches → IDs', reason: 'centred on the control-plane→app arrow crossing the hero boundary' },
+    { svg: 'LiteLLM proxy architecture', text: 'base-URL override', reason: 'centred on the client→proxy arrow, grazes both boxes it connects' },
+    // A long caption centred between two boxes 180px apart; any caption
+    // wider than that gap grazes both edges by construction, which is the
+    // point of centring it on the arrow rather than pinning it to one side.
+    { svg: 'Reinforcement-learning trade-execution loop', text: 'action a — place market / limit / wait', reason: 'centred between the two boxes the action arrow connects' },
+    { svg: 'Reinforcement-learning trade-execution loop', text: 'reward r = − implementation shortfall', reason: 'centred between the two boxes the reward arrow connects' },
+  ];
+
+  test('blog SVG text labels do not collide, escape their viewBox, or sit on a filled box', async () => {
     assert.ok(BLOG_SLUGS.length > 0, 'found no blog posts under src/content/blogs/posts/ — the derivation is broken, not the design');
     const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
     const page = await ctx.newPage();
     const collisions = [];
     const escapes = [];
+    const boxed = [];
     let seen = 0;
+    let rectsSeen = 0;
     for (const path of BLOG_PAGES) {
       await page.goto(server.url + path, { waitUntil: 'load' });
       // One evaluate call per post (one page load, per the plan) walks every
@@ -1380,8 +1444,32 @@ describe('design system', () => {
               return { content: content.slice(0, 40), ...box };
             })
             .filter(Boolean);
+          // Filled <rect>s a label could be sitting on top of. `fill: none`
+          // is a boundary/outline, not a surface a label could disappear
+          // into. A low fill-opacity, or a low element-level `opacity` (the
+          // decorative background wash several architecture diagrams paint
+          // behind a whole pipeline row uses `opacity="0.18"`, not
+          // fill-opacity), is likewise not a "box" in the sense a reader
+          // would perceive one — it is near-invisible by design, so a label
+          // crossing it is not the defect this check exists to catch. Proved
+          // on the ElevenLabs diagram: "Call audio out" overlaps that exact
+          // wash by 20px/26% and reads perfectly clearly, white on the
+          // hero's solid red, right up to and past the wash's edge.
+          const rects = [...svg.querySelectorAll('rect')]
+            .map((r) => {
+              const cs = getComputedStyle(r);
+              if (!cs.fill || cs.fill === 'none') return null;
+              const fillOpacity = parseFloat(cs.fillOpacity);
+              if (!Number.isNaN(fillOpacity) && fillOpacity < 0.5) return null;
+              const opacity = parseFloat(cs.opacity);
+              if (!Number.isNaN(opacity) && opacity < 0.5) return null;
+              const box = rootSpaceBBox(svg, r);
+              if (!box) return null;
+              return box;
+            })
+            .filter(Boolean);
           const title = svg.querySelector('title');
-          out.push({ label: title ? title.textContent.slice(0, 60) : '(untitled svg)', vb, texts });
+          out.push({ label: title ? title.textContent.slice(0, 60) : '(untitled svg)', vb, texts, rects });
         });
         return out;
       });
@@ -1413,13 +1501,53 @@ describe('design system', () => {
             );
           }
         }
+        // Third check, same groups, same page load: a label re-centred by a
+        // CSS text-anchor override does not always land on ANOTHER LABEL —
+        // on the feature-matrix diagrams it landed on the first column of
+        // boxes instead, which the two checks above cannot see (no second
+        // <text> to collide with, nothing pushed past the viewBox). Centre
+        // test is load-bearing, not decorative: without it this flags every
+        // caption deliberately centred over a wide band (e.g. an arrow
+        // label straddling the boundary between two boxes it connects) —
+        // an early draft flagged 21 of those across the architecture
+        // diagrams alone, all confirmed by screenshot to render perfectly
+        // legibly. Requiring the text's own centre to fall OUTSIDE the
+        // rect's x-range is what separates "recentred onto a box it was
+        // never meant to touch" from "authored to float over a wide box on
+        // purpose."
+        rectsSeen += group.rects.length;
+        for (const t of group.texts) {
+          for (const r of group.rects) {
+            const hOverlap = Math.min(t.x + t.width, r.x + r.width) - Math.max(t.x, r.x);
+            if (hOverlap <= 1) continue;
+            const vOverlap = Math.min(t.y + t.height, r.y + r.height) - Math.max(t.y, r.y);
+            if (vOverlap <= RECT_V_OVERLAP_FLOOR * t.height) continue;
+            const textCenterX = t.x + t.width / 2;
+            if (textCenterX >= r.x && textCenterX <= r.x + r.width) continue; // centred over the box on purpose
+            const pct = Math.round((hOverlap / t.width) * 100);
+            const allow = KNOWN_INTENTIONAL_BOXED_LABELS.find((k) => k.svg === group.label && k.text === t.content);
+            if (allow) { allow.matched = true; continue; }
+            boxed.push(`${path} [${group.label}] "${t.content}" ${pct}% covered by a box (${hOverlap.toFixed(1)}px)`);
+          }
+        }
       }
     }
     await ctx.close();
     // Coverage must be loud, not silent: a stale selector or an empty post
     // list must fail the run, not report a spotless zero.
     assert.ok(seen > 0, 'inspected zero <text> nodes across every blog post — the selector is stale, not the design');
+    assert.ok(rectsSeen > 0, 'inspected zero filled <rect> nodes across every blog post — the selector is stale, not the design');
+    // The allowlist above is a claim about the CURRENT rendered site — "this
+    // specific overlap exists and is fine." If a diagram is edited and the
+    // overlap goes away, the line becomes a claim about nothing, and the
+    // next real defect that happens to reuse the same label text would
+    // silently match a stale entry instead of failing. Force the allowlist
+    // to be edited in the same PR as the diagram.
+    const staleAllowlist = KNOWN_INTENTIONAL_BOXED_LABELS.filter((k) => !k.matched)
+      .map((k) => `[${k.svg}] "${k.text}" — no longer overlaps any box; remove or update this allowlist entry`);
+    assert.deepEqual(staleAllowlist, [], `stale entries in KNOWN_INTENTIONAL_BOXED_LABELS:\n${staleAllowlist.join('\n')}`);
     assert.deepEqual(collisions, [], `blog SVG text labels collide on the same line:\n${collisions.join('\n')}`);
     assert.deepEqual(escapes, [], `blog SVG text labels escape their viewBox:\n${escapes.join('\n')}`);
+    assert.deepEqual(boxed, [], `blog SVG text labels sit half-covered by a box:\n${boxed.join('\n')}`);
   });
 });
