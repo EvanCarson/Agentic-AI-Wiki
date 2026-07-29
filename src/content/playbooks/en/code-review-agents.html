@@ -1,0 +1,110 @@
+<section class="phase">
+  <div class="phase-num">U9</div>
+  <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
+  <h2>Code review agents: precision is the product.</h2>
+  <p class="goal">A review bot that finds 90% of the bugs and is wrong half the time gets muted in three weeks, and after that it finds nothing — so the metric that decides whether yours survives is not recall, it is the fraction of comments a human acts on. Everything in this playbook exists to buy precision: narrowing what the agent sees, making it prove a finding before it posts, and capping how many comments it is allowed to spend per pull request.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Do the attention arithmetic before you write any code.</h3>
+
+    <p>A review agent is a notification system, and its budget is not tokens — it is the reviewer's willingness to keep reading. That budget is small and it is spent per comment, whether the comment was right or not.</p>
+
+    <p>Run the numbers on a team merging 40 pull requests a week. A bot averaging eight comments per PR at 40% precision produces about 320 comments, of which roughly 190 are wrong. Every one of those costs a developer a context switch, a read, and a judgement call. Within a month the team has learned that the fastest way to merge is to scroll past the bot — and the 130 correct comments go with it. Halve the volume to four comments at 75% precision and the same team gets 120 findings that people still read.</p>
+
+    <div class="callout">
+      <p>The asymmetry is the whole design constraint: <strong>a missed bug costs what the bug costs; a false positive costs a little bit of every future finding.</strong> Recall failures are local and independent. Precision failures compound, because they are training the reviewer to ignore you.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Review the diff, in the context of the code it touches.</h3>
+
+    <p>The two failure shapes here are opposite and both common. Feed the agent only the unified diff and it reports on things the surrounding file already handles — a null check that exists twelve lines up, a validation the caller already performed. Feed it the whole repository and it drowns: the signal is a hundred changed lines inside a million-line haystack, and the model spends its attention summarizing architecture nobody asked about.</p>
+
+    <p>The shape that works is diff-anchored, context-expanded retrieval:</p>
+
+    <ul>
+      <li><strong>Anchor on changed hunks.</strong> Every finding must cite a line the PR actually modified. A comment on untouched code is out of scope by construction, and this single rule removes a large class of noise.</li>
+      <li><strong>Expand to the enclosing unit.</strong> Pull the full function or class containing each hunk, not a fixed window of ±20 lines. A window that cuts a function in half manufactures false positives about missing returns and unclosed resources.</li>
+      <li><strong>Follow one hop of callers and definitions.</strong> For each changed symbol, fetch its definition and its direct call sites. This is where "the caller already validates this" lives, and it is the single highest-yield expansion — see <a class="xref" href="/playbooks/coding-and-computer-use-agents/repo-navigation-and-context">repo navigation and context</a>.</li>
+      <li><strong>Stop there.</strong> Two hops is almost always cost without accuracy, and it is the change most likely to blow the per-PR budget you set in <a class="xref" href="/concepts/agent-cost-control">agent cost control</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Give it the three inputs a human reviewer has and a diff does not.</h3>
+
+    <p>Ask why a competent reviewer outperforms a model on the same diff and the answer is rarely reasoning ability. It is that the human knows three things the diff does not contain.</p>
+
+    <ul>
+      <li><strong>Intent.</strong> The PR title, description, and linked issue. Without them the agent cannot tell a deliberate behavior change from a regression, and it will confidently report the former as the latter.</li>
+      <li><strong>History.</strong> <code class="inline">git log</code> and <code class="inline">git blame</code> on the touched lines. Code that looks wrong is often code that was fixed to look that way, and the commit message says so. A blame lookup on a suspicious line is the cheapest false-positive filter available.</li>
+      <li><strong>Runtime truth.</strong> Whether the tests pass, what the type checker says, what the linter already flagged. An agent that duplicates your linter is spending the attention budget on findings the reviewer has already seen in CI.</li>
+    </ul>
+
+    <p>That last one is a hard rule and it is worth stating plainly. <strong>Never comment on anything a deterministic tool already reports.</strong> Formatting, unused imports, obvious type errors, and lint rules are solved problems with zero false positives; a model re-deriving them adds only the chance of being wrong. Run the deterministic tools first, put their output in the context, and instruct the agent that those findings are taken.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Make every finding survive a verification pass before it is allowed to post.</h3>
+
+    <p>This is the step that separates a review agent people keep from one they turn off. Generation and publication are different decisions, and the gate between them should be adversarial: a second pass whose job is to <em>refute</em> each candidate finding using the repository, not to agree with it.</p>
+
+<pre class="standalone"><span class="c-cm"># review/gate.py — a finding earns its comment; it is not granted one</span>
+<span class="c-kw">def</span> <span class="c-fn">admit</span>(finding, repo):
+    <span class="c-kw">if</span> finding.line <span class="c-kw">not in</span> repo.changed_lines:
+        <span class="c-kw">return</span> <span class="c-st">"drop: not in this diff"</span>
+    <span class="c-kw">if</span> repo.linter_already_reported(finding):
+        <span class="c-kw">return</span> <span class="c-st">"drop: deterministic tool owns this"</span>
+    <span class="c-kw">if</span> <span class="c-kw">not</span> finding.concrete_trigger:        <span class="c-cm"># inputs + state -&gt; wrong behavior</span>
+        <span class="c-kw">return</span> <span class="c-st">"drop: no failure scenario"</span>
+
+    <span class="c-cm"># adversarial pass: prompted to disprove, defaults to refuted</span>
+    verdict = refute(finding, context=repo.expand(finding.line))
+    <span class="c-kw">return</span> <span class="c-st">"post"</span> <span class="c-kw">if</span> verdict.stands <span class="c-kw">else</span> <span class="c-st">"drop: refuted"</span></pre>
+
+    <p>The <code class="inline">concrete_trigger</code> requirement does most of the work. Forcing each finding to name the inputs and state that produce wrong behavior kills the entire category of vague review comments — "this could be a race condition", "consider error handling here" — that are unfalsifiable and therefore unactionable. If the agent cannot describe how the code fails, it does not get to say that it does.</p>
+
+    <div class="callout">
+      <p>Where you can execute, do. A finding that comes with a failing test the agent actually ran is no longer a claim, and it converts a review comment into a <a class="xref" href="/playbooks/coding-and-computer-use-agents/patch-generation-and-tests">patch with a test</a>. Run it in the same isolation you would give any agent-written code — see <a class="xref" href="/playbooks/coding-and-computer-use-agents/sandboxing-and-execution">sandboxing and execution</a>.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Spend a fixed comment budget, ranked worst-first.</h3>
+
+    <p>Give the agent a hard cap — three to five comments per pull request is the range teams sustain — and make it choose. A cap is not a limitation on the agent's ability; it is what forces the ranking step that produces the quality your reviewers actually perceive.</p>
+
+    <ul>
+      <li><strong>Rank by consequence, not by confidence.</strong> A likely-correct nitpick outranks nothing. Order by what breaks if the reader is right to ignore you: data loss, security, correctness under load, then everything else.</li>
+      <li><strong>One comment per root cause.</strong> The same mistake repeated in six places is one finding with six locations, not six findings. Nothing reads as machine-generated faster than the same paragraph posted six times.</li>
+      <li><strong>Separate blocking from advisory.</strong> Post blocking findings inline where they must be read; put the rest in a single collapsed summary comment that costs one line of scroll. Two channels with different attention prices, per <a class="xref" href="/playbooks/agent-ux-and-human-interaction/progressive-disclosure-ux">progressive disclosure</a>.</li>
+      <li><strong>Say nothing when there is nothing.</strong> A bot that posts "LGTM, no issues found" on every clean PR is spending attention to report the absence of information. Silence is a valid and underused output.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Instrument the one metric that predicts whether it survives.</h3>
+
+    <p>Offline benchmarks on curated bug datasets will tell you the agent is good. Production will tell you whether anyone believes it. The number to put on a dashboard is <strong>acted-upon rate</strong>: comments that produced a code change or an explicit reply, divided by comments posted.</p>
+
+    <ul>
+      <li>Track it per repository and per finding category. It is almost never uniform — a bot with 70% overall can be at 20% on concurrency and 90% on API misuse, and the fix is to disable the category, not to tune the prompt.</li>
+      <li>Treat a resolved-without-change thread as a labeled false positive. That is a free, continuously produced eval set arriving from your reviewers, and it is better than anything you would have written by hand; feed it back per <a class="xref" href="/deep-dives/evaluating-agents/eval-driven-development-and-ci">eval-driven development</a>.</li>
+      <li>Watch the trend, not the level. A declining acted-upon rate means the team is starting to scroll past, and it shows up weeks before anyone files a complaint.</li>
+      <li>Remember the agent is reading untrusted input. A pull request body or a source comment can carry instructions aimed at your reviewer — treat the diff as hostile text, per <a class="xref" href="/deep-dives/agent-security/prompt-injection-defense-2026">prompt injection defense</a>.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Ship the narrowest useful version first: one finding category you can verify by executing something, capped at three comments per PR, posted as advisory only, with acted-upon rate on a dashboard from day one. Earn each expansion with a number. The failure mode is never that the agent was not clever enough — it is that it was allowed to talk too much before anyone measured whether it was worth reading.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/playbooks/coding-and-computer-use-agents/coding-agent-architecture">coding agent architecture</a> for the loop this sits inside, <a class="xref" href="/playbooks/coding-and-computer-use-agents/evaluating-coding-agents">evaluating coding agents</a> for offline scoring, and <a class="xref" href="/operations/evaluation-and-observability/llm-as-judge-for-agents">LLM-as-judge</a> for the verification pass in STEP 4.</p>
+  </div>
+</section>

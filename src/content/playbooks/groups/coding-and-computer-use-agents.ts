@@ -14,6 +14,7 @@ const group: Group = {
     { page: 'ide-agents', slug: 'ide-agents', title: L('IDE agents','IDE 智能体'), summary: L('Coding agents that live in the editor — the loop is the same as a CLI coding agent, but the interaction surface, undo expectations, and trust threshold are all different.','住在编辑器里的编码智能体——内循环和 CLI 编码智能体一样，但交互面、撤销预期与信任阈值都不同。') },
     { page: 'sandboxing-and-execution', slug: 'sandboxing-and-execution', title: L('Sandboxing & Safe Execution','沙箱与安全执行'), summary: L('Containerized execution, network and filesystem isolation, capability scoping, and designing for blast radius when an agent runs untrusted, attacker-influenced code.','容器化执行、网络与文件系统隔离、能力作用域，以及当智能体运行不可信、受攻击者影响的代码时如何为爆炸半径做设计。') },
     { page: 'evaluating-coding-agents', slug: 'evaluating-coding-agents', title: L('Evaluating Coding Agents','评估编码智能体'), summary: L('The SWE-bench family, pass@k vs. resolve rate, harness sensitivity, documented contamination, and why a private post-cutoff eval set is the only number to trust.','SWE-bench 系列、pass@k vs 解决率、测试编排敏感性、记录在案的污染，以及为何一个截止日期后的私有评测集才是唯一可信的数字。') },
+    { page: 'code-review-agents', slug: 'code-review-agents', title: L('Code Review Agents','代码评审智能体'), summary: L('A review bot lives or dies on precision, not recall: diff-anchored context, an adversarial gate that drops any finding without a concrete failure scenario, a hard comment budget ranked worst-first, and acted-upon rate as the one production metric.','评审机器人的生死取决于精确率而非召回率：以 diff 为锚的上下文、把说不出具体失败场景的发现一律丢弃的对抗性闸门、按最坏优先排序的硬性评论预算，以及作为唯一生产指标的采纳率。') },
   ],
 };
 export default group;

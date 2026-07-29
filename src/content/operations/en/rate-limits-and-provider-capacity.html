@@ -1,0 +1,118 @@
+<section class="phase">
+  <div class="phase-num">O9</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Rate limits and provider capacity: a 429 is a bill, not an error.</h2>
+  <p class="goal">The standard reflex — catch the 429, back off, retry — is what turns a capacity shortfall into an outage, because a rate limit is not a transient failure that heals; it is the provider telling you that you are asking for more throughput than you bought, and retrying asks for more. Agents hit this before anyone expects to, because token consumption grows with the square of the step count while your quota stays flat. The fix is admission control on your side of the wire, and the failover you reach for instead is a behavior change nobody evaluated.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Know which of the two limits you are actually hitting.</h3>
+
+    <p>Providers meter at least two independent dimensions, and they fail in completely different ways. <strong>Requests per minute</strong> counts calls. <strong>Tokens per minute</strong> counts the input and output volume those calls move — often split into separate input and output buckets, and often accounted against your <em>declared</em> maximum output tokens rather than what the model actually generated.</p>
+
+    <p>Chat products hit the request limit first. Agents almost never do. A twenty-step agent loop is twenty calls — trivial against a request budget — but each call re-sends a transcript that has been growing the whole time, so the same twenty calls can move millions of tokens. Teams size their capacity against request counts, watch the request meter sit at 8% utilisation, and get throttled anyway.</p>
+
+    <div class="callout">
+      <p>Read the response headers before you write any retry logic. Providers return the remaining allowance and reset window per dimension. If your incident review says "we got rate limited" without naming which bucket and how far over, you have not diagnosed anything and your mitigation is a guess.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Agent load is quadratic; your quota is flat.</h3>
+
+    <p>This is the structural mismatch, and it is why capacity planning that worked for a chat feature fails on the first agent deployment. Because the model is stateless, step <em>n</em> re-sends everything from steps 1 through <em>n</em>−1, so total input tokens for a task grow with the square of the step count — the same arithmetic that drives <a class="xref" href="/concepts/agent-cost-control">agent cost control</a>, arriving here as a throughput problem instead of a billing one.</p>
+
+    <p>Two consequences follow that nobody plans for:</p>
+
+    <ul>
+      <li><strong>Your peak is set by task difficulty, not by traffic.</strong> A day when tasks happen to run long produces a token spike with no corresponding rise in user count. Autoscaling on request rate sees nothing.</li>
+      <li><strong>Concurrency multiplies the tail, not the mean.</strong> Ten concurrent agents at step 3 are cheap; ten at step 25 can be an order of magnitude more expensive in tokens per minute. Since agents start together and drift apart, your worst minute is the one where several long runs overlap late.</li>
+    </ul>
+
+    <p>Plan capacity in tokens per minute at the p99 of concurrent long runs, not at the mean. And note that prompt caching changes the arithmetic but usually not the metering — cached reads still count against most token budgets even when they are billed at a discount, so verify with your provider rather than assuming your cache hit rate bought headroom.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Move the queue to your side of the wire.</h3>
+
+    <p>When the provider rejects a request you have already paid the latency of a round trip to learn something you could have known locally: that you are over budget. Worse, the standard exponential-backoff-and-retry loop is a positive feedback loop under sustained overload — every throttled caller retries, aggregate demand rises, more callers are throttled, and a 20% capacity shortfall presents as a total outage.</p>
+
+    <p>The shape that survives is a local admission controller: a token-bucket rate limiter, shared across your workers, sized slightly below your actual quota. Requests wait in your queue, where you can see them, prioritise them, and shed them — instead of in a retry storm you cannot observe.</p>
+
+<pre class="standalone"><span class="c-cm"># infra/admission.py — spend a budget you can see, not one you discover</span>
+BUCKET = TokenBucket(
+    tpm=<span class="c-st">1_800_000</span>,          <span class="c-cm"># 90% of the 2M/min contract: leave headroom</span>
+    rpm=<span class="c-st">900</span>,
+    shared=<span class="c-st">"redis://limits"</span>,  <span class="c-cm"># one budget across ALL workers, not per pod</span>
+)
+
+<span class="c-kw">async def</span> <span class="c-fn">call_model</span>(req, *, priority):
+    cost = req.input_tokens + req.max_output_tokens   <span class="c-cm"># reserve the declared max</span>
+    <span class="c-kw">if not await</span> BUCKET.acquire(cost, priority=priority, timeout=<span class="c-st">30</span>):
+        <span class="c-kw">raise</span> Shed(<span class="c-st">"no capacity for this class"</span>)      <span class="c-cm"># fail fast, fail visibly</span>
+    <span class="c-kw">try</span>:
+        <span class="c-kw">return await</span> provider.send(req)
+    <span class="c-kw">finally</span>:
+        BUCKET.settle(cost, actual=req.usage)         <span class="c-cm"># refund the unused reservation</span></pre>
+
+    <p>Two details do the work. The budget is <strong>shared</strong>, because a per-pod limiter divided across a fleet that scales is not a limit at all. And the reservation uses <code class="inline">max_output_tokens</code>, because that is usually what the provider reserves too — which is also why capping <code class="inline">max_output_tokens</code> to something realistic is one of the cheapest throughput wins available.</p>
+
+    <p>Keep retries for what they are for. A 429 you did not cause locally means the quota moved or another consumer is spending it; retry that once, slowly, with jitter, and treat repeated occurrences as a capacity signal rather than a transient. Genuine 5xx and timeouts are a different class and belong in <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Shed on purpose, because saturation will choose for you.</h3>
+
+    <p>Once the queue is yours, you own the interesting decision: when demand exceeds capacity, whose work stops. Left unmanaged, the answer is arbitrary — and arbitrary usually means the interactive request a customer is watching gets queued behind a batch backfill nobody is waiting for.</p>
+
+    <ul>
+      <li><strong>Class every call at the source.</strong> Interactive, background, retry, and speculative are four different priorities. The class travels with the request; it is not inferred at the limiter.</li>
+      <li><strong>Reserve a floor for interactive.</strong> A fixed share of the budget that background work can never consume. Without it, one large batch job takes the whole product down and the graphs will show a healthy provider.</li>
+      <li><strong>Move what can wait off the live budget entirely.</strong> Evals, backfills, summarisation and enrichment usually tolerate hours — see <a class="xref" href="/concepts/batch-and-async-inference">batch and async inference</a>, which typically runs on a separate quota <em>and</em> at a discount.</li>
+      <li><strong>Degrade before you drop.</strong> A smaller model, a shorter context, or fewer parallel branches delivers a worse answer under load, which almost always beats no answer — the routing decision in <a class="xref" href="/concepts/model-routing">model routing</a>, triggered by capacity rather than by task difficulty.</li>
+      <li><strong>Shed loudly.</strong> A shed request must surface as a distinct, counted outcome. Shedding that presents as a generic error is indistinguishable from a bug, and someone will spend a week debugging your own limiter.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Cross-provider failover changes behavior, not just availability.</h3>
+
+    <p>The reflex answer to capacity risk is a second provider and automatic failover. It is a real mitigation and it is routinely mis-specified, because teams reason about it as an availability feature when it is a <em>deploy</em>: at the moment of failover, a fleet of agents silently begins running on a model your evals never covered.</p>
+
+    <p>What actually differs on the other side, in rough order of how much damage it does:</p>
+
+    <ul>
+      <li><strong>Tool calling.</strong> Schema dialects, parallel-call support, argument coercion, and how strictly JSON Schema is honoured all vary. An agent whose tool loop was tuned on one provider can start emitting malformed arguments on another — the vendor differences catalogued in <a class="xref" href="/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">JSON Schema subsets per vendor</a>.</li>
+      <li><strong>Refusal and safety behavior.</strong> The fallback may decline work the primary performs, which reads to your users as a mysterious intermittent failure correlated with nothing they can see.</li>
+      <li><strong>Prompt caching.</strong> Failing over discards a warm cache and can multiply both cost and latency at exactly the moment you are already under pressure.</li>
+      <li><strong>Context limits and formatting.</strong> A prompt that fits the primary may not fit the fallback, so failover manifests as truncation errors rather than as a clean degradation.</li>
+    </ul>
+
+    <p>So treat the fallback path as a shipped configuration: run your eval suite against it on the same schedule as the primary, and send a small continuous share of live traffic through it so the path is warm and observed rather than theoretical. A failover route that has never served production traffic is an untested code path that activates only during an incident, which is the worst possible time to discover it. And pin the fallback to a dated snapshot too — everything in <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout, versioning and pinning</a> applies twice as hard to a model you rarely look at.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Make headroom a number somebody watches.</h3>
+
+    <p>Capacity is a contract with a lead time. Quota increases are negotiated, sometimes over days, occasionally with a commitment attached — so the useful signal is not "are we being throttled" but "how close are we, and how fast is that closing".</p>
+
+    <ul>
+      <li><strong>Graph utilisation per dimension</strong> — tokens per minute and requests per minute, as a percentage of contracted quota, per provider and per key. Alert at 70% sustained, not at the first 429. By the time you are being rejected, the negotiation you needed to start is already late.</li>
+      <li><strong>Alert on the derivative.</strong> A new feature that doubles tokens per task shows up as a slope days before it shows up as an incident.</li>
+      <li><strong>Track shed rate by class.</strong> Rising background sheds are healthy load management; a single interactive shed is a customer-visible failure and should page differently.</li>
+      <li><strong>Know your ceiling under failure.</strong> Run the arithmetic for "primary at zero, everything on the fallback" and confirm the fallback's quota can actually absorb it. Most cannot, and discovering that during the failover is how a partial outage becomes a total one.</li>
+      <li><strong>Separate keys by workload.</strong> Distinct keys or projects for interactive, batch, and evals give you per-workload meters and stop a runaway eval job from consuming the production budget — the containment principle behind <a class="xref" href="/operations/agentops/kill-switches">kill switches</a>.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do three things this week, in order: put a shared token-bucket limiter in front of every model call sized to 90% of your real quota; cap <code class="inline">max_output_tokens</code> per call type, since providers reserve the declared maximum and most defaults are wildly generous; and graph tokens-per-minute utilisation against contracted quota with an alert at 70%. That trio converts your most common production surprise from an outage into a ticket. Add the second provider afterwards — and only once its eval numbers are on the same dashboard as the primary's.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/agentops/concurrency-and-scaling">concurrency, queues and scaling</a> for the worker pool this limiter sits in, <a class="xref" href="/operations/agentops/cost-control-in-the-loop">cost control at the loop level</a> for the same arithmetic priced in dollars, and <a class="xref" href="/concepts/inference-providers">inference providers</a> for how quota differs across the market.</p>
+  </div>
+</section>
