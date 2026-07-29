@@ -1289,4 +1289,137 @@ describe('design system', () => {
     await ctx.close();
     assert.deepEqual(bad, [], `index gutter over 20% @ 1728px:\n${bad.join('\n')}`);
   });
+
+  // ---- Blog SVG label geometry -------------------------------------------
+  //
+  // BlogLayout.astro's inlineSvgs() splices every diagram's raw SVG markup
+  // straight into the built page (see AUTHORING.md §3), <style> block and
+  // all — so a bug in that markup is a bug in the live page, invisible to
+  // anyone reading the SVG source in isolation. On 2026-07-29,
+  // data-context-cost.svg's `.body-text { text-anchor: middle; }` class rule
+  // silently beat the text-anchor="start"/"end" PRESENTATION ATTRIBUTE on
+  // every row/value label (a CSS rule always wins that contest), recentring
+  // labels authored to sit flush left/right of their bars. Two value labels
+  // overlapped their row labels by up to 46px, rendering as unreadable
+  // mashed-together text, and a third was pushed 8px past the viewBox and
+  // clipped. Nothing checked SVG label geometry, so it shipped and stayed
+  // live until someone looked at the rendered page.
+  //
+  // getBBox() reports a <text> element's box in the SVG's OWN user-unit
+  // coordinate system — the same numbers regardless of viewport width or
+  // how `.blog-article figure svg { max-width: 100%; height: auto; }` scales
+  // the element on screen, since that scaling is a uniform CSS transform
+  // applied after layout. So this needs exactly one viewport and one load
+  // per post, not the viewport/theme matrix the contrast tests run.
+  //
+  // The 60% vertical-overlap floor is load-bearing, not decorative: an
+  // earlier draft of this assertion flagged ANY vertical overlap and threw
+  // 46 false positives across the site, because two ordinary stacked lines
+  // of text (e.g. a bold header line directly above a lighter sub-line) have
+  // tall glyph bounding boxes (ascenders/descenders) that graze each other
+  // by a few percent even when the rendered lines are visibly, correctly
+  // separate. A same-line collision, by contrast, has the two boxes sharing
+  // nearly the same y — verified against the real 46px/15px pre-fix defect
+  // below, both comfortably over 90% vertical overlap.
+  const BLOG_SLUGS = readdirSync(resolve(ROOT, 'src/content/blogs/posts'))
+    .filter((f) => f.endsWith('.ts'))
+    .map((f) => f.replace(/^\d{4}-\d{2}-\d{2}-/, '').replace(/\.ts$/, ''));
+  const BLOG_PAGES = BLOG_SLUGS.map((slug) => `/blogs/${slug}/`);
+  const VERTICAL_OVERLAP_FLOOR = 0.6;
+
+  test('blog SVG text labels do not collide or escape their viewBox', async () => {
+    assert.ok(BLOG_SLUGS.length > 0, 'found no blog posts under src/content/blogs/posts/ — the derivation is broken, not the design');
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const page = await ctx.newPage();
+    const collisions = [];
+    const escapes = [];
+    let seen = 0;
+    for (const path of BLOG_PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      // One evaluate call per post (one page load, per the plan) walks every
+      // inlined SVG in the article and every <text> inside each — collisions
+      // are only meaningful WITHIN a single SVG, so texts are grouped by svg.
+      const groups = await page.evaluate(() => {
+        // getBBox() reports the box in the element's OWN local coordinate
+        // system and deliberately ignores the element's own `transform`
+        // attribute (per spec) — several diagrams here rotate axis labels
+        // with transform="rotate(-90 …)" for a vertical caption, and a raw
+        // getBBox() reads those as if still horizontal, reporting a box
+        // hundreds of px wide that appears to blow through the viewBox when
+        // the rendered (rotated) label is nowhere near the edge. Map the
+        // local box into the SVG root's own user-space via the screen CTM
+        // (which composes every ancestor transform, this element's own
+        // included) so escape/collision checks see what actually renders.
+        function rootSpaceBBox(svg, el) {
+          const b = el.getBBox();
+          if (b.width <= 0 || b.height <= 0) return null;
+          const m = svg.getScreenCTM().inverse().multiply(el.getScreenCTM());
+          const corners = [
+            { x: b.x, y: b.y }, { x: b.x + b.width, y: b.y },
+            { x: b.x, y: b.y + b.height }, { x: b.x + b.width, y: b.y + b.height },
+          ].map((p) => ({
+            x: m.a * p.x + m.c * p.y + m.e,
+            y: m.b * p.x + m.d * p.y + m.f,
+          }));
+          const xs = corners.map((c) => c.x), ys = corners.map((c) => c.y);
+          return {
+            x: Math.min(...xs), y: Math.min(...ys),
+            width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys),
+          };
+        }
+        const out = [];
+        document.querySelectorAll('.blog-article svg').forEach((svg) => {
+          const vbAttr = svg.getAttribute('viewBox');
+          const vb = vbAttr ? vbAttr.trim().split(/[\s,]+/).map(Number) : null;
+          const texts = [...svg.querySelectorAll('text')]
+            .map((t) => {
+              const content = (t.textContent || '').trim();
+              if (!content) return null; // empty <text> (spacer rows) has no box worth checking
+              const box = rootSpaceBBox(svg, t);
+              if (!box) return null;
+              return { content: content.slice(0, 40), ...box };
+            })
+            .filter(Boolean);
+          const title = svg.querySelector('title');
+          out.push({ label: title ? title.textContent.slice(0, 60) : '(untitled svg)', vb, texts });
+        });
+        return out;
+      });
+      for (const group of groups) {
+        for (const t of group.texts) {
+          seen++;
+          if (!group.vb) continue;
+          const [vx, vy, vw, vh] = group.vb;
+          const EPS = 1; // sub-pixel rounding, not a real escape
+          if (t.x < vx - EPS || t.y < vy - EPS || t.x + t.width > vx + vw + EPS || t.y + t.height > vy + vh + EPS) {
+            escapes.push(
+              `${path} [${group.label}] "${t.content}" bbox x=${t.x.toFixed(1)} y=${t.y.toFixed(1)} ` +
+              `w=${t.width.toFixed(1)} h=${t.height.toFixed(1)} vs viewBox ${group.vb.join(' ')}`
+            );
+          }
+        }
+        for (let i = 0; i < group.texts.length; i++) {
+          for (let j = i + 1; j < group.texts.length; j++) {
+            const a = group.texts[i], b = group.texts[j];
+            const hOverlap = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+            if (hOverlap <= 0) continue;
+            const vOverlap = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+            if (vOverlap <= 0) continue;
+            const shorterH = Math.min(a.height, b.height);
+            if (vOverlap / shorterH < VERTICAL_OVERLAP_FLOOR) continue; // stacked lines, not a collision
+            collisions.push(
+              `${path} [${group.label}] "${a.content}" x "${b.content}" overlap ${hOverlap.toFixed(1)}px ` +
+              `(vertical ${Math.round((vOverlap / shorterH) * 100)}% of shorter box)`
+            );
+          }
+        }
+      }
+    }
+    await ctx.close();
+    // Coverage must be loud, not silent: a stale selector or an empty post
+    // list must fail the run, not report a spotless zero.
+    assert.ok(seen > 0, 'inspected zero <text> nodes across every blog post — the selector is stale, not the design');
+    assert.deepEqual(collisions, [], `blog SVG text labels collide on the same line:\n${collisions.join('\n')}`);
+    assert.deepEqual(escapes, [], `blog SVG text labels escape their viewBox:\n${escapes.join('\n')}`);
+  });
 });

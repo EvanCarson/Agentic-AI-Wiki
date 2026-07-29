@@ -82,7 +82,7 @@ Each page must **argue one non-obvious, load-bearing point**, not survey a field
 
 `AUTHORING.md` governs. These four break silently:
 
-- **SVGs** under `public/blogs/<slug>/` — viewBox-based, themeable colours only (`var(--ink)`, `var(--surface)`, `var(--accent, #d4421e)`, …; a bare hex is allowed only as the fallback inside `var()`), each with `role="img"` + `<title>` + `<desc>` + `aria-labelledby`, and no `<script>` or `on*=` handlers.
+- **SVGs** under `public/blogs/<slug>/` — viewBox-based, themeable colours only (`var(--ink)`, `var(--surface)`, `var(--accent, #d4421e)`, …; a bare hex is allowed only as the fallback inside `var()`), each with `role="img"` + `<title>` + `<desc>` + `aria-labelledby`, and no `<script>` or `on*=` handlers. Label geometry is enforced too, not just eyeballed: a CSS class-level `text-anchor` silently beats a per-element `text-anchor="start"/"end"` presentation attribute, which once shipped two labels overlapping by 46px and a third clipped past the viewBox. `npm run test:design` renders every blog post's inlined SVGs in a real browser and fails on any same-line label collision or any label escaping its viewBox — it must pass before a content PR merges, same as every other gate in §6.
 - **FAQ** — `<section class="faq">` with each `<h3>` immediately followed by a `<p>`, and no nested `<section>`. The JSON-LD parser bails at the first `</section>` and drops everything after it without warning.
 - **Dates** — the post filename's date prefix must equal the `date:` field, and both must equal the actual merge day.
 - **Tags** — lowercase kebab-case; reuse tags already present in `posts/*.ts` rather than minting near-duplicates.
