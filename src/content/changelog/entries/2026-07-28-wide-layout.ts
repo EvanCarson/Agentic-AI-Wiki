@@ -8,8 +8,8 @@ const entry: ChangelogEntry = {
   ),
   items: [
     L(
-      'The article shell no longer freezes at 1180px. It is now fluid up to 1440px with the navigation and contents rails sitting close to the viewport edge, and centres beyond that. On a 1728px screen the unused margin drops from 274px per side to 144px, and the reading column grows from 536px to 760px.',
-      '正文外框不再卡死在 1180px。现在它在 1440px 以内自适应，左侧导航与右侧目录贴近视口边缘，超过 1440px 后整体居中。在 1728px 的屏幕上，两侧闲置的空白从每边 274px 降到 144px，正文栏从 536px 加宽到 760px。',
+      'The article shell no longer freezes at 1180px. It is now fluid up to 1440px with the navigation and contents rails sitting close to the viewport edge, and centres beyond that. On a 1728px screen the unused margin drops from 274px per side to 144px, and the reading column grows from 536px to 864px.',
+      '正文外框不再卡死在 1180px。现在它在 1440px 以内自适应，左侧导航与右侧目录贴近视口边缘，超过 1440px 后整体居中。在 1728px 的屏幕上，两侧闲置的空白从每边 274px 降到 144px，正文栏从 536px 加宽到 864px。',
     ),
     L(
       'Body text on chapters and entries steps from 16px to 18px on wide screens, matching the blog — numbered lists included, which had been left behind at 16px inside 18px prose. Line length is capped everywhere: bulleted lists, numbered lists and deliverable checklists all sit inside the same measure as body text, so the extra width buys more columns and wider rails rather than longer lines.',

@@ -130,11 +130,42 @@ New in `src/styles/tokens.css`:
 ```css
 --w-shell:    1440px;   /* article shell ceiling; past this the shell centres */
 --w-wrap:     1080px;   /* single-column index and landing pages (was 860px) */
---w-rail-nav: 288px;    /* left chapter nav (was 232px) */
---w-rail-toc: 264px;    /* right in-page TOC (was 220px) */
+--w-rail-nav: 240px;    /* left chapter nav (232px pre-branch, 288px at initial ship, narrowed here) */
+--w-rail-toc: 208px;    /* right in-page TOC (220px pre-branch, 264px at initial ship, narrowed here) */
 --w-measure:  62ch;     /* cap on any running-text block */
 --t-prose:    16px;     /* article body text; steps to 18px at >=1360px */
 ```
+
+### 4.0 Follow-up, 2026-07-28: rails narrowed from 288px/264px to 240px/208px
+
+A reviewer on the preview deploy reported that the widened article did not
+read as bigger — only the nav rail's move was visible. The pixels agreed:
+between the pre-branch page and the version that first shipped from this
+spec, the reading column grew 24% (536px→664px) but prose only grew 11% in
+characters (63→70), because `--w-measure` caps prose regardless of how much
+column sits behind it, while the nav rail moved 98px left and grew 56px
+wider — the change the eye actually catches. The column, not the cap, was
+the binding constraint on *perceived* content width, so the fix takes width
+from the rails and gives it to the column rather than touching the cap.
+
+`--w-rail-nav: 240px` is still wider than the pre-branch 232px, so it cannot
+regress the sidebar: confirmed by measuring every `.chapter-side-nav li a`
+(453 links, 10 pages spanning field-guide/deep-dives/operations/playbooks/
+concepts, both locales) at 232px vs 240px — zero entries gained a wrapped
+line.
+
+`--w-rail-toc: 208px` is narrower than the pre-branch 220px, where the
+longest TOC entries already wrapped to 3 lines, so it needed to be measured
+rather than assumed. Candidates 208px and 224px were checked against the
+220px baseline on the two longest TOC entries site-wide — see §5.2 for the
+line-count table. 208px matched the baseline's line count on both, so it
+shipped as the narrower of the two.
+
+Net effect at ≥1440px: article column 760px → **864px**; prose stays capped
+at `--w-measure` (~704px at 18px, ~74 guard-characters — see §4.1), so the
+extra 104px of column goes entirely to the non-text content the widening was
+for (code, tables, diagrams), same as the extra width the initial ship
+already redirected there.
 
 ### 4.1 Why `--w-measure` is 62ch and not 72ch
 
@@ -285,8 +316,8 @@ the text, not chosen for roundness.
 | band | rails | article column | prose (capped at `--w-measure`) |
 |---|---|---|---|
 | **< 1024px** | none | full width | 41ch @390 · 46ch @430 · 70ch @768 · 70ch @1023 |
-| **1024–1359px** | nav only (`W − 384`) | 640px @1024 → 975px @1359 | 64ch @1024 · 70ch @1359 |
-| **≥ 1360px** | nav + TOC (`min(W,1440) − 680`) | 680px @1360 → 760px @1440+ | 61ch @1360 · 69ch @1440 and above |
+| **1024–1359px** | nav only (`W − 336`, narrowed 2026-07-28 from `W − 384`) | 688px @1024 → 1023px @1359 | 74 guard-characters @1024 and above — cap-bound throughout (was 64ch @1024, column-bound, before the narrowing) |
+| **≥ 1360px** | nav + TOC (`min(W,1440) − 576`, narrowed 2026-07-28 from `min(W,1440) − 680`) | 784px @1360 → 864px @1440+ | 74 guard-characters @1360 and above — cap-bound throughout (was 61ch @1360, column-bound, before the narrowing) |
 
 `--t-prose` steps to 18px at the same 1360px breakpoint, so "both rails" and
 "larger type" are one coherent wide-layout mode rather than two.
@@ -294,6 +325,18 @@ the text, not chosen for roundness.
 Derivation of 1360: the TOC rail plus its gap costs 296px. Below ~1290px the
 remaining column cannot hold 60 characters at 16px. 1360 clears that with margin
 and coincides with where 18px type first sustains 60 characters.
+
+**Note, 2026-07-28 narrowing.** With the narrower rails the column clears 60
+characters at a much lower width than 1290px (at 1024px it is already
+688px, comfortably over), so this derivation no longer describes why 1360
+is *necessary* — only why it remains *sufficient*. The breakpoint itself is
+untouched: retuning it is a separate decision from narrowing the rails and
+was not part of this follow-up's scope. The practical effect of narrowing is
+that the article column now exceeds `--w-measure`'s pixel cap at every band
+from 1024px up, so prose is cap-bound (not column-bound) everywhere in the
+ladder, and lands on the same guard-character count — 74, the corrected
+figure from §4.1 — at every width instead of varying by band as it did
+before.
 
 **Every band lands inside the 60–78 guard window except the two phone widths**
 (41ch at 390, 46ch at 430), which are unchanged from today and are inherent to
@@ -304,11 +347,75 @@ the viewport — 60 characters at 16px needs 510px in a 390px-wide screen.
 | viewport | gutter/side | nav | column | TOC | prose |
 |---|---|---|---|---|---|
 | 1728 today | 274 | 232 | 632 | 220 | 536px / 63ch @16px |
-| **1728 after** | **144** | **288** | **760** | **264** | **664px / 69ch @18px** |
-| 1440 after | 0 | 288 | 760 | 264 | 664px / 69ch @18px |
-| 2560 after | 560 | 288 | 760 | 264 | 664px / 69ch — 32px rail-to-text, no void |
+| 1728 initial ship | 144 | 288 | 760 | 264 | 664px / 69ch @18px |
+| 1440 initial ship | 0 | 288 | 760 | 264 | 664px / 69ch @18px |
+| 2560 initial ship | 560 | 288 | 760 | 264 | 664px / 69ch — 32px rail-to-text, no void |
 | 901 today | 0 | 232 | 353 | 220 | **257px / 30ch** |
 | 901 after | 0 | — | full | — | 595px / 70ch |
+
+#### 5.2.1 Follow-up narrowing, 2026-07-28: nav 288px→240px, TOC 264px→208px
+
+The "initial ship" rows above are what first shipped from this spec. A
+reviewer reported that the wider article did not read as bigger — only the
+nav rail's leftward move was visible — because prose is capped by
+`--w-measure` regardless of column width, so widening the column alone barely
+moved the character count (63→69, +11%) while the rail move (98px left,
++56px wide) was what the eye caught. The fix narrows both rails and gives the
+freed width to the column instead. Re-measured directly against the built
+HTML (Playwright, `.chapter-main` for column, canvas `measureText` for
+characters — the same method `system.mjs` uses):
+
+| viewport | gutter/side | nav | column | TOC | prose (cap) |
+|---|---|---|---|---|---|
+| 1024 | 0 | 240 | 688px | — (in-flow accordion) | 625px / 74 chars @16px |
+| 1280 | 0 | 240 | 944px | — (in-flow accordion) | 625px / 74 chars @16px |
+| 1360 | 0 | 240 | 784px | 208 | 704px / 74 chars @18px |
+| **1440** | **0** | **240** | **864px** | **208** | **704px / 74 chars @18px** |
+| 1728 | 144 | 240 | 864px | 208 | 704px / 74 chars @18px — 160px rail-to-text slack |
+| 2560 | 560 | 240 | 864px | 208 | 704px / 74 chars @18px — 160px rail-to-text slack |
+
+Column at 1440px and above: 760px → **864px** (+104px, +14%), which is what
+was approved. Prose itself does not move — `--w-measure` is untouched by this
+change — so all of the extra width becomes slack beside the text (measured
+**160px** at ≥1440px, up from the ~96px the initial ship already carried at
+1440; see §4.0). That slack goes to the site's non-text content (code blocks,
+tables, ASCII diagrams), which is the design's stated intent (§3), not a
+defect. At 1024–1280px the column now clears `--w-measure`'s pixel cap
+outright (previously the column itself was the binding constraint at
+1024px, giving 64ch there instead of the cap's 74) — see §5.1's note.
+
+Every figure above is inside the guard's 60–78 character window (all land at
+74, the corrected guard-character count from §4.1); `npm run test:design`
+re-passed 55/55 after the narrowing, including the two dead-gutter
+assertions at 1440px and 1728px and the ten-viewport prose-measure
+assertion.
+
+TOC-rail width was the one direction that could regress: the pre-branch
+width was 220px, where the longest entries already wrapped to 3 lines.
+208px and 224px were both measured against that 220px baseline (line count
+via `Range.getClientRects()` on the rendered `<a>` text, at 1440px, on the
+two longest TOC entries site-wide):
+
+| candidate | "The context window is a finite, position-sensitive resource." (`/field-guide/llm-mental-model/`) | 190-char MCP heading (`/deep-dives/mcp/mcp-building-servers-in-practice/`) |
+|---|---|---|
+| 220px (pre-branch baseline) | 3 lines | 7 lines |
+| 224px | 2 lines | 7 lines |
+| **208px** | **3 lines** | **7 lines** |
+
+208px matches the baseline's line count exactly on both entries — no
+additional wrap versus the pre-branch panel — so it ships as the narrower of
+the two candidates, per the rule "pick the narrowest value that does not
+increase the wrapped line count versus 220px."
+
+Nav-rail width only had to clear one bar — 240px is already wider than the
+pre-branch 232px — confirmed by measuring every `.chapter-side-nav li a`
+across the field-guide/deep-dives/operations/playbooks/concepts families (10
+pages, both locales, 453 links total) at 232px vs 240px: zero regressions.
+
+Phone rendering (375/390/430px, both themes) is unaffected by construction —
+rails do not exist below 1024px — and was re-verified byte-identical by
+SHA-256 over 42 full-page screenshots (3 widths × 2 themes × 7 pages)
+against the pre-narrowing build.
 
 ### 5.3 The TOC below 1360px
 
@@ -420,6 +527,20 @@ unchanged from today's 673px/69ch.
 After deleting the rule, **read the computed `max-width` back from built HTML**
 before calling it done. The failure being fixed here is precisely a rule that
 looked applied and was not.
+
+**Follow-up, 2026-07-28.** The rail-narrowing in §4.0/§5.2.1 (`--w-rail-nav`
+288px→240px) reaches `BlogLayout` too, since it shares the standard shell and
+the same nav rail. Its column formula becomes `min(W,1440) − 336`, so it
+widens further to **1104px at 1440px and above** (measured directly against
+built HTML), up from the 1056px the initial ship carried. Its prose is capped
+independently by `BlogLayout`'s own pre-existing `58ch` rule — a different
+token from `--w-measure`, deliberately untouched by this change — and
+measured **658px / 69 characters at 1440px**, unmoved (the 664px figure
+above was computed under the same approximate ch-to-px assumption §4.1
+corrected for `--w-measure`; 658px is the number read directly off the
+built page). The extra 48px the column gained goes to the same
+wide-table/code-block headroom the dead rule's removal already provided,
+not to the capped prose column.
 
 ---
 
