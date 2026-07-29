@@ -1,0 +1,118 @@
+<section class="phase">
+  <div class="phase-num">O9</div>
+  <div class="week">运维 · 智能体运维：部署与运营</div>
+  <h2>速率限制与厂商容量：429 是一张账单，不是一个错误。</h2>
+  <p class="goal">那套标准反射——捕获 429、退避、重试——正是把容量不足变成线上事故的东西，因为速率限制不是一个会自愈的瞬时故障；它是厂商在告诉你，你要的吞吐超过了你买的量，而重试是在要得更多。智能体撞上它的时间比谁预想的都早，因为令牌消耗随步数的平方增长，而你的配额是平的。修法是把准入控制放到你这一侧，而你顺手抓来的故障转移，本身就是一次没人评估过的行为变更。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>先搞清楚你撞的是两个限额中的哪一个。</h3>
+
+    <p>厂商至少在两个彼此独立的维度上计量，而它们的失败方式完全不同。<strong>每分钟请求数</strong>数的是调用次数。<strong>每分钟令牌数</strong>数的是这些调用搬运的输入与输出总量——常常还拆成输入桶和输出桶分别记，而且往往是按你<em>声明的</em>最大输出令牌数计，而不是模型实际生成了多少。</p>
+
+    <p>聊天类产品先撞请求限额。智能体几乎从不。一个二十步的智能体循环就是二十次调用——对请求预算而言微不足道——但每次调用都要重发一份一路在长大的对话记录，所以同样这二十次调用可以搬运数百万令牌。团队按请求数做容量规划，眼看着请求计量停在 8% 的利用率上，却照样被限流。</p>
+
+    <div class="callout">
+      <p>在写任何重试逻辑之前，先读响应头。厂商会按维度返回剩余额度与重置窗口。如果你的事故复盘只写"我们被限流了"，却说不出是哪个桶、超了多少，那你什么都没诊断出来，你的缓解措施只是猜。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>智能体的负载是平方级的；你的配额是平的。</h3>
+
+    <p>这是那个结构性的错配，也是为什么对聊天功能行得通的容量规划，会在第一次智能体上线时垮掉。由于模型是无状态的，第 <em>n</em> 步会把第 1 到 <em>n</em>−1 步的一切重发一遍，因此一个任务的总输入令牌随步数的平方增长——这与<a class="xref" href="/zh/concepts/agent-cost-control">智能体成本控制</a>里的算术是同一套，只不过在这里它以吞吐问题、而非账单问题的面貌出现。</p>
+
+    <p>由此引出两个没人会预先规划的后果：</p>
+
+    <ul>
+      <li><strong>你的峰值由任务难度决定，不由流量决定。</strong>某一天任务碰巧跑得长，就会产生一个令牌尖峰，而用户数毫无相应上升。按请求速率做的自动扩缩什么也看不见。</li>
+      <li><strong>并发放大的是长尾，不是均值。</strong>十个跑到第 3 步的并发智能体很便宜；十个跑到第 25 步的，每分钟令牌数可能贵上一个数量级。而智能体总是一起出发、慢慢岔开，所以你最糟的那一分钟，就是几个长任务在后期重叠的那一分钟。</li>
+    </ul>
+
+    <p>按"并发长任务的 p99"、而不是按均值，用每分钟令牌数来做容量规划。另外注意：提示词缓存改变的是算术，通常不改变计量——多数令牌预算里，被缓存命中的读取照样计数，即便计费时打了折。所以请去和厂商确认，别想当然地以为缓存命中率给你换来了余量。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>把队列挪到你这一侧的线缆上。</h3>
+
+    <p>当厂商拒绝一个请求时，你已经付出了一整个往返的延迟，才换来一件本可以在本地就知道的事：你超预算了。更糟的是，那套标准的"指数退避加重试"循环，在持续过载下是一个正反馈回路——每个被限流的调用方都在重试，总需求上升，更多调用方被限流，于是 20% 的容量缺口以一次彻底宕机的面貌呈现。</p>
+
+    <p>能活下来的形态是一个本地准入控制器：一个令牌桶限流器，在所有 worker 间共享，容量略低于你的真实配额。请求在你的队列里等待——在那里你看得见它们、能给它们排优先级、能把它们卸掉——而不是在一场你观测不到的重试风暴里等。</p>
+
+<pre class="standalone"><span class="c-cm"># infra/admission.py — spend a budget you can see, not one you discover</span>
+BUCKET = TokenBucket(
+    tpm=<span class="c-st">1_800_000</span>,          <span class="c-cm"># 90% of the 2M/min contract: leave headroom</span>
+    rpm=<span class="c-st">900</span>,
+    shared=<span class="c-st">"redis://limits"</span>,  <span class="c-cm"># one budget across ALL workers, not per pod</span>
+)
+
+<span class="c-kw">async def</span> <span class="c-fn">call_model</span>(req, *, priority):
+    cost = req.input_tokens + req.max_output_tokens   <span class="c-cm"># reserve the declared max</span>
+    <span class="c-kw">if not await</span> BUCKET.acquire(cost, priority=priority, timeout=<span class="c-st">30</span>):
+        <span class="c-kw">raise</span> Shed(<span class="c-st">"no capacity for this class"</span>)      <span class="c-cm"># fail fast, fail visibly</span>
+    <span class="c-kw">try</span>:
+        <span class="c-kw">return await</span> provider.send(req)
+    <span class="c-kw">finally</span>:
+        BUCKET.settle(cost, actual=req.usage)         <span class="c-cm"># refund the unused reservation</span></pre>
+
+    <p>其中两个细节承担了主要工作。预算是<strong>共享的</strong>，因为一个按 pod 分摊、而 pod 数量还会自动扩缩的限流器，根本不算限流。而预留量用的是 <code class="inline">max_output_tokens</code>，因为厂商通常也是这么预留的——这也正是为什么把 <code class="inline">max_output_tokens</code> 收敛到一个现实的值，是能拿到的最便宜的吞吐收益之一。</p>
+
+    <p>让重试回到它该干的事上。一个不是你本地造成的 429，意味着配额被调整了、或者另一个消费方正在花掉它；那种重试一次，慢一点，带抖动，并把反复出现当成容量信号而非瞬时故障。真正的 5xx 与超时是另一类，归<a class="xref" href="/zh/operations/agentops/idempotency-and-retries">幂等与重试</a>管。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>有意识地卸载，否则饱和会替你选。</h3>
+
+    <p>队列归你之后，你就拥有了那个有意思的决定：当需求超过容量时，谁的活儿停下来。放任不管的话，答案是随机的——而随机通常意味着，客户正盯着看的那个交互请求，排在了没人等的批量回填后面。</p>
+
+    <ul>
+      <li><strong>在源头给每次调用分类。</strong>交互、后台、重试、投机，是四种不同的优先级。类别随请求一起走，不是在限流器里推断出来的。</li>
+      <li><strong>给交互留一个下限。</strong>一份后台工作永远吃不到的固定份额。没有它，一个大批量作业就能把整个产品打趴下，而图表上厂商一切正常。</li>
+      <li><strong>能等的活儿整个挪出实时预算。</strong>评估、回填、摘要与富化通常能容忍数小时——见<a class="xref" href="/zh/concepts/batch-and-async-inference">批处理与异步推理</a>，它通常跑在<em>另一份</em>配额上，还带折扣。</li>
+      <li><strong>先降级，再丢弃。</strong>换更小的模型、更短的上下文、更少的并行分支，在高负载下交付一个更差的答案，几乎总好过不给答案——这就是<a class="xref" href="/zh/concepts/model-routing">模型路由</a>里的那个决策，只不过触发条件是容量而非任务难度。</li>
+      <li><strong>卸载要出声。</strong>被卸掉的请求必须以一个独立的、被计数的结果暴露出来。表现成通用错误的卸载与缺陷无从区分，然后就会有人花一周去调试你自己的限流器。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>跨厂商故障转移改变的是行为，不只是可用性。</h3>
+
+    <p>面对容量风险，反射式的答案是加第二家厂商加自动故障转移。它是一项真实的缓解措施，也常常被写错了规格，因为团队把它当成一个可用性特性来推理，而它其实是一次<em>部署</em>：在故障转移发生的那一刻，一整队智能体悄无声息地开始跑在一个你的评估从未覆盖过的模型上。</p>
+
+    <p>另一侧真正不同的东西，大致按破坏力排序：</p>
+
+    <ul>
+      <li><strong>工具调用。</strong>schema 方言、并行调用支持、参数强制转换、以及 JSON Schema 被遵守得有多严，全都不一样。一个在某家厂商上调好工具循环的智能体，换到另一家可能开始吐出畸形参数——这些厂商差异编录在<a class="xref" href="/zh/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">各厂商的 JSON Schema 子集</a>里。</li>
+      <li><strong>拒答与安全行为。</strong>备选模型可能拒绝主力模型照做的活儿，在用户看来这就是一个与他们所能看到的任何东西都不相关的、神秘的间歇性故障。</li>
+      <li><strong>提示词缓存。</strong>故障转移会丢掉一份热缓存，并可能在你本已承压的那一刻，把成本和延迟同时翻上几倍。</li>
+      <li><strong>上下文上限与格式。</strong>装得进主力模型的提示词未必装得进备选，于是故障转移表现为截断错误，而不是一次干净的降级。</li>
+    </ul>
+
+    <p>所以请把备选路径当作一份已上线的配置来对待：按与主力相同的节奏对它跑你的评估集，并持续把一小份线上流量导过去，让这条路是热的、被观测的，而不是理论上的。一条从未承载过生产流量的故障转移路径，是一段只在事故期间才被激活的未测试代码——那是发现它有问题的最糟时刻。备选也要钉到带日期的快照上——<a class="xref" href="/zh/operations/agentops/rollout-and-versioning">灰度发布、版本化与固定</a>里的一切，对一个你很少去看的模型只会加倍适用。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>把余量做成一个有人盯着的数字。</h3>
+
+    <p>容量是一份带前置期的合同。配额提升要谈，有时要谈上几天，偶尔还附带用量承诺——所以有用的信号不是"我们有没有被限流"，而是"我们离上限还有多远，以及这个距离缩得多快"。</p>
+
+    <ul>
+      <li><strong>按维度画利用率</strong>——每分钟令牌数与每分钟请求数，作为合同配额的百分比，按厂商、按 key 分开。在持续 70% 时告警，而不是在第一个 429 时。等你开始被拒，你本该启动的那场谈判已经晚了。</li>
+      <li><strong>对导数告警。</strong>一个把单任务令牌数翻倍的新功能，会在它变成事故的好几天前先以一条斜率出现。</li>
+      <li><strong>按类别追踪卸载率。</strong>后台卸载上升是健康的负载管理；而哪怕一次交互卸载都是客户可见的失败，应当以不同方式呼叫值班。</li>
+      <li><strong>知道你在故障下的天花板。</strong>把"主力归零、全部压到备选"算一遍，确认备选的配额真的吃得下。多数吃不下，而在故障转移当中才发现这一点，正是局部故障升级为彻底宕机的方式。</li>
+      <li><strong>按工作负载分 key。</strong>交互、批量、评估各用独立的 key 或项目，你就有了按负载的计量，也能防止一个失控的评估作业吃掉生产预算——这正是<a class="xref" href="/zh/operations/agentops/kill-switches">急停开关</a>背后的隔离原则。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>这周就做三件事，按顺序：在每一次模型调用前放一个共享令牌桶限流器，容量定在真实配额的 90%；按调用类型给 <code class="inline">max_output_tokens</code> 设上限，因为厂商是按声明的最大值预留的，而多数默认值大得离谱；把每分钟令牌数的利用率对着合同配额画出来，70% 告警。这三件事合起来，就把你最常见的那个生产意外从一次事故降级成一张工单。第二家厂商放到后面加——而且要等到它的评估数字和主力出现在同一块仪表盘上之后。</p>
+    </div>
+
+    <p>延伸阅读：<a class="xref" href="/zh/operations/agentops/concurrency-and-scaling">并发、队列与扩缩容</a>看这个限流器所在的 worker 池，<a class="xref" href="/zh/operations/agentops/cost-control-in-the-loop">在循环层面控制成本</a>看同一套算术以美元计价的样子，<a class="xref" href="/zh/concepts/inference-providers">推理服务商</a>看配额在市场上如何各不相同。</p>
+  </div>
+</section>

@@ -1,0 +1,70 @@
+<section class="phase">
+  <div class="phase-num">F15</div>
+  <div class="week">Concepts · AI Foundations</div>
+  <h2>Reproducibility and nondeterminism.</h2>
+  <p class="goal">Setting temperature to 0 does not make a model deterministic, and the reason is not the one almost everyone gives: the output of your request depends on how many <em>other people's</em> requests were batched alongside it. One lab logged 80 distinct completions from 1,000 identical greedy requests to the same model. For an agent that means a failing run usually cannot be reproduced by running it again — so reproducibility has to come from what you recorded, not from what you can re-execute.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Temperature 0 is a sampling rule, not a guarantee.</h3>
+
+    <p>Temperature controls how the model <em>chooses</em> among the next-token probabilities it has already computed. At 0 the choice becomes "always take the highest-probability token" — greedy decoding — which removes the deliberate randomness described in <a class="xref" href="/concepts/temperature-and-sampling">temperature and sampling</a>. It removes nothing else.</p>
+
+    <p>The probabilities themselves are the output of billions of floating-point operations on a GPU, and those are not guaranteed to come out bit-identical run to run. When two candidate tokens sit at 0.4013 and 0.4011, a difference in the last bits is enough to flip which one is "highest". Greedy decoding then amplifies that flip into a completely different sentence, because every subsequent token is conditioned on the one that changed.</p>
+
+    <div class="callout">
+      <p>Seeds do not fix this. A <code class="inline">seed</code> parameter pins the pseudo-random draw used for sampling; it cannot pin the arithmetic that produced the distribution being sampled from. Providers that expose a seed generally document it as best-effort for exactly this reason.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The cause is batching, not "GPUs are random".</h3>
+
+    <p>The usual explanation — floating-point addition is not associative, and GPU threads finish in nondeterministic order, so sums come out slightly different — is only half right. The individual kernels a modern inference server runs are mostly run-to-run deterministic when you hand them the same input. The instability comes from somewhere less obvious.</p>
+
+    <p><strong>Inference servers batch your request with whatever else arrived in the same window, and many kernels change their internal reduction strategy depending on the batch size.</strong> Matrix multiplication, RMSNorm and attention all split their work differently for a batch of 4 than for a batch of 64. Different split, different summation order, different last bits — for <em>your</em> tokens, even though your input never changed. The variable is server load, which is a property of other customers, and it is not exposed to you at all.</p>
+
+    <ul>
+      <li>The fix exists and is understood: <em>batch-invariant</em> kernels that use the same reduction strategy at every batch size. With them, thousands of repeated greedy runs return bit-identical text.</li>
+      <li>It is not free. Published implementations run roughly 1.6–2× slower than the batch-adaptive versions, though later work has cut that overhead substantially.</li>
+      <li>Hosted APIs do not offer it. You are paying for throughput, and throughput is precisely what determinism costs — so assume nondeterminism unless you run the server yourself and have deliberately turned it on.</li>
+    </ul>
+
+    <p>Two more sources sit on top of this, and both look identical from the outside: the provider silently moving a floating model alias to a new checkpoint, and your request being served by a different hardware or kernel generation within the same fleet. See <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout, versioning and pinning</a> for the first — it is the one you can actually control.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What it breaks, in order of how much it will cost you.</h3>
+
+    <p>A single chat completion that varies slightly is harmless. An <a class="xref" href="/concepts/the-agent-loop">agent loop</a> is where small divergence becomes structural, because each step conditions the next:</p>
+
+    <ul>
+      <li><strong>You cannot debug by re-running.</strong> The report says the agent deleted the wrong branch; you run the same input and it behaves perfectly. Nothing is wrong with your reproduction — the run you are trying to reproduce no longer exists.</li>
+      <li><strong>Eval scores wobble without any change.</strong> Re-scoring the same suite against the same pinned model on the same day yields a different number. If your release gate is "accuracy must not drop", you need to know the size of that wobble before you can read a regression, which is why <a class="xref" href="/concepts/evals-101">evals</a> report over repeated runs rather than single passes.</li>
+      <li><strong>Caches stop hitting.</strong> Any cache keyed on a generated string — a plan, a normalized query, a summary — gets a fresh key each time. This is separate from <a class="xref" href="/concepts/prompt-caching">prompt caching</a>, which keys on your input prefix and is unaffected.</li>
+      <li><strong>Trajectories diverge fast.</strong> One different tool argument at step 2 sends the run down a path the original never took. By step 10 the two runs share almost nothing, so even a partial replay tells you little.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Get reproducibility from records, not from re-execution.</h3>
+
+    <p>The productive move is to stop trying to make the model repeat itself and start making the <em>run</em> repeatable in the sense that matters: fully reconstructable after the fact. That is a logging decision, and it is cheap.</p>
+
+    <ul>
+      <li><strong>Record the exact request, not a template.</strong> The fully rendered prompt as sent, the tool schemas as sent, the resolved model snapshot, and every tool call with its arguments and its result. This is the substance of <a class="xref" href="/concepts/agent-observability">agent observability</a>, and it is the only artifact that survives nondeterminism.</li>
+      <li><strong>Replay tools against recorded results.</strong> Re-running an agent with its tool responses pinned to what they returned the first time isolates the model's variability from the environment's, and turns a flaky bug report into a fixed test case.</li>
+      <li><strong>Measure the variance instead of assuming it away.</strong> Run your eval set five times and look at the spread. A suite whose run-to-run spread is two points cannot detect a one-point regression, and knowing that is worth more than any single score.</li>
+      <li><strong>Pin what you can.</strong> Dated model snapshots, versioned prompts, versioned tool schemas. None of it buys bit-identical output — it buys the ability to say what changed when behavior does.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Assume every run is unique and design accordingly: log the rendered prompt on every call, treat any eval delta smaller than your measured run-to-run spread as noise, and never ship a test that asserts on an exact generated string. If you genuinely need bit-identical output — on-policy RL is the honest case — you need your own inference stack with batch-invariant kernels, and you should budget for the slowdown before you promise it.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/temperature-and-sampling">temperature and sampling</a> for the randomness you <em>do</em> control, <a class="xref" href="/concepts/prefill-and-decode">prefill, decode and the KV cache</a> for what the server is actually doing with your batch, and <a class="xref" href="/concepts/agent-evaluation">agent evaluation</a> for scoring trajectories that never repeat.</p>
+  </div>
+</section>
