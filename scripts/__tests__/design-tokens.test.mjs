@@ -129,3 +129,40 @@ test('the token layer actually defines what the rules reference', () => {
     );
   }
 });
+
+// The layout widths added 2026-07-28. Source-level, like the rules above:
+// this asserts the token layer exists and is declared once, in tokens.css.
+// Whether the rendered page honours it is the design guard's job.
+test('layout width tokens are declared in tokens.css', () => {
+  const src = read('../../src/styles/tokens.css');
+  const required = ['--w-shell', '--w-wrap', '--w-rail-nav', '--w-rail-toc', '--w-measure', '--t-prose'];
+  const missing = required.filter((t) => !new RegExp(`^\\s*${t}\\s*:`, 'm').test(src));
+  assert.deepEqual(missing, [], `width tokens missing from tokens.css: ${missing.join(', ')}`);
+});
+
+// --t-prose is the whole point of the 2026-07-28 layout change: 16px until
+// the column is wide enough to carry 18px, which is 1360px. Without the
+// step, the widened column measures 82 characters and breaks the guard's
+// own 78 ceiling. Asserted here so a future edit cannot quietly drop the
+// media query and leave a token that never changes.
+test('--t-prose steps up at the 1360px breakpoint', () => {
+  const src = read('../../src/styles/tokens.css');
+  const step = src.match(/@media\s*\(min-width:\s*1360px\)\s*\{[^}]*:root\s*\{[^}]*--t-prose\s*:\s*([^;]+);/);
+  assert.ok(step, '--t-prose has no @media (min-width: 1360px) override in tokens.css');
+  assert.match(step[1].trim(), /var\(--t-md\)/, `--t-prose must step to var(--t-md), got ${step[1].trim()}`);
+});
+
+// A vw-based clamp on the rails was designed and rejected: the shell caps at
+// 1440px while vw keeps growing, so vw rails widen past the cap and the
+// article column SHRINKS as the screen widens — measured 851px at 1440 down
+// to 765px at 1728, pushing the measure to 79 characters. Guarded because
+// clamp() is the intuitive thing to reach for here and it is wrong.
+test('rail widths do not depend on the viewport', () => {
+  const src = read('../../src/styles/tokens.css');
+  for (const t of ['--w-rail-nav', '--w-rail-toc']) {
+    const decl = src.match(new RegExp(`^\\s*${t}\\s*:\\s*([^;]+);`, 'm'));
+    assert.ok(decl, `${t} not declared`);
+    assert.doesNotMatch(decl[1], /vw|vmin|vmax|%/,
+      `${t} must be a fixed length, not viewport-relative — got ${decl[1].trim()}`);
+  }
+});

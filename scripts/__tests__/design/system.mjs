@@ -300,6 +300,35 @@ describe('design system', () => {
     assert.deepEqual(bad, [], `pages scroll horizontally: ${bad.join(', ')}`);
   });
 
+  // The in-flow TOC accordion (introduced in an earlier task) is a distinct
+  // layout mode that exists from 900px to 1359px, and nothing above checked
+  // overflow anywhere inside that band.
+  test('no horizontal overflow at 1024px', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1024, height: 900 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+      if (over) bad.push(path);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `pages scroll horizontally: ${bad.join(', ')}`);
+  });
+
+  test('no horizontal overflow at 1280px', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of PAGES) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+      if (over) bad.push(path);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `pages scroll horizontally: ${bad.join(', ')}`);
+  });
+
   test('mobile header is a single row', async () => {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
     const page = await ctx.newPage();
@@ -390,25 +419,154 @@ describe('design system', () => {
       `header labels compressed below their text width: ${JSON.stringify(squeezed)}`);
   });
 
-  test('prose measure is 60-75 characters', async () => {
-    const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  // The shipped guard ran at ONE viewport (1280px) against THREE article
+  // pages, which is why three separate measure defects shipped green: 30
+  // characters at 901px (both rails switching on with no width to hold them),
+  // 80 characters at 768px, and 97-108 characters on every index page, none
+  // of which has ever had a max-width.
+  //
+  // The window is 60-78 at >=768px. Below 700px it is 35-78: 60 characters at
+  // 16px needs 510px of column, which does not exist in a 390px viewport, so
+  // asserting 60 there would demand a font size no phone should use.
+  const MEASURE_WIDTHS = [390, 430, 768, 901, 1024, 1152, 1280, 1360, 1440, 1728];
+  const MEASURE_PAGES = [
+    '/field-guide/llm-mental-model/',
+    // Carries the ordered lists and the checklist. The whole list family
+    // escaped the cap because `.step ul li` was capped and `.step ol li`
+    // matched nothing: this page's 473-character <ol> item ran 96 characters
+    // at 901px and 95 at 1280px against a 78 ceiling, live, while the suite
+    // was green — none of the ~8 affected pages was in this list. A guard
+    // that only audits pages built from the same three components is not
+    // auditing the CSS, it is auditing those three components.
+    '/field-guide/llm-as-judge/',
+    '/concepts/prompt-caching/',
+    '/deep-dives/mcp/mcp-building-servers-in-practice/',
+    '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+    '/',
+    '/concepts/',
+    '/changelog/',
+    '/blogs/',
+    '/about/',
+    '/privacy/',
+    '/zh/concepts/prompt-caching/',
+  ];
+
+  /**
+   * Width in characters of every substantial run of text on the page, using
+   * the average advance of the lowercase alphabet plus space in each block's
+   * own computed font. Returns {max, worst} plus `seen` so a selector that
+   * stops matching cannot pass vacuously.
+   */
+  const measureChars = () => {
+    const c = document.createElement('canvas').getContext('2d');
+    const ab = 'abcdefghijklmnopqrstuvwxyz ';
+    const visible = (el) => {
+      const b = el.getBoundingClientRect();
+      if (b.width < 1 || b.height < 1) return false;
+      const cs = getComputedStyle(el);
+      return cs.visibility !== 'hidden' && cs.display !== 'none';
+    };
+    // A block carries a line of text only if it has no block-level child.
+    // Length-based rules are not enough: li.changelog-entry wraps <time> and
+    // <details>, and BOTH ways of having no long child defeat them — below
+    // 900px Chromium reports empty innerText for content inside a closed
+    // <details>, and above it an entry whose bullets are each under the
+    // threshold produces no qualifying child either. Either way the wrapper
+    // survives as a "leaf" and its column width is read as a line length,
+    // reporting a failure no CSS change could fix.
+    const BLOCK_CHILD = 'p, li, ul, ol, div, section, table, pre, details, summary, figure, blockquote, h1, h2, h3, h4, h5, h6, time, nav, aside';
+    const cands = [...document.querySelectorAll('main p, main li, .lede, .toc-desc, .entry-summary')]
+      .filter((el) => el.innerText.trim().length >= 120 && visible(el) && !el.querySelector(BLOCK_CHILD));
+    const leaves = cands.filter((el) => !cands.some((o) => o !== el && el.contains(o)));
+    let max = 0, worst = null, seen = 0;
+    for (const el of leaves) {
+      seen++;
+      const cs = getComputedStyle(el);
+      c.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+      const chars = Math.round(el.getBoundingClientRect().width / (c.measureText(ab).width / ab.length));
+      if (chars > max) {
+        max = chars;
+        worst = `${el.tagName.toLowerCase()}.${(el.className || '').toString().split(' ')[0]} ${Math.round(el.getBoundingClientRect().width)}px @${cs.fontSize}`;
+      }
+    }
+    return { max, worst, seen };
+  };
+
+  for (const w of MEASURE_WIDTHS) {
+    test(`prose measure is 60-78 characters (35-78 below 700px) @ ${w}px`, async () => {
+      const [floor, ceiling] = w < 700 ? [35, 78] : [60, 78];
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      const bad = [];
+      let total = 0;
+      for (const path of MEASURE_PAGES) {
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const { max, worst, seen } = await page.evaluate(measureChars);
+        total += seen;
+        // A page with no multi-line prose at this width is not a failure —
+        // /changelog/ below 900px is entirely inside a collapsed <details>
+        // and its hero lede is 74 characters, so nothing on it can wrap.
+        // Coverage is enforced across widths by the assertion below instead,
+        // so a page cannot silently drop out of the audit.
+        if (seen === 0) continue;
+        if (max < floor || max > ceiling) bad.push(`${path} = ${max} chars (${worst})`);
+      }
+      await ctx.close();
+      assert.ok(total > 0, 'measured nothing on any page — the selector list is stale');
+      assert.deepEqual(bad, [], `measure outside ${floor}-${ceiling} @ ${w}px:\n${bad.join('\n')}`);
+    });
+  }
+
+  // Per-width vacuity is legitimate; permanent vacuity is not. Every page in
+  // the audit must yield a real measurement at at least one width, or it is
+  // being listed as covered while contributing nothing — the "coverage
+  // pretending to be coverage" failure this suite already guards elsewhere.
+  test('every audited page is measured at some width', async () => {
+    const uncovered = [];
+    for (const path of MEASURE_PAGES) {
+      let covered = false;
+      for (const w of MEASURE_WIDTHS) {
+        const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+        const page = await ctx.newPage();
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const { seen } = await page.evaluate(measureChars);
+        await ctx.close();
+        if (seen > 0) { covered = true; break; }
+      }
+      if (!covered) uncovered.push(path);
+    }
+    assert.deepEqual(uncovered, [], `measured at no width — listed as covered, contributes nothing:\n${uncovered.join('\n')}`);
+  });
+
+  // Renamed from "blog prose is capped by --w-measure", which asserted only
+  // that a max-width existed. It passed identically whether this branch's
+  // token rule applied or the pre-existing 58ch rule did — and in fact the
+  // 58ch rule won, later in the same scoped block at equal specificity, so
+  // the assertion verified a mechanism it could not see. Assert the outcome.
+  test('blog prose measures 60-78 characters', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await ctx.newPage();
     const bad = [];
-    for (const path of ['/concepts/prompt-caching/', '/deep-dives/mcp/mcp-building-servers-in-practice/', '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/']) {
+    for (const path of [
+      '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+      '/zh/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+    ]) {
       await page.goto(server.url + path, { waitUntil: 'load' });
-      const chars = await page.evaluate(() => {
-        const p = [...document.querySelectorAll('main p')].find((x) => x.innerText.trim().length > 250);
-        if (!p) return null;
-        const cs = getComputedStyle(p);
+      const got = await page.evaluate(() => {
+        const el = [...document.querySelectorAll('.blog-article p')].find((x) => x.innerText.trim().length > 250);
+        if (!el) return null;
+        const cs = getComputedStyle(el);
         const c = document.createElement('canvas').getContext('2d');
         c.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
         const ab = 'abcdefghijklmnopqrstuvwxyz ';
-        return Math.round(p.getBoundingClientRect().width / (c.measureText(ab).width / ab.length));
+        const w = el.getBoundingClientRect().width;
+        return { chars: Math.round(w / (c.measureText(ab).width / ab.length)), w: Math.round(w) };
       });
-      if (chars !== null && (chars < 60 || chars > 78)) bad.push(`${path} = ${chars} chars`);
+      if (!got) { bad.push(`${path} found no .blog-article p over 250 chars`); continue; }
+      if (got.chars < 60 || got.chars > 78) bad.push(`${path} = ${got.chars} chars (${got.w}px)`);
     }
     await ctx.close();
-    assert.deepEqual(bad, [], `measure out of range:\n${bad.join('\n')}`);
+    assert.deepEqual(bad, [], `blog measure out of range:\n${bad.join('\n')}`);
   });
 
   // Keep this list in sync with the `.c-*` rules in guide.css — every
@@ -804,5 +962,331 @@ describe('design system', () => {
       separation(edged) >= NON_TEXT_MIN,
       `expected the edged panel to pass, scored ${separation(edged)}`
     );
+  });
+
+  // The reported bug: at 1728px the shell froze at 1180px and spent 274px per
+  // side — 15.9% of the viewport — on dead margin, while the article carried
+  // 536px of prose. No reference documentation site measured caps at 1180.
+  for (const w of [1440, 1728]) {
+    test(`article shell leaves no dead gutter @ ${w}px`, async () => {
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      const bad = [];
+      for (const path of ['/field-guide/llm-mental-model/', '/concepts/prompt-caching/', '/zh/concepts/prompt-caching/']) {
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const pct = await page.evaluate(() => {
+          const el = document.querySelector('.chapter-shell');
+          if (!el) return null;
+          return Math.round((el.getBoundingClientRect().left / window.innerWidth) * 1000) / 10;
+        });
+        if (pct === null) { bad.push(`${path} has no .chapter-shell`); continue; }
+        if (pct > 12) bad.push(`${path} gutter ${pct}% of viewport`);
+      }
+      await ctx.close();
+      assert.deepEqual(bad, [], `dead gutter over 12% @ ${w}px:\n${bad.join('\n')}`);
+    });
+  }
+
+  // Both rails switched on at 901px against a shell that had no width to give
+  // them, leaving the article 353px and the prose 257px — 30 characters. The
+  // ladder below is derived: the TOC rail plus its gap costs 296px, so below
+  // ~1290px the remaining column cannot hold 60 characters at 16px.
+  test('rails only appear where the column can still hold 60 characters', async () => {
+    const bad = [];
+    for (const [w, wantNav, wantToc] of [
+      [900, false, false], [1023, false, false],
+      [1024, true, false], [1359, true, false],
+      [1360, true, true], [1728, true, true],
+    ]) {
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      await page.goto(server.url + '/field-guide/llm-mental-model/', { waitUntil: 'load' });
+      const got = await page.evaluate(() => {
+        const railed = (sel) => {
+          const el = document.querySelector(sel);
+          if (!el) return false;
+          const cs = getComputedStyle(el);
+          if (cs.display === 'none') return false;
+          // A rail is a rail only while it is beside the article. The TOC
+          // below 1360px is in flow above it at full width, which is not a rail.
+          return el.getBoundingClientRect().width < window.innerWidth * 0.5;
+        };
+        return { nav: railed('.chapter-side'), toc: railed('.chapter-toc') };
+      });
+      await ctx.close();
+      if (got.nav !== wantNav) bad.push(`@${w}px nav rail ${got.nav}, want ${wantNav}`);
+      if (got.toc !== wantToc) bad.push(`@${w}px toc rail ${got.toc}, want ${wantToc}`);
+    }
+    assert.deepEqual(bad, [], `breakpoint ladder wrong:\n${bad.join('\n')}`);
+  });
+
+  // The ladder above runs on a chapter page only, and a chapter page's TOC is
+  // `.chapter-toc`. A blog post's is BlogPostTOC's `<nav class="blog-toc">`,
+  // which borrows the `.chapter-toc-*` CHILD classes but is not `.chapter-toc`
+  // — so raising `.chapter-side` to 1023.98px took the TOC off every blog post
+  // between 901 and 1023px while the compensating in-flow accordion, which
+  // targets `.chapter-toc`, replaced nothing. Posts here carry up to 40
+  // headings and the only fallback in that band was a "Browse all AI Blog"
+  // section link. Nothing caught it because no assertion looked at a blog
+  // post's TOC at all.
+  //
+  // This asserts the stronger property the chapter ladder only implies: above
+  // 900px a TOC is always REACHABLE — as a rail where the column can still
+  // hold 60 characters beside it, in flow above the article where it cannot.
+  // Below 900px it is absent by design (phone parity).
+  //
+  // It also pins the OPEN/CLOSED state, which the reachability check alone does
+  // not: restoring the panel in flow at full width made it one entry per
+  // heading, and a 40-heading post rendered 1289px of contents that pushed the
+  // article's top edge to y=1852 — roughly two screens before the first
+  // paragraph, which is its own way of making an article unreadable. So the
+  // in-flow panel ships CLOSED (y=619, a 55px header) and the rail ships OPEN,
+  // unchanged. The chapter TOC deliberately differs — 9 entries worst case,
+  // ~350px — and is left expanded; see spec 5.3.
+  //
+  // aria-expanded is what is asserted, not a CSS-only "is the list visible":
+  // the two must agree, and asserting the attribute is what catches a hide that
+  // leaves a screen reader told the list is open.
+  test('a blog post keeps a reachable table of contents at every width above 900px', async () => {
+    const bad = [];
+    for (const [w, wantVisible, wantRail, wantExpanded] of [
+      [899, false, false, true],
+      [900, true, false, false], [960, true, false, false], [1023, true, false, false],
+      [1024, true, true, true], [1359, true, true, true], [1360, true, true, true], [1728, true, true, true],
+    ]) {
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      await page.goto(server.url + '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/', { waitUntil: 'load' });
+      const got = await page.evaluate(() => {
+        const el = document.querySelector('.blog-toc');
+        if (!el) return { present: false };
+        const b = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+        const toggle = el.querySelector('.chapter-toc-toggle');
+        const list = el.querySelector('.chapter-toc-list');
+        const art = document.querySelector('.blog-article');
+        // Width 0 is the failure mode this test exists for: the nav itself
+        // stayed display:block while its `.chapter-side` parent went
+        // display:none, so a `display` check alone reported it as fine.
+        const visible = cs.display !== 'none' && cs.visibility !== 'hidden' && b.width >= 1 && b.height >= 1;
+        return {
+          present: true, visible, rail: visible && b.width < window.innerWidth * 0.5,
+          items: el.querySelectorAll('.chapter-toc-item').length,
+          expanded: toggle ? toggle.getAttribute('aria-expanded') === 'true' : null,
+          listShown: list ? getComputedStyle(list).display !== 'none' : null,
+          panelH: Math.round(b.height),
+          articleTop: art ? Math.round(art.getBoundingClientRect().top + window.scrollY) : null,
+          viewportH: window.innerHeight,
+        };
+      });
+      await ctx.close();
+      if (!got.present) { bad.push(`@${w}px no .blog-toc in the document at all`); continue; }
+      // A TOC with no entries is not a TOC; the script builds them client-side.
+      if (wantVisible && got.items < 3) bad.push(`@${w}px .blog-toc rendered ${got.items} entries`);
+      if (got.visible !== wantVisible) bad.push(`@${w}px .blog-toc visible ${got.visible}, want ${wantVisible}`);
+      if (got.rail !== wantRail) bad.push(`@${w}px .blog-toc rail ${got.rail}, want ${wantRail}`);
+      if (got.expanded !== wantExpanded) bad.push(`@${w}px .blog-toc aria-expanded ${got.expanded}, want ${wantExpanded} (panel ${got.panelH}px)`);
+      // The attribute and the rendering must agree, or a screen reader is told
+      // one thing and a sighted reader shown another.
+      if (got.listShown !== got.expanded) bad.push(`@${w}px .blog-toc aria-expanded ${got.expanded} but list shown ${got.listShown}`);
+      // The property the collapse exists to protect, asserted directly rather
+      // than as a magic pixel number: whatever sits above the article, the
+      // article still has to start on the first screen. Expanded in flow this
+      // reads 1852 against a 900px viewport.
+      if (got.articleTop >= got.viewportH) {
+        bad.push(`@${w}px article starts at y=${got.articleTop}, below the first screen (viewport ${got.viewportH}px, panel ${got.panelH}px)`);
+      }
+    }
+    assert.deepEqual(bad, [], `blog TOC ladder wrong:\n${bad.join('\n')}`);
+  });
+
+  // --t-prose is declared in :root and stepped in a @media at the foot of
+  // tokens.css. A same-specificity custom-property override loses to the base
+  // declaration on source order, and this repo has shipped that bug three
+  // times — so assert the COMPUTED size, at a width either side of the step.
+  // The source-level token test cannot see a reorder; this can.
+  //
+  // EVERY live consumer of --t-prose is listed, not a sample. The assertion
+  // shipped checking `.step p` and `.callout p`, which is half of them:
+  // reverting `.step ul li` to var(--t-base) rendered every bulleted list on
+  // every Field Guide, Concepts and Deep-Dive page at 16px inside 18px prose
+  // above 1360px, in both locales, with this suite still green.
+  // `.shell-plan-section p` and `.shell-plan-section ul.outline li strong`
+  // also read --t-prose and are deliberately NOT listed: the class matches
+  // nothing in src/ or dist/ (a removed stub-chapter feature whose CSS was
+  // left behind), and a selector that can never be found is under-coverage
+  // pretending to be coverage — the same reason the shell-banner marker was
+  // removed from COMPONENT_MARKERS.
+  const PROSE_SELECTORS = ['.step p', '.step ul li', '.step ol li', '.phase .goal', '.callout p'];
+  // Two chapters, both locales. Neither chapter carries every selector —
+  // llm-mental-model has no <ol> inside a .step, llm-as-judge has seven — so
+  // "not on this page" cannot be a per-page failure. It is a failure only if a
+  // selector is found on NO page at NO width, which is asserted after the loop.
+  const PROSE_PAGES = [
+    '/field-guide/llm-mental-model/', '/zh/field-guide/llm-mental-model/',
+    '/field-guide/llm-as-judge/', '/zh/field-guide/llm-as-judge/',
+  ];
+  test('article prose steps to 18px at 1360px and not before', async () => {
+    const bad = [];
+    const everFound = new Set();
+    for (const [w, want] of [[390, '16px'], [1280, '16px'], [1359, '16px'], [1360, '18px'], [1728, '18px']]) {
+      const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+      const page = await ctx.newPage();
+      for (const path of PROSE_PAGES) {
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const got = await page.evaluate((sels) => {
+          // No length threshold: computed font-size does not depend on text
+          // length, and a floor tuned for the measure test would never match a
+          // .callout p, which is short by nature — the assertion would report
+          // "found none" rather than checking the selector it was added for.
+          // Every selector is reported independently.
+          const out = {};
+          for (const sel of sels) {
+            const el = [...document.querySelectorAll(sel)].find((x) => {
+              const b = x.getBoundingClientRect();
+              return b.width > 0 && b.height > 0;
+            });
+            out[sel] = el ? getComputedStyle(el).fontSize : null;
+          }
+          return out;
+        }, PROSE_SELECTORS);
+        for (const [sel, size] of Object.entries(got)) {
+          if (size === null) continue;
+          everFound.add(sel);
+          if (size !== want) bad.push(`@${w}px ${path} ${sel} = ${size}, want ${want}`);
+        }
+      }
+      await ctx.close();
+    }
+    const never = PROSE_SELECTORS.filter((s) => !everFound.has(s));
+    assert.deepEqual(never, [],
+      `--t-prose consumers found on no tested page at any width — this assertion verifies nothing for: ${never.join(', ')}`);
+    assert.deepEqual(bad, [], `--t-prose step wrong:\n${bad.join('\n')}`);
+  });
+
+  // BlogLayout carried `:global(.blog-shell) { max-width: 1080px }` whose
+  // comment claimed it widened the shell for wide comparison tables. It did
+  // neither: 1080 is narrower than the 1180 it meant to override, and the
+  // rule never reached the browser at all. It sat inside a `<style is:global>`
+  // block, and `:global()` is a directive for Astro's SCOPING pass — a block
+  // that opts out of scoping never gets the rewrite, so the literal
+  // `:global(.blog-shell)` selector shipped into the compiled CSS and browsers
+  // discarded the rule as invalid syntax. Not a cascade contest it lost; a
+  // rule that did not exist as far as the browser was concerned. Seventh
+  // member of the "a reference hid where a CSS-source sweep cannot see it"
+  // family recorded in this repo's notes.
+  //
+  // Asserted on the COMPUTED value, which is the only thing that would have
+  // caught it — and note the consequence: this assertion could not be proved
+  // red before the fix, because the defect was invisible to the browser. Its
+  // proof that it can fail is the deliberate-break check in the plan's
+  // verification task, not a pre-fix red run.
+  test('the blog shell uses the standard shell width', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of [
+      '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+      '/zh/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
+    ]) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const got = await page.evaluate(() => {
+        const shell = document.querySelector('.chapter-shell');
+        const main = document.querySelector('.chapter-main');
+        if (!shell || !main) return null;
+        return {
+          maxW: getComputedStyle(shell).maxWidth,
+          main: Math.round(main.getBoundingClientRect().width),
+        };
+      });
+      if (!got) { bad.push(`${path} has no .chapter-shell/.chapter-main`); continue; }
+      if (got.maxW !== '1440px') bad.push(`${path} shell max-width computed ${got.maxW}, want 1440px`);
+      if (got.main < 1000) bad.push(`${path} article column ${got.main}px, want >=1000px`);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `blog shell wrong:\n${bad.join('\n')}`);
+  });
+
+  // Inline style attributes are the first entry on this repo's list of
+  // recurring bug classes: a CSS-source sweep structurally cannot see them,
+  // and four separate font/colour defects have hidden there. Layout
+  // properties are the ones that matter for the 2026-07-28 widening, because
+  // a grid whose column count lives in an attribute cannot be changed by a
+  // breakpoint. Content-level inline styles (visibility on the page-nav
+  // spacer) are not layout and stay allowed.
+  test('no layout property is set by an inline style attribute', () => {
+    const banned = /(max-width|grid-template-columns|display\s*:\s*grid)/;
+    const bad = [];
+    let seen = 0;
+    const walk = (dir) => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const p = resolve(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.name === 'index.html') {
+          const html = readFileSync(p, 'utf8');
+          for (const m of html.matchAll(/\sstyle="([^"]*)"/g)) {
+            seen++;
+            if (banned.test(m[1])) {
+              bad.push(`${p.slice(DIST.length)} → ${m[1].slice(0, 90)}`);
+            }
+          }
+        }
+      }
+    };
+    walk(DIST);
+    assert.ok(seen > 0, 'found no inline style attributes at all — the walk is broken');
+    assert.deepEqual([...new Set(bad)].slice(0, 20), [],
+      `layout properties in inline style attributes:\n${[...new Set(bad)].slice(0, 20).join('\n')}`);
+  });
+
+  // Every index grid moves from auto-fit to explicit column counts. auto-fit
+  // derives its column count from a minmax floor against a container that is
+  // about to change width, which is exactly how a widening turns the
+  // homepage's clean 3+2 into a 4+1 orphan without anyone editing the grid.
+  // Explicit counts are the thing that can be asserted.
+  test('index grids hold their column counts across the widening', async () => {
+    const bad = [];
+    const cases = [
+      ['/', '.home-grid', [[390, 1], [600, 2], [768, 3], [1728, 3]]],
+      ['/blogs/', '.blog-list', [[390, 1], [768, 1], [1024, 2], [1728, 2]]],
+      ['/deep-dives/', '.group-card-grid', [[390, 1], [768, 2], [1728, 2]]],
+    ];
+    for (const [path, sel, expectations] of cases) {
+      for (const [w, want] of expectations) {
+        const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
+        const page = await ctx.newPage();
+        await page.goto(server.url + path, { waitUntil: 'load' });
+        const cols = await page.evaluate((s) => {
+          const el = document.querySelector(s);
+          if (!el) return null;
+          return getComputedStyle(el).gridTemplateColumns.split(/\s+/).filter(Boolean).length;
+        }, sel);
+        await ctx.close();
+        if (cols === null) bad.push(`${path} has no ${sel}`);
+        else if (cols !== want) bad.push(`${path} ${sel} @${w}px = ${cols} cols, want ${want}`);
+      }
+    }
+    assert.deepEqual(bad, [], `grid column counts wrong:\n${bad.join('\n')}`);
+  });
+
+  // The reported complaint was about the whole web view, not only article
+  // pages: at 1728px the 860px .wrap left 434px per side.
+  test('index pages leave no dead gutter @ 1728px', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1728, height: 900 } });
+    const page = await ctx.newPage();
+    const bad = [];
+    for (const path of ['/', '/concepts/', '/blogs/', '/changelog/', '/zh/concepts/']) {
+      await page.goto(server.url + path, { waitUntil: 'load' });
+      const pct = await page.evaluate(() => {
+        const els = [...document.querySelectorAll('.wrap')].filter((e) => !e.classList.contains('wrap--prose'));
+        if (!els.length) return null;
+        const left = Math.min(...els.map((e) => e.getBoundingClientRect().left));
+        return Math.round((left / window.innerWidth) * 1000) / 10;
+      });
+      if (pct === null) { bad.push(`${path} has no .wrap`); continue; }
+      if (pct > 20) bad.push(`${path} gutter ${pct}%`);
+    }
+    await ctx.close();
+    assert.deepEqual(bad, [], `index gutter over 20% @ 1728px:\n${bad.join('\n')}`);
   });
 });
