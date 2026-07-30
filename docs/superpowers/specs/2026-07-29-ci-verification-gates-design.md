@@ -113,8 +113,35 @@ the install step for nothing.
 individually-green pull requests whose merged result is red. It cannot block anything after the
 fact — it is the only thing that would report it.
 
-Expected runtime ~4–5 minutes. The repository is public, so standard runners are free with no
-minute cap.
+### 3.1 Runtime, measured
+
+Measured on an 18-core Mac: `npm run build` 4.4s, `npm test` 0.2s, the design suite 171s.
+Estimated on `ubuntu-latest` (4 vCPU): **~6 minutes warm, ~8 minutes on a cold cache**, of which
+roughly 4 minutes is the design suite and the rest is `npm ci` plus the Chromium install.
+
+The suite has **no hotspot**. Its 56 assertions cost 1–11s each and the time is spread across
+families:
+
+| family | tests | time |
+|---|---|---|
+| geometry, SVG, i18n, coverage | 20 | 59.7s |
+| prose measure (10 viewports) | 11 | 34.6s |
+| contrast AA (2 themes × 3 viewports) | 6 | 27.0s |
+| horizontal overflow (5 widths) | 5 | 23.4s |
+| scroll affordance | 2 | 9.7s |
+| emphasis surfaces | 2 | 9.0s |
+| nav reachability | 10 | 7.7s |
+
+The cost is roughly 400 page navigations at 200–400ms each, most of them re-walking the same
+~15-page list — contrast alone is 6 × 15 = 90 loads, overflow another 75, measure 100.
+
+**They run serially because the whole guard is one file.** `node --test` parallelises across
+*files*, not within them, so the suite occupies a single process: one core of 18 locally, one of
+four in CI.
+
+Six minutes is accepted for this change. Nothing human waits on the run — the autonomous routine
+pushes, CI runs, the routine merges — and the repository is public, so standard runners are free
+with no minute cap. The fix is sequenced deliberately, see §8.1.
 
 ---
 
@@ -192,7 +219,26 @@ Local gates before opening the PR: `npm run build`, `npm run verify`, `npm test`
 
 ---
 
-## 8. Explicitly out of scope
+## 8. Out of scope, and one sequenced follow-up
+
+### 8.1 Splitting the design suite — next, not now
+
+Splitting `system.mjs` into several files lets `node --test` run them concurrently. Projected:
+171s → ~40s locally, ~250s → ~100s in CI, taking the whole run from ~6 minutes to ~3.5. Nothing
+about what is asserted changes; the shared helpers move to a module and the assertions distribute.
+`test:design`'s glob would widen to `scripts/__tests__/design/*.mjs`, and each file pays its own
+Chromium launch and static server.
+
+**It is deliberately a separate, later change.** Splitting a passing 56-assertion suite is exactly
+the refactor where coverage vanishes quietly — a helper moved wrong, a derived marker list that
+stops deriving, an assertion left matching nothing. This repository produced three separate
+instances of that failure mode on 2026-07-28/29 alone. The refactor should happen with CI already
+enforcing, not while the enforcement gap it would be judged by is still open.
+
+Expect the parallel speedup to be capped by the runner: four vCPUs sustain roughly three
+concurrent browsers, so the local 4× will not reproduce in CI.
+
+### 8.2 Also out of scope
 
 - Self-hosting the webfonts (§4).
 - Adding the other four gates to CI (§2).
