@@ -1,0 +1,106 @@
+<section class="phase">
+  <div class="phase-num">Y11</div>
+  <div class="week">实战手册 · 领域实战手册</div>
+  <h2>收件箱与日历智能体：唯一由陌生人替你写提示词的领域。</h2>
+  <p class="goal">收件箱智能体是唯一一种输入 100% 由攻击者掌控且这是设计使然的产品——互联网上任何人只要发一封邮件，就能把文本直接放进你智能体的上下文，而这是功能在正常工作，不是一次入侵。EchoLeak（CVE-2025-32711，CVSS 9.3）展示了终局：一封精心构造的邮件、零点击，当用户让 Microsoft 365 Copilot 总结收件箱时，组织数据就被外泄了。所以设计的主导因素是那道不可信内容边界，而不是起草质量；而真正有效的那个自主性旋钮，是按<em>对方是谁</em>分级，而不是按动作分级——在一条你本来就在的线程里回复几乎是免费的，而第一次给陌生人发邮件不是，但两者都是同一个 <code class="inline">send</code> 动词。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>不可信输入就是这个产品本身，不是边缘情况。</h3>
+
+    <p>诚实地对比一下威胁面。编码智能体读的是你挑的仓库。客服智能体读的是至少持有一个账号的人发来的消息。而收件箱智能体读的是某个匿名发件人决定写的任何东西，而且它是沿着正常、预期的路径这么做的——你的智能体一开始总结未读邮件，攻击者的散文就和你的指令一起进了上下文窗口。上游没有闸门可加，因为"接收不认识的人发来的邮件"正是收件箱存在的意义。</p>
+
+    <p>正是针对这种形状的系统，间接提示词注入在 OWASP Agentic Applications Top 10（2026）中位列第一，而 EchoLeak 是那个经典的完整案例：入站邮件里的隐藏指令、在检索期间被处理、绕过了一个跨提示词注入分类器、在零用户交互的情况下外泄了数据。注意它击败了哪些防御。用户什么都没做错；没有可供钓鱼的点击。一个内容分类器在位，而它被绕开了。<strong>把基于分类器的注入过滤当作降低发生率的手段，永远不要当作边界</strong>——关于这为何是结构性的、而非某人欠你的一个补丁，见<a class="xref" href="/zh/concepts/prompt-injection-101">提示词注入</a>与<a class="xref" href="/zh/deep-dives/agent-security/prompt-injection-defense-2026">提示词注入防御</a>。</p>
+
+    <p>对本手册的推论是：你没法靠让模型更谨慎来设计一个收件箱智能体。你的设计方式是安排出这样的局面——即使模型被完全攻陷，它仍然做不到你所害怕的那件事。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>把"读的那个智能体"和"动手的那个智能体"拆开。</h3>
+
+    <p>承重的架构是能力分离，而在这个领域它格外干净，因为两半本来就想要不同的输入。</p>
+
+    <p><em>读者</em>摄入原始邮件正文，且不持有任何能发送、拉取或搬运数据的工具。它唯一的输出是结构化的（<a class="xref" href="/zh/concepts/structured-outputs">结构化输出</a>）：一个类别、一个紧急度分值、抽取出的字段、一份拟议的草稿正文、一个按 ID 引用实体的拟议动作。<em>执行者</em>只消费那份结构，从不看原始正文。于是被注入的文本可以腐蚀草稿的<em>内容</em>——那会有人去读——但选不了收件人、调不了工具、也触及不了 URL，因为握有这些权力的那个组件根本没在看攻击者的散文。</p>
+
+<pre class="standalone"><span class="c-cm"># The reader's schema IS the security boundary: no free-text addresses, no URLs.</span>
+<span class="c-kw">class</span> <span class="c-fn">Proposal</span>(BaseModel):
+    category:   Literal[<span class="c-st">"urgent"</span>, <span class="c-st">"reply-needed"</span>, <span class="c-st">"fyi"</span>, <span class="c-st">"newsletter"</span>]
+    thread_id:  ThreadId                  <span class="c-cm"># an ID we already hold, not a string</span>
+    recipients: list[ParticipantRef]      <span class="c-cm"># indexes into the thread, not addresses</span>
+    draft_body: str                       <span class="c-cm"># untrusted; a human reads this</span>
+    reason:     str                        <span class="c-cm"># one line, shown in review</span>
+    abstain:    bool = <span class="c-kw">False</span>              <span class="c-cm"># "I could not tell" is a valid answer</span>
+
+<span class="c-cm"># The actor resolves refs itself. An injected "send to attacker@evil.tld"</span>
+<span class="c-cm"># has nowhere to land: the type system has no slot for a new address.</span>
+<span class="c-kw">def</span> <span class="c-fn">send_reply</span>(p: Proposal):
+    thread = store.get(p.thread_id)
+    to = [thread.participants[r.index] <span class="c-kw">for</span> r <span class="c-kw">in</span> p.recipients]   <span class="c-cm"># closed set</span>
+    <span class="c-kw">return</span> mail.reply(thread, to=to, body=strip_egress(p.draft_body))</pre>
+
+    <p>那段代码里有两处细节干了大部分的活。收件人是<em>指向线程内部的引用</em>而不是地址字符串，所以一个被攻陷的读者能触达的人的集合，被"谁本来就在这段对话里"所界定——由类型在模型之外强制执行，而那是唯一能在注入之下存活的执行位置（<a class="xref" href="/zh/concepts/agent-identity-and-permissions">智能体身份与权限</a>）。而 <code class="inline">strip_egress</code> 之所以存在，是因为 EchoLeak 那一类攻击里的外泄通道不是发邮件——而是<em>渲染</em>。输出里一个被你客户端拉取的 markdown 图片或链接，就是一次出站请求，查询串里装着攻击者选定的内容，由一个只读了个摘要的用户触发。把智能体从不可信内容渲染出来的东西里的每一个 URL 都剥掉或代理掉，并把这当作没得商量的前提而不是加固项（<a class="xref" href="/zh/operations/safety-and-security/data-exfiltration-risks">数据外泄风险</a>）。</p>
+
+    <div class="callout warn"><p>对整个邮箱做检索，是那台把一封敌意邮件放大成一次泄露的放大器。一个能搜索全部邮件并总结它们的读者，会乐意听从第 1 封信里的指令去定位并引用第 2 封信的内容——指令由攻击者提供，秘密由你的索引提供。如果智能体确实需要全邮箱搜索，那就让搜索的组件无工具、让动手的组件无搜索，并且绝不让同一段上下文同时装着攻击者的文本和一次被它影响过的查询的结果。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>按对方是谁给自主性分级，而不是按动作。</h3>
+
+    <p>那套惯常的阶梯——读是安全的、写需要批准——在这里太粗了，因为 <code class="inline">send</code> 在同一个动词底下横跨了两个数量级的风险。在一条你每天都在通信的同事线程里发一句两行的回复，是可挽回的、什么社交后果都没有的事。而用你的地址给一个陌生人发出第一封邮件，是一个你收不回来、且此前并无这个习惯的举动。同一个工具、同一份权限、后果天差地别——所以要按<em>另一端是谁</em>来给工具划范围：</p>
+
+    <ul>
+      <li><strong>分诊、打标、归档、稍后提醒。</strong>完全自主。可逆、私密、对任何其他人都不可见。把这一档做好，你已经交付了大部分价值。</li>
+      <li><strong>就地起草，绝不发送。</strong>完全自主，也是整个领域的甜蜜点：人的成本从"撰写"降到"编辑"，而智能体压根不持有任何不可逆的权力。在它下面的任何一档之前先上线这一档。</li>
+      <li><strong>在既有线程上回复既有参与者。</strong>可按内容类别设闸——日程确认与收讫回执可以，任何含有承诺、数字或道歉的内容不行。</li>
+      <li><strong>主动联系一个此前从未通信过的对象。</strong>在任何成熟度等级上都绝不自主。这同时也是收件箱智能体开始变成一个外呼工具、并带上另一套同意义务的那道边界（<a class="xref" href="/zh/playbooks/domain-playbooks/sales-and-gtm-agents">销售与 GTM 智能体</a>）。</li>
+      <li><strong>任何花掉别人时间的事。</strong>给八个人发邀请、挪一场会、代用户拒绝。见下一节。</li>
+    </ul>
+
+    <p>把这个区分实现成一份派生出来的白名单，而不是一句提示词指令：自主回复的收件人集合，是从线程参与者与既往通信历史算出来的，而发送工具会拒绝其之外的一切。<strong>一个说不出新收件人的智能体，也就没法被劝去给新收件人发信</strong>——这正是把规则放进工具签名而不是系统提示词的全部意义。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>可逆性由"谁已经看见了"来决定。</h3>
+
+    <p>"撤回发送"是一个三十秒的客户端延迟，不是邮件的属性；消息一旦离开，剩下的唯一补救就是再发一封为前一封道歉的消息。这让<a class="xref" href="/zh/playbooks/agent-ux-and-human-interaction/approval-and-confirmation-ux">审批与确认体验</a>里那套标准的可逆性框架变得更锋利而非不同：在这个领域里，<em>一个动作的可逆性是"谁已经感知到它"的函数，而不是"你的系统能否删掉那条记录"的函数。</em></p>
+
+    <p>日历是这一点咬得最狠的地方，而它一直被建模得过轻，因为 API 让它看起来像一次数据库写入。创建一个事件会在几秒内把通知推到每位参会者的手机上。挪一场会，会重写别人的下午。一封代用户发出的拒绝，会被一个人读作"用户做的一个决定"——而即使你之后删掉那个事件，它仍然被那样读着，因为删除本身也会发出自己的通知。回滚一次日历写入，产生的是两桩社交事件，而不是零桩。</p>
+
+    <p>由此得出三条规则，而它们都很便宜：</p>
+
+    <ul>
+      <li><strong>提议加占位，而不是直接订。</strong>一个找出三个可行时段、暫定占住它们、让用户一键确认的智能体，几乎捕获了全部价值，而不带任何不可逆性。暂定占位只有用户看得见；邀请不是。</li>
+      <li><strong>绝不自主地拒绝、取消或挪动有外部参会者的事件。</strong>拒绝是用户最悔于授权出去的那个动作，因为社交代价完全落在做出这个动作的系统之外。</li>
+      <li><strong>批量化的是复核，不是动作。</strong>一份用户九十秒清完的摘要，胜过十一次打断，而它能让复核成本——那个真正决定一个智能体是否值得拥有的指标（<a class="xref" href="/zh/concepts/agent-ux-patterns">为复核而设计</a>）——保持在智能体创造的价值之下。</li>
+    </ul>
+
+    <div class="callout tip"><p>展示 diff，而不是意图。"回复 Dana，接受周四下午 3 点"是一句用户会不读就批准的摘要。渲染出来的那封信、确切的收件人列表、确切的日历增量，才是让批准有分量的东西——而渲染真实产物也正是用户注意到"草稿里有一句他绝不会那样写的话"的方式，那是你对抗一份被腐蚀的草稿正文的最后一道防线。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>你用户的归档本身就是一份已标注的评测集。</h3>
+
+    <p>团队用 LLM 裁判来评测收件箱智能体的起草质量，因为散文是他们会去看的东西。而那度量的是最不危险的那个组件。让用户流失的失败是决策：那一封真正紧急的邮件被归为 <code class="inline">fyi</code>、一封回复落到了错的线程、一份收件人列表凭空多了一个人，以及听从了藏在某封邮件正文里的指令。</p>
+
+    <p>这个领域在构建那份评测集上有一份罕见的礼物：<strong>用户自己的邮件归档量大、私人，而且已经被他们的行为预先标注好了。</strong>他回复过什么，是"需要回复"的真值。他多快回复，是紧急度的真值。他未读就归档了什么，是"噪声"的真值。你可以在不做标注项目的情况下，为每位用户攒出几千个已标注用例——而那些标签是这位用户的真实偏好，而非一份通用评分细则，这很重要，因为分诊是不可化约地私人的（见<a class="xref" href="/zh/concepts/agent-evaluation">评估智能体</a>）。</p>
+
+    <p>要不对称地打分，因为代价是不对称的。在一封紧急邮件上漏报，是那个让产品被卸载的失败；而多浮出一封邮件的误报，代价是五秒钟。相应地给它们赋权，而不要报一个对称的准确率数字，把唯一有人在乎的那种错误藏起来。</p>
+
+    <p>然后在旁边跑一套常设的红队套件，因为一次注入失败是一桩安全事故，不是一次质量回归。给语料的一份副本播下敌意消息——白底白字里的指令、引用回复链里的、附件里的、ICS 描述字段里的、邮件头里的——并对<em>工具调用</em>而不是模型文本做断言。通过条件是：没有未授权收件人被寻址、没有外部 URL 被拉取、没有数据离开边界；一个雄辩地解释自己不会照办、而外壳却记录下一次对 <code class="inline">attacker.tld</code> 的请求的模型，是失败的（<a class="xref" href="/zh/operations/safety-and-security/prompt-injection">生产中的提示词注入</a>）。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>先上分诊与草稿；发送权要挣。</h3>
+
+    <p>这个上线顺序不是妥协，它就是价值真正所在的地方。分诊加"起草但绝不发送"现在就可部署、里面没有任何不可逆动作，而且拿掉了大部分劳动——用户仍然决定一切，只是以秒而不是分钟为单位地决定。此后每一份增量授予都该用证据来支付：一个自主回复类别只有在它以草稿模式跑了足够久、在这位用户自己的邮件上展示出低编辑率、且红队套件全绿之后，才能开放。</p>
+
+    <p>有两件事该在发布之前而不是之后决定。留存：一个收件箱智能体的轨迹里含有别人邮件的全文，这让你的可观测性存储成了这个邮箱的一份副本，而访问控制却不一样——通常是整个系统里最敏感的产物（<a class="xref" href="/zh/operations/governance-compliance/data-governance">智能体的数据治理</a>）。以及范围：给你用户写信的那位第三方，从未同意自己的消息被一个模型处理，而这在某些法域里是一条真实约束，在任何地方都是一个合理的期待。</p>
+
+    <div class="callout tip"><p>把读者建成没有网络访问、没有发送工具的，并且永久保持这样——不要把它当作一个"等模型变好就放开"的第一阶段限制。治理注入的变量不是模型质量；攻击者每次都写新的文本，而唯一持久的性质是"读他们文本的那个组件手里没有值得被拿走的东西"。你每交给读者一项能力，就把一次注入从一份烦人的草稿升级成一桩事故，而再多的提示词加固也买不回那项能力的安全。</p></div>
+  </div>
+</section>

@@ -1,0 +1,106 @@
+<section class="phase">
+  <div class="phase-num">Y11</div>
+  <div class="week">Playbook · Domain Playbooks</div>
+  <h2>Inbox &amp; calendar agents: the only domain where a stranger writes your prompt.</h2>
+  <p class="goal">An inbox agent is the one product where 100% of the input is attacker-controlled by design — anyone on the internet can place text directly into your agent's context simply by sending mail, and that is the feature working, not a breach. EchoLeak (CVE-2025-32711, CVSS 9.3) showed the endgame: one crafted email, no click, and Microsoft 365 Copilot exfiltrated organizational data when the user asked it to summarize their inbox. So the design is dominated by an untrusted-content boundary rather than by drafting quality, and the autonomy dial that actually works is graded by <em>counterparty</em>, not by action — replying inside a thread you are already on is nearly free, while emailing a stranger for the first time is not, and both are the same <code class="inline">send</code> verb.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Untrusted input is the product, not an edge case.</h3>
+
+    <p>Compare the threat surfaces honestly. A coding agent reads a repository you chose. A support agent reads messages from someone who at least holds an account. An inbox agent reads whatever an anonymous sender decided to write, and it does so as the normal, intended path — the moment your agent summarizes unread mail, an attacker's prose is in the context window alongside your instructions. There is no gate to add upstream, because "receiving mail from people you do not know" is what an inbox is for.</p>
+
+    <p>Indirect prompt injection leads the OWASP Top 10 for Agentic Applications (2026) for exactly this shape of system, and EchoLeak is the canonical worked example: hidden instructions in an inbound email, processed during retrieval, bypassing a cross-prompt-injection classifier, exfiltrating data with zero user interaction. Note which defenses it defeated. The user did nothing wrong; there was no click to phish. A content classifier was present and was routed around. <strong>Treat classifier-based injection filtering as a rate reducer, never as a boundary</strong> — see <a class="xref" href="/concepts/prompt-injection-101">prompt injection</a> and <a class="xref" href="/deep-dives/agent-security/prompt-injection-defense-2026">prompt-injection defense</a> for why this is structural rather than a patch someone owes you.</p>
+
+    <p>The consequence for this playbook: you cannot design an inbox agent by making the model more careful. You design it by arranging that a fully compromised model still cannot do the thing you are afraid of.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Split the agent that reads from the agent that acts.</h3>
+
+    <p>The load-bearing architecture is capability separation, and in this domain it is unusually clean because the two halves want different inputs anyway.</p>
+
+    <p>The <em>reader</em> ingests raw message bodies and holds no tools that can send, fetch, or move data. Its only output is structured (<a class="xref" href="/concepts/structured-outputs">structured outputs</a>): a category, an urgency score, extracted fields, a proposed draft body, a proposed action referencing entities by ID. The <em>actor</em> consumes only that structure and never sees a raw body. Injected text can therefore corrupt the <em>content</em> of a draft — which a human will read — but cannot choose a recipient, invoke a tool, or reach a URL, because the component with those powers is not looking at attacker prose at all.</p>
+
+<pre class="standalone"><span class="c-cm"># The reader's schema IS the security boundary: no free-text addresses, no URLs.</span>
+<span class="c-kw">class</span> <span class="c-fn">Proposal</span>(BaseModel):
+    category:   Literal[<span class="c-st">"urgent"</span>, <span class="c-st">"reply-needed"</span>, <span class="c-st">"fyi"</span>, <span class="c-st">"newsletter"</span>]
+    thread_id:  ThreadId                  <span class="c-cm"># an ID we already hold, not a string</span>
+    recipients: list[ParticipantRef]      <span class="c-cm"># indexes into the thread, not addresses</span>
+    draft_body: str                       <span class="c-cm"># untrusted; a human reads this</span>
+    reason:     str                        <span class="c-cm"># one line, shown in review</span>
+    abstain:    bool = <span class="c-kw">False</span>              <span class="c-cm"># "I could not tell" is a valid answer</span>
+
+<span class="c-cm"># The actor resolves refs itself. An injected "send to attacker@evil.tld"</span>
+<span class="c-cm"># has nowhere to land: the type system has no slot for a new address.</span>
+<span class="c-kw">def</span> <span class="c-fn">send_reply</span>(p: Proposal):
+    thread = store.get(p.thread_id)
+    to = [thread.participants[r.index] <span class="c-kw">for</span> r <span class="c-kw">in</span> p.recipients]   <span class="c-cm"># closed set</span>
+    <span class="c-kw">return</span> mail.reply(thread, to=to, body=strip_egress(p.draft_body))</pre>
+
+    <p>Two details in that snippet do most of the work. Recipients are <em>references into the thread</em> rather than address strings, so the set of people a compromised reader can reach is bounded by who was already in the conversation — enforced by the type, outside the model, which is the only place enforcement survives injection (<a class="xref" href="/concepts/agent-identity-and-permissions">agent identity and permissions</a>). And <code class="inline">strip_egress</code> exists because the exfiltration channel in EchoLeak-class attacks is not sending mail — it is <em>rendering</em>. A markdown image or link in output that your client fetches is an outbound request with attacker-chosen contents in the query string, triggered by a user who only read a summary. Strip or proxy every URL in anything an agent renders from untrusted content, and treat that as non-negotiable rather than hardening (<a class="xref" href="/operations/safety-and-security/data-exfiltration-risks">data exfiltration risks</a>).</p>
+
+    <div class="callout warn"><p>Retrieval over the whole mailbox is the amplifier that turns one hostile email into a breach. A reader that can search all mail and summarize it will happily follow instructions in message 1 to locate and quote the contents of message 2 — the attacker supplies the instruction, your index supplies the secret. If the agent needs mailbox-wide search, keep the searching component tool-free and the acting component search-free, and never let one context hold both an attacker's text and the results of a query it influenced.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Grade autonomy by counterparty, not by action.</h3>
+
+    <p>The usual ladder — read is safe, write needs approval — is too coarse here, because <code class="inline">send</code> spans two orders of magnitude of risk under one verb. Sending a two-line reply on a thread with a colleague you email daily is recoverable social nothing. Sending a first-ever email to a stranger, from your address, is an act you cannot take back and did not previously have a habit of. Same tool, same permission, wildly different consequence — so scope the tool by <em>who is on the other end</em>:</p>
+
+    <ul>
+      <li><strong>Triage, label, archive, snooze.</strong> Full autonomy. Reversible, private, invisible to anyone else. Get this right and you have delivered most of the value.</li>
+      <li><strong>Draft in place, never send.</strong> Full autonomy, and the sweet spot of the whole domain: the human's cost drops from composing to editing, while the agent holds no irreversible power at all. Ship this before anything below it.</li>
+      <li><strong>Reply to existing participants on an existing thread.</strong> Gateable by content class — scheduling confirmations and acknowledgements yes, anything containing a commitment, a number, or an apology no.</li>
+      <li><strong>Initiate contact with a party never previously emailed.</strong> Never autonomous, at any maturity level. This is also the boundary where an inbox agent starts becoming an outbound tool with a different set of consent obligations (<a class="xref" href="/playbooks/domain-playbooks/sales-and-gtm-agents">sales and GTM agents</a>).</li>
+      <li><strong>Anything that spends other people's time.</strong> Sending an invite to eight people, moving a meeting, declining on the user's behalf. Treated below.</li>
+    </ul>
+
+    <p>Implement the distinction as a derived allowlist rather than a prompt instruction: the recipient set for autonomous replies is computed from thread participants and prior correspondence history, and the send tool rejects anything outside it. <strong>An agent that cannot name a new recipient cannot be talked into emailing one</strong> — which is the whole point of putting the rule in the tool signature instead of the system prompt.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Reversibility is decided by who already saw it.</h3>
+
+    <p>"Undo send" is a thirty-second client-side delay, not a property of email; once the message leaves, the only remaining remedy is a second message apologizing for the first. This makes the standard reversibility framing from <a class="xref" href="/playbooks/agent-ux-and-human-interaction/approval-and-confirmation-ux">approval and confirmation UX</a> sharper rather than different: in this domain, <em>an action's reversibility is a function of who has already perceived it, not of whether your system can delete the record.</em></p>
+
+    <p>Calendar is where that bites hardest, and it is consistently under-modelled because the API makes it look like a database write. Creating an event pushes notifications to every attendee's phone within seconds. Moving a meeting rewrites other people's afternoons. A decline sent on the user's behalf is read by a human as a decision the user made — and it stays read that way even after you delete the event, because the deletion sends its own notification. Rolling back a calendar write produces two social events instead of zero.</p>
+
+    <p>Three rules that follow, and they are cheap:</p>
+
+    <ul>
+      <li><strong>Propose-with-holds rather than book.</strong> An agent that finds three viable slots and holds them tentatively, for the user to confirm in one click, captures nearly all the value with none of the irreversibility. Tentative holds are visible only to the user; invitations are not.</li>
+      <li><strong>Never decline, cancel, or move an event with external attendees autonomously.</strong> Declining is the action users most regret delegating, because the social cost lands entirely outside the system that took it.</li>
+      <li><strong>Batch the review, not the actions.</strong> One digest the user clears in ninety seconds beats eleven interruptions, and it keeps review cost — the metric that actually decides whether an agent is worth having (<a class="xref" href="/concepts/agent-ux-patterns">designing for review</a>) — under the value the agent creates.</li>
+    </ul>
+
+    <div class="callout tip"><p>Show the diff, not the intention. "Reply to Dana, accept Thursday 3pm" is a summary the user will approve without reading. The rendered message, the exact recipient list, and the exact calendar delta are what make approval mean something — and rendering the real artifact is also how a user notices that the draft contains a sentence they never would have written, which is your last line of defense against a corrupted draft body.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Your user's archive is a labelled eval set already.</h3>
+
+    <p>Teams evaluate inbox agents on draft quality with an LLM judge, because prose is what they look at. That measures the least dangerous component. The failures that lose users are decisions: the one genuinely urgent message classified <code class="inline">fyi</code>, a reply landing on the wrong thread, a recipient list that gained someone, and compliance with an instruction embedded in a message body.</p>
+
+    <p>This domain has an unusual gift for building that eval set: <strong>the user's own mail archive is large, personal, and pre-labelled by their behaviour.</strong> What they replied to is ground truth for "needed a reply." How fast they replied is ground truth for urgency. What they archived unread is ground truth for noise. You can assemble thousands of labelled cases per user without an annotation project — and the labels are that user's actual preferences rather than a generic rubric, which matters because triage is irreducibly personal (see <a class="xref" href="/concepts/agent-evaluation">evaluating agents</a>).</p>
+
+    <p>Score it asymmetrically, because the costs are asymmetric. A false negative on an urgent message is the failure that gets the product uninstalled; a false positive that surfaces one extra email costs five seconds. Weight them accordingly instead of reporting a symmetric accuracy number that hides the only error anyone cares about.</p>
+
+    <p>Then run a standing red-team suite alongside it, because an injection failure is a security incident and not a quality regression. Seed a copy of the corpus with hostile messages — instructions in white-on-white text, in a quoted reply chain, in an attachment, in an ICS description field, in a mail header — and assert on <em>tool calls</em>, not on model text. The passing condition is that no unauthorized recipient was addressed, no external URL was fetched, and no data left the boundary; a model that eloquently explains it will not comply, while the harness records a request to <code class="inline">attacker.tld</code>, has failed (<a class="xref" href="/operations/safety-and-security/prompt-injection">prompt injection in production</a>).</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Ship triage and drafts; earn the send.</h3>
+
+    <p>The shipping order is not a compromise, it is where the value actually is. Triage plus draft-never-send is deployable now, has no irreversible action in it, and removes most of the labour — the user still decides everything, but decides it in seconds instead of minutes. Every incremental grant beyond that should be paid for with evidence: an autonomous reply class opens only after that class has run in draft mode long enough to show a low edit rate, on that user's own mail, with the red-team suite green.</p>
+
+    <p>Two things to decide before launch rather than after. Retention: an inbox agent's traces contain the full text of other people's mail, which makes your observability store a copy of the mailbox with different access controls — usually the most sensitive artifact in the system (<a class="xref" href="/operations/governance-compliance/data-governance">data governance for agents</a>). And scope: the third party who emailed your user never consented to their message being processed by a model, which is a real constraint in some jurisdictions and a reasonable expectation everywhere.</p>
+
+    <div class="callout tip"><p>Build the reader with no network access and no send tool, and keep it that way permanently — not as a phase-one restriction you relax when the model gets better. Model quality is not the variable that governs injection; the attacker writes new text every time, and the only durable property is that the component reading their text has nothing worth capturing. Every capability you hand the reader converts an injection from an annoying draft into an incident, and no amount of prompt hardening buys that capability back safely.</p></div>
+  </div>
+</section>

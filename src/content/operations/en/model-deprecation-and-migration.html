@@ -1,0 +1,114 @@
+<section class="phase">
+  <div class="phase-num">O10</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Model deprecation: migrating on someone else's calendar.</h2>
+  <p class="goal">The model your agent was qualified against has a retirement date you did not choose, and the notice window is shorter than the time it takes to re-qualify an agent — Anthropic commits to at least 60 days for publicly released models, OpenAI to six months for generally available ones and as little as two weeks for previews. Pinning a dated snapshot is still the right call, but be clear about what it buys: determinism now, and a forced migration later, on a date someone else sets. The deliverable is therefore a standing candidate-versus-baseline eval diff, not a config change you make in a hurry.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The deadline is published in advance, and nobody reads it.</h3>
+
+    <p>Provider deprecation is not a surprise; it is a documented lifecycle. Anthropic labels models <em>active → legacy → deprecated → retired</em>, notifies customers with active deployments, and commits to <strong>at least 60 days' notice before retirement for publicly released models</strong>. Requests to a retired model do not degrade — they fail. OpenAI's published policy sets three tiers: at least six months for generally available models, at least three months for specialized variants, and as little as two weeks for anything with <code class="inline">preview</code> in the name.</p>
+
+    <p>The concrete shape of a 60-day window: <code class="inline">claude-opus-4-1-20250805</code> was deprecated on 5 June 2026 with a retirement date of 5 August 2026. Two months, inside which you must notice you are affected, obtain a candidate, re-qualify the agent, fix what regressed, and roll it out through your normal promotion gates. If your promotion path is a two-week canary, you have six weeks of engineering time and no slack.</p>
+
+    <p>The under-used half of this is that the forecast exists <em>before</em> the deprecation. Anthropic publishes a "retired not sooner than" date for every active model — the floor of its remaining life — so a model whose floor is eleven months out is a different planning object from one whose floor is two months out. <strong>Choosing a model without reading its published floor is choosing a migration date blind.</strong></p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Pinning is correct, and pinning is what creates the deadline.</h3>
+
+    <p><a class="xref" href="/operations/agentops/rollout-and-versioning">Rollout, Versioning &amp; Pinning</a> argues for pinning behavior to the dated <code class="inline">(model, prompt, tools)</code> triple, and that argument holds. Accept the corollary honestly: a pinned snapshot is a dated asset with an expiry, and you have taken on the obligation to renew it. The floating alias is not an escape — it does not remove the migration, it removes your control over <em>when</em> the migration happens and your ability to point at a diff when behavior changes underneath you.</p>
+
+    <p>So the two failure shapes are not "pinned" versus "safe." They are:</p>
+
+    <ul>
+      <li><strong>Pinned and forgotten.</strong> Everything works, in staging and in production, right up to the retirement date — then every request 404s at once, including the ones in the quarterly cron job nobody owns. The failure is total, simultaneous, and dated.</li>
+      <li><strong>Floating and unattributable.</strong> The alias moves you onto a new model during a normal week. Quality shifts a few points, the refusal rate moves, one tool starts getting called twice — and there is no deploy in your change log to correlate it with. You will spend the first day of that incident looking at your own code.</li>
+    </ul>
+
+    <p>Pinned-and-forgotten is the better failure because it is <em>detectable in advance</em> — but only if the retirement date is a tracked field rather than a fact living in a vendor changelog. That requires knowing what you actually call, which is a trace question, not a code-search question: an agent picks models at runtime through routers, fallbacks and per-tenant overrides, so grep will miss the one path that matters. If every run stamps its model ID (as <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout-and-versioning</a> requires), your exposure is one query away, and the CI check that turns it into a deadline is fifteen lines:</p>
+
+<pre class="standalone"><span class="c-cm"># models.yaml — the registry, keyed by (platform, model_id), with an owner</span>
+- platform: anthropic-api
+  model_id: claude-opus-4-5-20251101
+  retire_not_sooner_than: <span class="c-st">"2026-11-24"</span>
+  owner: agents-platform
+
+<span class="c-cm"># ci/check_model_horizon.py — fails the build at T-45 days</span>
+<span class="c-kw">for</span> m <span class="c-kw">in</span> registry:
+    days = (date.fromisoformat(m[<span class="c-st">"retire_not_sooner_than"</span>]) - today).days
+    <span class="c-kw">if</span> days &lt; <span class="c-nu">45</span> <span class="c-kw">and</span> seen_in_traces(m, window=<span class="c-st">"30d"</span>):
+        <span class="c-kw">raise</span> <span class="c-err">SystemExit</span>(<span class="c-st">f"{m['model_id']} retires in {days}d and is still live"</span>)</pre>
+
+    <div class="callout tip"><p>Set the CI threshold at 45 days, not 7. A 60-day notice with a 7-day alarm is a 7-day notice — you have spent the useful part of the window being unaware. The alarm should fire while migrating is still a planned piece of work rather than an incident.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Migration is a behavior port, not a string swap.</h3>
+
+    <p>The model ID is the cheapest thing that breaks. In rising order of what it costs you:</p>
+
+    <ul>
+      <li><strong>The identifier.</strong> A hard, immediate, obvious failure. This is the one everyone plans for and the one that never hurts.</li>
+      <li><strong>Request parameters.</strong> Anthropic deprecated <code class="inline">temperature</code>, <code class="inline">top_p</code> and <code class="inline">top_k</code> on Claude Opus 4.7 and later: setting a non-default value now returns a <code class="inline">400</code>. A parameter your client has passed since 2024 becomes a hard error on the replacement model. This is precisely the case that defeats "just swap the string," and it is why the migration needs a real test run rather than a find-and-replace.</li>
+      <li><strong>Tool-calling shape.</strong> Parallel-call behavior, strictness, and which slice of JSON Schema is actually honored all move between model generations — see <a class="xref" href="/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">JSON Schema subsets per vendor</a>. A schema the old model tolerated can become a validation error, or worse, quietly stop being enforced.</li>
+      <li><strong>The refusal boundary and the register.</strong> Refusals, verbosity, formatting habits and persona are installed in <a class="xref" href="/concepts/post-training-and-alignment">post-training</a>, a layer rebuilt for every release. Prompts tuned to talk one model out of an unhelpful refusal will over- or under-refuse on the next one.</li>
+      <li><strong>Token economics.</strong> A different tokenizer, price point, or thinking-budget default changes both your bill and your context budget, which can push a prompt that fit into one that does not. Re-derive the numbers from <a class="xref" href="/concepts/agent-cost-control">agent cost control</a> rather than assuming they carried over.</li>
+    </ul>
+
+    <p><strong>The expensive category is your own workarounds.</strong> Every phrase you added to fight a specific model's quirk — the "do not apologize," the triple-emphasized output format, the example that existed only to stop one recurring mistake — is now either dead weight burning tokens or an active bug steering a model that never had the quirk. A migration is the one good occasion to delete prompt scar tissue, and the eval diff in STEP 5 is how you find out which scars were load-bearing.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Your platform sets your date, not the model.</h3>
+
+    <p>This is the trap that catches teams who did everything else right. Retirement dates are a property of the <em>platform</em>, not of the model. Anthropic's published dates apply to Anthropic-operated platforms; partner-operated platforms such as Amazon Bedrock and Google Cloud set their own retirement schedules, so the same model ID can be active on one and retired on another. Your inventory key is <code class="inline">(platform, model_id)</code> — a registry keyed on the model string alone is tracking the wrong object and will be confidently wrong on the date.</p>
+
+    <p>This compounds with failover. A gateway that reroutes across providers under load (<a class="xref" href="/operations/agentops/rate-limits-and-provider-capacity">rate limits and provider capacity</a>) can put you on a platform whose calendar you never tracked — and the first evidence will be retirement errors from a route you did not know was live. Enumerate from traces, not from the config you believe is in effect.</p>
+
+    <div class="callout warn"><p>Do not let a cross-provider fallback be your migration plan. The fallback path is a model you have not qualified, reached for the first time during an incident, on a platform with a different retirement date. That is two unqualified changes at once. Failover buys availability; it does not buy a migration.</p></div>
+
+    <p>The other side of this ledger is worth pricing honestly: <strong>a model whose weights you hold has no retirement date at all.</strong> That is not an argument for self-hosting everything — the frontier gap is real. It is an argument for noticing which steps are commodity work. Embedding, reranking, routing and extraction are the high-volume steps where a <a class="xref" href="/concepts/small-and-local-models">small local model</a> is good enough, and taking them off the treadmill removes them from every future migration. Embeddings are the sharpest case in either direction: changing embedding models forces a full re-embed of the corpus, so a hosted embedding endpoint's retirement is not a config change, it is a re-index of everything you have (<a class="xref" href="/concepts/local-knowledge-bases">local knowledge bases</a>).</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The harness is standing, so the migration is boring.</h3>
+
+    <p>What turns a 60-day fire drill into a two-day change is that the qualification machinery already exists and already runs. This is the payoff for <a class="xref" href="/operations/evaluation-and-observability/eval-driven-agent-development">eval-driven agent development</a>: point the suite at the candidate model, and diff.</p>
+
+    <p>The output must be a <em>diff</em>, not a score. An aggregate that moves from 0.83 to 0.85 hides eleven cases that went from pass to fail behind fourteen that went the other way — and on an agent, the pass→fail set is what your users will report. Per case, you need the transition direction, and alongside it the cost, step-count and refusal deltas, because a candidate that matches on accuracy while taking 40% more steps is a regression in every dimension you actually operate on:</p>
+
+<pre class="standalone">$ evaldiff --baseline claude-opus-4-1-20250805 --candidate claude-opus-4-8
+
+  cases           412     pass 0.83 → 0.86   (+0.03)
+  pass  → fail     11     <span class="c-cm"># the only column that matters on day one</span>
+  fail  → pass     23
+  refuse → answer   4     <span class="c-cm"># check each: newly helpful, or newly unsafe?</span>
+  answer → refuse   2
+  median steps    6.0 → 8.5   (+42%)         <span class="c-cm"># cost + latency regression</span>
+  median $/task   0.11 → 0.14  (+27%)
+
+  pass → fail, grouped by tag:
+    tool-schema-strict   7    <span class="c-cm"># candidate rejects a schema the baseline accepted</span>
+    long-context         3
+    formatting           1    <span class="c-cm"># a prompt workaround that is now the bug</span></pre>
+
+    <p>Two things the eval set will not give you, and one habit that covers them. Your suite has the input distribution you thought of; production has the one you did not. Shadow-run the candidate on live traffic with its outputs discarded and compared offline (<a class="xref" href="/operations/agentops/rollout-and-versioning">rollout-and-versioning</a>) — that is where the odd tenant, the pathological attachment and the eight-turn conversation live. And because a run's <a class="xref" href="/concepts/reproducibility-and-determinism">outputs are not reproducible</a> even on a fixed model, judge the diff over enough cases that you are reading a shift and not sampling noise; a handful of flipped cases on a 40-case suite is a coin toss with a spreadsheet attached.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Migrate on your date, inside the window.</h3>
+
+    <p>The sequence that makes this routine, in order: stamp <code class="inline">(platform, model_id)</code> on every run so exposure is a query; keep a registry of what you call with its retirement floor and a named owner; fail CI at T-45 days on anything live; run candidate-versus-baseline eval diffs continuously rather than on notice, so a new frontier release is an opportunity you evaluate rather than an emergency you absorb; version prompts <em>per model</em> instead of sharing one string across a generation boundary; and promote through the same shadow-then-canary gate you would use for any behavior change, because that is what this is.</p>
+
+    <p>Do the migration early in the window and you get to do it once, deliberately, with the old model still live as a comparison baseline you can call. Do it in the final week and you are debugging a behavior port with no reference implementation, because the thing you would diff against has already been switched off.</p>
+
+    <div class="callout tip"><p>Run the candidate diff on <em>every</em> frontier release, not only when a retirement notice arrives. The work is identical, and doing it continuously converts the forced migration into a decision you have already made — you will usually find you can move to the replacement months early, at which point the retirement date stops being an operational event at all. The teams for whom deprecation is a crisis are the ones who only ever look at a new model when the old one is dying.</p></div>
+  </div>
+</section>
