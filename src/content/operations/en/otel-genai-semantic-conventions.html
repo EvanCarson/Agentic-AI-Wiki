@@ -1,0 +1,115 @@
+<section class="phase">
+  <div class="phase-num">E8</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>OpenTelemetry GenAI conventions: instrument the wire format, not the vendor.</h2>
+  <p class="goal">The instrumentation library you install this week decides what it costs to change observability vendors in two years, and almost nobody prices that at the time. Emit spans shaped by a vendor SDK and switching means re-instrumenting the application; emit spans shaped by the OpenTelemetry GenAI conventions and switching is a collector config change you ship on a Tuesday. The conventions are still marked Development — as of mid-2026 nothing in the GenAI set is Stable — and that is an argument for pinning the version you build against, not for waiting.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>You are choosing a data model, not a dashboard.</h3>
+
+    <p>Agent observability gets evaluated the way dashboards get evaluated: which product renders traces most legibly, whose judge integration is nicer, who has the better annotation queue. Those are real differences and they are the reversible ones. The irreversible decision is the shape of the data you emit, because that is what ends up compiled into every service you own.</p>
+
+    <p>The failure mode is specific and common. A team installs a vendor's tracing SDK, decorates their agent code with that vendor's decorators, and ships. Eighteen months later the pricing changes, or the product is acquired, or the team simply wants to run evals somewhere else — and the migration is not a config change, it is touching every instrumented call site in the codebase. The instrumentation has become the lock-in, and it was never a line item in the vendor comparison.</p>
+
+    <p>OpenTelemetry's answer is the same one it gave for HTTP and databases a decade ago: agree on attribute names and span shapes so that a trace means the same thing regardless of who emitted it, then let vendors compete on what they do with it. For GenAI that means a fixed vocabulary for the operations agents actually perform, and the ability to fan the same stream out to more than one backend without touching application code.</p>
+
+    <div class="callout">
+      <p>The test for whether you have this right: can you send your traces to a second backend, in parallel, for a week, without a code change? If yes, your instrumentation is portable and every vendor decision after this one is reversible. If no, you do not have an observability vendor, you have an observability dependency.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>What the conventions actually give you.</h3>
+
+    <p>The GenAI conventions are not only about wrapping a model call. As of the v1.41 conventions the specification covers the layers an agent actually has, which is what makes them usable for agent work rather than just for LLM calls:</p>
+
+    <ul>
+      <li><strong>Model spans</strong> — one inference request: the provider, the model name, the request parameters, the finish reason, and token counts split by input and output.</li>
+      <li><strong>Tool spans</strong> — one tool invocation, with the tool's name and call identifier, so a failed tool call is a span with an error rather than a line in a log.</li>
+      <li><strong>Agent spans</strong> — the agent as a unit, which is what lets you ask "how long did the agent take" separately from "how long did its eleventh model call take".</li>
+      <li><strong>Workflow spans</strong> — the orchestration above the agent, so multi-agent and multi-step systems have a place to hang.</li>
+      <li><strong>Metrics</strong> — operation latency and token usage as first-class instruments, not as attributes you have to aggregate yourself.</li>
+    </ul>
+
+    <p>That last point is where the practical payoff shows up fastest. Token usage as a standard metric, dimensioned by model and operation, means cost analysis is a query rather than a project — you can attribute spend to a route, a customer, or a single pathological trace without building anything. The same numbers feed <a class="xref" href="/operations/agentops/cost-control-in-the-loop">cost control in the loop</a> and the cost-per-completed-task metric argued for in <a class="xref" href="/concepts/agent-cost-control">agent cost control</a>.</p>
+
+    <p>The agent and workflow span kinds are the part that distinguishes this from generic LLM logging. Without them, a trace of a twenty-step run is twenty sibling spans and a human guessing at the structure; with them, the trajectory is in the trace tree, which is the precondition for <a class="xref" href="/deep-dives/evaluating-agents/trajectory-and-process-evaluation">trajectory evaluation</a> and for any incident review that needs to answer where a run went wrong rather than that it did.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Development status is a reason to pin, not to wait.</h3>
+
+    <p>Be clear about the maturity, because vendors are not always. As of mid-2026 no GenAI-specific span, metric, event or attribute is marked Stable — the whole set carries Development status, which in OpenTelemetry's terms means the names can change without the guarantees that apply to stable conventions. In June 2026 the <code class="inline">gen_ai.*</code> conventions were moved out of the main semantic-conventions repository into a dedicated one, so they now release on their own cadence rather than being held to the core repo's slower, stability-bound rhythm.</p>
+
+    <p>Both facts point the same way. The split is a signal that this area is expected to move quickly, and the Development status is the honest label on that movement. Neither is a reason to keep emitting proprietary spans in the meantime, because the alternative is not "wait for stability" — the alternative is accumulating eighteen months of traces in a format exactly one vendor can read.</p>
+
+    <p>The posture that works:</p>
+
+    <ul>
+      <li><strong>Pin the convention version you build against</strong>, the same way you pin a library. Upgrades then become a deliberate, tested change rather than something that arrives with an instrumentation package bump.</li>
+      <li><strong>Record the version in the telemetry itself.</strong> A resource attribute naming the schema version means that in a year you can tell which convention a historical trace was written against. Without it, a dashboard that silently stops matching is a debugging session nobody enjoys.</li>
+      <li><strong>Do renames in the collector, not in the application.</strong> When an attribute is renamed upstream, a transform processor can emit both the old and new names during a transition window, which decouples your dashboards' migration from your services' deploys entirely.</li>
+      <li><strong>Expect the conventions to move faster than your vendor's support for them.</strong> Verify what your backend actually indexes rather than what its marketing page claims compatibility with; partial support is common and shows up as an attribute you can see in the raw span but cannot query on.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The content problem: prompts and completions are not ordinary attributes.</h3>
+
+    <p>The conventions cover capturing message content, and this is the part that needs a decision rather than a default, because prompt and completion bodies are simultaneously the most useful and the most dangerous thing in the trace.</p>
+
+    <p>Useful, because a trace without content tells you an agent made eleven calls and cannot tell you why it did the wrong thing — content is the difference between observability and metrics. Dangerous, for three separate reasons that each need an answer:</p>
+
+    <ul>
+      <li><strong>Volume.</strong> Full prompt capture on an agent is enormous, because the transcript is re-sent every step and naive capture stores it every time. A twenty-step run can produce more telemetry than the entire rest of your service. Sample content, or store it by reference with the span carrying only a pointer.</li>
+      <li><strong>Sensitivity.</strong> The prompt contains whatever the user typed and whatever you retrieved for them, which frequently includes personal data your observability vendor's contract does not cover. Content capture is a data-governance decision with a review attached; see <a class="xref" href="/operations/governance-compliance/data-governance">data governance</a> and <a class="xref" href="/concepts/data-residency-and-sovereignty">data residency</a>.</li>
+      <li><strong>Retention mismatch.</strong> Traces default to short retention, which is right for debugging and wrong for an audit record. If a regulator may ask what an agent did, that record belongs in a durable store with its own retention policy — a trace backend is not an <a class="xref" href="/operations/governance-compliance/audit-trails">audit trail</a>, however much it looks like one.</li>
+    </ul>
+
+    <p>The pattern that resolves all three is to separate the two destinations at the collector. Structural telemetry — spans, timings, token counts, tool names, error status — goes to the observability backend at full fidelity, cheaply and with short retention. Content goes to a store you control, redacted at the collector on the way, with the retention and residency rules that content actually requires, and the span carries a reference to it. This costs one processor in the collector pipeline and it is the difference between an observability bill you can predict and one you cannot.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Wiring it, and the one thing to get right first.</h3>
+
+    <p>The mechanics are ordinary OpenTelemetry, which is the point:</p>
+
+    <ul>
+      <li><strong>Instrument once, in the application, with the conventions' attribute names.</strong> Auto-instrumentation for common frameworks covers the model and tool spans; the agent and workflow spans usually need you to say where the boundaries are, because only you know what counts as one run.</li>
+      <li><strong>Export to a collector you run, never directly to a vendor.</strong> This is the single decision that keeps everything downstream reversible. Direct export from application to vendor endpoint re-creates the lock-in that adopting the conventions was meant to remove.</li>
+      <li><strong>Fan out from the collector.</strong> Observability backend, eval store, cost analytics, audit archive — all of them are exporters, all configurable, none requiring a redeploy of the agent.</li>
+      <li><strong>Sample on the trace, not on the span.</strong> Half a trajectory is worse than none: it looks complete and is not. Use tail sampling so the decision is made once the run has finished and can be made on outcome — keep everything that errored or ran long, sample the routine successes.</li>
+    </ul>
+
+    <p>The thing to get right before any of it is the trace and session identity. One trace per agent run, one span per step, and a session or conversation identifier carried on every span in the run — set as a resource or baggage attribute so it survives across service boundaries. Almost every "we have traces but cannot answer the question" situation reduces to a missing correlation identifier, and it is far cheaper to add now than to backfill. The broader treatment is in <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a>; the conceptual grounding is <a class="xref" href="/concepts/agent-observability">agent observability</a>.</p>
+
+    <div class="callout">
+      <p>Instrument the judge too. If a model grades your outputs, that grading call is an inference request with a cost, a latency and a model version, and it belongs in the same trace as the run it graded. Teams routinely discover that their eval judge is a significant share of their model spend, and they discover it late because the judge was the one call nobody instrumented.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to do this week.</h3>
+
+    <p>You do not need a migration project to get most of the benefit:</p>
+
+    <ul>
+      <li><strong>Check what you emit today.</strong> Take one production trace and look at the attribute names. If they are vendor-prefixed rather than <code class="inline">gen_ai.*</code>, you know the size of the problem, and you know it before the contract renewal rather than during it.</li>
+      <li><strong>Put a collector in the path.</strong> Even with a single backend and no transformations, this one change makes every later vendor decision a config edit. It is an afternoon and it is the highest-return item on this list.</li>
+      <li><strong>Add the session identifier if it is missing.</strong> Cheap now, impossible retroactively, and it is the field the first real incident will need.</li>
+      <li><strong>Decide the content policy explicitly, and write it down.</strong> What is captured, what is redacted, where it is stored, how long it is kept. If nobody has decided, the default is "everything, forever, at the vendor", and that is a decision too.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you take one thing: put your own collector between your services and whatever backend you use today, even if you are perfectly happy with that backend. It costs an afternoon, it changes nothing visible, and it converts your observability vendor from a dependency compiled into your code into a line of YAML. Every other recommendation on this page becomes easy afterwards, and the one after that — swapping backends, adding an eval store, redacting content, running two vendors in parallel during an evaluation — becomes possible at all.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/evaluation-and-observability/online-vs-offline-evals">online vs offline evals</a> for what to do with the stream once it is portable, <a class="xref" href="/operations/agentops/model-deprecation-and-migration">model deprecation and migration</a> for why the model identifier on every span is worth more than it looks, and <a class="xref" href="/operations/governance-compliance/audit-trails">audit trails</a> for the record a trace backend is not.</p>
+  </div>
+</section>
