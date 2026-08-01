@@ -1,0 +1,134 @@
+<p class="lede">Read the 28 July release notes and the headline is a transport change: MCP dropped the <code>initialize</code> handshake and the <code>Mcp-Session-Id</code> header, so any instance can answer any request. That is the enabling change, not the important one. Removing the held-open connection put Sampling, Roots and Logging on a twelve-month deprecation clock — the three features that made an MCP client a peer rather than a caller — and demoted Tasks to an extension. After eighteen months of ambiguity, the protocol has decided what it is: a tool-calling API for the web, not a bidirectional agent protocol.</p>
+
+<section>
+  <h2>What actually shipped</h2>
+  <p>The 2026-07-28 revision was locked as a release candidate in May and validated for ten weeks by SDK maintainers and client implementers before publication — a long runway by this protocol's standards, and a reasonable signal of how much it moves.</p>
+
+  <table>
+    <thead>
+      <tr><th>Change</th><th>What it means</th><th>Who notices</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Stateless core</strong></td>
+        <td><code>initialize</code>/<code>initialized</code> and <code>Mcp-Session-Id</code> retired; each request carries its protocol version, client identity and capabilities in <code>_meta</code>.</td>
+        <td>Anyone running more than one server instance.</td>
+      </tr>
+      <tr>
+        <td><strong>Multi Round-Trip Requests</strong></td>
+        <td>A tool needing mid-call input returns <code>resultType: "input_required"</code>; the client retries with <code>inputResponses</code> attached.</td>
+        <td>Server authors who used server-initiated requests.</td>
+      </tr>
+      <tr>
+        <td><strong>Header-based routing</strong></td>
+        <td><code>Mcp-Method</code> and <code>Mcp-Name</code> headers, so gateways and WAFs route and meter without parsing the JSON body.</td>
+        <td>Platform teams putting MCP behind existing infrastructure.</td>
+      </tr>
+      <tr>
+        <td><strong>Cacheable list results</strong></td>
+        <td><code>ttlMs</code> and <code>cacheScope</code> on tool, prompt and resource listings.</td>
+        <td>Everyone, quietly and for free.</td>
+      </tr>
+      <tr>
+        <td><strong>Authorization hardening</strong></td>
+        <td>Issuer (<code>iss</code>) returned per RFC 9207 and validated before code redemption; credentials bound to their issuer; Dynamic Client Registration deprecated for Client ID Metadata Documents.</td>
+        <td>Anyone doing OAuth against a remote server.</td>
+      </tr>
+      <tr>
+        <td><strong>Extensions framework</strong></td>
+        <td>Tasks left the core for <code>io.modelcontextprotocol/tasks</code>, poll-based, with <code>tasks/update</code>.</td>
+        <td>Long-running-tool authors.</td>
+      </tr>
+      <tr>
+        <td><strong>Deprecations</strong></td>
+        <td>Roots, Sampling and Logging deprecated with a twelve-month minimum window; legacy HTTP+SSE transport deprecated with a year's transition.</td>
+        <td>Client authors, almost exclusively.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>All four Tier 1 SDKs — TypeScript, Python, Go and C# — support the new revision at publication, with Rust in beta. That is a meaningfully different posture from earlier revisions, where the specification landed and the SDKs caught up over a quarter.</p>
+</section>
+
+<section>
+  <h2>The stateless core, and what it is worth</h2>
+  <figure>
+    <img src="/blogs/mcp-goes-stateless/arch-stateless-core.svg" alt="Diagram contrasting the old handshake-and-session-header model, which pinned a client to one instance and needed a shared session store, with the new model where every request carries its own context and any instance can answer." width="900" height="500" loading="lazy" />
+    <figcaption>The server stopped being a session and became a URL — which is what makes ordinary web infrastructure work on it.</figcaption>
+  </figure>
+  <h3>The operational payoff is immediate</h3>
+  <p>A stateful MCP server behind a load balancer was a distributed-systems problem dressed as an integration. You needed sticky routing, or a shared session store, or both — and the failure mode was a redeploy silently breaking conversations mid-flight. Statelessness deletes that category. Instances become interchangeable, a rolling deploy stops being an event, and horizontal scaling stops requiring a design review. If you operate MCP servers at any scale, this release is a straightforward gift.</p>
+  <h3>Two smaller changes compound it</h3>
+  <p>Header-based routing matters more than it reads. Putting the method and tool name in <code>Mcp-Method</code> and <code>Mcp-Name</code> means an API gateway can rate-limit per tool, a WAF can block a dangerous method, and a router can shard by name — all without body inspection, which is exactly the layer at which enterprises already own policy. Cacheable list results are the same idea one level up: <code>tools/list</code> is issued constantly and changes rarely, so a <code>ttlMs</code> turns a per-conversation round trip into a CDN hit.</p>
+</section>
+
+<section>
+  <h2>Mid-call input, without holding a connection</h2>
+  <figure>
+    <img src="/blogs/mcp-goes-stateless/arch-mrtr.svg" alt="Diagram of a Multi Round-Trip Request: the client calls a tool, the server returns input_required with its questions, the client resolves them, and the client retries the original call with inputResponses attached." width="900" height="500" loading="lazy" />
+    <figcaption>Four ordinary exchanges replace one long-lived connection — and every hop can land on a different instance.</figcaption>
+  </figure>
+  <p>Multi Round-Trip Requests are the mechanism that made the rest survivable. A tool that needs a confirmation or a missing parameter used to require the server to call back to the client mid-execution, which required the stream to stay open, which required the session. MRTR inverts the control flow: the server returns what it needs and stops, the client resolves it however it wants — asking a user, consulting a policy, filling a default — and re-sends the original call with the answers attached.</p>
+  <p>This is a better design for reasons beyond statelessness. The retry is idempotent, the pending question is a value you can persist rather than a callback you must keep alive, and an agent that goes away for ten minutes before answering costs the server nothing. It is also more work for client authors, who now own a state machine they previously got for free.</p>
+</section>
+
+<section>
+  <h2>The deprecation list is the actual news</h2>
+  <p>Sampling let a server ask the client to run a model completion on its behalf. Roots let a client tell a server which parts of its filesystem were in scope. Logging let a server stream structured log messages back. All three are now on a twelve-month clock, and all three depended on the connection being bidirectional and alive.</p>
+  <h3>What those three had in common</h3>
+  <p>They were the features that made an MCP client something other than an HTTP caller. Sampling in particular was the interesting one: a server that can request inference is a participant in the agent loop rather than a resource it reaches into. Losing it draws a hard line — the model stays entirely on the client's side, the server is a thing you call, and the interesting agent behaviour lives in exactly one place.</p>
+  <h3>The honest reading</h3>
+  <p>They also never got implemented widely. Sampling in particular was supported by a small minority of clients, which meant server authors could not rely on it, which meant fewer used it, which meant fewer clients bothered. Cutting features that the ecosystem declined to adopt is a healthier outcome than carrying them as a permanent asterisk — and a twelve-month window is a serious deprecation rather than a break. But it is worth naming what was decided rather than letting it read as housekeeping: the spec has given up on the client as a peer.</p>
+  <h3>Tasks moving out is the same decision in a different register</h3>
+  <p>Long-running work is now an extension — <code>io.modelcontextprotocol/tasks</code>, poll-based, with <code>tasks/update</code> — rather than a core concern. Polling is the right shape for a stateless protocol and the wrong shape for anything wanting push, which is consistent, and the extensions framework at least gives the pattern a defined home instead of leaving it experimental in the core.</p>
+</section>
+
+<section>
+  <h2>The auth change nobody is writing about</h2>
+  <p>Dynamic Client Registration is formally deprecated in favour of Client ID Metadata Documents, and for enterprise deployments this is the line item with the longest tail. DCR let a client register itself with an authorization server at runtime, which was convenient and which security teams disliked precisely because of that convenience. CIMD replaces runtime registration with a document at a URL the client controls, so the authorization server resolves the client's identity rather than accepting a self-assertion.</p>
+  <p>Alongside it: authorization servers must return the issuer per RFC 9207, clients must validate that issuer before redeeming a code, and credentials bind to the issuer that produced them. Together these close mix-up attacks, in which a client is fooled into redeeming a code at the wrong authorization server. If you have an MCP integration in front of a compliance review, this is the paragraph worth quoting — see <a href="/deep-dives/mcp/mcp-auth-oauth21">MCP auth &amp; OAuth 2.1</a> for the shape of the flow this hardens.</p>
+</section>
+
+<section>
+  <h2>What breaks, and who pays</h2>
+  <figure>
+    <img src="/blogs/mcp-goes-stateless/data-migration-matrix.svg" alt="Matrix of migration cost by deployment shape: local stdio server, single HTTP server, HTTP fleet, and client or host app, across the five main changes." width="900" height="400" loading="lazy" />
+    <figcaption>The cost lands unevenly — near zero for a local stdio server, a windfall for a fleet, and a genuine rewrite only where server-initiated calls were used.</figcaption>
+  </figure>
+  <p>If you run a local stdio server, most of this is not addressed to you: no session bookkeeping to delete, no auth layer, no transport to migrate. If you operate an HTTP fleet, the stateless core is the reason this revision exists and the CIMD migration is the real work. If you wrote a client, you inherit both the new per-request identity plumbing and the loss of the peer features — and you are the one who has to tell users that a server capability they relied on is going away.</p>
+  <p>The genuine rewrite is narrower than the noise suggests: it is servers that used server-initiated requests, which now need the MRTR pattern. Everything else is deletion, a config change, or a twelve-month calendar entry.</p>
+  <h3>What to do this quarter</h3>
+  <p>Pin the revision explicitly rather than negotiating whatever the SDK defaults to, because two revisions will be live across your dependencies for the next year. Grep your servers for Sampling, Roots and Logging and price the replacements now while the window is long. Start the CIMD work before the DCR path stops being accepted, since it touches an authorization server you probably do not own. And if you have been deferring a horizontally-scaled MCP deployment because sessions made it awkward, that reason has expired.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Does the 2026-07-28 revision break my existing MCP server?</h3>
+  <p>Not immediately. The legacy HTTP+SSE transport and the deprecated features carry deprecation windows of a year or more. What breaks now is only code that depended on protocol-level sessions — the <code>initialize</code> exchange and the <code>Mcp-Session-Id</code> header are gone from the new revision.</p>
+  <h3>Why remove sessions at all?</h3>
+  <p>Because a session forces every server instance to share state, which means sticky routing, a shared store, or both. Stateless requests can be answered by any instance behind ordinary HTTP infrastructure — load balancers, gateways, CDNs — which is what makes MCP scale like the rest of the web.</p>
+  <h3>What replaces Sampling?</h3>
+  <p>Nothing, by design. Inference moves entirely to the client side; a server that wants a model completion is expected to call a model itself rather than borrow the client's. You have a twelve-month minimum window to migrate.</p>
+  <h3>Is Dynamic Client Registration gone today?</h3>
+  <p>It is formally deprecated in favour of Client ID Metadata Documents, not removed. Treat it as a migration to plan this year rather than an outage to fix this week — but start early, because it usually involves an authorization server owned by another team.</p>
+  <h3>Which SDKs support it?</h3>
+  <p>All four Tier 1 SDKs — TypeScript, Python, Go and C# — shipped support with the specification, and the Rust SDK supports it in beta.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/what-is-mcp">What Is the Model Context Protocol?</a> — the one-page version if you are arriving cold.</li>
+    <li><a href="/deep-dives/mcp/mcp-streamable-http-deep-dive">MCP Streamable HTTP, in depth</a> — the transport this revision simplifies.</li>
+    <li><a href="/deep-dives/mcp/mcp-auth-oauth21">MCP Auth &amp; OAuth 2.1</a> — the flow the issuer-validation changes harden.</li>
+    <li><a href="/deep-dives/mcp/mcp-sampling-and-elicitation">MCP Sampling &amp; Elicitation</a> — what the deprecated peer features were for.</li>
+    <li><a href="/deep-dives/mcp/mcp-ops-in-production">MCP Ops in Production</a> — running servers now that instances are interchangeable.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://blog.modelcontextprotocol.io/posts/2026-07-28/">The 2026-07-28 Specification — Model Context Protocol blog</a></li>
+    <li><a href="https://modelcontextprotocol.io/specification/2026-07-28">Specification 2026-07-28</a></li>
+    <li><a href="https://blog.modelcontextprotocol.io/posts/2026-mcp-roadmap/">The 2026 MCP Roadmap</a></li>
+  </ul>
+</section>
