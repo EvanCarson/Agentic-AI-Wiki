@@ -1,0 +1,90 @@
+<section class="phase">
+  <div class="phase-num">O11</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Self-hosted inference: you stop buying tokens and start buying KV-cache bytes.</h2>
+  <p class="goal">The day you move an agent off a provider API, the currency changes underneath you and most capacity plans do not notice. You are no longer buying tokens with the memory problem included; you are renting GPU-seconds, and the thing that decides how many agents run at once is cache memory, not compute. On an 80 GB card serving an 8B model, four concurrent agents at long context will fill it — and the levers that fix that are context discipline and cache-aware routing, not a bigger GPU.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Capacity is concurrent sequences × context length, and QPS is meaningless.</h3>
+    <p>Every token in flight holds a slice of KV cache for the entire life of the request, and an agent request lives for minutes. The arithmetic is unforgiving and exact:</p>
+
+<pre class="standalone"><span class="c-cm"># KV cache bytes per token (per sequence)</span>
+bytes_per_token = <span class="c-st">2</span> * layers * kv_heads * head_dim * dtype_bytes
+<span class="c-cm">#          K and V ---^</span>
+
+<span class="c-cm"># 8B-class GQA model: 32 layers, 8 KV heads, head_dim 128, fp16</span>
+<span class="c-cm">#   2 * 32 * 8 * 128 * 2  =  131,072 B  =  128 KiB / token</span>
+<span class="c-cm">#   128k-token context    =  16 GiB for ONE sequence</span>
+
+<span class="c-cm"># 80 GB card, 16 GB of weights, ~60 GB left for cache:</span>
+<span class="c-cm">#   60 / 16  ~=  3.7 concurrent agents at full context</span></pre>
+
+    <p>Read that last line twice, because it is the number that surprises teams. The GPU is not compute-starved and the model is not large; it is out of room to remember four conversations. The consequences follow directly:</p>
+    <ul>
+      <li><strong>Plan in sequence-slots, not requests per second.</strong> A dashboard of QPS tells you nothing about whether the next agent can start. The number to alert on is cache occupancy and the count of sequences waiting for a slot.</li>
+      <li><strong>Long context is a capacity cost, not just a bill.</strong> Cutting a run from 128k to 32k of working context does not shave 75% off a token invoice you no longer receive — it quadruples the number of agents the same card can hold. <a class="xref" href="/concepts/context-engineering">Context engineering</a> stops being an economy measure and becomes a scaling one.</li>
+      <li><strong>Quantise the cache before you buy hardware.</strong> An fp8 KV cache halves bytes per token and roughly doubles concurrency, at a quality cost you can measure in an afternoon on your own eval set. It is the highest-return knob on this list and the one most often left at the default.</li>
+      <li><strong>Preemption is the pressure valve, and it is not free.</strong> When cache runs out, engines evict a sequence and recompute it later. Under load you can spend a large fraction of your compute re-prefilling work you already did — which shows up as latency that gets worse with load in a way throughput graphs hide.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Prefix-cache hit rate is the lever, and it is a routing problem.</h3>
+    <p>An agent loop re-sends its whole transcript every step, so by step twenty the prompt is mostly identical to step nineteen's. Every serving engine can reuse the cached prefix and skip that prefill — which turns the dominant cost of agentic serving into almost nothing. Then a load balancer sends step twenty to a different replica, the cache is cold there, and you re-prefill the entire conversation from scratch.</p>
+    <p>This is the difference between a fleet that serves agents well and one that does not, and it has nothing to do with which engine you picked:</p>
+    <ul>
+      <li><strong>Route by prefix, or at minimum by session.</strong> Pin a conversation to the replica that already holds its cache. Round-robin is actively wrong for agent traffic in a way it is not for chat.</li>
+      <li><strong>Instrument the hit rate as a first-class SLI.</strong> Prefix cache hit rate per replica, plus time-to-first-token split by hit and miss. A fleet drifting from 90% to 60% hit rate loses far more capacity than any engine upgrade returns, and nothing else on your dashboard moves.</li>
+      <li><strong>Keep the prefix stable and put the variable part last.</strong> The same rule as <a class="xref" href="/concepts/prompt-caching">prompt caching</a> on a hosted API — a timestamp near the top of the system prompt invalidates everything after it, on every request.</li>
+      <li><strong>Beware the deploy.</strong> Rolling a new system prompt or tool schema invalidates every cache in the fleet at once. Expect a prefill storm on release and stage it rather than discovering it.</li>
+    </ul>
+    <div class="callout tip">
+      <p>Before evaluating engines, measure your own hit rate. Teams routinely chase a 20% throughput difference between serving frameworks while running a load balancer that throws away 40% of their prefix cache — and the routing fix is a config change, while the engine migration is a quarter.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Two workloads with opposite shapes, sharing one GPU.</h3>
+    <p>Prefill is compute-bound and bursty; decode is memory-bandwidth-bound and steady (see <a class="xref" href="/concepts/prefill-and-decode">prefill &amp; decode</a>). Agents make the split pathological: a long tool result arrives and triggers a huge prefill in the middle of a fleet of sequences that were quietly decoding, and every one of their inter-token latencies spikes. On a shared endpoint, one agent pasting a 50,000-token file stalls everyone else's stream.</p>
+    <ul>
+      <li><strong>Cap prompt length at admission, not at the model.</strong> A per-request token ceiling enforced before scheduling is the only thing that stops one oversized prompt from becoming everyone's latency incident.</li>
+      <li><strong>Separate the lanes when the latencies differ.</strong> Interactive agents and background batch work on the same replicas means the batch job's prefills set the interactive tail. Split the fleet or split the priority class; do not average them.</li>
+      <li><strong>Chunk long prefills.</strong> Every serious engine can interleave a large prefill with ongoing decode in pieces. It is usually a flag, it is usually off by default in older configs, and it is the difference between a hiccup and a stall.</li>
+      <li><strong>Watch the right latency.</strong> For an agent, end-to-end task time is what matters, and it is dominated by step count × per-step latency. Optimising tokens-per-second while step count grows is optimising the wrong factor — the same trap as <a class="xref" href="/operations/economics-roi/unit-economics">cost per token versus cost per task</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The ops surface you just inherited.</h3>
+    <p>The provider was absorbing more than capacity. Self-hosting hands you a stateful, slow-starting, expensive-to-idle service, and the operational assumptions from stateless web services do not transfer.</p>
+    <ul>
+      <li><strong>Autoscaling does not work at agent timescales.</strong> Cold start means allocating a GPU, pulling tens of gigabytes of weights, and loading them — minutes, not seconds, and that is when capacity is available at all. You provision for peak, you queue, or you burst to an API. There is no fourth option, and "we'll scale up when traffic arrives" is the plan that fails during the incident.</li>
+      <li><strong>Fairness must be enforced in tokens.</strong> One tenant running 200k-context agents will consume the cache while a hundred short requests wait. Per-tenant limits denominated in sequence-slots and tokens, not request counts — the same admission discipline as <a class="xref" href="/operations/agentops/rate-limits-and-provider-capacity">provider capacity</a>, except now you are the provider and the 429 is yours to issue.</li>
+      <li><strong>You own the upgrade risk in both directions.</strong> Nobody deprecates your model for you, which removes the forced migration of <a class="xref" href="/operations/agentops/model-deprecation-and-migration">retirement</a> — and equally means nothing stops you running a stale model for two years. Meanwhile engine upgrades change sampling behaviour, kernel numerics and default flags; pin the engine version alongside the weights and re-qualify on your eval set, because "same weights" does not mean same outputs.</li>
+      <li><strong>Keep a warm fallback.</strong> A single-region GPU fleet with no API path is a single point of failure with a multi-minute recovery. The cheapest insurance is a provider key and a router that can fail over mid-incident.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The economics turn on utilisation, and agent traffic is bursty.</h3>
+    <p>An on-demand H100 runs roughly $2–3 an hour on specialist GPU clouds in 2026 and appreciably more on hyperscalers — call it $1,500–2,200 a month per card, paid identically whether it is saturated or idle at 4am. That is the whole equation: you converted a variable cost into a fixed one, so the break-even is a utilisation number, and utilisation is exactly what a diurnal, bursty agent workload is bad at.</p>
+    <ul>
+      <li><strong>Compute the honest break-even.</strong> Monthly GPU cost divided by tokens actually served at your real utilisation — not at benchmark throughput. A fleet sized for peak and idle two-thirds of the day is paying triple its headline per-token rate.</li>
+      <li><strong>Fill the trough deliberately.</strong> Batch work — evals, embeddings, offline classification, synthetic data — is what makes the arithmetic work, and it is why self-hosting suits teams that already have background inference to run.</li>
+      <li><strong>Price the people.</strong> The GPU bill is the visible half; the engineer maintaining engine versions, cache routing and capacity is the other, and it does not scale down when traffic does.</li>
+      <li><strong>Self-host the high-volume small stuff first.</strong> Embedding, reranking, routing and extraction are steady, cheap and fit a small model — the argument in <a class="xref" href="/concepts/small-and-local-models">small &amp; local models</a> — while the frontier reasoning loop stays on an API. Hybrid is usually the right answer, and it is rarely the one debated.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When self-hosting is right anyway.</h3>
+    <p>Three cases survive the arithmetic even when the per-token comparison does not: data that legally cannot leave your boundary (<a class="xref" href="/concepts/data-residency-and-sovereignty">residency and sovereignty</a>), a fine-tuned model that no provider serves, and sustained high-volume traffic on a small model where utilisation is genuinely high. Everything else is usually a hybrid. <strong>Whichever you pick, instrument cache occupancy and prefix-cache hit rate on day one and plan capacity in concurrent sequences at your real context length — a fleet sized on tokens per second will look correctly provisioned right up to the moment it cannot admit a fifth agent.</strong></p>
+    <p>Related: <a class="xref" href="/operations/agentops/concurrency-and-scaling">concurrency, queues &amp; scaling</a> for the job-queue layer above this, <a class="xref" href="/concepts/inference-providers">serving &amp; access</a> for where self-hosting sits among the options, and <a class="xref" href="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp">vLLM vs SGLang vs TensorRT-LLM vs llama.cpp</a> for the engine comparison itself.</p>
+  </div>
+</section>

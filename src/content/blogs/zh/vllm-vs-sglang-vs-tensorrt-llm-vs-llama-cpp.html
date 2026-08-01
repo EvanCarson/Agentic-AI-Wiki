@@ -1,0 +1,160 @@
+<p class="lede">照着吞吐量基准去选服务引擎，你优化的会是智能体从来用不上的那个数字。聊天基准把全新的提示词发给一个固定 batch；而智能体是把同一段提示词带着几百个新 token 送回来二十次，于是绝大部分工作量都是在预填充 GPU 已经见过的文本。这份重复的工作会不会被做第二遍，由三件事决定——KV 缓存以什么为键、受约束解码在满 batch 下还撑不撑得住、以及那道构建步骤要花多久——而下面四个引擎里，只有一个是把这三件事都放在设计前提里的。</p>
+
+<section>
+  <h2>先看全貌</h2>
+  <p>四个项目都通过一个 HTTP 端点提供开放权重模型的服务，而在"怎么做到"这件事上几乎毫无共同之处。</p>
+
+  <table>
+    <thead>
+      <tr><th>项目</th><th>始于</th><th>许可证</th><th>部署形态</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>vLLM</strong></td>
+        <td>2023 年 2 月</td>
+        <td>Apache-2.0</td>
+        <td>Python 服务，每组 GPU 一个进程；机群的默认选择。</td>
+      </tr>
+      <tr>
+        <td><strong>SGLang</strong></td>
+        <td>2024 年 1 月</td>
+        <td>Apache-2.0</td>
+        <td>Python 服务，形态与 vLLM 相同；围绕一个前缀共享缓存构建。</td>
+      </tr>
+      <tr>
+        <td><strong>TensorRT-LLM</strong></td>
+        <td>2023 年 8 月</td>
+        <td>NVIDIA 条款</td>
+        <td>为特定 GPU 与精度编译出一个 engine，然后拿它提供服务。</td>
+      </tr>
+      <tr>
+        <td><strong>llama.cpp</strong></td>
+        <td>2023 年 3 月</td>
+        <td>MIT</td>
+        <td>一个 C++ 二进制加一个 GGUF 文件；从笔记本到单台服务器。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp/data-stars-comparison.svg" alt="GitHub star 数柱状图：llama.cpp 12.23 万、vLLM 8.78 万、SGLang 3.10 万、TensorRT-LLM 1.43 万，截至 2026 年 8 月 1 日。" width="900" height="400" loading="lazy" />
+    <figcaption>Star 数衡量的是有多少人把它跑在自己的机器上，所以这个排序几乎正好是数据中心部署份额的反过来。</figcaption>
+  </figure>
+
+  <p>两个 Python 服务的迭代速度快到任何"某版本如何"的说法一个月内就会过期——vLLM 于 2026 年 7 月 27 日发布 v0.26.0，含 212 位贡献者的 411 次提交；SGLang 早两天发布 v0.5.16，含 169 位贡献者的 574 个 PR。把功能对齐上的空缺当成暂时的，把架构上的取舍当成永久的，因为只有后者能熬过一个发布周期。</p>
+
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp/data-feature-matrix.svg" alt="能力矩阵：四个引擎在前缀复用、满 batch 下的受约束解码、机群运维、非 NVIDIA 硬件，以及从零到可服务端点的耗时上的评级。" width="900" height="400" loading="lazy" />
+    <figcaption>每个引擎最强的地方，恰好就是它立项前提所指的方向；其余各处都是逆着纹理来的。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>vLLM——默认选项，而且大体上当之无愧</h2>
+  <h3>PagedAttention 换来了什么</h3>
+  <p>vLLM 最初的贡献，是不再把每个序列的 KV 缓存当成一整块连续分配。它把缓存切成固定大小的块，用操作系统管理虚拟内存页的方式来管它们，于是碎片率接近于零，一个 batch 也能塞得很紧。这就是 2023 年 vLLM 相对朴素服务方式的吞吐优势大到足以终结争论的原因，也是今天这里每个引擎都在做同一件事的某个版本的原因。</p>
+  <h3>真正的护城河是生态</h3>
+  <p>三年当默认选项，攒出了那件真正难以复制的东西：Kubernetes operator、自动扩缩器、前缀感知路由、可观测性集成，以及一个通常在新架构发布后几天内就能跑起来的模型支持面。它跑得动的芯片也比同类里任何一个都多——CUDA、ROCm、Intel XPU、TPU——当你的容量规划取决于"到底能搞到哪种 GPU"时，这一点比看上去重要得多。</p>
+  <h3>它最弱的地方</h3>
+  <p>结构化输出。vLLM 的引导式解码默认走 XGrammar，而约束掩码是在关键路径上算的；整个 2026 年，第三方测量反复显示：一旦打开引导式解码且 batch 涨过个位数，吞吐就会下滑。对聊天机器人来说这是一条脚注。而对智能体来说，每一次工具调用都是一次受约束生成，这就是常态。</p>
+</section>
+
+<section>
+  <h2>SGLang——按智能体真实形状造出来的那一个</h2>
+  <h3>RadixAttention：缓存懂得什么叫前缀</h3>
+  <p>SGLang 把 KV 缓存存在一棵以 token 前缀为键的基数树里，而不是平铺的哈希块。其后果不是命中率好一点点，而是一种不同的能力。两个共享前四万个 token 的请求会自动共享那段计算，不需要谁去声明会话、打缓存标签、或把它们路由到一起。对一群跑着同一段系统提示词、同一套工具定义、同一份检索语料的智能体来说，这基本就是全部输入。</p>
+  <h3>不会把 batch 卡住的受约束解码</h3>
+  <p>SGLang 把语法掩码的计算与 GPU 步骤重叠起来，而不是阻塞在它上面，这正好对上了 vLLM 最弱的那根轴。如果你的负载主要是工具调用与 JSON，这个差别会出现在你的延迟分位数上，而不是某张基准表格里。</p>
+  <h3>当第二名的代价</h3>
+  <p>vLLM 三分之一的 star 数、更小的 operator 与工具生态，以及更少的"在你之前踩过这个坑"的人。2026 年的第三方 H100 基准把 SGLang 在共享前缀负载上放在领先 vLLM 大约 15%–30% 的位置；把这个区间当作方向性的参考就好，因为它会随模型、batch 和"基准是哪半个月跑的"而移动。</p>
+</section>
+
+<section>
+  <h2>TensorRT-LLM——最快，前提是你付得起那道构建</h2>
+  <h3>编译就是这笔交易的全部</h3>
+  <p>TensorRT-LLM 不在运行时解释模型图。它把模型编译成一个针对某一种 GPU 架构与某一种精度调优过的 engine，这也是它能在 NVIDIA 硬件上跑出最快绝对数字的原因。代价是一道以数十分钟计的构建步骤——按"模型 × GPU × 精度"的每一种组合各来一次——而其中任何一项变了，就得重建。</p>
+  <h3>这对你的运维意味着什么</h3>
+  <p>下游每一条部署属性都继承了那道编译。混合机群需要每种 GPU 一个 engine。试一种新的量化是一次构建，不是一个开关。回滚一个模型版本，意味着你得把旧的 engine 产物留着。如果你在一个同构的 NVIDIA 机群上高流量地跑一个模型，那是一笔你乐意摊销的固定成本；如果你还在每几周换一次模型，它就是一笔正好压在你做得最多的那件事上的税。</p>
+  <h3>只支持 NVIDIA，而且是有意的</h3>
+  <p>这不是一个等着被修的疏漏。性能来自编译到特定的 NVIDIA 算子，所以被换掉的东西就是硬件可移植性。把它当作一次对某个厂商的有意下注，并且主动给这份锁定定价，而不是在容量吃紧时才发现它。</p>
+</section>
+
+<section>
+  <h2>llama.cpp——并不在同一场比赛里的那一个</h2>
+  <h3>另一个问题，而且解得出奇地好</h3>
+  <p>llama.cpp 是这里 star 数遥遥领先的项目，也是对服务机群最不相关的一个，因为它是为"在你自己的一台机器上跑起一个模型"而造的——CPU、Apple Silicon、Vulkan、ROCm 或 CUDA——从单个量化后的 GGUF 文件出发，不要 Python，也不要 CUDA 工具链。这就是它有 12.2 万 star、同时几乎不出现在任何生产级智能体机群里的原因。</p>
+  <h3>它彻底赢下的地方</h3>
+  <p>开发者本机上的一切、气隙或边缘部署里的一切、以及模型必须随产品一起交付的一切。它从零到一个可服务端点的距离也是这场对比里最短的：一个二进制、一个文件、一个 OpenAI 兼容的服务端，外加用于受约束输出的 GBNF 语法。</p>
+  <h3>它到哪儿为止</h3>
+  <p>多租户并发。它的服务端按 slot 保留提示缓存，也能复用公共前缀，但它的设计是围绕一台机器上的少数几个 slot，而不是一整个机群上的数百条并发序列。在它上面跑智能体负载并不算错——那是一个范畴错误，而它会以一条队列的形式显现出来。</p>
+</section>
+
+<section>
+  <h2>真正定胜负的三根轴</h2>
+  <h3>1. 前缀复用——而这是路由问题，不是引擎问题</h3>
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp/compare-cache-keying.svg" alt="四列对比各引擎的 KV 缓存以什么为键：vLLM 的内容哈希块、SGLang 的 token 前缀基数树、TensorRT-LLM 编译 engine 内部的块、llama.cpp 的按 slot 提示缓存。" width="900" height="300" loading="lazy" />
+    <figcaption>四者都能跳过一次重复的预填充。它们的差别在于：缓存本身能不能察觉两段对话是重叠的。</figcaption>
+  </figure>
+  <p>SGLang 的基数树让重叠自动发生，vLLM 的内容哈希块让它可用，TensorRT-LLM 的复用被绑在你构建出的那个 engine 上，llama.cpp 的则被绑在一个进程里。但只要你在负载均衡器后面放了不止一个副本，这份排名就立刻蒸发——因为没有哪个引擎能复用一份从没被送到它手上的缓存。</p>
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp/arch-prefix-cache-routing.svg" alt="示意图：智能体循环的第 20 步经前缀感知路由送到缓存热的副本，只需预填充 300 个 token；同一请求经轮询送到冷副本，则要预填充 60,300 个。" width="900" height="500" loading="lazy" />
+    <figcaption>同一个引擎、同一份权重、同一张 GPU。是做 300 个 token 的活儿还是 60,300 个，由路由决定。</figcaption>
+  </figure>
+  <p>这个发现应该重排大多数迁移计划。团队常常花一个季度在引擎之间搬家、去追那 20% 的吞吐差异，而与此同时他们跑着的轮询均衡正在丢掉相当大一部分前缀缓存——那是一个以倍数计的差距，改一份路由配置就能补上。在比较任何人的基准之前，先量你自己的前缀缓存命中率；如果它在智能体流量上低于 80% 左右，引擎不是你的问题。</p>
+
+  <h3>2. 受约束解码，在你真实跑的那个 batch 上</h3>
+  <p>这里每个引擎都支持语法受约束输出；差别只在并发下才显现。SGLang 把掩码计算与 GPU 步骤重叠，vLLM 以 XGrammar 为默认后端在关键路径上算它，TensorRT-LLM 支持但在公开场合被检验得较少，而 llama.cpp 的 GBNF 对单条流很优秀、到一百条时就不是重点了。既然智能体每一次工具调用都要吐出一次受约束生成，这根轴对智能体就是承重的，而对聊天则根本不是——它也恰恰是大多数对比文章完全略过的那一根，因为它们的基准是在无约束条件下跑的。</p>
+
+  <h3>3. 那道准备步骤，会反复向你收费</h3>
+  <p>llama.cpp 让你一分钟内开始服务，两个 Python 服务要花一个下午处理依赖，而 TensorRT-LLM 要按"模型 × GPU × 精度"每种组合各编译一次。真正该问的不是一次性成本，而是那笔反复发生的成本：你多久换一次模型、量化或硬件？一个把某个模型钉住一年的团队几乎察觉不到 TensorRT-LLM 的构建。一个每几周就评估一次新开放权重发布的团队每次都要付，而这笔反复的成本通常会淹没它换来的那点吞吐优势。</p>
+</section>
+
+<section>
+  <h2>什么情况下选哪个</h2>
+  <table>
+    <thead>
+      <tr><th>情形</th><th>选</th><th>因为</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>通用智能体机群、多种模型、要有人把它运维起来</td><td>vLLM</td><td>生态、硬件覆盖面，以及"调过它的人"这一供给最充足。</td></tr>
+      <tr><td>提示词与工具集稳定的高并发智能体</td><td>SGLang</td><td>自动前缀共享，加上不会卡住 batch 的受约束解码——正是智能体流量猛砸的那两件事。</td></tr>
+      <tr><td>单一模型、同构 NVIDIA 机群、延迟就是产品</td><td>TensorRT-LLM</td><td>最快的绝对数字，而当什么都不变时，构建成本摊得下来。</td></tr>
+      <tr><td>本地、边缘、气隙，或随 App 一起交付</td><td>llama.cpp</td><td>一个二进制、一个文件、不要工具链，跑在你已经有的硬件上。</td></tr>
+      <tr><td>你还没想好</td><td>vLLM，并打开前缀感知路由</td><td>先把路由做对；引擎迁移一直是便宜的，而路由那一笔收益本来就更大。</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>SGLang 比 vLLM 快吗？</h3>
+  <p>在共享前缀的负载上，2026 年的第三方 H100 基准把它放在领先大约 15%–30% 的位置，而它的架构就是原因。但这个差距小于你用轮询去均衡智能体流量所制造出来的那个差距，所以先修路由，再谈迁移。</p>
+  <h3>为什么 star 最多的 llama.cpp 部署得最少？</h3>
+  <p>Star 衡量的是自己动手跑过的人，而大多数人是用 llama.cpp 在笔记本上跑模型的。数据中心服务是一个小得多的人群，在做另一个选择。</p>
+  <h3>TensorRT-LLM 的编译步骤真有那么久吗？</h3>
+  <p>按"模型 × GPU 架构 × 精度"每种组合数十分钟，是排期时该照着算的数字。它是一笔固定成本，不是按请求算的——问题在于你的配置多久变一次。</p>
+  <h3>这些能跑在 AMD 或 Apple 硬件上吗？</h3>
+  <p>vLLM 支持 ROCm、Intel XPU 与 TPU；SGLang 声明支持 AMD、Intel Xeon、TPU 与 NPU；llama.cpp 几乎什么都能跑，包括通过 Metal 跑在 Apple Silicon 上。TensorRT-LLM 按设计只支持 NVIDIA。</p>
+  <h3>选之前该测什么？</h3>
+  <p>你真实流量上的前缀缓存命中率、按缓存命中与未命中拆开的首 token 时延，以及端到端任务完成时间而不是每秒 token 数。这三项没有埋点，任何基准对比都预测不了你的结果。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关：</h3>
+  <ul>
+    <li><a href="/zh/operations/agentops/self-hosted-inference-for-agents">为智能体自建推理</a>——这个选择底下的容量算术：KV 缓存字节、并发序列数，以及为什么自动扩缩在这里不管用。</li>
+    <li><a href="/zh/concepts/prefill-and-decode">预填充、解码与 KV 缓存</a>——一次模型调用内部那两个相反的瓶颈。</li>
+    <li><a href="/zh/concepts/inference-providers">服务与访问：API、本地、网关</a>——自建在诸多备选中的位置。</li>
+    <li><a href="/zh/concepts/small-and-local-models">小模型与本地模型</a>——哪些活儿本来就用不上前沿模型。</li>
+    <li><a href="/zh/concepts/prompt-caching">提示缓存</a>——同一条前缀稳定性规则，在托管 API 上的版本。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://github.com/vllm-project/vllm">vLLM</a></li>
+    <li><a href="https://github.com/sgl-project/sglang">SGLang</a></li>
+    <li><a href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM</a></li>
+    <li><a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a></li>
+  </ul>
+</section>

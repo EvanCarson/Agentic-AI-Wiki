@@ -1,0 +1,160 @@
+<p class="lede">Pick your serving engine on a throughput benchmark and you will optimise the one number your agents never exercise. A chat benchmark sends fresh prompts to a fixed batch; an agent sends the same prompt back twenty times with a few hundred tokens appended, so the work is overwhelmingly prefill of text the GPU has already seen. Three things decide whether that work happens twice — what the KV cache is keyed on, whether constrained decoding survives a full batch, and how long the build step takes — and only one of the four engines below was designed with all three in mind.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four projects that all serve open-weight models over an HTTP endpoint, and share almost nothing else about how they get there.</p>
+
+  <table>
+    <thead>
+      <tr><th>Project</th><th>Since</th><th>Licence</th><th>Deployment shape</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>vLLM</strong></td>
+        <td>Feb 2023</td>
+        <td>Apache-2.0</td>
+        <td>Python server, one process per GPU group; the default fleet choice.</td>
+      </tr>
+      <tr>
+        <td><strong>SGLang</strong></td>
+        <td>Jan 2024</td>
+        <td>Apache-2.0</td>
+        <td>Python server, same shape as vLLM; built around a prefix-sharing cache.</td>
+      </tr>
+      <tr>
+        <td><strong>TensorRT-LLM</strong></td>
+        <td>Aug 2023</td>
+        <td>NVIDIA terms</td>
+        <td>Compile an engine for a specific GPU and precision, then serve it.</td>
+      </tr>
+      <tr>
+        <td><strong>llama.cpp</strong></td>
+        <td>Mar 2023</td>
+        <td>MIT</td>
+        <td>One C++ binary and one GGUF file; laptop to single server.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp/data-stars-comparison.svg" alt="Bar chart of GitHub stars: llama.cpp 122.3k, vLLM 87.8k, SGLang 31.0k, TensorRT-LLM 14.3k, as of 1 August 2026." width="900" height="400" loading="lazy" />
+    <figcaption>Stars measure how many people run something on their own machine, which is why this ordering is close to the inverse of datacentre deployment share.</figcaption>
+  </figure>
+
+  <p>Both Python servers ship at a pace that makes any version-specific claim stale within a month — vLLM cut v0.26.0 on 27 July 2026 with 411 commits from 212 contributors, SGLang cut v0.5.16 two days earlier with 574 pull requests from 169. Treat feature-parity gaps as temporary and architectural commitments as permanent, because only the second kind survives a release cycle.</p>
+
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp/data-feature-matrix.svg" alt="Capability matrix scoring the four engines on prefix reuse, constrained decoding at batch, fleet operations, non-NVIDIA silicon, and time from zero to a serving endpoint." width="900" height="400" loading="lazy" />
+    <figcaption>Each engine is strong exactly where its founding premise points, and against the grain everywhere else.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>vLLM — the default, and mostly deservedly</h2>
+  <h3>PagedAttention, and what it bought</h3>
+  <p>vLLM's original contribution was to stop treating the KV cache as one contiguous allocation per sequence. It splits the cache into fixed-size blocks and manages them the way an operating system manages virtual memory pages, which drops fragmentation close to zero and lets a batch pack tightly. That is why vLLM's throughput advantage over naive serving was large enough in 2023 to end the argument, and why every engine here now does some version of the same thing.</p>
+  <h3>The ecosystem is the actual moat</h3>
+  <p>Three years of being the default produced the thing that is genuinely hard to replicate: Kubernetes operators, autoscalers, prefix-aware routers, observability integrations, and a model-support surface that usually has a new architecture working within days of release. It also runs on more silicon than anything else in its class — CUDA, ROCm, Intel XPU and TPU — which matters more than it looks when your capacity plan depends on whatever GPUs you can actually get.</p>
+  <h3>Where it is weakest</h3>
+  <p>Structured output. vLLM defaults to XGrammar for guided decoding, and the constraint mask is computed on the critical path; third-party measurements through 2026 have repeatedly shown throughput degrading once guided decoding is on and the batch grows past single digits. For a chatbot that is a footnote. For an agent, where every tool call is a constrained generation, it is the common case.</p>
+</section>
+
+<section>
+  <h2>SGLang — the one built for the shape agents actually make</h2>
+  <h3>RadixAttention: the cache knows about prefixes</h3>
+  <p>SGLang stores the KV cache in a radix tree keyed on the token prefix rather than in flat hashed blocks. The consequence is not a marginally better hit rate — it is a different capability. Two requests that share their first forty thousand tokens share that computation automatically, without anyone declaring a session, tagging a cache key, or routing them together. For a fleet of agents running the same system prompt, the same tool definitions and the same retrieved corpus, that describes essentially all of the input.</p>
+  <h3>Constrained decoding that does not stall the batch</h3>
+  <p>SGLang overlaps grammar-mask computation with the GPU step instead of blocking on it, which is the direct answer to vLLM's weakest axis. If your workload is mostly tool calls and JSON, this is the difference that shows up in your latency percentiles rather than in a benchmark table.</p>
+  <h3>The cost of being second</h3>
+  <p>A third of vLLM's stars, a smaller operator and tooling ecosystem, and fewer people who have hit your bug before. Third-party H100 benchmarks in 2026 put SGLang roughly 15–30% ahead of vLLM on shared-prefix workloads; treat that band as directional, since it moves with the model, the batch and which fortnight the benchmark was run.</p>
+</section>
+
+<section>
+  <h2>TensorRT-LLM — fastest, if you can pay the build</h2>
+  <h3>Compilation is the whole trade</h3>
+  <p>TensorRT-LLM does not interpret a model graph at runtime. It compiles the model into an engine tuned to one GPU architecture and one precision, which is how it posts the fastest absolute numbers on NVIDIA hardware. The price is a build step measured in tens of minutes per combination of model, GPU and precision, and a rebuild whenever any of those change.</p>
+  <h3>What that does to your operations</h3>
+  <p>Every deployment property downstream inherits the compile step. Mixed fleets need an engine per GPU type. Trying a new quantisation is a build, not a flag. Rolling back a model version means having kept the old engine artifact. If you run one model on one homogeneous NVIDIA fleet at high volume, that is a fixed cost you amortise happily; if you are still moving between models every few weeks, it is a tax on exactly the thing you do most.</p>
+  <h3>NVIDIA-only, by design</h3>
+  <p>This is not an oversight to be fixed. The performance comes from compiling to specific NVIDIA kernels, so hardware portability is the thing being traded away. Take it as a deliberate bet on a vendor, and price the lock-in on purpose rather than discovering it during a capacity crunch.</p>
+</section>
+
+<section>
+  <h2>llama.cpp — the one that is not competing</h2>
+  <h3>A different problem, solved unusually well</h3>
+  <p>llama.cpp is the most-starred project here by a wide margin and the least relevant to a serving fleet, because it was built to run a model on one machine you own — CPU, Apple Silicon, Vulkan, ROCm or CUDA — from a single quantised GGUF file with no Python and no CUDA toolchain. That is why it has 122,000 stars and why it appears in almost no production agent fleets.</p>
+  <h3>Where it wins outright</h3>
+  <p>Anything on the developer's machine, anything in an air-gapped or edge deployment, anything where the model must ship inside the product. It also has the shortest distance from zero to a serving endpoint of anything in this comparison: one binary, one file, an OpenAI-compatible server, and GBNF grammars for constrained output.</p>
+  <h3>Where it stops</h3>
+  <p>Multi-tenant concurrency. The server keeps prompt caches per slot and can reuse a common prefix, but it is designed around a handful of slots on one box rather than hundreds of concurrent sequences across a fleet. Running an agent workload on it is not wrong — it is a category error that shows up as a queue.</p>
+</section>
+
+<section>
+  <h2>The three axes that actually decide it</h2>
+  <h3>1. Prefix reuse — and it is a routing problem, not an engine one</h3>
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp/compare-cache-keying.svg" alt="Four columns comparing what each engine keys its KV cache on: content-hashed blocks in vLLM, a radix tree over token prefixes in SGLang, blocks inside a compiled engine in TensorRT-LLM, per-slot prompt caches in llama.cpp." width="900" height="300" loading="lazy" />
+    <figcaption>All four can skip a repeated prefill. They differ in whether the cache can notice that two conversations overlap.</figcaption>
+  </figure>
+  <p>SGLang's radix tree makes overlap automatic, vLLM's content-hashed blocks make it available, TensorRT-LLM's reuse is bound to the engine you built, and llama.cpp's is bound to one process. But that ranking evaporates the moment you put more than one replica behind a load balancer, because none of them can reuse a cache they were never sent.</p>
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp/arch-prefix-cache-routing.svg" alt="Diagram: step 20 of an agent loop routed by a prefix-aware router to the warm replica prefills 300 tokens, while the same request routed round-robin to a cold replica prefills 60,300." width="900" height="500" loading="lazy" />
+    <figcaption>Same engine, same weights, same GPU. The router decides whether you do 300 tokens of work or 60,300.</figcaption>
+  </figure>
+  <p>This is the finding that should reorder most migration plans. Teams routinely spend a quarter moving between engines to chase a 20% throughput difference while running round-robin balancing that discards a large fraction of their prefix cache — a difference measured in multiples, fixed by a routing config. Measure your own prefix-cache hit rate before you compare anyone's benchmark, and if it is below about 80% on agent traffic, the engine is not your problem.</p>
+
+  <h3>2. Constrained decoding, at the batch size you actually run</h3>
+  <p>Every engine here supports grammar-constrained output; the differences appear only under concurrency. SGLang overlaps mask computation with the GPU step, vLLM computes it on the critical path with XGrammar as the default backend, TensorRT-LLM supports it but has it less exercised in the open, and llama.cpp's GBNF is excellent for one stream and not the point at a hundred. Since an agent emits a constrained generation on every single tool call, this axis is load-bearing for agents in a way it simply is not for chat — and it is the axis most comparison posts omit entirely, because their benchmark ran unconstrained.</p>
+
+  <h3>3. What the setup step costs you, repeatedly</h3>
+  <p>llama.cpp gets you serving in a minute, the two Python servers in an afternoon of dependency work, and TensorRT-LLM after a compile per model-GPU-precision triple. The relevant question is not the one-time cost but the recurring one: how often do you change model, quantisation or hardware? A team pinning one model for a year barely notices TensorRT-LLM's build. A team evaluating a new open-weight release every few weeks pays it every time, and that recurring cost usually swamps the throughput advantage it bought.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>General agent fleet, mixed models, a team that has to operate it</td><td>vLLM</td><td>The ecosystem, the hardware breadth, and the largest supply of people who have debugged it.</td></tr>
+      <tr><td>High-concurrency agents on a stable prompt and toolset</td><td>SGLang</td><td>Automatic prefix sharing and constrained decoding that does not stall the batch — the two things agent traffic hammers.</td></tr>
+      <tr><td>One model, homogeneous NVIDIA fleet, latency is the product</td><td>TensorRT-LLM</td><td>Fastest absolute numbers, and the build cost amortises when nothing changes.</td></tr>
+      <tr><td>Local, edge, air-gapped, or shipped inside the app</td><td>llama.cpp</td><td>One binary, one file, no toolchain, runs on the hardware you already have.</td></tr>
+      <tr><td>You are not sure yet</td><td>vLLM, with prefix-aware routing on</td><td>Get the routing right first; the engine swap stays cheap and the routing win is larger anyway.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Is SGLang faster than vLLM?</h3>
+  <p>On shared-prefix workloads, third-party H100 benchmarks in 2026 have put it roughly 15–30% ahead, and its architecture is the reason. But that gap is smaller than the one you create by load-balancing agent traffic round-robin, so fix routing before you migrate.</p>
+  <h3>Why is llama.cpp the most-starred if it is the least deployed?</h3>
+  <p>Stars measure people who ran something themselves, and llama.cpp is what most people use to run a model on a laptop. Datacentre serving is a much smaller population making a different choice.</p>
+  <h3>Does TensorRT-LLM's compile step really take that long?</h3>
+  <p>Tens of minutes per model, GPU architecture and precision combination is the number to plan against. It is a fixed cost, not a per-request one — the question is how often your configuration changes.</p>
+  <h3>Can I run these on AMD or Apple hardware?</h3>
+  <p>vLLM runs on ROCm, Intel XPU and TPU; SGLang reports AMD, Intel Xeon, TPU and NPU support; llama.cpp runs on nearly anything including Apple Silicon via Metal. TensorRT-LLM is NVIDIA-only by design.</p>
+  <h3>What should I measure before choosing?</h3>
+  <p>Prefix-cache hit rate on your real traffic, time-to-first-token split by cache hit and miss, and end-to-end task completion time rather than tokens per second. If those three are not instrumented, no benchmark comparison will predict your outcome.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/operations/agentops/self-hosted-inference-for-agents">Self-Hosted Inference for Agents</a> — the capacity arithmetic underneath this choice: KV-cache bytes, concurrent sequences, and why autoscaling does not work here.</li>
+    <li><a href="/concepts/prefill-and-decode">Prefill, Decode &amp; the KV Cache</a> — the two opposite bottlenecks inside one model call.</li>
+    <li><a href="/concepts/inference-providers">Serving &amp; Access: APIs, Local, Gateways</a> — where self-hosting sits among the alternatives.</li>
+    <li><a href="/concepts/small-and-local-models">Small &amp; Local Models</a> — which jobs never needed a frontier model in the first place.</li>
+    <li><a href="/concepts/prompt-caching">Prompt Caching</a> — the same prefix-stability rule, on a hosted API.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://github.com/vllm-project/vllm">vLLM</a></li>
+    <li><a href="https://github.com/sgl-project/sglang">SGLang</a></li>
+    <li><a href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM</a></li>
+    <li><a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a></li>
+  </ul>
+</section>

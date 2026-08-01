@@ -1,0 +1,90 @@
+<section class="phase">
+  <div class="phase-num">O11</div>
+  <div class="week">运维 · 智能体运维：部署与运营</div>
+  <h2>自建推理：你不再买 token，你开始买 KV 缓存的字节。</h2>
+  <p class="goal">把智能体从厂商 API 上搬下来的那天，脚下的计价单位就换了，而大多数容量规划没察觉。你买的不再是"已经把内存问题打包进去"的 token，而是 GPU 秒；决定同时能跑多少个智能体的，是缓存内存，不是算力。在一张 80 GB 的卡上跑 8B 模型，四个长上下文的并发智能体就能把它塞满——而能解决这件事的杠杆是上下文纪律与缓存感知路由，不是换一张更大的卡。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>容量是"并发序列数 × 上下文长度"，而 QPS 毫无意义。</h3>
+    <p>每一个在飞的 token，都在整个请求生命周期里占着一片 KV 缓存，而一次智能体请求要活好几分钟。这笔账既不留情面，也算得准：</p>
+
+<pre class="standalone"><span class="c-cm"># KV cache bytes per token (per sequence)</span>
+bytes_per_token = <span class="c-st">2</span> * layers * kv_heads * head_dim * dtype_bytes
+<span class="c-cm">#          K and V ---^</span>
+
+<span class="c-cm"># 8B-class GQA model: 32 layers, 8 KV heads, head_dim 128, fp16</span>
+<span class="c-cm">#   2 * 32 * 8 * 128 * 2  =  131,072 B  =  128 KiB / token</span>
+<span class="c-cm">#   128k-token context    =  16 GiB for ONE sequence</span>
+
+<span class="c-cm"># 80 GB card, 16 GB of weights, ~60 GB left for cache:</span>
+<span class="c-cm">#   60 / 16  ~=  3.7 concurrent agents at full context</span></pre>
+
+    <p>最后一行请读两遍，因为让团队意外的正是这个数字。GPU 并不缺算力，模型也不算大；它只是没地方同时记住四段对话了。由此直接推出几条结论：</p>
+    <ul>
+      <li><strong>按"序列槽位"规划，而不是按每秒请求数。</strong>一块 QPS 看板完全说不出下一个智能体能不能启动。该报警的是缓存占用率，以及正在等槽位的序列数。</li>
+      <li><strong>长上下文是一笔容量成本，不只是一笔账单。</strong>把一次运行的工作上下文从 128k 压到 32k，省下的不是那张你已经收不到的 token 账单上的 75%——而是让同一张卡能装下的智能体数量翻两番。<a class="xref" href="/zh/concepts/context-engineering">上下文工程</a>就此从一项省钱措施变成一项扩容措施。</li>
+      <li><strong>先量化缓存，再买硬件。</strong>fp8 的 KV 缓存把每 token 的字节数砍半，并发数大致翻倍，而它的质量代价你花一个下午就能在自己的评测集上量出来。它是这份清单上回报最高的旋钮，也是最常被留在默认值上的那个。</li>
+      <li><strong>抢占是泄压阀，而它不是免费的。</strong>缓存不够时，引擎会驱逐某个序列、稍后再重算。在高负载下，你可能把相当大一部分算力花在重新预填充已经算过的内容上——它表现为"负载越高延迟越糟"的那种延迟，而吞吐曲线恰好把它盖住。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>前缀缓存命中率才是那根杠杆，而它是一个路由问题。</h3>
+    <p>智能体循环每一步都把整段记录重发一遍，所以到第二十步时，提示词与第十九步的几乎完全一样。任何一个服务引擎都能复用缓存住的前缀、跳过那次预填充——这就把智能体服务的主要成本变成了近乎为零。然后负载均衡器把第二十步发给了另一个副本，那边缓存是冷的，于是整段对话从头重新预填充一遍。</p>
+    <p>这就是"能把智能体服务好的机群"和"不能的机群"之间的区别，而它跟你选了哪个引擎毫无关系：</p>
+    <ul>
+      <li><strong>按前缀路由，至少也要按会话路由。</strong>把一段对话钉在已经持有其缓存的那个副本上。对智能体流量来说，轮询是实实在在的错，而它对聊天流量并不是。</li>
+      <li><strong>把命中率当作一等 SLI 来埋点。</strong>每副本的前缀缓存命中率，外加按命中/未命中拆开的首 token 时延。一个命中率从 90% 滑到 60% 的机群，损失的容量远大于任何引擎升级带来的收益，而你看板上别的指标一动不动。</li>
+      <li><strong>保持前缀稳定，把可变的部分放最后。</strong>这跟托管 API 上的<a class="xref" href="/zh/concepts/prompt-caching">提示缓存</a>是同一条规则——系统提示词顶部的一个时间戳，会让它后面的一切在每一次请求里全部失效。</li>
+      <li><strong>当心发布。</strong>更新一版系统提示词或工具 schema，会同时让整个机群的缓存全部失效。发布时要预期一场预填充风暴，把它分批放出来，而不是等着被它撞见。</li>
+    </ul>
+    <div class="callout tip">
+      <p>在评估引擎之前，先量一下自己的命中率。团队常常为两个服务框架之间 20% 的吞吐差异反复折腾，而与此同时他们的负载均衡器正扔掉 40% 的前缀缓存——路由那一改是一次配置变更，而引擎迁移是一个季度。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>两种形状相反的负载，共用一张 GPU。</h3>
+    <p>预填充受算力约束且成阵发性；解码受显存带宽约束且平稳（见<a class="xref" href="/zh/concepts/prefill-and-decode">预填充与解码</a>）。智能体把这个割裂放大成病态：一条很长的工具结果返回，在一群正安静解码的序列中间触发一次巨大的预填充，于是它们每一个的 token 间延迟都被顶上去。在共享端点上，一个智能体粘进一份五万 token 的文件，会把其他所有人的流式输出都卡住。</p>
+    <ul>
+      <li><strong>在准入处限制提示词长度，而不是在模型处。</strong>在调度之前就执行的单请求 token 上限，是唯一能阻止一条超大提示词变成所有人的延迟事故的东西。</li>
+      <li><strong>延迟要求不同就分开泳道。</strong>交互式智能体和后台批量任务跑在同一批副本上，意味着批量作业的预填充决定了交互式的尾延迟。要么拆机群，要么拆优先级，别把它们平均掉。</li>
+      <li><strong>把长预填充切块。</strong>正经引擎都能把一次大预填充切成片、与进行中的解码交错执行。它通常是一个开关，在旧配置里通常默认关着，而它是"打个嗝"与"卡死"之间的分界。</li>
+      <li><strong>盯对延迟。</strong>对智能体而言要紧的是端到端任务耗时，而它由"步数 × 每步延迟"主导。在步数还在涨的时候优化每秒 token 数，是在优化错误的那个因子——与<a class="xref" href="/zh/operations/economics-roi/unit-economics">每 token 成本 vs 每任务成本</a>是同一个陷阱。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>你刚刚接手的那一整块运维面。</h3>
+    <p>厂商替你吸收掉的不只是容量。自建交到你手上的是一个有状态、启动慢、闲置也很贵的服务，而无状态 Web 服务那套运维假设并不迁移过来。</p>
+    <ul>
+      <li><strong>在智能体的时间尺度上，自动扩缩不管用。</strong>冷启动意味着申请一张 GPU、拉取几十 GB 权重再把它们加载起来——是分钟级而不是秒级，而且那还得是有容量可用的时候。你要么按峰值备产能、要么排队、要么溢出到 API。没有第四个选项，而"等流量来了我们再扩"正是在事故当中失效的那个方案。</li>
+      <li><strong>公平性必须按 token 来执行。</strong>一个跑 200k 上下文智能体的租户会把缓存吃光，而一百个短请求在旁边等着。按租户的限额要以序列槽位和 token 计价，而不是以请求数——与<a class="xref" href="/zh/operations/agentops/rate-limits-and-provider-capacity">厂商容量</a>那套准入纪律一样，只不过现在厂商是你，429 也由你来发。</li>
+      <li><strong>两个方向的升级风险都归你。</strong>没有人替你把模型退役，于是<a class="xref" href="/zh/operations/agentops/model-deprecation-and-migration">退役</a>那种被迫迁移消失了——同样地，也没有任何东西拦着你把一个陈旧模型跑上两年。与此同时，引擎升级会改变采样行为、算子数值与默认开关；把引擎版本与权重一起钉住，并在自己的评测集上重新做资格认证，因为"权重一样"不等于"输出一样"。</li>
+      <li><strong>留一条热的兜底路径。</strong>一个单地域、没有 API 通路的 GPU 机群，是一个恢复时间以分钟计的单点故障。最便宜的保险是一把厂商密钥，加一个能在事故中途切换过去的路由器。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>经济性取决于利用率，而智能体流量是阵发的。</h3>
+    <p>2026 年，按需 H100 在专业 GPU 云上大约每小时 2–3 美元，在超大规模云厂商那里明显更贵——算下来每张卡每月约 1,500–2,200 美元，无论它是被打满还是凌晨四点闲着，价钱一模一样。整个等式就在这里：你把一笔可变成本换成了固定成本，于是盈亏平衡点是一个利用率数字，而利用率恰恰是一个昼夜起伏、阵发性的智能体负载最不擅长的东西。</p>
+    <ul>
+      <li><strong>算出诚实的盈亏平衡点。</strong>用每月 GPU 成本除以在你<em>真实</em>利用率下实际服务出去的 token 数——不是除以基准测试的吞吐。一个按峰值配、一天里三分之二时间空转的机群，实际每 token 成本是它标称值的三倍。</li>
+      <li><strong>刻意去填低谷。</strong>批量任务——评测、嵌入、离线分类、合成数据——才是让这笔账算得平的东西，这也是为什么自建适合那些本来就有后台推理要跑的团队。</li>
+      <li><strong>把人也算进价格。</strong>GPU 账单是看得见的那一半；那个维护引擎版本、缓存路由与容量的工程师是另一半，而且流量降下来时它并不会跟着降。</li>
+      <li><strong>先自建高频的小活儿。</strong>嵌入、重排序、路由与抽取平稳、便宜、正好适配小模型——这正是<a class="xref" href="/zh/concepts/small-and-local-models">小模型与本地模型</a>里的论证——而前沿的推理循环留在 API 上。混合通常才是正确答案，也恰恰是最少被拿出来讨论的那个。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>什么时候自建无论如何都是对的。</h3>
+    <p>有三种情形即便每 token 的比价不划算也依然成立：法律上不能离开你边界的数据（<a class="xref" href="/zh/concepts/data-residency-and-sovereignty">驻留与主权</a>）、一个没有厂商提供服务的微调模型，以及在小模型上持续的高流量、利用率确实高的场景。其余情况通常是混合。<strong>无论你选哪一种，第一天就把缓存占用率与前缀缓存命中率埋上点，并按你真实上下文长度下的并发序列数来规划容量——一个按每秒 token 数配出来的机群，会一直看起来配得刚好，直到它装不下第五个智能体的那一刻。</strong></p>
+    <p>延伸阅读：<a class="xref" href="/zh/operations/agentops/concurrency-and-scaling">并发、队列与扩缩容</a>——这之上的作业队列层；<a class="xref" href="/zh/concepts/inference-providers">服务与访问</a>——自建在诸多选项中的位置；以及 <a class="xref" href="/zh/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp">vLLM、SGLang、TensorRT-LLM 与 llama.cpp</a>——引擎本身的横向对比。</p>
+  </div>
+</section>
