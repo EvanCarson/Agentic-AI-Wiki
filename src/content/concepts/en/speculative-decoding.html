@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">F16</div>
+  <div class="week">Concepts · AI Foundations</div>
+  <h2>Speculative decoding.</h2>
+  <p class="goal">Every other way to make generation faster changes what the model says &mdash; quantize it, swap in a smaller one, trim the context &mdash; and each of those obliges you to re-run your evals before you ship. Speculative decoding is the one exception: a cheap draft guesses several tokens ahead, the real model checks the guess in a single pass, and the tokens that survive are provably the ones the real model would have emitted anyway. It is not free, though. It buys latency with spare compute, which means it pays handsomely on a quiet GPU and quietly costs you throughput on a busy one.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Draft, verify, keep the prefix.</h3>
+
+    <p>Generation is slow for a boring reason. During <a class="xref" href="/concepts/prefill-and-decode">decode</a>, producing one token requires reading every weight in the model out of memory, and a modern GPU can read memory far more slowly than it can multiply. One token per full sweep of a 70-billion-parameter model is a terrible use of the hardware: the arithmetic units sit idle waiting on bandwidth.</p>
+
+    <p>Speculative decoding exploits that idle compute. Each round has two halves:</p>
+
+    <ul>
+      <li><strong>Draft.</strong> Something cheap proposes the next <em>k</em> tokens &mdash; typically 3 to 8. That "something" can be a small model from the same family, a lightweight head bolted onto the big model's own hidden states (EAGLE, Medusa), or, in the cheapest case, an n-gram lookup that just copies a phrase already present in the prompt.</li>
+      <li><strong>Verify.</strong> The full model runs <em>once</em> over the whole proposed span, scoring all <em>k</em> positions in parallel. Because the sweep of weights is what costs, scoring eight positions costs barely more than scoring one.</li>
+    </ul>
+
+    <p>Then the accept rule: walk the draft left to right, keep each token while it agrees with what the full model would have sampled, and cut at the first disagreement &mdash; replacing that token with the full model's own choice. A round that accepts five of six drafted tokens has produced six tokens for the price of roughly one forward pass.</p>
+
+    <div class="callout">
+      <p>The losslessness is a property of the accept rule, not a claim about quality. The rule is a rejection-sampling step, and it is constructed so that the output distribution is <em>identical</em> to sampling from the full model directly &mdash; same temperature, same top-p, same everything. Any individual run still differs run-to-run exactly as much as ordinary sampling does, so this is not a route to <a class="xref" href="/concepts/reproducibility-and-determinism">determinism</a>. What it guarantees is that turning speculation on cannot shift your quality metrics, which is a very different and much more useful promise than "we measured it and it seemed fine".</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Acceptance rate is the whole equation.</h3>
+
+    <p>Two numbers decide whether any of this helps: how often the draft is right, and what the draft cost to produce. Everything else is detail.</p>
+
+    <ul>
+      <li><strong>Acceptance rate</strong> is the fraction of drafted tokens that survive verification. It is not a property of the technique &mdash; it is a property of the draft/target pair <em>on your traffic</em>. Well-matched modern draft heads report roughly 0.8 on code and instruction-following; a mismatched pair on unusual text can fall by half.</li>
+      <li><strong>Draft cost</strong> is what you spend generating a proposal you may throw away. A separate small model that is a tenth the size costs a real tenth of a forward pass per drafted token; a head trained against the big model's own hidden states costs far less and is why that design took over.</li>
+    </ul>
+
+    <p>The two combine in an obvious way and an unobvious one. Obviously, raising <em>k</em> raises the ceiling on tokens-per-round. Unobviously, acceptance compounds: a token is only usable if every token before it in the same round was also accepted, so expected accepted length grows sub-linearly and each extra speculative token is worth less than the one before it. Past a certain <em>k</em> you are paying to draft tokens that are almost never reached.</p>
+
+    <p>Two practical consequences fall out of this:</p>
+
+    <ul>
+      <li>Acceptance is content-dependent, and predictably so. Highly patterned output &mdash; code, structured JSON, a document being lightly edited, anything where the next span is nearly copyable from context &mdash; accepts far better than open-ended prose. This is why the trivially cheap n-gram drafter is genuinely competitive on <a class="xref" href="/concepts/structured-outputs">structured output</a> and on edit-a-file workloads.</li>
+      <li>Acceptance is worth logging. It is the one number that tells you whether the feature is still earning its keep after a model swap, a prompt rewrite, or a shift in what your users ask for. A drop in acceptance is the leading indicator that the draft has stopped matching the traffic.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The trade is latency for compute &mdash; so load decides.</h3>
+
+    <p>This is the part that surprises people, and it is the reason a technique advertised as a 2&ndash;3&times; speedup sometimes makes a production system slower.</p>
+
+    <p>Speculation works by converting spare arithmetic into fewer sequential steps. On a GPU serving one request, there is enormous spare arithmetic and the trade is close to free. But a serving engine's answer to an idle GPU is <em>batching</em>: run many requests through the same weight sweep at once. A large batch already fills the arithmetic units, and at that point the machine is compute-bound rather than bandwidth-bound &mdash; there is no idle capacity left to spend, and every rejected draft token is compute that could have served another user.</p>
+
+    <ul>
+      <li><strong>Low concurrency</strong> &mdash; interactive chat, a single agent stepping through a task, anything where a user is watching tokens appear. Speculation is close to pure win: you were wasting the compute anyway.</li>
+      <li><strong>High concurrency</strong> &mdash; a saturated endpoint serving many requests. Speculation can reduce total throughput, and with it your tokens-per-dollar. Serving engines expose this as a load threshold for exactly this reason; vLLM's <code class="inline">--speculative-disable-by-batch-size</code> turns speculation off once concurrent requests exceed a limit you set.</li>
+      <li><strong>Long context</strong> shifts the line, because a large KV cache pushes the system back toward bandwidth-bound even at higher batch sizes. Where your own crossover sits is a measurement, not a number you can look up.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Notice which metric moves. Speculative decoding improves <strong>time per output token</strong> for a single stream; it does not improve time-to-first-token, which is set by <a class="xref" href="/concepts/prefill-and-decode">prefill</a>, and it does not improve aggregate throughput. If your complaint is "the agent takes ninety seconds to finish a twenty-step task", most of that is steps, tool calls, and re-sent context &mdash; not decode speed. Fix the loop first; see <a class="xref" href="/concepts/agent-cost-control">agent cost control</a>.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Where it sits among the other speed levers.</h3>
+
+    <p>Put speculation next to its alternatives and the shape of the decision is clear. Only one of these columns is free of a quality argument.</p>
+
+    <ul>
+      <li><strong>Quantization</strong> shrinks the weights so each sweep reads less memory. It is the bigger single-stream win and it stacks with speculation &mdash; but it changes outputs, so it costs you an eval cycle. See <a class="xref" href="/concepts/distillation-and-quantization">distillation and quantization</a>.</li>
+      <li><strong>A smaller model</strong> is the largest win of all and the largest quality risk; <a class="xref" href="/concepts/model-routing">routing</a> the easy requests to it is usually smarter than serving everything from it.</li>
+      <li><strong>Prompt caching</strong> attacks prefill rather than decode, which is often where the perceived latency actually lives on long-context agent turns.</li>
+      <li><strong>Streaming</strong> does not make anything faster, it makes the wait legible &mdash; and on most interfaces that is worth more than a 20% decode improvement. See <a class="xref" href="/concepts/streaming-and-partial-output">streaming and partial output</a>.</li>
+    </ul>
+
+    <p>If you buy inference from an API rather than running it, none of this is a knob you turn &mdash; it is already applied on your behalf, silently, and it is part of why <a class="xref" href="/concepts/inference-providers">provider</a> latency differs on identical models. It becomes your decision the moment you <a class="xref" href="/operations/agentops/self-hosted-inference-for-agents">self-host</a>.</p>
+
+    <div class="callout tip">
+      <p>If you self-host and your traffic is interactive, turn speculative decoding on with a well-matched draft head, then do the two things nobody does: set the disable-by-batch-size threshold before you get a traffic spike, and log acceptance rate as a first-class metric next to latency. The first prevents your latency optimisation from becoming a capacity incident on your busiest day; the second tells you the month it stops working. And unlike every other item on the list, you do not owe your eval suite a re-run &mdash; that is the whole reason to reach for this one first.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/prefill-and-decode">prefill and decode</a> for the two phases this optimises between, <a class="xref" href="/concepts/cost-quality-latency">cost, quality &amp; latency</a> for the trade-off it sits inside, and <a class="xref" href="/concepts/batch-and-async-inference">batch and async inference</a> for the workloads where latency is not the metric at all.</p>
+  </div>
+</section>
