@@ -1,0 +1,141 @@
+<p class="lede">A grammar engine can guarantee that your model emits <code>{"action": "refund", "amount": 4200}</code> and never a stray backtick — and it cannot tell you whether the refund should have been issued at all. That gap is where structured-output projects go wrong: teams shop for the fastest constrained decoder, ship it, and discover their failure rate barely moved, because malformed JSON was never what was breaking them. Three of the four tools here solve well-formedness and differ only in when they pay for the grammar. The fourth solves a different problem, and most comparisons file it in the wrong column.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four projects that all appear under "structured outputs" and do not all do the same thing.</p>
+  <table>
+    <thead>
+      <tr><th>Project</th><th>What it is</th><th>Where it runs</th><th>Guarantee</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Outlines</td><td>Grammar engine; precomputes a token index from the schema</td><td>Inside a serving engine you host</td><td>Output cannot be malformed</td></tr>
+      <tr><td>XGrammar</td><td>Grammar engine; JIT-compiles with a persistent cache</td><td>Inside a serving engine you host</td><td>Output cannot be malformed</td></tr>
+      <tr><td>llguidance</td><td>Grammar engine; builds automata lazily, masks on the fly</td><td>Inside a serving engine you host</td><td>Output cannot be malformed</td></tr>
+      <tr><td>Instructor</td><td>Client wrapper; validates against Pydantic and retries</td><td>In your application, against any API</td><td>Output satisfies your validators — or raises</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/outlines-vs-xgrammar-vs-llguidance-vs-instructor/arch-mask-strategies.svg" alt="Two pipelines compared: constrained decoding compiles a schema to a grammar and masks invalid tokens at every step, while validate-and-retry generates freely then parses, validates and re-requests on failure." width="900" height="500" loading="lazy" />
+    <figcaption>The categorical split. The top row prevents the error; the bottom row detects it — and only the bottom row can see semantics.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/outlines-vs-xgrammar-vs-llguidance-vs-instructor/data-feature-matrix.svg" alt="Matrix scoring Outlines, XGrammar, llguidance and Instructor on well-formedness, recursive schemas, per-request unique schemas, semantic validation, and support for hosted APIs." width="900" height="400" loading="lazy" />
+    <figcaption>Each is strong exactly where its design premise points, and unhelpful against the grain.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>How constrained decoding actually works</h2>
+  <p>The mechanism is simpler than the project count suggests. At every decoding step the model produces a distribution over the whole vocabulary. A grammar engine computes, for the current parser state, which tokens could legally come next; every other token has its logit set to negative infinity before sampling. Invalid output is not corrected, it is unreachable — and because the mask applies before sampling, the guarantee holds at any temperature.</p>
+
+  <p>That leaves exactly one hard engineering problem: computing the mask fast enough that it does not dominate the step. A vocabulary is 100,000-plus tokens and a step is single-digit milliseconds, so the mask has to be produced in microseconds. Every difference between the three engines is a different answer to that problem, and every one of those answers is a trade between work done up front and work done per token.</p>
+
+  <h3>The counter-intuitive result</h3>
+  <p>Constrained generation is often assumed to cost latency. Benchmarks across large collections of real-world JSON schemas have repeatedly found the opposite in aggregate: a well-implemented engine can produce lower per-token latency than unconstrained generation. The reason is not magic — a constrained model finishes sooner. It cannot ramble, cannot emit a preamble, cannot re-open a closed object, and frequently there is only one legal token, which some engines fast-path without consulting the model at all. If your objection to structured decoding is that it will slow you down, measure before you believe it.</p>
+</section>
+
+<section>
+  <h2>The three grammar engines, and the one question that separates them</h2>
+  <figure>
+    <img src="/blogs/outlines-vs-xgrammar-vs-llguidance-vs-instructor/compare-schema-churn.svg" alt="Four columns showing cost before the first token on a novel schema: Outlines precomputes an index, XGrammar JIT-compiles with a cache, llguidance builds lazily with no startup cost, and Instructor has no compile step." width="900" height="300" loading="lazy" />
+    <figcaption>Startup cost versus per-token cost. Your schema churn decides which side of that trade you want.</figcaption>
+  </figure>
+
+  <h3>Outlines — compile once, then it is nearly free</h3>
+  <p>Outlines popularised the approach: turn the schema into a finite automaton and precompute, for every state, the set of allowed tokens. The result is a lookup at sampling time, which is about as cheap as this can get. The costs are the mirror image — building that index takes real time and memory for a schema you have not seen before, and a finite automaton cannot express unbounded recursion, so deeply recursive or self-referential schemas are either rejected or flattened to a fixed depth. If you serve a small fixed set of schemas, both costs are paid once at startup and never again.</p>
+
+  <h3>XGrammar — just in time, with a cache that does the work</h3>
+  <p>XGrammar reframes the problem around a context-free grammar and a compilation step that is fast enough to run on demand, backed by a persistent cache. Repeated schemas hit the cache and cost nothing; genuinely novel ones pay a compile that is small relative to a generation. It also handles the recursive schemas that trip an automaton-based approach, and its published overhead per token is low enough to disappear into normal step time. This combination is why it became the default structured-output backend in vLLM and SGLang rather than an option you opt into, and the 2026 follow-on work has been aimed squarely at the dynamic-schema case where agents live.</p>
+
+  <h3>llguidance — pay nothing up front</h3>
+  <p>llguidance, the engine underneath Microsoft's Guidance, takes the opposite position: build the automata lazily and compute masks on the fly, so there is essentially no startup cost at all. Under a fixed schema set this loses to a precomputed index on raw per-token throughput. Under genuinely unique-per-request schemas it wins, because the competition is paying a compile that llguidance never incurs. Independent comparisons on serving engines show exactly this crossover — XGrammar ahead on repeated simple schemas, llguidance ahead when every request brings something new.</p>
+
+  <h3>So: do your schemas repeat?</h3>
+  <p>That is the decision. A product with twenty fixed extraction schemas has near-total cache hits and should take whatever its serving engine defaults to, which today means XGrammar and means not thinking about it. A platform where tenants supply their own schemas, or an agent whose tool set is assembled per session, has a cache-miss workload and should benchmark llguidance against it. Outlines remains the reference implementation of the precompute idea and the right pick when you control the schema set completely and want the lowest possible per-token cost.</p>
+</section>
+
+<section>
+  <h2>Instructor is not in the same category</h2>
+  <p>Instructor does not touch the sampler. It wraps the provider client, sends your Pydantic model as a schema or tool definition, parses what comes back, validates it, and on failure sends the validation error to the model as a new request — by default up to three times. This is retry-based, not constraint-based, and the difference is not a matter of degree.</p>
+
+  <p>What that costs is obvious: a failure is a whole extra generation, latency is unbounded in the tail, and there is no guarantee at all — only an exception when the retries run out. What it buys is the part people undersell. A grammar can enforce that <code>discount_percent</code> is an integer between 0 and 100. It cannot enforce that <code>discount_percent</code> is zero unless <code>customer_tier</code> is "gold", that <code>end_date</code> is after <code>start_date</code>, or that every ID in the response appears in the retrieved context. Those are arbitrary predicates over a parsed object, they are the constraints that actually fail in production, and a Pydantic validator expresses all of them in a line.</p>
+
+  <p>The second thing it buys is reach. Grammar engines run inside a serving engine, which means you need to be running the model. Against a hosted API you get whatever structured-output feature the provider ships and nothing else. Instructor works everywhere, and where the provider does offer constrained decoding it uses it and keeps the validation layer on top.</p>
+
+  <h3>The honest recommendation is both</h3>
+  <p>These compose, and composing them is the configuration that actually works: a grammar engine guarantees the object parses, and a validation layer enforces the semantics the grammar cannot see. You then have exactly one retry path, and it triggers only on the errors that were always going to need one. Teams that pick a single tool usually end up rebuilding the other half by hand.</p>
+</section>
+
+<section>
+  <h2>The failure mode nobody benchmarks</h2>
+  <p>Schema compliance and correctness are different properties, and only one of them is measured by every benchmark in this space. A model forced into a schema will fill it. Ask for a required <code>root_cause</code> field and you will get one whether or not the evidence supports a root cause; ask for a five-value enum and the model picks one rather than telling you none applies. The constraint has converted "I do not know" — the most useful thing a model can say — into a confident, well-formed, unfalsifiable value.</p>
+
+  <ul>
+    <li><strong>Give abstention a legal encoding.</strong> Make fields optional where the answer genuinely may not exist, and add an explicit <code>insufficient_evidence</code> variant to enums. If the schema has no way to express uncertainty, you have not eliminated uncertainty; you have hidden it.</li>
+    <li><strong>Do not constrain the reasoning.</strong> Forcing structure over the whole response constrains the tokens the model thinks in. Let it reason in free text, then emit the structured object as a separate constrained segment or a separate call.</li>
+    <li><strong>Field order is a prompt.</strong> Generation is left to right, so a field placed early is produced with less context and conditions everything after it. Put conclusions after evidence, not before.</li>
+    <li><strong>Names carry instruction.</strong> <code>is_fraudulent</code> and <code>risk_flag</code> are the same boolean and do not produce the same distribution. Schema key wording is a prompt-engineering surface, and recent work has measured it as one.</li>
+  </ul>
+
+  <p>None of this is a criticism of the tools. It is the reminder that they solve the syntactic half of the problem completely and the semantic half not at all, and that the second half is where your incident reports come from.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Take</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Hosted API, no serving engine of your own</td><td>Instructor, plus the provider's structured-output mode</td><td>Grammar engines are not available to you; validation and retry is the whole toolkit</td></tr>
+      <tr><td>Self-hosted, small fixed schema set</td><td>Your engine's default, which is XGrammar</td><td>Cache hits on every request; the tuning has no headroom to find</td></tr>
+      <tr><td>Self-hosted, unique schema per request</td><td>Benchmark llguidance against the default</td><td>No compile cost is the whole advantage, and it is exactly your workload</td></tr>
+      <tr><td>Recursive or self-referential schemas</td><td>XGrammar or llguidance</td><td>A finite automaton cannot express unbounded recursion</td></tr>
+      <tr><td>Cross-field or evidence-grounded rules</td><td>Instructor on top of whatever you use</td><td>No grammar expresses a predicate over the whole parsed object</td></tr>
+      <tr><td>Agent tool calls</td><td>Your engine's default, and check it survives a full batch</td><td>Vendor tool-calling already constrains; the risk is throughput under load</td></tr>
+    </tbody>
+  </table>
+
+  <p>One operational note that outranks the whole comparison: whichever engine you use, verify it still behaves at production batch sizes. Structured decoding is applied per sequence, and an engine that looks free at batch 1 can become visible when every request in a large batch carries its own grammar. That is an axis the <a href="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp">serving-engine comparison</a> treats as a first-class differentiator, and it is worth measuring on your own traffic rather than inheriting from a blog post.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Does constrained decoding make the model dumber?</h3>
+  <p>It can, if you constrain the wrong tokens. Forcing structure across an entire response restricts the tokens the model reasons in and measurably hurts on tasks that need working-through. Constraining only the final output segment, after free-text reasoning, avoids nearly all of it.</p>
+
+  <h3>Do I still need this if my provider offers structured outputs?</h3>
+  <p>For well-formedness, no — the provider is doing the same thing server-side. For semantic and cross-field rules, yes, because no provider validates predicates it cannot see. That is the layer Instructor occupies and it does not go away.</p>
+
+  <h3>Is XGrammar always the right default?</h3>
+  <p>It is the right default in the literal sense that vLLM and SGLang have made it one, and for most workloads there is no reason to override that. The exception is genuinely unique-per-request schemas, where the cache stops helping and llguidance's lazy construction is a real advantage.</p>
+
+  <h3>Can a grammar guarantee the values are right?</h3>
+  <p>No. A grammar constrains the shape of the output — types, structure, which strings are legal in an enum. Which legal value gets chosen is a modelling question, and a schema that offers no way to say "I don't know" will get a confident answer instead of an honest one.</p>
+
+  <h3>What about tool calling — is that the same machinery?</h3>
+  <p>Underneath, usually yes: a tool schema is a JSON Schema and constrained decoding is how providers make tool calls parse reliably. The difference is that with tool calling you rarely choose the engine, and the failure you actually see is the model picking the wrong tool with perfectly valid arguments.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/structured-outputs">Structured outputs</a> — the concept, from "ask for JSON" to schema-constrained decoding.</li>
+    <li><a href="/deep-dives/tool-capability-design/structured-outputs-vs-tool-calls">Structured outputs vs tool calls</a> — which mechanism to reach for.</li>
+    <li><a href="/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">JSON Schema subsets per vendor</a> — what each provider actually accepts.</li>
+    <li><a href="/deep-dives/tool-capability-design/streaming-tool-calls-in-practice">Streaming tool calls in practice</a> — partial structured output on the wire.</li>
+    <li><a href="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp">vLLM vs SGLang vs TensorRT-LLM vs llama.cpp</a> — where these engines are hosted.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://github.com/dottxt-ai/outlines">Outlines</a></li>
+    <li><a href="https://github.com/mlc-ai/xgrammar">XGrammar</a></li>
+    <li><a href="https://github.com/guidance-ai/llguidance">llguidance</a></li>
+    <li><a href="https://github.com/567-labs/instructor">Instructor</a></li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/structured_outputs/">vLLM — structured outputs documentation</a></li>
+    <li><a href="https://arxiv.org/abs/2501.10868">Generating Structured Outputs from Language Models: Benchmark and Studies</a></li>
+  </ul>
+</section>

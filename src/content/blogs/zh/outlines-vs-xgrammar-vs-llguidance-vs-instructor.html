@@ -1,0 +1,141 @@
+<p class="lede">一个语法引擎能保证你的模型吐出 <code>{"action": "refund", "amount": 4200}</code>，一个多余的反引号都不会有——却没法告诉你这笔退款究竟该不该退。结构化输出项目走偏，正是偏在这道缝上：团队去挑最快的受约束解码器、上线，然后发现故障率几乎没动，因为把他们搞垮的从来就不是格式不合法的 JSON。这里的四个工具，有三个解决的是"格式良构"，彼此的区别只在于何时为语法买单。第四个解决的是另一个问题，而多数对比把它归错了栏。</p>
+
+<section>
+  <h2>要点速览</h2>
+  <p>四个都挂在"结构化输出"名下、却并不都做同一件事的项目。</p>
+  <table>
+    <thead>
+      <tr><th>项目</th><th>它是什么</th><th>跑在哪里</th><th>保证什么</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Outlines</td><td>语法引擎；从 schema 预计算令牌索引</td><td>你自托管的服务引擎内部</td><td>输出不可能格式不合法</td></tr>
+      <tr><td>XGrammar</td><td>语法引擎；即时编译，带持久缓存</td><td>你自托管的服务引擎内部</td><td>输出不可能格式不合法</td></tr>
+      <tr><td>llguidance</td><td>语法引擎；惰性构建自动机，掩码即时计算</td><td>你自托管的服务引擎内部</td><td>输出不可能格式不合法</td></tr>
+      <tr><td>Instructor</td><td>客户端封装；按 Pydantic 校验并重试</td><td>你的应用里，对任何 API 都行</td><td>输出满足你的校验器——否则抛异常</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/outlines-vs-xgrammar-vs-llguidance-vs-instructor/arch-mask-strategies.svg" alt="两条流水线对比：受约束解码把 schema 编译成语法并在每一步屏蔽非法令牌；校验重试则自由生成，然后解析、校验，失败时重新请求。" width="900" height="500" loading="lazy" />
+    <figcaption>这条分类的裂缝。上面一行防止错误发生；下面一行检测错误——而只有下面一行看得见语义。</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/outlines-vs-xgrammar-vs-llguidance-vs-instructor/data-feature-matrix.svg" alt="矩阵图：Outlines、XGrammar、llguidance 与 Instructor 在格式良构、递归 schema、每请求独立 schema、语义校验以及托管 API 支持上的表现。" width="900" height="400" loading="lazy" />
+    <figcaption>每一个都恰好强在它的设计前提所指的方向，逆着纹路就帮不上忙。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>受约束解码到底怎么工作</h2>
+  <p>机制比项目数量所暗示的要简单。每一个解码步骤，模型都会产出一个覆盖整个词表的分布。语法引擎针对当前的解析器状态计算出哪些令牌可以合法地接下去；其余每个令牌的 logit 在采样之前都被置为负无穷。非法输出不是被纠正的，而是根本够不着——而且因为掩码作用在采样之前，这个保证在任何温度下都成立。</p>
+
+  <p>于是只剩下一个真正的工程难题：把掩码算得足够快，快到不至于主导整个步骤。词表有十万多个令牌，而一步只有个位数毫秒，所以掩码必须在微秒级产出。这三个引擎之间的每一处差别，都是对这个难题的一个不同答案，而每一个答案都是"前期做多少功"与"每令牌做多少功"之间的一次取舍。</p>
+
+  <h3>反直觉的那个结果</h3>
+  <p>人们常假定受约束生成要付出延迟代价。跨越大量真实世界 JSON schema 的基准测试反复发现，总体上恰恰相反：一个实现良好的引擎，每令牌延迟可以低于无约束生成。原因并不神奇——受约束的模型更早收尾。它没法东拉西扯、没法先来一段开场白、没法把已经闭合的对象再打开，而且经常只有一个合法令牌可选——有些引擎会为此走快速通路，压根不去问模型。如果你反对结构化解码的理由是"它会拖慢我"，请先测量再相信。</p>
+</section>
+
+<section>
+  <h2>三个语法引擎，以及区分它们的那一个问题</h2>
+  <figure>
+    <img src="/blogs/outlines-vs-xgrammar-vs-llguidance-vs-instructor/compare-schema-churn.svg" alt="四栏对比在一个全新 schema 上首个令牌之前的成本：Outlines 预计算索引，XGrammar 带缓存地即时编译，llguidance 惰性构建、几乎无启动成本，Instructor 根本没有编译步骤。" width="900" height="300" loading="lazy" />
+    <figcaption>启动成本对每令牌成本。你的 schema 更替率，决定你想站在这笔取舍的哪一侧。</figcaption>
+  </figure>
+
+  <h3>Outlines——编译一次，之后近乎免费</h3>
+  <p>Outlines 让这条路线流行起来：把 schema 变成一个有限自动机，并为每一个状态预计算出允许的令牌集合。结果是采样时只做一次查表，便宜到差不多是这件事的下限。代价则是镜像对称的——对一个没见过的 schema，构建那个索引要花实打实的时间和内存；而且有限自动机表达不了无界递归，所以深度递归或自引用的 schema 要么被拒绝，要么被压平到一个固定深度。如果你服务的是一小组固定的 schema，这两笔成本都在启动时付一次，之后再不发生。</p>
+
+  <h3>XGrammar——即时编译，靠缓存干活</h3>
+  <p>XGrammar 把问题重构到上下文无关文法之上，并配一个快到可以按需运行的编译步骤，背后是持久缓存。重复的 schema 命中缓存、成本为零；真正新出现的则付一次相对于一次生成而言很小的编译。它还能处理那些让基于自动机的路子栽跟头的递归 schema，而它公布的每令牌开销低到可以消融进正常的步骤时间里。这个组合正是它成为 vLLM 与 SGLang 默认结构化输出后端、而不是一个需要你主动选上的选项的原因；而 2026 年的后续工作，瞄的正是智能体所在的动态 schema 场景。</p>
+
+  <h3>llguidance——前期什么都不付</h3>
+  <p>微软 Guidance 底下的引擎 llguidance 走的是相反的立场：惰性构建自动机、掩码即时计算，于是几乎完全没有启动成本。在固定 schema 集下，论纯每令牌吞吐它输给预计算索引。在真正每请求都不同的 schema 下它赢，因为对手在付一笔 llguidance 根本不产生的编译成本。在服务引擎上做的独立对比恰恰显示了这个交叉点——简单且重复的 schema 上 XGrammar 领先，每个请求都带来新东西时 llguidance 领先。</p>
+
+  <h3>所以：你的 schema 会重复吗？</h3>
+  <p>这就是那个决策。一个有二十个固定抽取 schema 的产品，缓存几乎全命中，应该直接用服务引擎的默认值——今天这意味着 XGrammar，也意味着不必为此费心。一个由租户自带 schema 的平台，或者一个工具集按会话拼装的智能体，属于缓存高失效的负载，应该拿 llguidance 对着自己的流量测一测。Outlines 仍然是预计算这一思路的参考实现，也是"你完全掌控 schema 集合、且想要尽可能低的每令牌成本"时的正确选择。</p>
+</section>
+
+<section>
+  <h2>Instructor 不在同一个类别里</h2>
+  <p>Instructor 根本不碰采样器。它封装提供方的客户端，把你的 Pydantic 模型作为 schema 或工具定义发出去，解析返回的内容、做校验，失败时把校验错误作为一次新请求发回给模型——默认最多三次。这是基于重试的，不是基于约束的，而这个差别不是程度问题。</p>
+
+  <p>它的代价一目了然：一次失败就是一整次额外生成、尾部延迟无界，而且根本没有任何保证——只有重试耗尽时的一个异常。它换来的东西才是被低估的那部分。语法能强制 <code>discount_percent</code> 是 0 到 100 之间的整数。它没法强制"除非 <code>customer_tier</code> 是 gold，否则 <code>discount_percent</code> 必须为零"，没法强制 <code>end_date</code> 晚于 <code>start_date</code>，也没法强制响应里的每一个 ID 都出现在检索到的上下文中。这些都是对已解析对象的任意谓词，它们才是生产中真正会失败的约束，而一个 Pydantic 校验器一行就能表达全部。</p>
+
+  <p>它换来的第二样东西是覆盖面。语法引擎跑在服务引擎里面，这意味着你得自己在跑模型。面对一个托管 API，你只能拿到提供方给的那个结构化输出特性，别无其他。Instructor 到处都能用；而在提供方确实提供了受约束解码的地方，它会用上，并在其上保留校验层。</p>
+
+  <h3>诚实的建议是两个都要</h3>
+  <p>它们是可组合的，而组合起来才是真正管用的配置：语法引擎保证对象能解析，校验层强制语法看不见的那些语义。这样你就恰好只有一条重试路径，而且它只在那些本来就非重试不可的错误上触发。只挑一个工具的团队，通常最后都在手工重建另一半。</p>
+</section>
+
+<section>
+  <h2>没人做基准的那个失败模式</h2>
+  <p>schema 合规与正确是两种不同的性质，而这个领域里的每一个基准只测其中一种。一个被塞进 schema 的模型会把它填满。你要一个必填的 <code>root_cause</code> 字段，你就会拿到一个——不管证据支不支持存在一个根因；你要一个五值枚举，模型就会挑一个，而不会告诉你一个都不适用。这道约束把"我不知道"——模型能说出的最有用的一句话——变成了一个笃定、良构、无从证伪的取值。</p>
+
+  <ul>
+    <li><strong>给"弃答"一个合法的编码方式。</strong>在答案确实可能不存在的地方把字段设为可选，并给枚举加上明确的 <code>insufficient_evidence</code> 变体。如果 schema 没有任何办法表达不确定性，你并没有消除不确定性；你只是把它藏了起来。</li>
+    <li><strong>不要约束推理过程。</strong>对整个响应强加结构，就是在约束模型用以思考的那些令牌。让它用自由文本推理，再把结构化对象作为一个单独的受约束片段、或一次单独的调用吐出来。</li>
+    <li><strong>字段顺序是一种提示词。</strong>生成是从左到右的，所以放在前面的字段是在更少上下文下产出的，并且会条件化它之后的一切。把结论放在证据之后，别放在之前。</li>
+    <li><strong>命名承载指令。</strong><code>is_fraudulent</code> 和 <code>risk_flag</code> 是同一个布尔值，却不会产生同一个分布。schema 的键名措辞是一处提示词工程的作用面，近期已有研究把它当作一处来测量。</li>
+  </ul>
+
+  <p>这些都不是对工具的批评。这是一个提醒：它们把问题的句法那一半解决得干干净净，语义那一半则完全没碰——而你的事故报告来自第二半。</p>
+</section>
+
+<section>
+  <h2>什么时候选哪个</h2>
+  <table>
+    <thead>
+      <tr><th>情形</th><th>选</th><th>为什么</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>托管 API，自己没有服务引擎</td><td>Instructor，加上提供方的结构化输出模式</td><td>语法引擎对你不可得；校验加重试就是全部工具</td></tr>
+      <tr><td>自托管，schema 集小且固定</td><td>你的引擎的默认值，也就是 XGrammar</td><td>每个请求都命中缓存；这里没有可供调优的余量</td></tr>
+      <tr><td>自托管，每请求 schema 都不同</td><td>拿 llguidance 与默认值做对比测试</td><td>"没有编译成本"就是它的全部优势，而这恰好是你的负载</td></tr>
+      <tr><td>递归或自引用的 schema</td><td>XGrammar 或 llguidance</td><td>有限自动机表达不了无界递归</td></tr>
+      <tr><td>跨字段或需接地于证据的规则</td><td>在你所用之物之上叠一层 Instructor</td><td>没有任何语法能表达对整个已解析对象的谓词</td></tr>
+      <tr><td>智能体的工具调用</td><td>引擎默认值，并检查它在满 batch 下还撑得住</td><td>厂商的工具调用本已受约束；风险在负载下的吞吐</td></tr>
+    </tbody>
+  </table>
+
+  <p>有一条运维层面的提醒，重要性盖过整份对比：无论你用哪个引擎，都要验证它在生产批量下依然表现正常。结构化解码是按序列施加的，一个在 batch 1 下看着免费的引擎，在一个大 batch 里每个请求都带着自己的语法时，可能就现形了。这是<a href="/zh/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp">服务引擎对比</a>那篇当作一等区分项来处理的一个维度，而且值得你拿自己的流量去测，而不是从一篇博客里继承结论。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>受约束解码会让模型变笨吗？</h3>
+  <p>如果你约束错了令牌，会。对整个响应强加结构，会限制模型用来推理的那些令牌，在需要一步步想的任务上会有可测量的损害。只约束自由文本推理之后的最终输出片段，就能规避掉其中绝大部分。</p>
+
+  <h3>如果我的提供方已经提供结构化输出，我还需要这些吗？</h3>
+  <p>就格式良构而言，不需要——提供方在服务端做的是同一件事。就语义与跨字段规则而言，需要，因为没有哪家提供方会校验它看不见的谓词。那正是 Instructor 所占的那一层，而它不会消失。</p>
+
+  <h3>XGrammar 总是正确的默认值吗？</h3>
+  <p>在字面意义上它是正确的默认值——vLLM 与 SGLang 已经把它设成默认了，而对多数负载没有理由去覆盖它。例外是真正每请求都不同的 schema：那里缓存不再帮忙，而 llguidance 的惰性构建是一项实打实的优势。</p>
+
+  <h3>语法能保证取值是对的吗？</h3>
+  <p>不能。语法约束的是输出的形状——类型、结构、枚举里哪些字符串合法。至于合法取值中被选中的是哪一个，那是个建模问题；而一个没有任何办法说"我不知道"的 schema，得到的将是一个笃定的答案，而不是一个诚实的答案。</p>
+
+  <h3>那工具调用呢——是同一套机制吗？</h3>
+  <p>底层通常是的：一个工具 schema 就是一份 JSON Schema，而受约束解码正是提供方让工具调用可靠解析的手段。区别在于，工具调用时你很少能选引擎，而你真正会见到的失败是——模型带着完全合法的参数挑错了工具。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关：</h3>
+  <ul>
+    <li><a href="/zh/concepts/structured-outputs">结构化输出</a>——从"要 JSON"到 schema 约束解码的概念篇。</li>
+    <li><a href="/zh/deep-dives/tool-capability-design/structured-outputs-vs-tool-calls">结构化输出 vs 工具调用</a>——该伸手拿哪一种机制。</li>
+    <li><a href="/zh/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">各厂商的 JSON Schema 子集</a>——每家提供方实际接受什么。</li>
+    <li><a href="/zh/deep-dives/tool-capability-design/streaming-tool-calls-in-practice">流式工具调用的实践</a>——线上的部分结构化输出。</li>
+    <li><a href="/zh/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp">vLLM、SGLang、TensorRT-LLM 与 llama.cpp</a>——这些引擎寄居的地方。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://github.com/dottxt-ai/outlines">Outlines</a></li>
+    <li><a href="https://github.com/mlc-ai/xgrammar">XGrammar</a></li>
+    <li><a href="https://github.com/guidance-ai/llguidance">llguidance</a></li>
+    <li><a href="https://github.com/567-labs/instructor">Instructor</a></li>
+    <li><a href="https://docs.vllm.ai/en/latest/features/structured_outputs/">vLLM——结构化输出文档</a></li>
+    <li><a href="https://arxiv.org/abs/2501.10868">Generating Structured Outputs from Language Models: Benchmark and Studies</a></li>
+  </ul>
+</section>
