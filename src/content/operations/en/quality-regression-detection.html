@@ -1,0 +1,117 @@
+<section class="phase">
+  <div class="phase-num">E9</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>Detecting quality regressions: you cannot alert on accuracy, so alert on the shape of the run.</h2>
+  <p class="goal">Production has no labels, which means the monitor every team asks for — page me when quality drops — cannot be built the way they imagine it. Worse, the version that can be built is slow: judging enough traffic to see a five-point drop takes about fourteen hundred scored runs, and at a realistic sampling rate that is a fortnight. The signal that moves first is not the text of the answer but the geometry of the trajectory — step count, tool-error rate, retry rate, how runs terminate — and those statistics need no labels, cost nothing, and shift within an hour of a change you did not make.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why the obvious monitor does not exist.</h3>
+
+    <p>Offline evals answer "is the new version better on our suite" before release. That is a different question from "is the thing running right now still working", and the second one is the one that pages you. Three structural facts stand between you and a direct accuracy alarm:</p>
+
+    <ul>
+      <li><strong>There is no ground truth in production.</strong> The user asked something nobody has a labelled answer for. Anything you compute is an estimate produced by another model, with its own drift.</li>
+      <li><strong>Judging is a second production system.</strong> Running an <a class="xref" href="/operations/evaluation-and-observability/llm-as-judge-for-agents">LLM judge</a> on every run roughly doubles your inference footprint and adds a component that can itself regress silently when the judge model is updated. Nobody runs it at 100%, so everybody samples, and sampling costs you time.</li>
+      <li><strong>Statistical power is unkind at high baselines.</strong> The better your agent is, the more traffic it takes to prove it got worse:</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># Detect a drop from 90% to 85% success, alpha 0.05, power 0.80</span>
+n_per_arm = <span class="c-st">700</span>                <span class="c-cm"># ~1,400 scored runs in total</span>
+
+<span class="c-cm"># At 2,000 runs/day:</span>
+<span class="c-cm">#   judging 100% of traffic  -&gt;  detectable inside a day, at 2x inference</span>
+<span class="c-cm">#   judging 5% of traffic    -&gt;  detectable in about two weeks</span>
+<span class="c-cm">#</span>
+<span class="c-cm"># Over that same window, the tool-error rate leaves its</span>
+<span class="c-cm"># 14-day band within an hour, for free, with no labels.</span></pre>
+
+    <p>None of this argues against judged evaluation — it is the confirmation step, and step 4 puts it back. It argues that judged evaluation is the wrong <em>detector</em>. See <a class="xref" href="/deep-dives/evaluating-agents/eval-variance-and-statistical-power">eval variance and statistical power</a> for why these numbers are worse than intuition suggests, and <a class="xref" href="/operations/evaluation-and-observability/online-vs-offline-evals">online vs offline evals</a> for the division of labour.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The shape of the run moves first.</h3>
+
+    <p>An agent that has gotten worse almost always works harder before it answers worse. Retrieval degrades, so it searches three more times. A tool schema changed, so it retries and reformulates. The model update made it more cautious, so it asks a clarifying question it used to skip. All of that is visible in the trace before a single output is judged, and all of it is free because you are already emitting spans.</p>
+
+    <ul>
+      <li><strong>Steps per run, as a distribution.</strong> The mean barely moves while the tail doubles — and the tail is where the failures are. Watch p50, p90 and the fraction of runs that hit the step cap; that last one is the single most informative number on this list.</li>
+      <li><strong>Tool-call error rate, per tool.</strong> Aggregated, it hides everything. Per tool, it names the broken integration in the alert itself.</li>
+      <li><strong>Retry and reformulation rate.</strong> The same tool called twice with near-identical arguments is the agent telling you the result was unusable.</li>
+      <li><strong>Termination-reason mix.</strong> Completed, gave up, hit the step cap, hit the token cap, errored, escalated to a human. This mix is remarkably stable in a healthy system and it moves days before anyone complains.</li>
+      <li><strong>Context length at the final turn.</strong> A creeping upward drift means retrieval is returning more and cutting less, which is both a cost signal and a quality one — long contexts are where instruction-following decays.</li>
+      <li><strong>Refusal and clarification rate.</strong> The most sensitive detector of a silent model update there is, and it needs no labels at all.</li>
+    </ul>
+
+    <p>Alert on bands rather than thresholds: compute a rolling fourteen-day distribution per statistic and page when today sits outside it, segmented by tenant, entry point and agent version. A fleet-wide average is exactly the aggregation that lets one broken segment hide.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Add invariants, which are cheap and unambiguous.</h3>
+
+    <p>Trajectory statistics are sensitive but soft — they tell you something changed, not that something is wrong. Invariants are the opposite: rare, but when one fires it is a defect with no interpretation required. Every agent has a handful, and they are the cheapest quality signal you will ever ship.</p>
+
+    <ul>
+      <li><strong>Structured-output validation failures.</strong> A response that does not parse against its schema is a bug, full stop. If you use constrained decoding this should be flat zero, which makes any non-zero value an incident.</li>
+      <li><strong>Loop detection.</strong> The same tool, the same arguments, three times in one run. Never legitimate, trivially detectable, and the leading indicator of a cost incident as much as a quality one.</li>
+      <li><strong>Citation grounding.</strong> For any answer that cites retrieved material, assert that the cited chunk was actually in the context. A drift here means the model is inventing provenance, which is worse than being wrong.</li>
+      <li><strong>Policy-gate hit rate.</strong> If your agent has a gate that blocks certain actions, its firing rate is a behavioural fingerprint. A gate that suddenly stops firing usually means the agent stopped attempting the action, not that it got safer.</li>
+      <li><strong>Tool-argument distribution.</strong> A parameter that has always been one of four enum values and is now sometimes free text tells you a prompt or schema change landed somewhere upstream.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Invariants are also the only signals you can enforce in a pre-merge check, because they do not require a baseline. Put them in CI against a fixed set of runs and they become a gate rather than a monitor — a regression that cannot reach production is one you never have to detect.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Judging is the confirmation, and you stratify it by the anomaly.</h3>
+
+    <p>Once a band is breached you need to know whether output quality actually moved, and that does require a judge. The mistake is running the judge as a uniform background sample, which is both the most expensive way to buy statistical power and the least likely to contain the failure.</p>
+
+    <ul>
+      <li><strong>Sample where the anomaly is.</strong> If the step-cap rate doubled, judge the runs that hit the cap, not a random slice of everything. Conditioning on the anomaly raises the density of the failure by an order of magnitude, which is what makes a small sample decisive.</li>
+      <li><strong>Judge pairwise against the previous version, not absolutely.</strong> Absolute scores drift with the judge; a preference between two answers to the same input is far more stable and needs fewer samples for the same confidence.</li>
+      <li><strong>Pin and version the judge.</strong> A judge on a floating model alias will silently redefine your metric during an incident, which is the worst possible moment. Treat the judge like any other production dependency — see <a class="xref" href="/operations/agentops/model-deprecation-and-migration">model deprecation and migration</a>.</li>
+      <li><strong>Score the trajectory as well as the answer.</strong> A run that reached the right answer through three failed tool calls is a regression that outcome-only judging scores as a pass. <a class="xref" href="/operations/evaluation-and-observability/outcome-vs-trajectory-eval">Outcome vs trajectory evaluation</a> is the full argument.</li>
+      <li><strong>Keep a human in the sample.</strong> A small, standing human review of judged runs is what tells you the judge itself has drifted. It is always the first thing cut and always the thing you needed.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Run a canary suite on a schedule, because your inputs move too.</h3>
+
+    <p>Production statistics confound two things: your system changing, and your traffic changing. A Monday spike in step count might be a regression, or it might be a new customer whose documents are longer. The only way to separate them is a fixed set of inputs run on a schedule against production, where anything that moves is unambiguously yours.</p>
+
+    <ul>
+      <li><strong>Twenty to fifty representative tasks, run hourly or daily against the live stack.</strong> Real tools, real indexes, real model endpoints. Not the offline suite with mocks — the point is to catch the dependency that changed underneath you.</li>
+      <li><strong>Expect nondeterminism and design for it.</strong> Identical requests do not return identical text, so a canary that asserts on exact output will be red permanently and then ignored permanently. Assert on the invariants of step 3 and on band membership for the statistics of step 2. <a class="xref" href="/concepts/reproducibility-and-determinism">Reproducibility and nondeterminism</a> explains why this is structural rather than a configuration mistake.</li>
+      <li><strong>This is the detector for the silent third-party change.</strong> A provider ships a minor model update, an MCP server changes a tool description, an index finishes a re-embed, a vendor's rate limits tighten. None of those appear in your deploy log, and the canary is the only instrument that sees them the same day.</li>
+      <li><strong>Include an adversarial slice.</strong> A handful of injection attempts and known-bad inputs, permanently in the suite, so that safety behaviour is monitored on the same cadence as quality rather than at review time.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Wire the alert to an action, or do not send it.</h3>
+
+    <p>A quality alert that arrives with no attached decision trains people to close it. The value of everything above is realised in the twenty minutes after the page, and that requires two things you must build before the incident: the ability to attribute the change, and the ability to undo it.</p>
+
+    <ul>
+      <li><strong>Every alert names the version.</strong> Prompt version, tool-schema version, model ID, index version, retrieval config. If a regression cannot be attributed to a change, the responder's only move is to guess. <a class="xref" href="/operations/agentops/rollout-and-versioning">Rollout and versioning</a> is the prerequisite for this entire page.</li>
+      <li><strong>The first response is to pin, not to debug.</strong> Roll back to the last known-good configuration, confirm the statistic returns to its band, and diagnose afterwards. A <a class="xref" href="/operations/agentops/feature-flags-for-agents">feature flag</a> per behaviour makes this a decision rather than a deploy.</li>
+      <li><strong>Know which alerts justify the <a class="xref" href="/operations/agentops/kill-switches">kill switch</a>.</strong> A grounding-invariant breach on a customer-facing agent and a five-point quality dip are not the same class of event; write the mapping down before you need it, and keep the switch scoped so one segment can be stopped without stopping the fleet.</li>
+      <li><strong>Close the loop into the offline suite.</strong> Every confirmed regression becomes a case in the eval set, or you will detect the same failure again next quarter. This is the mechanism by which a monitoring practice compounds instead of merely repeating.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Start with three numbers this week — step-cap rate, per-tool error rate, and termination-reason mix — banded over fourteen days and segmented by version. They cost nothing beyond the traces you already emit, they move hours before a judge could, and they will catch the majority of real regressions you currently learn about from a customer. <strong>Judge to confirm, never to detect: a metric that needs fourteen hundred labelled runs is a report, and a report is not a monitor.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a> for the spans everything here reads from, <a class="xref" href="/concepts/agent-observability">agent observability</a> for the underlying model, and <a class="xref" href="/operations/agentops/incident-response-for-agents">incident response for agents</a> for what happens after the page.</p>
+  </div>
+</section>

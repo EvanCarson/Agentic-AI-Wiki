@@ -13,6 +13,7 @@ const group: Group = {
   { page: 'voice-tooling-and-state', slug: 'voice-tooling-and-state', title: L('Tool Use & State in Voice','语音中的工具调用与状态'), summary: L('Calling tools without dead air: preambles, async/parallel tool runs, confirm-by-ear before mutating, and slot state across an interruptible call.','不留空气死寂地调工具：前导语、异步/并行工具运行、变更前靠耳朵确认，以及贯穿可打断通话的槽位状态。') },
   { page: 'voice-failure-modes', slug: 'voice-failure-modes', title: L('Voice Agent Failure Modes','语音智能体失败模式'), summary: L('Hallucinated hearing, dead air, the infinite apology loop, the latency death spiral, and the escalation/handoff you must design for.','幻听、空气死寂、无限道歉循环、延迟死亡螺旋，以及你必须为之设计的升级/移交。') },
   { page: 'outbound-voice-agents', slug: 'outbound-voice-agents', title: L('Outbound voice agents','外呼语音智能体'), summary: L('Agents that **make** the call instead of answering it — pacing, abandonment, identity disclosure, and the regulatory landmines that turn a clever demo into a fine.','主动拨打而非接听的智能体——节奏、放弃率、身份披露，以及把炫酷 demo 变成罚单的合规雷区。') },
+  { page: 'evaluating-voice-agents', slug: 'evaluating-voice-agents', title: L('Evaluating Voice Agents','评估语音智能体'), summary: L('Transcript evals score the one layer that was not broken: build the golden set from recorded audio, measure entity error rate rather than WER, and treat timing as a first-class score.','文字记录评测量的是唯一那层本来就没坏的东西：用录下来的音频搭黄金集，量实体错误率而不是 WER，并把时序当作一等公民的评分项。') },
   ],
 };
 export default group;

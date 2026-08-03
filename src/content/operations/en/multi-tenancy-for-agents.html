@@ -1,0 +1,103 @@
+<section class="phase">
+  <div class="phase-num">O12</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Multi-tenancy for agents: five new stores your row-level policy never heard of.</h2>
+  <p class="goal">Your application already isolates tenants — a row-level policy, a scoped token, a per-tenant schema — and none of it reaches the five stores an agent adds: the provider's prompt cache, your semantic cache, the vector index, the memory store, and the rate-limit pool. Four of those leak metadata or capacity. One of them, the semantic cache, can return tenant A's answer to tenant B, because it decides a hit by similarity rather than by equality. That single distinction is the difference between a performance regression and a disclosure incident, and it is the one boundary you must draw by hand.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The isolation you bought is around your account, not around your tenant.</h3>
+
+    <p>Providers do isolate their prompt caches. Anthropic states that cache entries are isolated between organizations and, on several platforms, between workspaces within an organization; OpenAI states that prompt caches are not shared between organizations. Read those sentences from the position you are actually in: you are one organization, and all of your customers live inside it. The vendor's boundary separates you from other vendors' customers. It does nothing between your tenant A and your tenant B, because from the provider's side there is only you.</p>
+
+    <p>What that does and does not mean is worth being precise about, because both the panic and the shrug are wrong:</p>
+
+    <ul>
+      <li><strong>A prefix cache cannot hand over content.</strong> A hit requires a byte-identical prefix. Tenant B's request only hits an entry created by tenant A if tenant B already sent exactly those bytes — in which case B had the content to begin with. This is the one cache in the list that is structurally incapable of leaking data.</li>
+      <li><strong>It can still leak an inference.</strong> A cache hit is faster and cheaper than a miss, and both facts are visible to the caller in latency and in the usage fields on the response. A tenant who can guess a prefix can learn whether someone else has sent it. For most products this is noise; if your tenants are competitors, or the prefix could encode a customer name, it is a side channel and you should keep tenant-identifying content out of the cached prefix entirely.</li>
+      <li><strong>Cache economics are shared, which is a billing problem.</strong> Cache writes cost a premium and reads a fraction; whoever's request happened to write the entry paid for the others. If you bill by usage this quietly cross-subsidises between tenants — see <a class="xref" href="/operations/economics-roi/cost-attribution">cost attribution</a> for why the invoice will not explain itself.</li>
+    </ul>
+
+    <p>The practical rule is simple and it survives every provider's implementation detail: <strong>the cached prefix carries your system prompt, your tool schemas and your shared instructions; the tenant's data goes after the cache breakpoint.</strong> That is also what <a class="xref" href="/concepts/prompt-caching">prompt caching</a> wants for hit-rate reasons, which is a rare case of the secure design and the fast design being the same design.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The semantic cache is the only one that can be wrong, and it is the one teams share.</h3>
+
+    <p>Every other cache in your stack can only ever be slow or stale. A semantic cache decides a hit by embedding distance, so "what is our renewal date" from tenant B can match the stored answer to "when does our contract renew" from tenant A — and return it, confidently, with no error anywhere. There is no threshold that makes this safe, because the whole mechanism is approximate matching, and the queries that are most similar across tenants are exactly the high-value questions everyone asks in the same words.</p>
+
+    <ul>
+      <li><strong>Tenant ID belongs in the cache key, not in the filter.</strong> The lookup must be scoped before the nearest-neighbour search runs, not applied to its results. A post-filter still performed a cross-tenant search, which means an implementation change or an indexing bug reopens the hole silently.</li>
+      <li><strong>A shared cache is legitimate for tenant-independent content only.</strong> Product documentation, public policy text, "how do I export a CSV" — content where the answer does not depend on who asked. Keep that in a separate, explicitly-shared cache with its own key namespace, so the decision to share is written down rather than inherited.</li>
+      <li><strong>Instrument the false-hit rate as a safety metric, not a performance one.</strong> Sample hits, re-answer without the cache, and compare. A semantic cache is a retrieval system with a false-positive budget; if you do not know the number, you have not set the budget. See <a class="xref" href="/concepts/semantic-caching">semantic caching</a>.</li>
+      <li><strong>Consider not having one.</strong> For most agent workloads the hit rate is low — agent prompts carry long, unique conversation state — and the prefix cache already captures the bulk of the savings without the failure mode.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The version of this bug that reaches production is almost never a cache implemented deliberately across tenants. It is a cache implemented for a single-tenant pilot, keyed on the query text, that nobody re-keyed when the second customer arrived. Search your codebase for cache keys derived only from user input; that is the whole audit.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>In the vector index, a namespace and a metadata filter are not the same control.</h3>
+
+    <p>Every vector database offers both a way to partition data and a way to filter it, and the documentation makes them sound interchangeable. They are not, and the difference is visible in exactly the situation you care least about it: under load, at scale, in an approximate index.</p>
+
+    <ul>
+      <li><strong>Pre-filtered or partitioned search restricts the candidate set before the approximate search runs.</strong> This is a boundary. Correctness does not depend on the search returning enough neighbours.</li>
+      <li><strong>Post-filtered search retrieves top-k globally and then discards the rows that fail the filter.</strong> This is not a leak of content, but it is a recall cliff: for a tenant whose documents are a small fraction of the corpus, top-50 across all tenants may contain two of theirs, and the agent answers "I found nothing" on a corpus that has the answer. Teams debug this for weeks as a model problem.</li>
+      <li><strong>Separate indexes per tenant are the strongest and the most operationally expensive option.</strong> They also make deletion honest — a tenant offboarding is dropping an index rather than a filtered delete you then have to prove. If you are subject to per-customer deletion commitments, price this in before choosing the shared-index design; retrofitting it means a full re-index. See <a class="xref" href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">choosing a vector database</a> and <a class="xref" href="/operations/governance-compliance/data-governance">data governance</a>.</li>
+      <li><strong>Reranking and hybrid search re-open the question.</strong> A reranker fed candidates from a shared pool, or a keyword index that was never partitioned alongside the vector one, will happily undo a careful vector-side boundary. The rule is that <em>every</em> retrieval path carries the tenant scope, including the one someone added last quarter for a demo.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Memory is where tenants bleed, because the write path summarises.</h3>
+
+    <p>Retrieval reads what you put in. Memory writes something new — a distilled fact, a preference, a lesson — and the distillation step is a model call that will happily merge whatever is in its context. The failure is not a query returning the wrong row; it is a summary that was <em>authored</em> from two tenants' material and is now durably stored as one tenant's truth. No filter downstream can undo that, because the offending record is legitimately owned by the tenant it was written for.</p>
+
+    <ul>
+      <li><strong>One tenant per summarisation call, always.</strong> Batching memory consolidation across tenants for efficiency is the single highest-risk optimisation in this whole page. If a job processes many tenants, it processes them in many calls.</li>
+      <li><strong>Scope the memory key by tenant and by user, and decide which one owns the memory.</strong> "Our company prefers metric units" and "Priya prefers terse answers" have different owners and different deletion semantics, and conflating them means a departing employee's preferences persist as company policy.</li>
+      <li><strong>Resist cross-tenant learning, or make it an explicit product with consent.</strong> "The agent gets better for everyone as it learns" is a compelling roadmap line and a contractual problem; anything derived from tenant A's data and applied to tenant B is a use of their data that your DPA probably did not contemplate. See <a class="xref" href="/deep-dives/memory-and-context/memory-write-path-architectures">memory write-path architectures</a>.</li>
+      <li><strong>Deletion has to reach the derived layer.</strong> A tenant deletes a document; the memory record distilled from it two months ago is still there, and so is the vector. Enumerate every store that can hold a derivative before you sign a deletion SLA. <a class="xref" href="/deep-dives/memory-and-context/memory-poisoning-defenses">Memory poisoning defenses</a> covers the adversarial version of the same write path.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Noisy neighbours are a capacity problem with a latency signature.</h3>
+
+    <p>Provider rate limits are enforced per account, so your tenants share one bucket whether or not you modelled it. One tenant running a bulk import can consume your organisation's tokens-per-minute and the symptom every other tenant sees is a slow agent, not an error you can attribute. On self-hosted inference the same dynamic is sharper: a single 200k-token context occupies KV cache that would have held several ordinary sessions, so one tenant's long document reduces everyone's concurrency — the arithmetic is in <a class="xref" href="/operations/agentops/self-hosted-inference-for-agents">self-hosted inference for agents</a>.</p>
+
+    <ul>
+      <li><strong>Give every tenant a token budget per window, enforced by you, below the provider ceiling.</strong> Your queue, your fairness policy, your error message. Discovering fairness through the provider's 429 means the loudest tenant wins.</li>
+      <li><strong>Separate the interactive lane from the batch lane.</strong> Bulk work is where the volume is; a user waiting on a chat turn should never be behind it. Route long jobs to the <a class="xref" href="/concepts/batch-and-async-inference">batch tier</a> where the economics are better anyway.</li>
+      <li><strong>Alert on per-tenant p95, not fleet p95.</strong> A fleet average stays healthy while one tenant is comprehensively broken — and that tenant is the one who will email you.</li>
+      <li><strong>Decide who eats a runaway loop.</strong> An agent that loops burns a tenant's budget in minutes. Per-tenant spend caps with a hard stop, plus the <a class="xref" href="/operations/agentops/kill-switches">kill switch</a> scoped to one tenant rather than the fleet, is the difference between one bad afternoon and an outage for everyone.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Prove it, because none of these failures raise an error.</h3>
+
+    <p>Every leak on this page is silent by construction: the wrong answer is well-formed, the degraded recall looks like a knowledge gap, the noisy neighbour looks like a slow model. Nothing in your error budget moves. So the only honest posture is a test that tries to cross the boundary on purpose, running continuously.</p>
+
+    <ul>
+      <li><strong>A two-tenant canary suite in CI.</strong> Two synthetic tenants with deliberately similar corpora and one unique, distinctive secret each. After every change, ask tenant B every question whose answer is tenant A's secret, through every path: retrieval, cache, memory, and the agent end to end. This suite is cheap, it never expires, and it is the only artifact that will let you answer a security questionnaire honestly.</li>
+      <li><strong>Tag every span with the tenant.</strong> Traces without a tenant ID cannot answer "did this run read anything it should not have", which is the first question asked in an incident. <a class="xref" href="/concepts/agent-observability">Agent observability</a> is the substrate; the tenant tag is what makes it a control.</li>
+      <li><strong>Test the deletion path, not the deletion API.</strong> Insert a distinctive document for a tenant, let the agent run long enough that it lands in memory and in every index, then delete it and re-ask. Most teams discover their derived stores this way.</li>
+      <li><strong>Rehearse the disclosure.</strong> If a cross-tenant leak did happen, could you enumerate which tenants and which records from your traces? If the answer is no, that is a gap in <a class="xref" href="/operations/governance-compliance/audit-trails">audit trails</a>, and it is the difference between a scoped notification and a blanket one.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do the cheap 80% this week: put the tenant ID in every cache key and every trace, move tenant data after the prompt-cache breakpoint, switch retrieval to a partitioned or pre-filtered path, and never batch a memory-summarisation call across tenants. Then add the two-tenant canary suite to CI so the property is enforced rather than remembered. <strong>Isolation in an agent is not a policy you configure once — it is an invariant that five independent stores can each break quietly, so it needs a test that fails loudly.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/economics-roi/per-customer-economics">per-customer economics</a> for the billing side of the same partition, <a class="xref" href="/concepts/data-residency-and-sovereignty">data residency and sovereignty</a> for when the boundary must also be geographic, and <a class="xref" href="/operations/safety-and-security/rag-security">RAG security</a> for the adversarial reading of step 3.</p>
+  </div>
+</section>
