@@ -1,0 +1,80 @@
+<section class="phase">
+  <div class="phase-num">F17</div>
+  <div class="week">Concepts · AI Foundations</div>
+  <h2>Mixture of experts.</h2>
+  <p class="goal">A 400-billion-parameter model can be cheaper per token than a 70-billion one, and that inversion quietly retired every rule of thumb you built when parameter count meant cost. Mixture-of-experts splits the bill in two — compute follows only the parameters that fire on each token, memory follows all of them — which is why the same model is a bargain on somebody else's API and an expensive mistake on your own GPUs.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>One number became two.</h3>
+
+    <p>In a dense <a class="xref" href="/concepts/transformers-overview">transformer</a>, every parameter participates in every token. Feed it a token, and all 70 billion weights are multiplied against it. A mixture-of-experts model replaces the feed-forward block in each layer with a bank of parallel blocks — the <strong>experts</strong> — plus a small <strong>router</strong> that reads the token and picks a handful of them. The rest of the layer's weights sit idle for that token.</p>
+
+    <p>So a single parameter count no longer describes the model. You need a pair:</p>
+
+    <ul>
+      <li><strong>Total parameters</strong> — everything that must be resident in memory, because the router may reach for any expert on the next token.</li>
+      <li><strong>Active parameters</strong> — what actually gets multiplied per token, and therefore what the arithmetic costs.</li>
+    </ul>
+
+    <p>The published 2026 open-weight models make the spread obvious. Qwen3-235B-A22B is 235B total with roughly 22B active, routing 8 experts out of a pool of 128. Llama 4 Maverick is around 400B total against roughly 17B active, with 128 routed experts plus one shared expert that every token passes through. Mistral Large 3 is 675B total, 41B active. DeepSeek-V4's Pro configuration is about 1.6T total with 49B active, and its Flash configuration 284B against 13B. Note where they converge: the totals span a factor of seven, and the active counts all land between roughly 13B and 50B, because that band is what a serving fleet can push tokens through economically.</p>
+
+    <div class="callout">
+      <p>The naming convention encodes it when the vendor is being helpful — <code class="inline">Qwen3-235B-A22B</code> is "235 billion total, A22B = 22 billion active". When a model is described only as "a 400B model", you have been told the memory bill and nothing about the compute bill. Ask for the other number before you compare it to anything.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Why the same model is cheap to rent and expensive to own.</h3>
+
+    <p>Renting and owning charge you for different resources, and MoE separates those resources further than any other architectural choice.</p>
+
+    <ul>
+      <li><strong>On an API, you are billed against active parameters.</strong> The provider's cost per token is dominated by arithmetic, and a 235B/22B model does roughly the arithmetic of a 22B dense model. That is why open MoE models list at prices — commonly in the region of <code class="inline">$0.15–$0.30</code> per million input tokens across hosters — that look impossible next to their headline size.</li>
+      <li><strong>On your own hardware, you are billed against total parameters.</strong> Every expert must be resident, because you cannot know which one the next token needs. At bf16, 400B total is roughly 800 GB of weights — ten 80 GB accelerators before you have allocated a single byte of KV cache. Quantizing to 4 bits brings it to about 240 GB, which is still three cards to serve a model that computes like a 17B one.</li>
+      <li><strong>The idle capital is the real cost.</strong> You are paying for, powering, and cooling memory that is doing nothing on most tokens. That trade is excellent for a provider running thousands of concurrent requests across the whole expert pool, and terrible for a team running one workload on a fixed cluster — the point developed in <a class="xref" href="/operations/agentops/self-hosted-inference-for-agents">self-hosted inference for agents</a>.</li>
+    </ul>
+
+    <div class="callout">
+      <p>This is the cleanest example on this wiki of a cost that inverts with deployment shape. Almost every other <a class="xref" href="/concepts/cost-quality-latency">cost, quality and latency</a> trade-off points the same direction whether you rent or own. This one points opposite ways, and teams get it wrong in both directions: they self-host an MoE model because the API price looked cheap, or they dismiss one as "too big" while paying for its hosted version by the token.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What batch size does to the bargain.</h3>
+
+    <p>The subtlety that decides whether MoE works for <em>you</em> is that the saving changes shape with concurrency.</p>
+
+    <ul>
+      <li><strong>At batch size one, MoE is a genuine local win — if it fits.</strong> Generating a single stream is limited by memory bandwidth: the accelerator reads weights faster than it can be given work. An MoE model only reads the routed experts per token, so a 235B/22B model decodes at roughly the speed of a 22B dense model while carrying the knowledge of something much larger. The condition is unforgiving. Spill the resident weights to system RAM or SSD and the transfer cost dwarfs everything you saved.</li>
+      <li><strong>At high batch, the per-token saving erodes and the throughput saving arrives.</strong> Sixty concurrent requests route to different experts, so a serving step touches most of the pool anyway — but it amortises that read across sixty tokens instead of one. This is the regime hosted providers actually operate in, and it is why their pricing reflects active-parameter economics that a single-tenant deployment will never reproduce.</li>
+      <li><strong>Utilisation is the metric, not tokens per second.</strong> An MoE model on an under-loaded cluster is the worst of both bills: total-parameter memory, batch-one throughput. If your traffic is bursty rather than sustained, the arithmetic in <a class="xref" href="/operations/economics-roi/provisioned-throughput-and-commitments">provisioned throughput and commitments</a> applies with extra force here.</li>
+    </ul>
+
+    <div class="callout">
+      <p>One reproducibility wrinkle worth knowing before it surprises you in an eval: in implementations that cap how many tokens each expert may accept per step, the tokens that overflow get routed elsewhere or dropped — so <em>which requests share your batch</em> can change your output. Temperature 0 does not save you from this. If a result will not reproduce and you have already ruled out sampling, see <a class="xref" href="/concepts/reproducibility-and-determinism">reproducibility and determinism</a>; batch composition belongs on your list of suspects.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>What it changes for the way you pick and run models.</h3>
+
+    <p>Almost nothing about prompting or <a class="xref" href="/concepts/the-agent-loop">agent loop</a> design changes. What changes is the shape of every comparison you make.</p>
+
+    <ul>
+      <li><strong>Stop reading parameter count as capability.</strong> A 1.6T MoE model and a 1.6T dense model are not comparable objects and will never exist in the same market. Compare on task evals, price per token, and latency at your concurrency — the checklist in <a class="xref" href="/concepts/choosing-a-model">choosing a model</a> — and treat size as a deployment fact rather than a quality signal.</li>
+      <li><strong>"Open weights" and "you can run it" have drifted apart.</strong> The strongest permissively-licensed models are now MoE models whose total size exceeds any single machine you own. The licence is genuinely open; the hardware bill is the gate. This is the sharpest current version of the distinction in <a class="xref" href="/concepts/open-vs-closed-models">open vs closed models</a>.</li>
+      <li><strong>Quantization pays back more here, and hurts differently.</strong> Because memory is the binding constraint, dropping to 4-bit converts directly into cards you do not have to buy — but experts are individually small, and aggressive quantization of a rarely-routed expert degrades exactly the inputs that needed it, which an average benchmark will not show. Test on your own distribution; see <a class="xref" href="/concepts/distillation-and-quantization">distillation and quantization</a>.</li>
+      <li><strong>Sparsity does not compose with your other speedups the way you expect.</strong> <a class="xref" href="/concepts/speculative-decoding">Speculative decoding</a> still helps, because it also trades spare compute for latency — and spare compute is precisely what an MoE model has. Prompt caching and batching help as much as ever. What does not transfer is any capacity plan you wrote against dense models.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Default to renting MoE models and owning dense ones. The hosted route buys the architecture's advantage — frontier-scale quality at small-model arithmetic — without buying the memory that makes it possible, and the providers' batching is the thing you cannot replicate. Self-host an MoE model only when the total weights fit your cards with KV-cache headroom to spare <em>and</em> you can keep the fleet loaded; otherwise a dense model half the size will serve your traffic better on the same hardware. <strong>When a vendor quotes one parameter count, they have told you either the memory bill or the compute bill, and you cannot tell which — get the pair before you plan around it.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/small-and-local-models">small and local models</a> for what actually fits on your own machine, <a class="xref" href="/concepts/prefill-and-decode">prefill and decode</a> for why bandwidth rather than arithmetic sets your token rate, <a class="xref" href="/concepts/inference-providers">inference providers</a> for who is absorbing the memory bill, and <a class="xref" href="/concepts/model-routing">model routing</a> for the system-level version of the same idea — send each request to the smallest thing that can answer it.</p>
+  </div>
+</section>
