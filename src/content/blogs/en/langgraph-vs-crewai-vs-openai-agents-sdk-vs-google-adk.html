@@ -1,0 +1,158 @@
+<p class="lede">Framework comparisons argue about the metaphor — graphs versus crews versus handoffs versus agent trees — and the metaphor is the part you stop noticing by week three. What you cannot re-pick eighteen months in is the state model: where a run lives, what "resume" means after a crash, and whether a human can pause a half-finished task without you building the machinery yourself. Choose on that, and the rest of the comparison mostly resolves itself.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four frameworks that dominate production agent work in 2026, sorted by the thing that actually differs.</p>
+  <table>
+    <thead>
+      <tr><th>Framework</th><th>Core abstraction</th><th>Where the run lives</th><th>Best fit</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>LangGraph</strong></td>
+        <td>Directed graph of nodes with conditional edges</td>
+        <td>Typed graph state, checkpointed to an external store at each superstep</td>
+        <td>Long-running work that must survive a crash and pause for a human</td>
+      </tr>
+      <tr>
+        <td><strong>Google ADK</strong></td>
+        <td>Hierarchical agent tree plus Sequential / Parallel / Loop workflow agents</td>
+        <td>Session service holding shared state and events, with pluggable backends</td>
+        <td>Teams already on Google Cloud, and deterministic multi-step pipelines</td>
+      </tr>
+      <tr>
+        <td><strong>CrewAI</strong></td>
+        <td>Role-based crews, wrapped in event-driven Flows</td>
+        <td>Flow state as a dict or Pydantic model, persisted where you ask for it</td>
+        <td>Fast modelling of a team-shaped process by people who think in roles</td>
+      </tr>
+      <tr>
+        <td><strong>OpenAI Agents SDK</strong></td>
+        <td>Agents, tools, handoffs, guardrails — four primitives, thin runner</td>
+        <td>Run context in the process; sessions carry conversation history</td>
+        <td>Short-horizon agents on OpenAI models, shipped quickly</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-openai-agents-sdk-vs-google-adk/data-feature-matrix.svg" alt="Matrix of four frameworks against built-in durability, human-in-the-loop pause, model portability, multi-agent shape, and out-of-the-box tracing" width="900" height="400" loading="lazy" />
+    <figcaption>No row is best. The first column is the one you cannot add later without redrawing the other four.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Why the state model is the load-bearing choice</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-openai-agents-sdk-vs-google-adk/arch-state-models.svg" alt="Diagram of four frameworks showing where each keeps agent state: LangGraph's external checkpointer, ADK's session service, CrewAI's flow state, and the OpenAI SDK's in-process run context" width="900" height="500" loading="lazy" />
+    <figcaption>Four answers to one question: after a crash mid-run, what can you reconstruct, and from where?</figcaption>
+  </figure>
+  <p>Agents are not requests. A meaningful agent run is minutes to hours, calls tools with side effects, and will be interrupted — by a crash, a deploy, a rate limit, a human who wants to look at it before it sends the email. Every one of those events asks the same question: what is the durable representation of this run, and can the framework rebuild the loop from it?</p>
+  <p>That question is answered differently by each of these four, and the answer propagates upward through everything you write. If the framework externalises state, then resume, fork, replay and human approval are properties you inherit. If it keeps state in the process, they are yours to build, and building them means introducing a persistence boundary the control flow above was not written to cross. That is why the migration hurts: not because the prompts are hard to port, but because "where do we pick up from" has no answer in the code you already have.</p>
+  <p>This is also why the frameworks look more similar than they are on a tutorial. Every one of them will build you a tool-calling loop with a few agents in an afternoon. The divergence appears the first time something needs to survive the afternoon.</p>
+</section>
+
+<section>
+  <h2>LangGraph — durability as the primitive</h2>
+  <h3>What it actually does</h3>
+  <p>LangGraph models the agent as a directed graph: nodes are steps, edges are explicit transitions, and conditional edges encode where control goes when a step produces one outcome rather than another. State is a typed object threaded through the graph, and a checkpointer writes it to an external store at every superstep, organised by thread. Durability is configurable — persist synchronously before each step, asynchronously alongside the next one, or only on exit — which is a real trade of write amplification against how much you are willing to lose in a crash.</p>
+  <h3>What that buys you</h3>
+  <p>Three things that are otherwise projects. Resume: a run picks up from its last checkpoint rather than restarting. Time travel: invoke the graph with a specific checkpoint ID to replay from a prior state or fork an alternate branch, which is as useful for debugging as it is for product features. And <code>interrupt()</code>, a durable pause that stops mid-graph, waits for a human decision, and continues — the primitive that makes approval flows a few lines instead of a queue, a webhook and a state machine.</p>
+  <h3>The cost</h3>
+  <p>You write the graph. Explicit edges mean explicit thinking about failure paths and control flow, which is precisely what you want in production and precisely what makes the first week slower than a framework where you describe roles and let the model route. If your agent genuinely is a short conversation with three tools, that structure is overhead you are paying for nothing.</p>
+</section>
+
+<section>
+  <h2>Google ADK — the workflow agents are the point</h2>
+  <h3>What it actually does</h3>
+  <p>ADK's fundamental unit is an agent, and its distinctive move is that some agents are not model-driven at all. <code>SequentialAgent</code> runs its children in a fixed order, <code>ParallelAgent</code> runs them concurrently, and <code>LoopAgent</code> repeats until a stopping condition or a maximum iteration count. These compose into a hierarchical tree, and the whole tree shares one session state — including a <code>temp:</code> namespace scoped to a single turn — carried by a session service whose storage backend you choose.</p>
+  <h3>What that buys you</h3>
+  <p>Determinism where you want it and model judgement where you need it, in the same tree, without writing an orchestrator. A pipeline of "fetch, then analyse three ways in parallel, then synthesise, then loop until the critic is satisfied" is four built-in constructs, and the parts that must happen in order actually happen in order rather than being requested politely in a prompt. Java support alongside Python is unusual in this space and matters more than it sounds if your platform team is a JVM shop.</p>
+  <h3>The cost</h3>
+  <p>Shared session state across a <code>ParallelAgent</code> is exactly the concurrency hazard it looks like — sub-agents run in separate threads over one state object, so each has to write to a distinct key or they clobber each other. That is a documented, avoidable footgun, and it is a footgun. The gravity toward Gemini and Vertex is real: everything works better inside Google Cloud, which is a feature if you are there and a tax if you are not.</p>
+</section>
+
+<section>
+  <h2>CrewAI — role modelling, with the real engine one layer down</h2>
+  <h3>What it actually does</h3>
+  <p>A Crew is a set of role-defined agents collaborating on a shared goal — the abstraction that made CrewAI popular, because "researcher, writer, editor" is a description a product manager can write. What the popularity obscures is that Crews deliberately do not give you sequential control, and the answer to that is Flows: a Python class wrapping crews and direct LLM calls in an event-driven engine, with methods decorated <code>@start</code>, <code>@listen</code> and <code>@router</code>. State is a dict or, better, a Pydantic model, and <code>@persist()</code> saves it so a run can resume.</p>
+  <h3>What that buys you</h3>
+  <p>The fastest path from "here is our process, described as people" to something running. For workflows that genuinely are a team of specialists producing a document, the metaphor is not a toy — it maps, and the code reads like the process. Flows then give you back the determinism the crew metaphor gave away, which is why the honest recommendation is Flows-with-Crews-inside rather than Crews alone.</p>
+  <h3>The cost</h3>
+  <p>Persistence is opt-in and placement-sensitive; the community guidance is to persist at a terminal step rather than decorating the whole class, which tells you this is a layer you are managing rather than a runtime guarantee you inherit. There is no equivalent of a durable interrupt, so human-in-the-loop is something you construct. And the role metaphor invites more agents than a task needs — a crew of five where a graph would have had two nodes is a cost paid every run, in tokens and in the failure modes that <a href="/deep-dives/multi-agent-systems/multi-agent-failure-modes">multi-agent systems</a> catalogue.</p>
+</section>
+
+<section>
+  <h2>OpenAI Agents SDK — the thinnest thing that works</h2>
+  <h3>What it actually does</h3>
+  <p>Four primitives and almost no ceremony: agents with instructions and tools, handoffs that transfer control between agents, guardrails that check inputs and outputs, and a runner that drives the tool loop, switches agents on a handoff, and stops when the run finishes or pauses for approval. Sessions carry conversation history; tracing is built in and collects LLM generations, tool calls, handoffs and guardrail events, uploaded to the OpenAI platform by default. A TypeScript SDK mirrors the same primitives.</p>
+  <h3>What that buys you</h3>
+  <p>Speed, and a debugging story you did not have to instrument. The tracing in particular is the best out-of-the-box observability of the four — for a small team, "I can replay exactly what happened" on day one is worth more than most architectural elegance. Handoffs are the right abstraction for triage-and-delegate shapes, which is a large fraction of real support and routing agents.</p>
+  <h3>The cost</h3>
+  <p>Run context is in the process, so durability across a crash is your problem, and handoffs get awkward when the pattern is genuine parallel collaboration rather than delegation. The SDK is designed around OpenAI's own API surface; other providers are reachable but off the golden path, so this is the framework where <a href="/concepts/model-routing">model portability</a> costs you the most, and the one whose default tracing destination is a decision your security review will have an opinion about.</p>
+</section>
+
+<section>
+  <h2>What actually transfers, and what does not</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-openai-agents-sdk-vs-google-adk/compare-switching-cost.svg" alt="Three-column diagram: prompts and tool definitions port in hours, orchestration shape ports in weeks, the state and persistence contract does not port" width="900" height="300" loading="lazy" />
+    <figcaption>Teams evaluate on the first two columns because that is what a tutorial shows. The migration that hurts is always the third.</figcaption>
+  </figure>
+  <p>Prompts and tool definitions are close to free to move. A function schema is a function schema, and if your tools are behind <a href="/concepts/what-is-mcp">MCP</a> servers they are not framework-coupled at all — which is the strongest argument for putting them there regardless of what you pick. Evals move too, provided they were written against outcomes rather than against the framework's internals.</p>
+  <p>Orchestration shape is a rewrite, but a mechanical one. Converting a crew to a graph or a graph to an agent tree is tedious and predictable; you know what it costs before you start.</p>
+  <p>The state contract does not move. If you built on in-process context and now need to resume a four-hour run after a deploy, there is no incremental path — the control flow above the persistence boundary was written assuming the boundary was not there. This is the same lesson <a href="/operations/agentops/durable-state-and-resumability">durable state and resumability</a> reaches from the operations side, and it is why the pairing of an orchestration framework with a durable execution engine keeps recurring in production architectures.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Runs last minutes to hours and must survive a deploy</td><td>LangGraph</td><td>Checkpointed state and resume are the primitive, not an add-on</td></tr>
+      <tr><td>A human must approve a step mid-run</td><td>LangGraph</td><td><code>interrupt()</code> is a durable pause; elsewhere you build a queue</td></tr>
+      <tr><td>Already on Vertex AI, or you need Java</td><td>Google ADK</td><td>Deployment and identity are solved; Java is a genuine differentiator</td></tr>
+      <tr><td>The pipeline has deterministic stages with a model in the middle</td><td>Google ADK</td><td>Sequential / Parallel / Loop agents encode order without an orchestrator</td></tr>
+      <tr><td>The process is genuinely a team of specialists</td><td>CrewAI (Flows)</td><td>The metaphor maps, and Flows restore the control the crew gave up</td></tr>
+      <tr><td>Triage-and-delegate on OpenAI models, shipping this month</td><td>OpenAI Agents SDK</td><td>Four primitives, and tracing you did not have to build</td></tr>
+      <tr><td>Multi-provider by policy or by cost</td><td>LangGraph or CrewAI</td><td>Both are model-agnostic by design; the other two have gravity</td></tr>
+      <tr><td>You cannot tell yet</td><td>Start thinner</td><td>Put tools behind MCP, keep evals framework-free, and decide when the run length tells you</td></tr>
+    </tbody>
+  </table>
+  <p>One caveat worth stating plainly: none of these choices is as consequential as the shape of the problem. A well-scoped agent with three good tools works on all four. A badly scoped one fails on all four, and the framework will get the blame.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Which agent framework is best in 2026?</h3>
+  <p>There is no best, but there is a best question: how long does a run last, and what happens when it is interrupted? If the answer involves minutes, crashes or human approval, pick a framework where state is externalised by default — LangGraph most clearly, ADK's session service next. If runs are short and self-contained, the thinner frameworks cost less and ship faster.</p>
+  <h3>Can I mix them?</h3>
+  <p>Partly, and along one seam in particular. Tools behind MCP servers are framework-neutral, so they compose with anything. Evals written against outcomes are portable too. Orchestration does not mix — running two frameworks' loops inside one process gives you two state models and no clear owner of the run.</p>
+  <h3>Is CrewAI only for multi-agent work?</h3>
+  <p>No, and treating it that way is the common mistake. Flows wrap direct LLM calls as happily as they wrap crews, and a Flow with one crew and several plain steps is often the right shape. The role metaphor invites more agents than most tasks need; resist it and CrewAI is a reasonable single-agent framework.</p>
+  <h3>Does the OpenAI Agents SDK lock me into OpenAI?</h3>
+  <p>Not contractually, but practically it is designed around OpenAI's API surface, and the default tracing destination is OpenAI's platform. Other providers are reachable. If multi-provider routing is a requirement rather than a preference, the model-agnostic frameworks start ahead.</p>
+  <h3>What about durable execution engines?</h3>
+  <p>They are complementary rather than competing, and the pairing is common: the agent framework owns the reasoning loop while a workflow engine owns retries, timers and exactly-once side effects. That combination is worth reaching for when your agent's side effects are expensive or irreversible.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/agent-frameworks">Agent frameworks</a> — the ground floor, and what a framework is actually for.</li>
+    <li><a href="/operations/agentops/durable-state-and-resumability">Durable state and resumability</a> — the operations view of the argument this post makes.</li>
+    <li><a href="/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal">Durable execution: LangGraph plus Temporal</a> — the pairing when one framework is not enough.</li>
+    <li><a href="/deep-dives/architectures-and-patterns/single-vs-multi-agent">Single vs multi-agent</a> — before you let a role metaphor add four agents.</li>
+    <li><a href="/deep-dives/multi-agent-systems/multi-agent-topologies">Multi-agent topologies</a> — graphs, trees, crews and handoffs as shapes rather than brands.</li>
+    <li><a href="/concepts/human-in-the-loop">Human in the loop</a> — what a durable pause has to guarantee.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://docs.langchain.com/oss/python/langgraph/durable-execution">LangGraph — durable execution</a></li>
+    <li><a href="https://google.github.io/adk-docs/">Google Agent Development Kit documentation</a></li>
+    <li><a href="https://docs.crewai.com/en/guides/flows/mastering-flow-state">CrewAI — mastering flow state</a></li>
+    <li><a href="https://openai.github.io/openai-agents-python/">OpenAI Agents SDK documentation</a></li>
+  </ul>
+</section>

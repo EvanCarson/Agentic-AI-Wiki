@@ -1,0 +1,112 @@
+<section class="phase">
+  <div class="phase-num">V9</div>
+  <div class="week">Playbook · Voice &amp; Realtime Agents</div>
+  <h2>Telephony and the PSTN: your voice agent's hardest dependency is a network you cannot optimise.</h2>
+  <p class="goal">You can shave two hundred milliseconds off time-to-first-token and still ship a phone agent that sounds worse than the one you demoed, because roughly half the turn latency, all of the audio quality and the entire question of whether the call connects at all live in a carrier path you do not control and cannot profile. Integrating with the phone network means accepting a fixed transport tax, treating your outbound number as a reputation asset that degrades under volume, and designing around the fact that a phone call carries no metadata channel — no auth header, no idempotency key, no structured result.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The transport tax is fixed, and it is charged before your model sees anything.</h3>
+
+    <p>A voice agent on the web talks to a browser over WebRTC with a path you own end to end. A voice agent on a phone number talks through a chain — the caller's handset, their mobile or landline carrier, one or more interconnect carriers, your SIP trunk provider, your media server — and every hop adds delay you cannot tune. The <a class="xref" href="/playbooks/voice-realtime-agents/latency-budget">latency budget</a> has line items here that no amount of model work touches.</p>
+
+    <ul>
+      <li><strong>Post-dial delay on outbound.</strong> Between your SIP INVITE and the far end ringing there is signalling across carriers, and it commonly runs one to several seconds. This is invisible in your traces because nothing of yours is running, and it is the first thing a user perceives as "the agent is slow to start".</li>
+      <li><strong>The jitter buffer is latency you are choosing to add.</strong> Packet arrival over the PSTN is uneven, so the media server buffers before playing out. A short buffer means clipped and garbled audio; a long one means every turn is slower. Somewhere between 40&nbsp;ms and 120&nbsp;ms is the usual operating range, and it is a genuine quality-versus-speed dial, not a bug to be fixed.</li>
+      <li><strong>Codec transcoding costs a pass.</strong> Interconnects still negotiate G.711 constantly. If your stack prefers Opus you are paying a transcode on both legs, and if a leg runs G.729 you have added compression artefacts on top of narrowband.</li>
+      <li><strong>8&nbsp;kHz is the ceiling, not the floor.</strong> Telephony audio is band-limited to roughly 300–3400&nbsp;Hz. That is where sibilants blur and letters of the alphabet stop being acoustically distinct — the reason <a class="xref" href="/playbooks/voice-realtime-agents/speech-stack">every recognition benchmark you read is optimistic</a> for your channel. HD voice over Opus or AMR-WB exists but only survives when both legs and every carrier in between support it, which you cannot assume and should not design for.</li>
+    </ul>
+
+    <p>The practical consequence is a budgeting discipline: measure the transport separately from the model, and measure it in production rather than in the lab. Instrument time from SIP answer to first inbound RTP packet, and time from your first outbound audio frame to the far end hearing it, and hold those as a floor. Optimising the model below that floor buys nothing a caller can perceive.</p>
+
+    <div class="callout">
+      <p>A test that costs an afternoon and changes the roadmap: run your existing eval set once over a real phone leg and once over WebRTC, and compare entity error rate and p95 time to first audio. Teams routinely find that most of their gap to the demo was the channel, and that the fix list they had written — a faster model, a shorter prompt — addressed none of it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Your number is an identity with a reputation, and the reputation is the product.</h3>
+
+    <p>This is the part that surprises engineering teams, because it has no analogue anywhere else in the stack: a phone number accumulates a trust score across carriers and analytics vendors, that score determines whether your calls are delivered, silently labelled "Spam Likely", or blocked outright, and it moves in response to how the called parties behave, not to anything in your code.</p>
+
+    <ul>
+      <li><strong>STIR/SHAKEN attestation is a claim your carrier makes about you.</strong> A-level means the originating carrier both authenticated you and confirmed you have the right to use that number; B-level means it knows the customer but not the number's provenance; C-level means it is just passing the call along. Attestation is the input to downstream filtering, so it is the difference between "connects" and "goes to a labelled screen nobody answers". Getting to A is paperwork and provisioning with your trunk provider, not engineering — do it before launch, not after the connect rate collapses.</li>
+      <li><strong>Rotating numbers to escape a bad label is the classic mistake.</strong> It looks like it works for a week. Analytics vendors detect the rotation pattern itself and it is a stronger negative signal than the original complaints, so the second label arrives faster than the first. Fix the calling behaviour instead: fewer calls, better targeting, an opt-out that actually works.</li>
+      <li><strong>Branded calling is worth more than another 50&nbsp;ms.</strong> Registering your number so the handset displays your business name lifts answer rates far beyond anything you can achieve inside the agent, and it is a per-carrier registration process with a lead time.</li>
+      <li><strong>Reputation is a shared resource across your tenants.</strong> If you serve multiple customers from a pooled number range, one customer's aggressive campaign degrades delivery for everyone else on the pool. Either isolate numbers per tenant or make calling-behaviour limits a contractual term, because <a class="xref" href="/operations/agentops/multi-tenancy-for-agents">the noisy-neighbour problem here is external and irreversible</a>.</li>
+    </ul>
+
+    <p>The metric to own is <strong>answer-seizure ratio segmented by carrier and number</strong>. Aggregate connect rate hides that one mobile carrier started filtering you on Tuesday, which is exactly the event you need to catch within hours rather than at the end of the month.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>There is no metadata channel. The other side's IVR is your API.</h3>
+
+    <p>Every integration pattern you rely on elsewhere assumes a side channel: a header for auth, a key for idempotency, a structured body for the result. A phone call has none of them. The entire interface is audio, and the only structured signalling available is a sixteen-symbol keypad.</p>
+
+    <ul>
+      <li><strong>Send DTMF out of band and expect to be misheard anyway.</strong> RFC&nbsp;4733 telephone-events are the reliable path; in-band tones survive G.711 and are mangled by compressed codecs. Also expect the reverse problem — your speech synthesis can produce artefacts that a far-end IVR scores as a keypress.</li>
+      <li><strong>Navigating someone else's phone tree is a retrieval problem, not a reasoning problem.</strong> The menu is stable for months and re-listening to it every call costs thirty seconds of dead time. Cache the tree per destination number, replay the known path, and fall back to listening only when the cached path fails. Treat the cached tree as data with a staleness policy, because the callee changes it without telling you.</li>
+      <li><strong>The outcome arrives as a sentence, so extraction is where correctness is decided.</strong> "Yeah we've got a couple left, I think" has to become a typed result. Do that with a <a class="xref" href="/concepts/structured-outputs">structured extraction step</a> over the transcript rather than letting the conversational model assert an outcome inline, and carry a confidence field that downstream code is required to handle.</li>
+      <li><strong>Nothing is idempotent.</strong> If your call drops after the far end agreed to something, you have no request ID to retry against and no way to ask whether the effect happened. The <a class="xref" href="/operations/agentops/idempotency-and-retries">exactly-once machinery you would normally reach for</a> has nothing to grip. The only real mitigations are asking a confirming question before the mutating step, and recording a durable local intent record before you place the call so a human can reconcile.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Worth stating plainly because it shapes the whole design: a phone call is a best-effort, unauthenticated, unacknowledged, non-repeatable channel. Any workflow that needs a guarantee has to obtain it somewhere else — an emailed confirmation, a booking system, a human check. Do not put the phone call on the critical path of anything you cannot reconcile afterwards.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Transfers are where the state dies.</h3>
+
+    <p>Escalation is the one feature every phone agent ships and the one most likely to be implemented as a shrug. The telephony primitives make it easy to move the call and offer nothing at all for moving the context.</p>
+
+    <ul>
+      <li><strong>Blind transfer (SIP REFER) hands off the leg and drops you out.</strong> Cheap, and it means the caller repeats everything. If the destination is busy or rejects, you are no longer in the call to recover — the caller just gets a failure.</li>
+      <li><strong>Attended transfer keeps you bridged until the human accepts.</strong> More expensive in trunk minutes and more code, but it lets you announce the caller, hand over a summary by voice, and abort back if nobody picks up. For anything where the caller has already invested five minutes, this is the one to build.</li>
+      <li><strong>Move the context out of band, before the audio moves.</strong> Write the conversation summary, the captured entities and the reason for escalation into the CRM or ticket keyed by call ID, then transfer. A human agent who sees the record as their phone rings is the entire difference between a good handoff and a restart, and it is the piece that <a class="xref" href="/playbooks/agent-ux-and-human-interaction/interruption-and-handoff">handoff design</a> keeps insisting on because it keeps getting skipped.</li>
+      <li><strong>Decide what happens to recording and disclosure across the boundary.</strong> A transfer can move the call into a different jurisdiction's consent regime or out of the scope of the disclosure you made at the top. Answer it once, in policy, rather than per-integration.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The legal layer is architecture, not paperwork you attach later.</h3>
+
+    <p>Phone calls are the most regulated channel an agent can touch, and the rules are old, enforced, and expensive. In the United States the FCC's February 2024 declaratory ruling settled the foundational question: an AI-generated voice is an "artificial or prerecorded voice" under the TCPA, so every consent rule written for robocalls applies to your agent in full.</p>
+
+    <ul>
+      <li><strong>Consent depends on the purpose of the call, and marketing is the strict tier.</strong> The FCC's rule requires prior express <em>written</em> consent for marketing calls using an artificial voice, and prior express consent — which can be oral — for informational ones. In February 2026 the Fifth Circuit held in <em>Bradford v. Sovereign Pest Control</em> that the statute's text requires only prior express consent for artificial-voice calls, which softens the position in Texas, Louisiana and Mississippi and changes nothing in the other forty-seven states. Build to the written-consent standard; a circuit split is not a design input.</li>
+      <li><strong>Statutory damages are per call and uncapped.</strong> $500 to $1,500 per violating call, multiplied by an agent that can dial continuously, is the reason the pacing and suppression logic belongs in the same fail-closed tier as your <a class="xref" href="/operations/agentops/kill-switches">kill switch</a> rather than in the prompt.</li>
+      <li><strong>Disclose identity and automation at the top of the call, every time.</strong> The FCC's rulemaking to define an AI-generated call and mandate specific disclosure language was still a proposal as of August 2026, so treat immediate disclosure as the safe default rather than waiting for the text. In the EU, the AI Act's transparency obligations already require that a person be told they are interacting with an AI system, and those provisions have been enforceable since 2 August 2026 — the same disclosure discipline covered in <a class="xref" href="/operations/governance-compliance/disclosure-and-content-provenance">disclosure and provenance</a>.</li>
+      <li><strong>Recording consent is a separate, state-by-state question.</strong> Two-party consent jurisdictions require the announcement before any recording begins, which means before your speech-to-text pipeline starts, which means it is a property of the media path and not of the prompt.</li>
+      <li><strong>Opt-out has to be honoured in the record, not just in the conversation.</strong> "Press 0 to opt out" that does not write to a durable suppression list shared by every campaign is a violation with a transcript attached. Wire the spoken opt-out and the do-not-call list to the same store, and make the suppression check a precondition on dialling.</li>
+    </ul>
+
+    <p>None of this is optional infrastructure, and none of it can live in a system prompt — a model that can be talked out of a disclosure is not a compliance control. Encode consent state, suppression and disclosure as code paths the agent cannot bypass, exactly as <a class="xref" href="/playbooks/voice-realtime-agents/outbound-voice-agents">outbound voice agents</a> lays out.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Operate it like a network service, because that is what it is.</h3>
+
+    <p>Once the agent works, the failures that follow are telecom failures, and they will not appear in the dashboards you built for the model. Your provider changes an interconnect, a carrier updates its filtering, a codec negotiation shifts, and the symptom is a quality metric drifting with no deploy attached to it.</p>
+
+    <ul>
+      <li><strong>Monitor the media path directly.</strong> Jitter, packet loss and round-trip time per call, aggregated by carrier and by trunk. A rise in loss on one route is the root cause behind a week of "the agent keeps mishearing people" tickets, and no transcript-level metric will name it.</li>
+      <li><strong>Watch answer-seizure ratio and post-dial delay as leading indicators.</strong> Both move before your business metrics do, and both move for reasons entirely outside your deploy history.</li>
+      <li><strong>Keep a second trunk provider provisioned and tested.</strong> Trunk outages happen, failover configured but never exercised does not work, and the test is a scheduled synthetic call over the standby route — not a document.</li>
+      <li><strong>Record everything you are permitted to record, and keep the audio.</strong> The audio is the only ground truth; a transcript is already a lossy interpretation of it, and <a class="xref" href="/playbooks/voice-realtime-agents/evaluating-voice-agents">the eval set you actually need is recorded calls</a>. Pair retention with a deletion policy, because call recordings are personal data in every regime that matters.</li>
+      <li><strong>Alert on dead air and on call duration outliers.</strong> A call that ran eleven minutes when the median is ninety seconds is a stuck loop billing you by the minute on both legs — one of the few places where an agent failure has a direct, linear, external cost.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you do only one thing this week: pull your answer-seizure ratio and p95 post-dial delay segmented by carrier, then check your STIR/SHAKEN attestation level with your trunk provider. If you are not at A-level attestation, that single fix will move your connect rate more than any change you could make to the agent — and it takes a support ticket, not a sprint. <strong>The phone network is a dependency you integrate with and negotiate with, never one you optimise.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/playbooks/voice-realtime-agents/realtime-architecture">realtime agent architecture</a> for where the loop lives relative to the media path, <a class="xref" href="/playbooks/voice-realtime-agents/voice-failure-modes">voice agent failure modes</a> for the catalogue this monitoring is trying to detect, and <a class="xref" href="/concepts/voice-and-realtime-agents">voice and realtime agents</a> for the ground floor.</p>
+  </div>
+</section>

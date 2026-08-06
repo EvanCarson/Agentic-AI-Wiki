@@ -1,0 +1,158 @@
+<p class="lede">框架对比总在争论比喻——图 vs 团队 vs 交接 vs 智能体树——而比喻恰恰是你到第三周就不再注意的那部分。十八个月后你无法重选的，是状态模型：一次运行住在哪里、崩溃之后"恢复"意味着什么，以及一个人能不能在不需要你自己造一整套机制的前提下，把一个做了一半的任务暂停下来。照着这一点选，对比里的其余部分大多会自行解决。</p>
+
+<section>
+  <h2>速览</h2>
+  <p>2026 年主导生产级智能体工作的四个框架，按真正有差别的那件事排列。</p>
+  <table>
+    <thead>
+      <tr><th>框架</th><th>核心抽象</th><th>运行住在哪里</th><th>最佳适配</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>LangGraph</strong></td>
+        <td>带条件边的有向节点图</td>
+        <td>带类型的图状态，每个 superstep 检查点写入外部存储</td>
+        <td>必须扛过崩溃、并能为人停下来的长时运行</td>
+      </tr>
+      <tr>
+        <td><strong>Google ADK</strong></td>
+        <td>分层智能体树，外加 Sequential / Parallel / Loop 工作流智能体</td>
+        <td>持有共享状态与事件的 session service，存储后端可插拔</td>
+        <td>已经在 Google Cloud 上的团队，以及确定性的多步流水线</td>
+      </tr>
+      <tr>
+        <td><strong>CrewAI</strong></td>
+        <td>基于角色的 crew，外包一层事件驱动的 Flow</td>
+        <td>Flow 状态为 dict 或 Pydantic 模型，按你的指定持久化</td>
+        <td>让习惯以角色思考的人快速建模一个团队形状的流程</td>
+      </tr>
+      <tr>
+        <td><strong>OpenAI Agents SDK</strong></td>
+        <td>agent、tool、handoff、guardrail——四个原语，一层薄 runner</td>
+        <td>run context 在进程内；session 承载对话历史</td>
+        <td>跑在 OpenAI 模型上的短周期智能体，追求快速交付</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-openai-agents-sdk-vs-google-adk/data-feature-matrix.svg" alt="四个框架在内建持久性、人在环暂停、模型可移植性、多智能体形态与开箱即用追踪五个维度上的矩阵" width="900" height="400" loading="lazy" />
+    <figcaption>没有哪一行是最好的。第一列是那个你之后无法在不重画其余四列的前提下补上的。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>为什么状态模型才是那个承重的选择</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-openai-agents-sdk-vs-google-adk/arch-state-models.svg" alt="四个框架各自把智能体状态放在哪里的示意图：LangGraph 的外部检查点、ADK 的 session service、CrewAI 的 flow 状态，以及 OpenAI SDK 的进程内 run context" width="900" height="500" loading="lazy" />
+    <figcaption>对同一个问题的四种回答：运行中途崩溃之后，你能重建出什么，又是从哪里重建？</figcaption>
+  </figure>
+  <p>智能体不是请求。一次有意义的智能体运行持续几分钟到几小时，会调用带副作用的工具，并且一定会被打断——被崩溃、被发布、被限流，或者被一个想在邮件发出去之前先看一眼的人。而这每一种事件问的都是同一个问题：这次运行的持久表示是什么，框架能不能据此把循环重建出来？</p>
+  <p>这四者对这个问题的回答各不相同，而答案会沿着你写的每一行代码向上传播。如果框架默认把状态外置，那么恢复、分叉、重放与人工审批就是你继承来的性质；如果它把状态留在进程里，这些就得你自己造，而造它们意味着引入一条上层控制流从未被设计去跨越的持久化边界。这就是迁移之所以痛的原因：不是因为提示词难移植，而是因为"我们从哪儿接着往下走"这个问题，在你已有的代码里根本没有答案。</p>
+  <p>这也是为什么这些框架在教程里看起来比实际更像。它们每一个都能在一个下午里给你搭出一个带几个 agent 的工具调用循环。分歧出现在第一次"某样东西需要活过这个下午"的时候。</p>
+</section>
+
+<section>
+  <h2>LangGraph——把持久性当作原语</h2>
+  <h3>它究竟做了什么</h3>
+  <p>LangGraph 把智能体建模成一张有向图：节点是步骤、边是显式的跳转，条件边则编码了"当某一步产出这个结果而非那个结果时，控制权去哪里"。状态是一个带类型的对象，被穿过整张图，而一个 checkpointer 会在每个 superstep 把它写入外部存储，按 thread 组织。持久性档位是可配置的——每步之前同步落盘、与下一步并行地异步落盘，或只在退出时落盘——这是一次货真价实的取舍：写放大 vs 你愿意在崩溃时丢掉多少。</p>
+  <h3>它换来什么</h3>
+  <p>三样否则就是独立项目的东西。恢复：一次运行从上一个检查点接着跑，而不是重来。时间旅行：用一个特定的 checkpoint ID 调用这张图，即可从先前状态重放或分叉出另一条分支——它对调试的价值不亚于对产品功能的价值。以及 <code>interrupt()</code>：一个持久的暂停，能在图的中途停下、等待一个人的决定、然后继续——正是这个原语让审批流程从"一个队列 + 一个 webhook + 一个状态机"变成几行代码。</p>
+  <h3>它的代价</h3>
+  <p>图得你自己写。显式的边意味着要显式地思考失败路径与控制流，而这恰恰是生产环境里你想要的，也恰恰使得第一周比那种"描述角色、让模型去路由"的框架更慢。如果你的智能体确实只是一段带三个工具的短对话，那这套结构就是你白白付出的开销。</p>
+</section>
+
+<section>
+  <h2>Google ADK——工作流智能体才是重点</h2>
+  <h3>它究竟做了什么</h3>
+  <p>ADK 的基本单元是 agent，而它最与众不同的一手是：有些 agent 根本不由模型驱动。<code>SequentialAgent</code> 按固定顺序运行子节点，<code>ParallelAgent</code> 并发运行它们，<code>LoopAgent</code> 则不断重复直到满足停止条件或达到最大迭代次数。它们组合成一棵分层的树，而整棵树共享同一份 session state——包括一个作用域限于单轮的 <code>temp:</code> 命名空间——由一个 session service 承载，其存储后端由你选择。</p>
+  <h3>它换来什么</h3>
+  <p>在同一棵树里，既有你想要的确定性，也有你需要的模型判断，而且不用自己写编排器。"先取数，再并行做三种分析，再综合，然后循环直到评审满意"这样一条流水线，就是四个内建构件；那些必须按顺序发生的部分是真的按顺序发生，而不是在提示词里被礼貌地请求。除 Python 外还支持 Java，在这个领域里不常见；如果你的平台团队是 JVM 阵营，这一点比听上去重要得多。</p>
+  <h3>它的代价</h3>
+  <p><code>ParallelAgent</code> 下的共享 session state，正是它看上去的那种并发隐患——子 agent 在各自线程里跑，却操作同一个状态对象，因此每个都必须写到不同的键，否则互相覆盖。这是一个有文档、可规避的坑，但它确实是个坑。向 Gemini 与 Vertex 倾斜的引力是真实的：一切在 Google Cloud 内部都更顺，如果你在那儿这是特性，不在那儿就是税。</p>
+</section>
+
+<section>
+  <h2>CrewAI——角色建模，而真正的引擎在下面一层</h2>
+  <h3>它究竟做了什么</h3>
+  <p>一个 Crew 是一组按角色定义、围绕共同目标协作的 agent——正是这个抽象让 CrewAI 流行起来，因为"研究员、撰稿人、编辑"是一句产品经理写得出来的描述。而流行掩盖了一件事：Crew 刻意不给你顺序控制权，对此的答案是 Flow——一个把 crew 与直接 LLM 调用包进事件驱动引擎的 Python 类，方法上装饰着 <code>@start</code>、<code>@listen</code> 与 <code>@router</code>。状态是一个 dict，或者更好，一个 Pydantic 模型，而 <code>@persist()</code> 会把它保存下来，使运行可以恢复。</p>
+  <h3>它换来什么</h3>
+  <p>从"这是我们的流程，用人来描述"到"有东西在跑"的最短路径。对于那些确实就是一队专家在合作产出一份文档的工作流，这个比喻不是玩具——它对得上，而代码读起来就像那个流程。Flow 随后把 crew 让出去的确定性还给你，这也是为什么诚实的建议是"Flow 里面套 Crew"，而不是只用 Crew。</p>
+  <h3>它的代价</h3>
+  <p>持久化是选择性开启的，而且对位置敏感；社区的指导是在终止步骤上持久化，而不是给整个类加装饰器——这告诉你，这是一层你在管理的东西，不是一份你继承来的运行时保证。它没有持久 interrupt 的等价物，所以人在环是你自己搭出来的。另外，角色比喻会诱使你用上超过任务所需的 agent 数量——一个五人 crew 换成图只需两个节点，那份差额每一次运行都在付，既付 token，也付<a href="/zh/deep-dives/multi-agent-systems/multi-agent-failure-modes">多智能体系统</a>所列举的那些失败模式。</p>
+</section>
+
+<section>
+  <h2>OpenAI Agents SDK——能跑起来的最薄的那个</h2>
+  <h3>它究竟做了什么</h3>
+  <p>四个原语，几乎没有仪式感：带指令与工具的 agent、在 agent 之间转移控制权的 handoff、检查输入输出的 guardrail，以及一个 runner——它驱动工具循环、在 handoff 时切换 agent，并在运行结束或暂停等待审批时停下。session 承载对话历史；追踪是内建的，会收集 LLM 生成、工具调用、handoff 与 guardrail 事件，默认上传到 OpenAI 平台。一个 TypeScript SDK 镜像了同一套原语。</p>
+  <h3>它换来什么</h3>
+  <p>速度，以及一份你不必自己埋点的调试能力。尤其是追踪，是这四者里开箱即用的可观测性最好的一个——对小团队来说，第一天就能"把发生过的事精确重放一遍"，比大多数架构上的优雅更值钱。而 handoff 对于"分诊后委派"这类形态是恰当的抽象，而它覆盖了相当大一部分真实的客服与路由智能体。</p>
+  <h3>它的代价</h3>
+  <p>run context 在进程内，所以跨崩溃的持久性是你的问题；而当模式是真正的并行协作而非委派时，handoff 会变得别扭。这个 SDK 是围绕 OpenAI 自家 API 面设计的，其他厂商够得着但不在主干道上，因此这是四者中<a href="/zh/concepts/model-routing">模型可移植性</a>代价最高的那个，也是那个"默认追踪目的地"会让你的安全评审有话要说的那个。</p>
+</section>
+
+<section>
+  <h2>什么真能带走，什么带不走</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-crewai-vs-openai-agents-sdk-vs-google-adk/compare-switching-cost.svg" alt="三列示意图：提示词与工具定义以小时计迁移，编排形态以周计迁移，状态与持久化契约无法迁移" width="900" height="300" loading="lazy" />
+    <figcaption>团队之所以按前两列做评估，是因为教程展示的就是这两列。而真正痛的那次迁移永远是第三列。</figcaption>
+  </figure>
+  <p>提示词与工具定义几乎可以免费搬走。一个函数 schema 就是一个函数 schema；而如果你的工具在 <a href="/zh/concepts/what-is-mcp">MCP</a> 服务器后面，它们根本不与框架耦合——这就是"无论你选什么都该把工具放那儿"的最强理由。评测同样能搬，前提是它们当初是对着结果写的，而不是对着框架内部写的。</p>
+  <p>编排形态是一次重写，但是一次机械的重写。把一个 crew 改成一张图，或把一张图改成一棵 agent 树，枯燥且可预测；动手之前你就知道它值多少。</p>
+  <p>状态契约搬不走。如果你建在进程内 context 上，现在却需要在一次发布之后恢复一段四小时的运行，那不存在渐进路径——持久化边界之上的控制流，当初就是假设那条边界不存在而写的。这与<a href="/zh/operations/agentops/durable-state-and-resumability">持久状态与可恢复性</a>从运维一侧得出的是同一个结论，也是为什么"编排框架 + 持久执行引擎"这一组合在生产架构里反复出现。</p>
+</section>
+
+<section>
+  <h2>什么时候选哪个</h2>
+  <table>
+    <thead>
+      <tr><th>处境</th><th>选</th><th>因为</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>运行持续几分钟到几小时，且必须扛过一次发布</td><td>LangGraph</td><td>检查点状态与恢复是原语，不是加装件</td></tr>
+      <tr><td>需要人在运行中途审批某一步</td><td>LangGraph</td><td><code>interrupt()</code> 是一个持久暂停；别处你得自己造队列</td></tr>
+      <tr><td>已经在 Vertex AI 上，或者需要 Java</td><td>Google ADK</td><td>部署与身份已被解决；Java 是一个货真价实的差异点</td></tr>
+      <tr><td>流水线有确定性的阶段，中间夹着一个模型</td><td>Google ADK</td><td>Sequential / Parallel / Loop 智能体把顺序编码进来，无需编排器</td></tr>
+      <tr><td>流程确实就是一队各有专长的人</td><td>CrewAI（用 Flow）</td><td>比喻对得上，而 Flow 把 crew 让出去的控制权还了回来</td></tr>
+      <tr><td>在 OpenAI 模型上做分诊委派，这个月就要上</td><td>OpenAI Agents SDK</td><td>四个原语，外加一份你不用自己造的追踪</td></tr>
+      <tr><td>出于政策或成本必须多厂商</td><td>LangGraph 或 CrewAI</td><td>两者在设计上都是模型无关的；另外两个有引力</td></tr>
+      <tr><td>你还判断不出来</td><td>先做得更薄</td><td>把工具放到 MCP 后面、让评测与框架无关，等运行时长告诉你答案时再决定</td></tr>
+    </tbody>
+  </table>
+  <p>有一句需要直说的告诫：这些选择没有一个比问题本身的形状更要紧。一个划分得当、配三个好工具的智能体，在这四个上都能跑；一个划分糟糕的，在这四个上都会失败——而背锅的会是框架。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>2026 年哪个智能体框架最好？</h3>
+  <p>没有最好，但有一个最好的问题：一次运行持续多久，被打断时会发生什么？如果答案里出现了"几分钟"、"崩溃"或"人工审批"，就选一个默认把状态外置的框架——最明确的是 LangGraph，其次是 ADK 的 session service。如果运行短小自足，那么更薄的框架成本更低、交付更快。</p>
+  <h3>能混用吗？</h3>
+  <p>部分可以，而且主要沿着一条缝。放在 MCP 服务器后面的工具是框架中立的，因此和什么都能组合；对着结果写的评测同样可移植。编排则混不了——在同一个进程里跑两个框架的循环，你会得到两套状态模型，以及一次没有明确归属的运行。</p>
+  <h3>CrewAI 只适合多智能体吗？</h3>
+  <p>不是，而把它当成只适合多智能体正是常见的误解。Flow 包裹直接 LLM 调用和包裹 crew 一样自然，而"一个 crew 加若干普通步骤"的 Flow 往往才是对的形状。角色比喻会诱使你用上超过多数任务所需的 agent 数量；抵住它，CrewAI 是一个相当合理的单智能体框架。</p>
+  <h3>OpenAI Agents SDK 会把我锁死在 OpenAI 吗？</h3>
+  <p>合同上不会，但实际上它是围绕 OpenAI 的 API 面设计的，而默认追踪目的地是 OpenAI 的平台。其他厂商够得着。如果多厂商路由是硬性要求而非偏好，那么模型无关的那两个框架起跑就领先。</p>
+  <h3>持久执行引擎怎么算？</h3>
+  <p>它们是互补而非竞争关系，而且这种搭配很常见：智能体框架掌管推理循环，工作流引擎掌管重试、定时器与恰好一次的副作用。当你的智能体副作用昂贵或不可逆时，就值得伸手去拿这个组合。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站：</h3>
+  <ul>
+    <li><a href="/zh/concepts/agent-frameworks">智能体框架</a>——地基，以及框架究竟是干什么用的。</li>
+    <li><a href="/zh/operations/agentops/durable-state-and-resumability">持久状态与可恢复性</a>——本文论证的运维视角版本。</li>
+    <li><a href="/zh/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal">持久执行：LangGraph 加 Temporal</a>——当一个框架不够用时的搭配。</li>
+    <li><a href="/zh/deep-dives/architectures-and-patterns/single-vs-multi-agent">单智能体 vs 多智能体</a>——在让一个角色比喻凭空多出四个 agent 之前先读。</li>
+    <li><a href="/zh/deep-dives/multi-agent-systems/multi-agent-topologies">多智能体拓扑</a>——把图、树、crew 与 handoff 当作形态而非品牌来看。</li>
+    <li><a href="/zh/concepts/human-in-the-loop">人在环</a>——一个持久暂停必须保证些什么。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://docs.langchain.com/oss/python/langgraph/durable-execution">LangGraph —— 持久执行</a></li>
+    <li><a href="https://google.github.io/adk-docs/">Google Agent Development Kit 文档</a></li>
+    <li><a href="https://docs.crewai.com/en/guides/flows/mastering-flow-state">CrewAI —— 掌握 Flow 状态</a></li>
+    <li><a href="https://openai.github.io/openai-agents-python/">OpenAI Agents SDK 文档</a></li>
+  </ul>
+</section>
