@@ -1,0 +1,181 @@
+<p class="lede">Every sandbox comparison opens with cold-start milliseconds, and in an agent loop that is the number that matters least. A sandbox serving a twenty-step agent spends roughly six sevenths of its life idle, waiting for a model to finish thinking — so the question that decides your bill is not how fast it starts but whether you are charged while it waits, and the question that decides your blast radius is what its outbound network does by default. Both answers differ sharply across E2B, Daytona, Modal and Cloudflare, and neither appears in the benchmark tables.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four platforms that all run untrusted agent-written code, built on four genuinely different isolation primitives. The primitive is what everything else follows from.</p>
+
+  <table>
+    <thead>
+      <tr><th>Platform</th><th>Isolation primitive</th><th>Billing shape</th><th>Egress default</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>E2B</strong></td>
+        <td>Firecracker microVM — separate guest kernel per sandbox.</td>
+        <td>Per second while the sandbox is alive.</td>
+        <td>Open; allow/deny lists available, including by domain.</td>
+      </tr>
+      <tr>
+        <td><strong>Daytona</strong></td>
+        <td>Container from a pre-warmed snapshot.</td>
+        <td>Per second while alive; auto-stop and auto-archive to end it.</td>
+        <td>Governed by a documented network-limits layer; posture varies by tier.</td>
+      </tr>
+      <tr>
+        <td><strong>Modal</strong></td>
+        <td>gVisor — a user-space kernel intercepting syscalls.</td>
+        <td>Per second of active compute; idle is not billed.</td>
+        <td>Open; <code>block_network</code> and <code>outbound_cidr_allowlist</code> per sandbox.</td>
+      </tr>
+      <tr>
+        <td><strong>Cloudflare Sandbox</strong></td>
+        <td>Container attached to a Worker, at the edge.</td>
+        <td>Container runtime, with <code>sleepAfter</code> ending it (10 min default).</td>
+        <td><code>enableInternet</code> on by default; the Worker in front can mediate.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/e2b-vs-daytona-vs-modal-vs-cloudflare-sandboxes/data-feature-matrix.svg" alt="Feature matrix rating E2B, Daytona, Modal and Cloudflare Sandbox across isolation strength, idle billing, session lifetime, egress control granularity and GPU support, at three levels." width="900" height="400" loading="lazy" />
+    <figcaption>No column has a winner in every row, which is why the choice is workload-shaped rather than quality-shaped.</figcaption>
+  </figure>
+
+  <p>Worth noting for context: when OpenAI shipped Agents SDK v2 in April 2026 it came with seven sandbox providers wired in natively — Blaxel, Cloudflare, Daytona, E2B, Modal, Runloop and Vercel. Swapping providers is now close to a configuration change, which makes it easy to pick on the wrong axis and expensive to notice.</p>
+</section>
+
+<section>
+  <h2>The idle problem, with arithmetic</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-daytona-vs-modal-vs-cloudflare-sandboxes/compare-billing-shape.svg" alt="Timeline of a multi-step agent loop showing short code-execution spans separated by long model-inference waits, with two billing rules overlaid: one charging the whole span and one charging only the execution spans." width="900" height="300" loading="lazy" />
+    <figcaption>Same work, same wall clock, two bills. The gap is the waiting.</figcaption>
+  </figure>
+
+  <p>Take an agent doing a data-analysis task: twenty steps, each one a model call of roughly twelve seconds followed by about two seconds of code execution. The sandbox has to exist across the whole thing, because the filesystem and the Python kernel carry state between steps.</p>
+
+  <p>That is 280 seconds of sandbox lifetime containing 40 seconds of compute. Under a bill-while-alive model you pay for 280. Under a bill-while-active model you pay for 40. The ratio is seven to one, and it is set by inference latency — a variable you do not control and which grows as reasoning effort goes up. Nothing in the cold-start benchmark predicts it.</p>
+
+  <p>Two consequences follow. First, per-vCPU-hour rates are close to meaningless as a comparison unless you normalise them by the billing shape; a platform charging noticeably more per active hour can be dramatically cheaper on an agent workload. Second, the idle share rises with the quality of your model, because better models think for longer. Teams that benchmark on a fast small model and deploy on a reasoning model see the sandbox line move in a direction the spreadsheet did not predict.</p>
+
+  <p>The counter-argument is real: a bill-while-alive platform with a short auto-stop interval and a fast resume approximates the same thing, and Daytona's auto-stop and auto-archive controls exist for exactly this. But that is a configuration you have to get right per workload, against a default that costs you money, whereas Modal's model is the default. Defaults determine what most teams actually pay.</p>
+</section>
+
+<section>
+  <h2>Isolation: four different answers to the same threat</h2>
+  <figure>
+    <img src="/blogs/e2b-vs-daytona-vs-modal-vs-cloudflare-sandboxes/arch-isolation-models.svg" alt="Diagram comparing four isolation stacks: a Firecracker microVM with its own guest kernel, a gVisor user-space kernel intercepting syscalls, a namespaced container from a pre-warmed snapshot, and a container attached to a Worker at the edge." width="900" height="500" loading="lazy" />
+    <figcaption>How far the agent's code sits from the host kernel — and what each step of distance costs.</figcaption>
+  </figure>
+
+  <h3>The threat is the code, not the user</h3>
+  <p>All four platforms assume the workload is hostile, which is correct: agent-written code is untrusted code even when the agent is yours, because its behaviour depends on inputs — retrieved documents, issue comments, web pages — that you do not control. The differences are in how much of the host kernel the code can reach.</p>
+
+  <p>E2B's Firecracker microVMs give each sandbox its own guest kernel, so a kernel exploit has to escape a hypervisor rather than a namespace. Modal's gVisor sits between: a user-space kernel intercepts syscalls before they reach the host, which is a much smaller attack surface than a shared kernel and a larger one than hardware virtualization — and, usefully, it keeps GPU passthrough straightforward in a way microVMs make awkward. Daytona's container-from-snapshot is the fastest to start and the most conventional, which is the trade it makes. Cloudflare's containers inherit the Workers platform's boundaries and, uniquely, put the sandbox at the edge next to the request.</p>
+
+  <h3>Where the difference actually bites</h3>
+  <p>For most agent workloads the isolation tier is not the deciding factor, and saying so is more useful than pretending otherwise. If your agent runs your own generated Python against your own data in your own account, a container is fine. The tier starts to matter when you are running <em>other people's</em> agents — a multi-tenant product where one customer's prompt injection should not reach another customer's execution — and there the microVM boundary is the one you can put in a security questionnaire without a footnote.</p>
+
+  <p>The larger practical constraint is GPU. If the sandboxed work touches a model — running an embedding pass, executing generated CUDA, driving an RL environment — Modal is the platform in this set built for it. The others are CPU-shaped, and that is an architectural fact rather than a roadmap gap.</p>
+</section>
+
+<section>
+  <h2>Lifetime and persistence: what survives between steps</h2>
+  <p>Agent loops need state to persist across model calls, and each platform expresses that differently. This is the axis most likely to force a rewrite if you choose wrong.</p>
+
+  <p><strong>Session length.</strong> E2B supports long-lived sandboxes measured in hours on paid tiers, which suits a research agent that works on one problem all afternoon. Cloudflare's sandboxes are shaped for shorter interactions and sleep after an inactivity window — ten minutes by default, configurable — which suits a request-scoped code interpreter and does not suit a job that thinks for an hour. Modal and Daytona both let a sandbox live until you end it, with idle timeouts and auto-stop intervals as the safety net.</p>
+
+  <p><strong>Filesystem state.</strong> Daytona's snapshot model is the most developed here: a point-in-time capture of filesystem, packages and settings that any number of new sandboxes can start from, plus declarative image building from a Dockerfile. If your agent needs a repository already cloned and dependencies already installed, that is the difference between a five-minute setup tax on every run and a warm start — and it matters far more than the cold-start figure it is usually quoted alongside.</p>
+
+  <p><strong>Resume semantics.</strong> The question to ask each platform is what happens when a sandbox stops and starts again: does the filesystem come back, does the process tree, does an open network connection. The answers differ, and an agent architecture that assumed a live process across a resume will fail in a way that looks like a model regression. Design for the weaker guarantee — reconstruct from the filesystem — and the platform choice stops constraining you.</p>
+</section>
+
+<section>
+  <h2>Egress: the control that matters and the default that is wrong</h2>
+  <p>This is the axis nobody benchmarks and the one that decides what a successful prompt injection can do. If an agent's sandbox can reach arbitrary hosts, then any instruction that reaches the agent — from a scraped page, a dependency's postinstall script, an issue comment — has a channel out for whatever the sandbox can read.</p>
+
+  <p>All four platforms now expose a control. Modal takes <code>block_network</code> or an <code>outbound_cidr_allowlist</code> per sandbox. E2B supports allow and deny lists covering IPs, CIDR blocks and domain names, resolving domains via Host-header inspection on port 80 and SNI on 443, and lets you replace the rules on a running sandbox without restarting it — which is the most agent-shaped design of the four, since it lets you widen access for one step and close it again. Cloudflare exposes <code>enableInternet</code> as a switch and, more interestingly, lets the Worker in front of the container mediate outbound requests, so a policy can be code rather than configuration. Daytona documents a network-limits layer whose default posture varies by account tier — check yours rather than assuming.</p>
+
+  <p>The uniform problem is that the permissive setting is the default everywhere. A sandbox created with the SDK's minimal constructor can talk to the internet, and the framework integrations that make providers swappable are the layer where this configuration is easiest to leave unset. Default-deny egress with a small allowlist — your package registry, your source host, the one API the task needs — is the highest-leverage control in this whole comparison, and it is one line at construction on three of the four platforms.</p>
+
+  <div class="callout">
+    <p>The credential half is the same story. A sandbox that holds a long-lived API key with broad scope has already lost the argument, because egress control cannot save you from a key the agent is entitled to use. Narrow, short-lived credentials injected per run are the pair to the egress allowlist; either alone leaves the other's hole open.</p>
+  </div>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Long agent loops with heavy model latency</td>
+        <td>Modal</td>
+        <td>Idle is not billed, so the six-sevenths of the sandbox's life spent waiting is free.</td>
+      </tr>
+      <tr>
+        <td>Multi-tenant product running other people's agents</td>
+        <td>E2B</td>
+        <td>A guest kernel per sandbox is the boundary you can defend in a security review, and the egress rules are the most granular here.</td>
+      </tr>
+      <tr>
+        <td>Heavy environment setup — repo, dependencies, fixtures</td>
+        <td>Daytona</td>
+        <td>Snapshots and declarative images make the warm start the normal case rather than an optimisation.</td>
+      </tr>
+      <tr>
+        <td>Request-scoped code execution inside an existing Workers app</td>
+        <td>Cloudflare</td>
+        <td>The sandbox lives next to the request, and outbound policy can be Worker code instead of configuration.</td>
+      </tr>
+      <tr>
+        <td>Anything touching a GPU</td>
+        <td>Modal</td>
+        <td>gVisor keeps GPU access workable; the others in this set are CPU-shaped.</td>
+      </tr>
+      <tr>
+        <td>Very high-frequency, very short executions</td>
+        <td>Daytona</td>
+        <td>This is the one case where the cold-start number genuinely dominates, and it is the fastest.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>One caveat on all of it: rates and limits move quarterly, and every number quoted anywhere in this comparison should be re-checked against the provider's own documentation before you build a cost model on it. The billing <em>shapes</em> — alive versus active — are architectural and change far more slowly than the rates attached to them, which is why they are the thing to choose on.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Does sandbox cold start matter for an agent?</h3>
+  <p>Much less than the comparisons imply. It matters if you create a fresh sandbox per tool call, which is usually the wrong architecture — state between steps is what agents need. It matters a great deal for very high-frequency short executions, which is a different workload. For a normal multi-step agent, environment setup time and idle billing both dominate it.</p>
+  <h3>Is a microVM meaningfully safer than a container for agent code?</h3>
+  <p>Yes, in the sense that a kernel exploit has to cross a hypervisor rather than a namespace. Whether that difference is worth paying for depends on your tenancy: running your own agents on your own data, a container is usually adequate; running untrusted third-party agents side by side, the stronger boundary is what makes the answer defensible to someone else.</p>
+  <h3>What is the single most important sandbox setting?</h3>
+  <p>Outbound network policy. Default-deny with a narrow allowlist bounds what a successful prompt injection can exfiltrate, and it is the only control that still works after the model has been convinced to cooperate with an attacker. Every platform here defaults to permissive.</p>
+  <h3>Can I switch providers later?</h3>
+  <p>The execution API is close to commodity, and framework-level integrations make provider swapping near-trivial. What does not port is anything you built on a provider-specific primitive — snapshots, resume semantics, edge placement — plus your cost model, which inverts when the billing shape changes.</p>
+  <h3>Do I need a hosted sandbox at all?</h3>
+  <p>Not always. A container you run yourself with a locked-down network policy is a legitimate answer for a single-tenant internal agent, and it is cheaper. You are buying provisioning speed, snapshot management and a stronger isolation boundary than you would build; if none of those bind, self-hosting is fine.</p>
+  <h3>Does GPU support change the isolation trade-off?</h3>
+  <p>It does. Hardware virtualization makes GPU passthrough awkward, which is why the platform in this set with the best GPU story is also the one using a user-space kernel rather than a microVM. If you need both maximum isolation and a GPU, expect to pay for it in one or the other.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/sandboxing-and-code-execution">Sandboxing &amp; Code Execution</a> — the five independent isolation decisions underneath this choice.</li>
+    <li><a href="/deep-dives/agent-security/sandbox-and-isolation-patterns">Sandbox &amp; Isolation Patterns</a> — the architecture layer above the provider.</li>
+    <li><a href="/playbooks/coding-and-computer-use-agents/sandboxing-and-execution">Sandboxing &amp; Execution</a> — running a coding agent's code specifically.</li>
+    <li><a href="/playbooks/coding-and-computer-use-agents/background-coding-agents">Background Coding Agents</a> — where environment snapshots and egress policy pay off most.</li>
+    <li><a href="/operations/safety-and-security/scoped-credentials-for-agents">Scoped Credentials for Agents</a> — the other half of the egress story.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://e2b.dev/docs">E2B documentation</a></li>
+    <li><a href="https://www.daytona.io/docs/">Daytona documentation</a></li>
+    <li><a href="https://modal.com/docs/guide/sandbox-networking">Modal — Sandbox networking and security</a></li>
+    <li><a href="https://developers.cloudflare.com/sandbox/">Cloudflare Sandbox SDK documentation</a></li>
+  </ul>
+</section>
