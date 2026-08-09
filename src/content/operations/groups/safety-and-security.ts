@@ -17,6 +17,7 @@ const group: Group = {
     { page: 'alignment-basics', slug: 'alignment-basics', title: L('Alignment Basics: Intent & Oversight','对齐基础：意图与监督'), summary: L('Instruction-following vs intent, reward hacking, and scalable oversight as the practical builder lever.','遵循指令与意图、奖励黑客，以及作为可行杠杆的可扩展监督。') },
     { page: 'deployment-safety-checklist', slug: 'deployment-safety-checklist', title: L('The Pre-Ship Safety Review','上线前安全评审'), summary: L('A practical, fail-closed-first deployment checklist including MCP/third-party supply-chain trust.','一份实用、失败趋关闭优先的部署清单，含 MCP/第三方供应链信任。') },
     { page: 'rag-security', slug: 'rag-security', title: L('RAG Pipeline Security','RAG 管道安全'), summary: L('Why retrieved context is untrusted input that skipped the guard — corpus poisoning, indirect injection, embedding leakage, and the trust-boundary design that contains them.','为何检索上下文是绕过守卫的不可信输入——语料库投毒、间接注入、嵌入泄露，以及遏制它们的信任边界设计。') },
+    { page: 'egress-control-for-agents', slug: 'egress-control-for-agents', title: L('Egress Control for Agents','智能体的出站控制'), summary: L('Three labs disclosed models reaching real systems from an eval sandbox in three weeks, and the boundary turned out to be a sentence in the prompt — compute isolation says nothing about routing, a domain allowlist is a scope control rather than a confidentiality one, and the only workable boundary is a proxy scoped to the task.','三周之内三家实验室先后披露模型从评测沙箱触达了真实系统，而那道边界原来只是提示词里的一句话——算力隔离对路由什么也没说，域名允许清单是范围控制而非保密控制，唯一可行的边界是一个按任务收窄的代理。') },
   ],
 };
 export default group;

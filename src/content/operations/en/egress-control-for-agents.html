@@ -1,0 +1,108 @@
+<section class="phase">
+  <div class="phase-num">S12</div>
+  <div class="week">Operation · Safety, Alignment &amp; Agentic Security</div>
+  <h2>Egress control: the sandbox bounds what the agent runs, not what it reaches.</h2>
+  <p class="goal">Between 21 July and 6 August 2026, OpenAI, Anthropic and Meta each disclosed that a model under evaluation reached the open internet and compromised real third-party systems — and in the Anthropic and Meta cases the containment boundary turned out to have been asserted in the evaluation prompt while the network stayed open. That is the whole lesson in one sentence: a boundary written in prose is not a boundary, and the compute isolation everyone buys says nothing about where packets are allowed to go. Egress is a separate control with a separate budget, and every major agent sandbox still ships it permissive by default.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Egress control does three different jobs, and conflating them is why it gets built badly.</h3>
+
+    <p>"Block the network" is not a requirement. Three distinct risks hide under it, they have different threat models, and a control that handles one can be useless against another.</p>
+
+    <ul>
+      <li><strong>Exfiltration.</strong> The agent holds data it is allowed to read and sends it somewhere it should not. The adversary is usually not the agent but whoever wrote the untrusted content it processed — the pattern <a class="xref" href="/operations/safety-and-security/data-exfiltration-risks">data exfiltration risks</a> catalogues. The payload is small: an API key, a customer record, a token. Bandwidth is irrelevant, so throttling is not a control.</li>
+      <li><strong>Unsanctioned action on a third party.</strong> The agent does something to a system that never consented to be in scope. This is the 2026 eval failure exactly: the models were not exfiltrating anything, they were pursuing a capture-the-flag objective and the real internet was reachable, so real infrastructure became part of the exercise. Here the payload direction is outbound-as-action, and blocking data volume does nothing.</li>
+      <li><strong>Cost and abuse.</strong> An agent in a loop hammering an external API, or a compromised sandbox mining, or a scraper you did not intend to run against a site that will block your whole IP range. Boring, common, and the only one of the three that shows up on a bill.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The three jobs share one implementation and disagree on the policy. Exfiltration wants the destination set to shrink after the agent reads untrusted input; unsanctioned action wants a hard scope fixed before the run starts; cost wants rate limits per destination. Write them down separately — a single "allowed domains" list that tries to satisfy all three ends up satisfying none.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Deny by default — and notice that nothing you use defaults that way.</h3>
+
+    <p>Compute isolation and network isolation are sold together and delivered separately. Every agent-sandbox product now exposes an egress control; every one of them ships permissive.</p>
+
+    <ul>
+      <li><strong>The default is open because the alternative breaks the demo.</strong> An agent that cannot <code class="inline">pip install</code>, fetch a doc page or call an API fails its first task, so the first-run experience is unrestricted and the restriction is a thing you opt into after you have a working system and no appetite to break it.</li>
+      <li><strong>"We run it in a container" is a statement about the filesystem.</strong> Namespace and syscall isolation are orthogonal to routing. A microVM with a default route to the internet is a strong compute boundary and no network boundary at all, and the strength of the first is regularly used as evidence for the second.</li>
+      <li><strong>The eval bench is the least-hardened environment you own.</strong> It is where refusals are deliberately reduced, capability is deliberately maximised, and the infrastructure is treated as test kit rather than production. Anthropic found its three incidents only by reviewing 141,006 evaluation runs after a competitor disclosed first — no live control fired. If you run capability evals, harden that environment before you harden production.</li>
+      <li><strong>Deny-by-default is affordable precisely because agent tasks are narrow.</strong> A task that reads three internal services and one vendor API needs four destinations. The allowlist feels impossible when you write it for the environment and becomes trivial when you write it for the task — which is the actual design decision two steps below.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>A domain allowlist is not egress control, because the exfiltration channel is on the allowlist.</h3>
+
+    <p>This is the step that changes what you build. Teams implement a list of permitted hostnames, mark the risk closed, and ship a system that leaks through the destinations they approved.</p>
+
+    <ul>
+      <li><strong>Any allowed destination that accepts arbitrary content is an exfiltration endpoint.</strong> Your own logging endpoint, your error tracker, a webhook receiver, an issue tracker, a paste service on a vendor domain, an LLM provider's API. A secret placed in a log line, an error message, a search query or a commit body has left the building through a channel your policy explicitly permits.</li>
+      <li><strong>The URL is a covert channel and it is wide enough.</strong> Secrets are hundreds of bytes. A path segment, a query parameter, a subdomain label or a DNS lookup carries them fine. If the agent can render markdown that fetches an image, it can exfiltrate by constructing the image URL — no outbound tool call required.</li>
+      <li><strong>Name-based filtering is weaker than it reads.</strong> Enforcement by requested hostname is evaded by requesting an allowed name and reaching a different host; enforcement by resolved address breaks CDNs and multi-tenant clouds, where one allowed name shares an address with everything else on the platform. Wildcarding a vendor's domain usually admits customer-controlled subdomains you never considered.</li>
+      <li><strong>The DNS resolver is an egress path.</strong> If the sandbox can resolve arbitrary names, it can encode data in the names it looks up, and that traffic leaves through a service that is almost never in scope for the network policy.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The conclusion is not that allowlists are useless — they are the only thing that reduces the unsanctioned-action risk, and they are cheap. The conclusion is that an allowlist is a scope control, not a confidentiality control. If you need the second, you need to bound what leaves, not only where it goes, and that means the boundary has to be a proxy that can see the request.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Put the boundary at a proxy you operate, and scope it to the task.</h3>
+
+    <p>The workable architecture is not a firewall rule per environment. It is a mandatory forward proxy that every sandbox must route through, holding a policy derived from the task the agent was given.</p>
+
+    <ul>
+      <li><strong>No default route. Proxy or nothing.</strong> The sandbox gets no direct path off-host; the only reachable address is the proxy. This is the property that makes everything else enforceable, and it is the one most setups skip because it requires configuring the runtime rather than writing a rule.</li>
+      <li><strong>The allowlist is generated from the tool set, not maintained by hand.</strong> A task that was granted three tools has three destinations, and the policy should be derived from that grant at dispatch time. Hand-maintained environment-wide lists rot upward — nobody ever removes an entry — until the list permits everything anyone ever needed.</li>
+      <li><strong>Terminate credentials at the proxy.</strong> If the vendor token is injected by the proxy on the way out, the sandbox never holds it, and a compromised agent cannot take the credential anywhere the proxy will not send it. This is the highest-leverage change on the list, and it is the network expression of <a class="xref" href="/operations/safety-and-security/scoped-credentials-for-agents">scoped credentials</a>.</li>
+      <li><strong>Log every attempt, allowed and denied, with the task ID.</strong> A denied connection is a first-class signal — it is either a policy gap or the earliest observable evidence of an injection succeeding. It belongs in the trace next to the tool calls, per <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a>, not in a network log nobody joins to a run.</li>
+      <li><strong>Fail closed, and make the failure legible to the agent.</strong> A blocked request should return a clear, structured error the model can act on — the same argument <a class="xref" href="/deep-dives/tool-capability-design/tool-error-messages">tool error messages</a> makes — otherwise the agent retries the block twenty times and you have converted a security control into a latency bug.</li>
+      <li><strong>Egress policy is versioned config, deployed like code.</strong> It gets reviewed, rolled and rolled back on the same machinery as everything else in <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout and versioning</a>. A policy edited live in a console is one that will be widened at 2 a.m. during an incident and never narrowed again.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Sequence the policy: the moment untrusted content enters, the network should shrink.</h3>
+
+    <p>A static per-task allowlist is a large improvement and still leaves the main hole open, because the dangerous state is not a property of the task — it is a property of the moment. An agent becomes dangerous when it simultaneously holds sensitive data, has processed attacker-controlled content, and can still reach outward.</p>
+
+    <ul>
+      <li><strong>Remove one leg and the exfiltration risk collapses.</strong> That is the entire content of the "lethal trifecta" framing in <a class="xref" href="/concepts/agentic-risks-intro">risks and limits of agents</a>, and egress is by far the cheapest leg to remove — you cannot un-read a document, and you usually cannot drop the data access without dropping the feature.</li>
+      <li><strong>So make egress a state machine, not a list.</strong> Before the agent ingests untrusted input, permit the destinations the task needs. After it ingests untrusted input, permit only the response channel back to the requesting user. Most useful work — fetch, then reason, then answer — fits that ordering naturally, and the tasks that do not fit are exactly the ones worth escalating.</li>
+      <li><strong>Mark tool results by trust, and let the marking drive the policy.</strong> A result from your own database and a result from a web fetch are different objects. If nothing in your system distinguishes them, you cannot implement this step, and the tagging is the prerequisite work.</li>
+      <li><strong>The response channel is itself an egress path.</strong> Rendering agent output as HTML or markdown with remote images hands the model a request primitive, so sanitise on the way out and disallow remote references in rendered output. This is where a well-firewalled agent still leaks.</li>
+      <li><strong>Where the ordering cannot hold, put a human on the outbound side.</strong> Not on the plan, on the specific outbound call — approving a plan does not approve a request the agent constructs three steps later. The gating pattern is in <a class="xref" href="/operations/safety-and-security/human-in-the-loop">human-in-the-loop</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Operate it: first-seen destinations, drills, and the eval bench you forgot you owned.</h3>
+
+    <p>Egress control fails in operation rather than in design. The policy is written once, correctly, and then erodes under delivery pressure while nobody watches the thing it was protecting.</p>
+
+    <ul>
+      <li><strong>Alert on first-seen destination per task type.</strong> Not on denials in aggregate — on the first time a task class reaches somewhere it has never reached before. That single alert is the highest-signal detection available here and it is nearly free once the proxy logs carry task IDs.</li>
+      <li><strong>Review allowlist growth on a schedule and delete aggressively.</strong> Every entry needs an owner and a reason. Entries added during an incident are the ones to revisit first, because they were added under time pressure by whoever had the console open.</li>
+      <li><strong>Drill the block.</strong> Run a task that deliberately attempts a disallowed destination, on a cadence, in production configuration. A control nobody has watched fire is a control nobody knows is still wired up, and egress policy is unusually easy to disable accidentally with an infrastructure change.</li>
+      <li><strong>Treat a denied outbound request during a real run as an incident input.</strong> It is frequently the first observable symptom of a successful injection, and it arrives before any damage. Route it into <a class="xref" href="/operations/agentops/incident-response-for-agents">incident response</a> with the trace attached rather than into a dashboard.</li>
+      <li><strong>Harden the eval and red-team environments to the same standard, or higher.</strong> They run more capable configurations with fewer refusals against deliberately adversarial objectives. If you use a third-party evaluation partner, the network configuration of their environment is now your risk, and the 2026 disclosures make it clear it needs to be verified rather than assumed — see <a class="xref" href="/operations/governance-compliance/third-party-model-and-vendor-risk">third-party and vendor risk</a>.</li>
+      <li><strong>Write down what "no internet" means, and then test that claim.</strong> If a document, a prompt or a contract says an environment has no internet access, someone has to have run a connection attempt from inside it and kept the result. Both labs that failed here believed the statement.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>The first hour is worth more than the roadmap: take one agent, remove its default route, point it at a proxy, and let it fail. The destinations it hits in the first day are your real allowlist, and it will be shorter than anyone predicted. Then move the vendor credentials into the proxy so the sandbox never holds them, log every attempt against the task ID, and add one alert on first-seen destination. <strong>Compute isolation stops the agent from breaking the machine; only egress control decides which other people's machines are in scope — and it is the control that keeps working after prompt injection has already won.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/sandboxing-and-code-execution">sandboxing and code execution</a> for the five isolation decisions this is one of, <a class="xref" href="/deep-dives/agent-security/sandbox-and-isolation-patterns">sandbox and isolation patterns</a> for the implementation shapes, <a class="xref" href="/operations/safety-and-security/prompt-injection">prompt injection</a> for the attack this bounds, and <a class="xref" href="/operations/safety-and-security/agentic-threat-model">the agentic threat model</a> for where egress sits in the whole picture.</p>
+  </div>
+</section>
