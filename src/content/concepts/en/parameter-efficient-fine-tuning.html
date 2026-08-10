@@ -1,0 +1,79 @@
+<section class="phase">
+  <div class="phase-num">F18</div>
+  <div class="week">Concepts · AI Foundations</div>
+  <h2>Parameter-efficient fine-tuning.</h2>
+  <p class="goal">The reason LoRA took over is not that it made training cheap — full fine-tuning was already affordable for most teams by the time it did. It is that the specialisation comes out as a 50 MB file instead of a 140 GB one, so a hundred specialised models can share a single copy of the base in memory, and switching between them becomes a routing decision rather than a deployment. Everything else about it follows from that, including the mistake almost everyone makes with the rank setting.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What actually changes, and what does not.</h3>
+
+    <p>Full fine-tuning updates every weight in the model. Parameter-efficient fine-tuning (PEFT) freezes all of them and trains a small set of new parameters alongside. LoRA — low-rank adaptation, and the only variant most teams need — is the dominant form: for a weight matrix <code class="inline">W</code>, it learns two skinny matrices <code class="inline">A</code> and <code class="inline">B</code> and computes <code class="inline">y = Wx + (α/r)·BAx</code>. The base is untouched; the adapter is the difference.</p>
+
+    <ul>
+      <li><strong>The parameter count collapses.</strong> For a 4096×4096 projection, full fine-tuning trains 16.8 million weights. At rank 16, LoRA trains <code class="inline">16 × (4096 + 4096)</code> = 131,072 — about 0.8% of them. Across a whole model this typically lands between 0.1% and 2% of parameters trained.</li>
+      <li><strong>The memory saving is mostly from the optimiser, not the weights.</strong> Adam keeps two moment estimates per <em>trainable</em> parameter. Training 1% of the weights removes 99% of the optimiser state and 99% of the gradient buffers, which is the bulk of what makes full fine-tuning need a cluster. QLoRA goes further by holding the frozen base in 4-bit while keeping the adapter in bf16 — the combination is what put fine-tuning a 70B model on a single card.</li>
+      <li><strong>The artefact is a file, not a model.</strong> A trained adapter is tens to a few hundred megabytes. You can store thousands of them, version them in ordinary object storage, and ship one without shipping weights you may not be licensed to redistribute.</li>
+      <li><strong>Inference cost is unchanged.</strong> The adapter adds a small extra matrix multiply per layer — single-digit percent latency, and zero if you merge it back into the base. PEFT is a training-time and storage-time saving that does not tax you at serving time.</li>
+    </ul>
+
+    <div class="callout">
+      <p>PEFT is not a weaker kind of fine-tuning that you accept because you are poor. On the instruction-following and style-adaptation tasks most teams actually run, a well-configured LoRA lands close enough to full fine-tuning that the difference is hard to detect above eval noise. Where it genuinely lags is large-scale knowledge injection and continued pre-training on a new domain or language — which is the subject of the next step, and the reason so many fine-tuning projects are declared failures.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Rank is a capacity dial, and it decides what you are able to teach.</h3>
+
+    <p>The rank <code class="inline">r</code> sets how much information the adapter can hold. This is the single setting that most often explains a disappointing result, because the failure looks like "fine-tuning didn't work" rather than "the container was too small".</p>
+
+    <ul>
+      <li><strong>Rank 8–16 teaches behaviour.</strong> Output format, tone, refusal boundaries, a schema the model keeps drifting from, a house style, a tool-calling convention. This is what the overwhelming majority of production LoRAs do, and it is where the technique is at its most reliable — the model already knows how to do the task and you are moving where it lands.</li>
+      <li><strong>Rank 64–256 is where you start teaching content.</strong> A new domain vocabulary, an unusual reasoning pattern, a language the base handles poorly. It costs more to train and more to store, and it starts to need real data volume rather than a few hundred examples.</li>
+      <li><strong>No rank teaches facts economically.</strong> If the model needs to know your product catalogue, your incident history, or anything that changes, the answer is retrieval, not weights — the whole argument in <a class="xref" href="/concepts/fine-tuning-vs-rag-vs-prompting">fine-tuning, RAG, or prompting</a>. Teams reach for rank 128 to force facts in, get a model that is confidently wrong in a new way, and conclude the method is broken.</li>
+      <li><strong>Alpha is a scale, not a second capacity knob.</strong> The <code class="inline">α/r</code> factor scales the adapter's contribution. The common convention is <code class="inline">α = 2r</code>; changing rank without adjusting alpha silently changes the effective learning rate, which is a frequent cause of "it worked at rank 16 and broke at rank 64".</li>
+      <li><strong>Which layers you attach to matters more than most people expect.</strong> The original recipe adapted only the attention query and value projections. Current practice targets every linear layer including the feed-forward blocks, which costs more parameters and consistently closes more of the gap to full fine-tuning.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The diagnostic is cheap: train the same data at rank 8 and rank 64 and compare. If rank 64 is meaningfully better, you are trying to teach content and should either commit to the capacity or move the requirement into retrieval. If they are indistinguishable — the usual outcome — take rank 8, and spend the saved effort on the dataset, which is where the returns actually are.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The property that changes system design: one base, many adapters.</h3>
+
+    <p>Here is the part that matters for agents rather than for training budgets. Because the base weights are shared and untouched, a serving stack can hold one copy of the model in GPU memory and apply a different adapter per request. Multi-adapter serving is a standard feature of modern inference engines, built on batching kernels that let requests using different adapters share the same forward pass.</p>
+
+    <ul>
+      <li><strong>Specialisation stops being a deployment.</strong> Ten fine-tuned variants used to mean ten model deployments and ten times the memory. Now it means ten files and one deployment, and the choice of which to apply is made at request time — the same shape as <a class="xref" href="/concepts/model-routing">model routing</a>, but one layer down.</li>
+      <li><strong>Per-tenant and per-task adapters become affordable.</strong> An adapter per customer, per document type, or per stage of an agent loop is a reasonable design when the marginal cost is a file and a few hundred megabytes of pooled memory. It is an absurd one when it is a GPU each.</li>
+      <li><strong>Merge or don't merge is a real trade.</strong> Merging the adapter into the base removes the extra multiply and gives you a plain model — best when you have exactly one specialisation and want maximum throughput. Keeping it separate preserves hot-swapping and lets one fleet serve everybody. You cannot have both on the same fleet.</li>
+      <li><strong>The ranks have to be compatible.</strong> A serving cluster is configured with a maximum adapter rank, and adapters above it will not load. This is the most common day-one failure when a training team and a serving team pick their defaults independently.</li>
+      <li><strong>The base version is now a shared dependency.</strong> Every adapter is trained against exact base weights and is not portable to a different checkpoint. When the base is deprecated, every adapter is invalidated at once — the retraining event described in <a class="xref" href="/operations/agentops/model-deprecation-and-migration">model deprecation and migration</a>, with a multiplier on it.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>When it is the right tool, and what it costs after you ship.</h3>
+
+    <p>PEFT is cheap to start and not cheap to own. The training run is an afternoon; the obligations last as long as the adapter is in production.</p>
+
+    <ul>
+      <li><strong>Reach for it when the base model can do the task but will not do it consistently.</strong> Format adherence that survives long contexts, a domain register, a tool-calling style, reliable structured output on a schema the model keeps bending. These are behaviour problems and behaviour is what adapters move.</li>
+      <li><strong>Do not reach for it before prompting has been tried properly.</strong> A prompt change ships in minutes and is reversible; an adapter is a dataset, a training run, an eval, and a permanent artefact. The ordering argued in <a class="xref" href="/deep-dives/training-agentic-models/prompt-finetune-or-rl">prompt, fine-tune, or RL</a> holds — and the honest version is that most teams that skip to fine-tuning had a prompt they never seriously iterated on.</li>
+      <li><strong>Every adapter needs its own eval, forever.</strong> This is the cost people miss. Ten adapters means ten eval suites, ten regression surfaces, and ten things to re-verify on every base upgrade. The <a class="xref" href="/concepts/agent-evaluation">evaluation</a> burden scales with adapter count, and it is what makes per-tenant adapters expensive despite the serving economics being excellent.</li>
+      <li><strong>Watch for narrowing.</strong> Training hard on one behaviour degrades others, and the losses land outside your training distribution where your eval is not looking. Keep a held-out general-capability check alongside your task eval; a LoRA that improved your metric by four points and lost eight on instruction-following is a common and invisible outcome.</li>
+      <li><strong>Assume it will need retraining on someone else's schedule.</strong> Adapters bind to a base checkpoint, and base checkpoints get deprecated. Budget the retraining as recurring cost, and keep the training data and the recipe in version control — the adapter file is worthless without them.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Default to rank 8 on all linear layers with <code class="inline">α = 16</code>, a few thousand carefully-checked examples, and a held-out eval that includes tasks you are <em>not</em> trying to improve. That configuration handles the great majority of real fine-tuning needs, trains in under an hour on one card, and fails fast when the requirement was actually a retrieval problem. <strong>Choose the technique on what you are teaching — behaviour goes in the adapter, facts go in the retriever — and choose the rank on how much of the model's behaviour has to move, not on how important the project feels.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/distillation-and-quantization">distillation and quantization</a> for the other two ways to change what a model costs, <a class="xref" href="/concepts/post-training-and-alignment">post-training</a> for the layer an adapter is editing, <a class="xref" href="/deep-dives/training-agentic-models/rl-fine-tuning-open-weights">RL fine-tuning on open weights</a> for when supervised adaptation is not enough, and <a class="xref" href="/operations/agentops/self-hosted-inference-for-agents">self-hosted inference for agents</a> for the serving stack that makes multi-adapter deployment worth having.</p>
+  </div>
+</section>
