@@ -1,0 +1,102 @@
+<section class="phase">
+  <div class="phase-num">E12</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>Trace sampling: head-based sampling deletes exactly the runs you needed.</h2>
+  <p class="goal">Sample 10% of agent runs at the start of each run and you keep 10% of the failures — which, at a 2% failure rate and a hundred thousand runs a month, means you are reasoning about your worst behaviour from two hundred examples while paying to store two thousand successes that all look the same. The decision has to move to the end of the run, where the outcome is known. And once you accept that, the second thing follows: this archive is your future eval set, so retention is a dataset decision that finance is currently making for you.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Agent traces do not fit the logging mental model, and the arithmetic is why.</h3>
+
+    <p>Teams size their trace budget from experience with request logs and are wrong by one to two orders of magnitude, because a trace is not a line per event — it is the whole context, repeatedly.</p>
+
+    <ul>
+      <li><strong>The payload grows with the square of the step count.</strong> Models are stateless, so step twenty re-sends everything from steps one to nineteen. If you record the prompt and completion at each step — and you must, or the trace cannot be replayed — a twenty-step run stores something closer to two hundred step-equivalents of text. The same quadratic that drives <a class="xref" href="/concepts/agent-cost-control">agent cost</a> drives the storage bill.</li>
+      <li><strong>Payload dwarfs structure by a factor nobody guesses correctly.</strong> The span skeleton — names, timings, status, token counts, tool names — is kilobytes per run. The prompts, retrieved documents and completions are megabytes. They are stored together by default, and they have completely different value curves.</li>
+      <li><strong>Retrieval makes it worse.</strong> An agent that pulls twenty chunks per step and records what it retrieved — necessary to debug a wrong answer — multiplies the payload again, and those chunks are duplicated across every run that retrieved them.</li>
+      <li><strong>So you will sample.</strong> Not as a design preference but as an arithmetic consequence. The only real question is <em>which</em> runs survive, and that question has a clearly right answer that most systems get wrong by default.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The default is head-based, and it is anti-correlated with what you want.</h3>
+
+    <p>Head-based sampling decides at trace start, before anything has happened. It is the default in most instrumentation because it is the only thing you can decide cheaply and locally — and it throws away information in precisely the wrong direction.</p>
+
+    <ul>
+      <li><strong>Failures are rare, so uniform sampling makes them rarer.</strong> A control that keeps 1 in 10 runs keeps 1 in 10 incidents. The population you actually study — bad trajectories — shrinks by the same factor as the population you are drowning in, which is the opposite of the intended effect.</li>
+      <li><strong>The tail is where the money and the danger are.</strong> The p99 run costs orders of magnitude more than the median and is usually a loop that never terminated. Uniform sampling keeps 1% of them, and the runaway you most needed to see is the one you did not keep.</li>
+      <li><strong>Nothing at trace start predicts the outcome.</strong> That is the structural point. In a conventional service, the endpoint and the customer tier tell you a lot about a request before it runs. In an agent, two runs with identical inputs diverge at step four, and the interesting one is not identifiable at step zero.</li>
+      <li><strong>Ad-hoc "debug mode" sampling does not rescue it.</strong> Turning full tracing on for a tenant after they complain gives you future runs, not the one they are complaining about — and the complaint is usually about a run from last week.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Run the numbers for your own system before choosing anything: monthly runs × failure rate × sample rate is the number of bad trajectories you will have to work from. If that number is under a few hundred, you cannot do <a class="xref" href="/operations/evaluation-and-observability/quality-regression-detection">regression detection</a>, you cannot build a representative eval set, and no dashboard will tell you why — it will simply be quiet.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Decide at the end: buffer the run, then keep it on outcome.</h3>
+
+    <p>Tail-based sampling holds the trace until the run completes and then decides, which costs you a buffer and buys you the ability to condition on what happened. For agents this is not an optimisation, it is the difference between a usable archive and an expensive one.</p>
+
+    <ul>
+      <li><strong>Keep 100% of anything that went wrong.</strong> Errors, timeouts, step-cap terminations, guardrail refusals, tool-call failure loops, human overrides and rejections, low-rated sessions. This population is small by definition, so keeping all of it is affordable — and it is the whole point of the archive.</li>
+      <li><strong>The outcome signal is the shape of the run, not a label.</strong> Production has no ground truth, so define "interesting" from what you can observe without a judge: hit the step cap, retried the same tool three times, terminated without producing the expected artifact, cost above the p95, latency above the p95, or the user re-asked immediately. These are the same indicators <a class="xref" href="/operations/evaluation-and-observability/quality-regression-detection">quality regression detection</a> builds on, and they are cheap to compute at run end.</li>
+      <li><strong>Keep a stratified baseline of successes, not a uniform one.</strong> You need normal runs for comparison, but not proportionally — sample successes by task type, tenant and model version so that rare task classes stay represented. Uniform success sampling gives you ten thousand copies of your most common workflow and nothing from the workflow that only runs at month end.</li>
+      <li><strong>Always keep the skeleton for every run, sampled or not.</strong> Metrics computed from a sample have sampling error; metrics computed from every run's span structure do not. This split is the reason the next step matters.</li>
+      <li><strong>Budget for the buffer.</strong> A long-running agent may hold a trace in memory for minutes. Cap the buffer, spill to disk, and decide what happens when it overflows — usually keep the skeleton, drop the payload, and record that you did.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Split the trace in two at the collector, with two retentions.</h3>
+
+    <p>Structure and payload have different value curves, different privacy exposure and different costs, and storing them in one place forces a single retention policy that is wrong for both.</p>
+
+    <ul>
+      <li><strong>Structural telemetry is cheap and stays useful for years.</strong> Step counts, tool names, durations, token counts, model versions, outcome codes. This is what trend analysis, capacity planning and "did the p95 step count change after the model swap?" run on. Keep it long — it is small enough that the argument for deleting it is weak.</li>
+      <li><strong>Payload is expensive and its debugging value decays in weeks.</strong> Nobody debugs a specific trajectory from four months ago. Its <em>dataset</em> value, however, does not decay at all — which is the tension the next step is about.</li>
+      <li><strong>Split at the collector, not at the vendor.</strong> One collector hop that forks structural spans to your metrics store and payloads to storage you own is the change that makes every later decision reversible, which is the argument <a class="xref" href="/operations/evaluation-and-observability/otel-genai-semantic-conventions">the OpenTelemetry GenAI conventions</a> page makes for instrumentation generally. It is also where redaction belongs.</li>
+      <li><strong>Redact on the way in, because you cannot redact retroactively at scale.</strong> Secrets, credentials and personal data in prompts are permanent once written to an append-only store. Do the detection at the collector, keep a hash so you can still tell two runs apart, and accept that some fidelity is the price of being able to keep the archive at all.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Retention is a dataset decision, and it collides with your deletion duties.</h3>
+
+    <p>This is the part that gets decided by accident. Someone sets a 30-day retention to control cost, and eighteen months later the team discovers that the golden trajectories, the regression baseline and the only record of how the system behaved before the last three model migrations are all gone.</p>
+
+    <ul>
+      <li><strong>Your trace archive is the eval set you have not built yet.</strong> Real production trajectories are the highest-value input to <a class="xref" href="/operations/evaluation-and-observability/eval-driven-agent-development">eval-driven development</a>, and they cannot be regenerated — the model version, the index and the traffic that produced them are gone. Deleting them is not a storage decision, it is deleting the only training and evaluation data that reflects your actual users.</li>
+      <li><strong>Keep a permanent, curated slice deliberately.</strong> A few thousand traces, chosen for coverage rather than recency, promoted out of the sampling pipeline into a dataset with its own lifecycle. Once promoted, a trace is no longer telemetry — it is a fixture, and it should survive any retention sweep.</li>
+      <li><strong>Reconcile that against erasure and legal hold before you promote anything.</strong> Traces contain user content, so a deletion request must reach the curated set too — which means the promotion step has to preserve the subject linkage, or you have built an undeletable corpus. Conversely, a legal hold must suspend the sampler's deletion, and a sampler that has already dropped the run cannot comply. Both directions are worked through in <a class="xref" href="/operations/governance-compliance/retention-and-legal-hold">retention and legal hold</a>.</li>
+      <li><strong>Decide the retention with the eval owner in the room.</strong> The person who will need the data in a year is not the person optimising the observability invoice, and if only one of them is in the meeting the answer is predictable.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Operate it: measure what you dropped, and prove you can still replay.</h3>
+
+    <p>A sampling policy fails silently. Nothing alerts when the archive stops being representative; the dashboards keep rendering and the numbers keep looking fine.</p>
+
+    <ul>
+      <li><strong>Record the sampling decision and its reason on every run.</strong> Kept-as-failure, kept-as-baseline, dropped, buffer-overflow. Without this you cannot reweight a metric computed from the archive, and every number derived from it is quietly biased toward failures.</li>
+      <li><strong>Alert on the composition, not the volume.</strong> The signal is the ratio — if kept-as-failure traces jump from 2% to 9% of the archive, something regressed; if they fall to near zero, either the system improved or the detector broke, and those two need different responses.</li>
+      <li><strong>Drill the replay.</strong> Once a quarter, take a trace from the oldest tier you claim to keep and actually reconstruct the run from it. Missing tool schemas, an unrecoverable model version, redaction that removed something load-bearing — these are discovered during an incident otherwise, which is the worst possible time.</li>
+      <li><strong>Price the archive per completed task, not per gigabyte.</strong> Observability spend that is a few percent of inference spend is not worth optimising; a trace bill approaching the model bill means you are storing payloads you should be sampling, and that comparison is more useful than any absolute threshold.</li>
+      <li><strong>Never sample the evaluation environment.</strong> Eval and red-team runs are low-volume and maximally informative. Keep them whole, keep them forever, and keep them separate from production sampling — the cost is negligible and the alternative is an eval you cannot audit.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Make one change this week: stop deciding at run start. Buffer to run end, keep every failed, capped, overridden or expensive run at full fidelity, and cut the success sample hard — most teams find they can drop successes to 1–2% and still hold a bigger useful archive than before, at lower cost. Then fork the structural spans off at the collector and keep those for years. <strong>The trace you delete is not a log line, it is a labelled example of your system failing in production — the single most expensive kind of data to acquire and the only kind you already have.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a> for what a trace should contain, <a class="xref" href="/operations/evaluation-and-observability/production-feedback-signals">production feedback signals</a> for routing runs into the eval set, <a class="xref" href="/operations/economics-roi/cost-of-evaluation">the cost of evaluation</a> for the other half of this bill, and <a class="xref" href="/operations/governance-compliance/audit-trails">audit trails and provenance</a> for the records sampling must never touch.</p>
+  </div>
+</section>

