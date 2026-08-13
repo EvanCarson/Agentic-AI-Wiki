@@ -1,0 +1,105 @@
+<section class="phase">
+  <div class="phase-num">O16</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Your tools change without your deploy.</h2>
+  <p class="goal">A tool description is part of your prompt, and someone else owns the text. When a vendor reworders a parameter, adds an optional field or renames an enum value, your agent's behaviour changes with no commit in your repository and no error in your logs — and the loud breakages are the harmless kind, because they throw. Version the tool catalog like the dependency it is: snapshot it, hash it into the trace, and alarm on the diff.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The dependency nobody declared.</h3>
+
+    <p>You pin your model. You version your prompts. You review every line of application code. Then you hand the model thirty tool definitions — names, descriptions, parameter docs, enum values, response shapes — most of which were written by someone at another company and are fetched at run time from an <a class="xref" href="/concepts/what-is-mcp">MCP</a> server, a hosted connector platform, or an OpenAPI document you convert on boot.</p>
+
+    <p>Those definitions go straight into the context window. A tool description is not configuration; it is instruction text that competes with your system prompt for the model's attention. Which means the honest statement of your deployment's behaviour is <strong>(model, prompt, tools)</strong>, exactly as your <a class="xref" href="/operations/agentops/rollout-and-versioning">versioning policy</a> already says — and two of those three are pinned while the third is fetched fresh from a third party on every process start.</p>
+
+    <p>The failure this produces is unusual in production systems: a behaviour regression with no deploy, no config change, no incident trigger, and a git log that proves nobody touched anything. Teams spend the first day of that investigation looking in the wrong repository.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Four kinds of drift, sorted by how loudly they fail.</h3>
+
+    <p>The intuition to correct is that breaking changes are the danger. Breaking changes are the safe ones — they throw, you page, you fix. The expensive drift is the kind that leaves everything green.</p>
+
+    <ul>
+      <li><strong>Structural drift</strong> — a tool disappears, a required parameter appears, a type changes. Loud. You get a 4xx or a schema validation error, and your existing alerting already catches it. Treat this as the best case.</li>
+      <li><strong>Semantic drift</strong> — the schema is unchanged but the meaning moved. An enum gains a value your prompt never mentioned; a field that used to be a country name is now an ISO code; pagination defaults change from 50 to 20 and your agent silently sees less data. Nothing errors. The agent takes a slightly wrong action, or the right action on incomplete input.</li>
+      <li><strong>Description drift</strong> — the vendor rewrites the docstring to be clearer, or adds "use this tool only when the user explicitly asks". That is a prompt edit applied to your system by a stranger, and it can move tool-selection rates by tens of percent. This is the one with no error surface at all.</li>
+      <li><strong>Behavioural drift</strong> — the contract holds and the service changed underneath: slower, rate-limited differently, stricter validation, results ordered differently. Your <a class="xref" href="/operations/agentops/rate-limits-and-provider-capacity">capacity assumptions</a> quietly stop holding.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Rank them by cost and the order inverts the noise: description and semantic drift do the most damage and produce the least signal, while the structural break everyone fears is a page at 2am and a fix by breakfast. Any detection strategy that only watches for errors is watching the harmless half.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Snapshot the catalog and make the diff a review event.</h3>
+
+    <p>The mechanism is boring and it is the whole fix. At build time, fetch every tool definition your agent will be given, serialise them canonically, and write the result to a file in your repository. Hash it. Compare on every build.</p>
+
+    <ul>
+      <li><strong>Normalise before hashing</strong> — sort keys and tool order, strip volatile fields like server timestamps and instance IDs. An unstable hash produces alert fatigue in a week and then gets muted.</li>
+      <li><strong>Hash per tool as well as per catalog.</strong> The catalog hash tells you something moved; the per-tool hash tells you what, and lets you ignore an unrelated tool churning while watching the three that matter.</li>
+      <li><strong>Fail the build on an unreviewed change,</strong> the same way a lockfile change fails review when nobody looked at it. The diff is small and readable — a changed description is a two-line diff and a thirty-second decision.</li>
+      <li><strong>Serve from the snapshot where you can.</strong> Some platforms let you pin a tool version or supply your own schema; a connector platform with schema modifiers lets you define the shape the model sees regardless of what upstream did. That converts drift from a behaviour change into a merge conflict, which is the correct place for it.</li>
+    </ul>
+
+    <p>This is the same discipline as <a class="xref" href="/operations/agentops/model-deprecation-and-migration">pinning a model to a dated snapshot</a>, applied to the other unpinned half of the behaviour triple. Teams that already do one and not the other usually have not noticed the symmetry.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Contract tests that check meaning, not just shape.</h3>
+
+    <p>Schema validation catches structural drift, which you were already going to catch. The tests worth writing assert the semantics your prompt quietly depends on. Keep a dedicated sandbox tenant per integration and run a small suite against the live third party on a schedule — nightly is usually enough, and it is deliberately not in the pull-request path, because a vendor's outage must not block your deploys.</p>
+
+    <ul>
+      <li><strong>Assert the enum sets you branch on.</strong> If your prompt or your code knows about <code class="inline">open | pending | closed</code>, a test should fail the day a fourth value appears — before the model meets it.</li>
+      <li><strong>Assert a golden call end to end.</strong> One representative invocation per tool with a fixed input, checking that the result still has the fields you extract and that they still mean what they meant. Formats drift more often than schemas.</li>
+      <li><strong>Assert the defaults.</strong> Page size, sort order, timezone, currency, truncation limits. These are undocumented as often as not, and they change without a changelog entry.</li>
+      <li><strong>Diff the description text explicitly.</strong> No assertion is possible, so make the test a snapshot: the description changed, here it is, approve or adapt. Treat an approved description change as a prompt change and re-run the eval subset that exercises that tool.</li>
+    </ul>
+
+    <p>See <a class="xref" href="/deep-dives/tool-capability-design/tool-schemas-and-contracts">tool schemas &amp; contracts</a> for what a good contract looks like from the authoring side; this is the consumer's half of the same problem.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Detect it in production, where the real catalog lives.</h3>
+
+    <p>Your build-time snapshot describes what you expected. Production is where the model met what was actually served, including per-tenant differences you cannot see from CI — connector platforms return different tool sets depending on which integrations a customer has authorised, so no two tenants necessarily hold the same catalog.</p>
+
+    <ul>
+      <li><strong>Stamp the catalog hash on every trace.</strong> One field, alongside the model ID and prompt version you already record. It makes "did the tools change" a filter rather than an archaeology project, and it is the single highest-value line of code on this page. See <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing &amp; observability</a>.</li>
+      <li><strong>Watch tool-selection rates per tool, per day.</strong> A description edit shows up here and nowhere else: the same traffic, the same prompt, and suddenly a tool is chosen 40% more often. This is the leading indicator for description drift and it costs one dashboard.</li>
+      <li><strong>Watch the argument distribution, not just the call count.</strong> A shift in which enum values the model passes, or a parameter that used to be supplied and now is not, is semantic drift arriving. Cheap to compute from traces you already keep.</li>
+      <li><strong>Split error rates by class per tool.</strong> Validation errors, auth errors, rate-limit errors and timeouts drift for different reasons and blend into an unreadable line when aggregated.</li>
+      <li><strong>Alarm on the arrival of an unknown enum value or an unknown tool name,</strong> which is the earliest machine-detectable signal that upstream moved.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Respond at your boundary, not in your prompt.</h3>
+
+    <p>When drift lands, the tempting fix is to patch the system prompt: "note that the status field may also be <code class="inline">archived</code>". It works today and it accumulates into a prompt that is a changelog of other people's decisions. Fix it one layer lower.</p>
+
+    <p>Put a thin facade between the agent and every third-party tool — your own name, your own description, your own parameter set, mapping onto theirs. It is a small amount of code and it buys three things: the model's view of the tool stops changing when the vendor edits prose, you can absorb a rename or an added enum in one adapter instead of across several prompts, and you can shrink a bloated vendor surface to the operations you actually use. That last one is a quality win independent of drift — see <a class="xref" href="/deep-dives/tool-capability-design/tool-design-antipatterns">tool design anti-patterns</a>.</p>
+
+    <p>Then run the response as a change, because it is one:</p>
+
+    <ul>
+      <li><strong>Re-run the eval subset that touches the affected tool</strong> before accepting the new snapshot. A tool change is a behaviour change and deserves the same gate as a model swap — see <a class="xref" href="/operations/evaluation-and-observability/quality-regression-detection">quality regression detection</a>.</li>
+      <li><strong>Keep a per-tool <a class="xref" href="/operations/agentops/feature-flags-for-agents">flag</a></strong> so you can withdraw one tool from the catalog without a deploy when a vendor ships something bad on a Friday.</li>
+      <li><strong>Record the drift event in the same place as incidents.</strong> Three description changes to the same vendor in a quarter is procurement information, and nobody will have it unless someone wrote the first two down.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do these three, in order, and the rest is refinement. Stamp the tool-catalog hash on every trace — it costs one field and turns a week-long investigation into a filter. Snapshot the catalog at build time and fail the build on an unreviewed diff, so a vendor's prose edit becomes a pull-request comment instead of a mystery. Then put a facade in front of the three tools you depend on most, so the next rename is an adapter change rather than a prompt archaeology exercise. And when a description does change, treat it as a prompt edit: re-run the evals for that tool before you ship it.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout &amp; versioning</a> for pinning the other two legs of the behaviour triple, <a class="xref" href="/deep-dives/mcp/mcp-ops-in-production">MCP ops in production</a> for running the servers these definitions come from, <a class="xref" href="/deep-dives/mcp/mcp-tool-poisoning">MCP tool poisoning</a> for when the description change is hostile rather than careless, and <a class="xref" href="/operations/governance-compliance/agent-inventory-and-registry">agent inventory &amp; registry</a> for knowing which agents hold which tools when one of them moves.</p>
+  </div>
+</section>
