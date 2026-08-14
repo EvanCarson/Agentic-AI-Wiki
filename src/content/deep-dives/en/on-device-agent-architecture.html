@@ -1,0 +1,114 @@
+<section class="phase">
+  <div class="phase-num">D13</div>
+  <div class="week">Deep Dive · Architectures &amp; Patterns</div>
+  <h2>On-device agent architecture.</h2>
+  <p class="goal">Running the model on the user's machine buys you three real things — zero marginal cost per step, no network round-trip inside the loop, and an agent that works on a plane — and one thing it is constantly sold as and does not buy: privacy. The moment your local agent calls a calendar or a payment API, the user's data crosses the network in a request the model never sees the far side of. Design the split by asking which parts of the loop must be local for latency and which must be remote for judgement, and treat the device edge as a performance boundary that happens to look like a security one.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three real wins and one that evaporates.</h3>
+
+    <p>Local inference has become genuinely practical: 30-billion-parameter open-weight models shaped for agent loops now fit on one consumer GPU or a well-specified laptop, quantized to around four bits, and answer fast enough to sit <em>inside</em> a loop rather than beside one. The case for using them is strong and it is worth stating precisely, because the strongest-sounding argument on the list is the weak one.</p>
+
+    <ul>
+      <li><strong>Marginal cost goes to zero.</strong> This is the win that changes designs rather than budgets. When a step is free, you can afford to run a classifier before every action, re-read the whole context after every tool result, or draft three candidates and pick one — all things you would never do at metered prices. Loops that are uneconomic on an API become ordinary.</li>
+      <li><strong>The network leaves the inner loop.</strong> A twenty-step task on a hosted model pays connection setup, queueing and time-to-first-token twenty times. Locally the same loop pays memory bandwidth. Even where the hosted model is faster per token, the loop can be slower end to end.</li>
+      <li><strong>It works with no connection.</strong> Underrated until the product is a phone, a vehicle, a factory floor or a hospital basement.</li>
+      <li><strong>It does not make the system private.</strong> The model is one component. The tools are the rest, and tools are where data leaves.</li>
+    </ul>
+
+    <p>That last point is the one this page keeps returning to, because it is the failure mode that a "runs on your device" launch reliably produces in the systems built on top of it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The loop has five parts, and each one localizes for a different reason.</h3>
+
+    <p>"On-device agent" is not one architectural choice. It is five, and treating them as a bundle is how teams end up with an agent that is local in the expensive places and remote in the sensitive ones. Take <a class="xref" href="/concepts/the-agent-loop">the agent loop</a> apart:</p>
+
+    <ul>
+      <li><strong>The model.</strong> Local for cost and latency. This is the part everyone means, and it is the least security-relevant of the five.</li>
+      <li><strong>The index and memory.</strong> Local because that is where the sensitive corpus actually is — mail, notes, files, message history. An on-device index is the strongest privacy claim in this architecture and it does not require a local model, only a local embedding step.</li>
+      <li><strong>Tool execution.</strong> Mostly remote, because the tools are other people's services. This is the egress path and there is no version of "on-device" that removes it.</li>
+      <li><strong>Policy checks.</strong> Local is convenient and remote is enforceable. A limit that lives on the user's machine is a limit the user's machine can be persuaded to ignore.</li>
+      <li><strong>Session state.</strong> Local by default is good for privacy and bad for continuity — no handoff to another device, no server-side inspection when something goes wrong, and no <a class="xref" href="/operations/agentops/durable-state-and-resumability">resumability</a> beyond what you write to disk yourself.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Sort those five by "what breaks if it is remote" and the answer is: model — cost and speed; index — privacy; tools — nothing, they were always remote; policy — nothing, remote is better; state — continuity. Only one row on that list is a privacy row, and it is not the model.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Latency is the design driver, and it behaves differently on a device.</h3>
+
+    <p>A hosted deployment optimises throughput because it serves many users on one GPU. A device serves exactly one user and has no queue, which inverts several familiar trade-offs.</p>
+
+    <p><strong>Speculative decoding wins here and loses in the data centre.</strong> It spends extra compute to cut per-token latency, so it is close to free on an idle personal GPU and a throughput regression on a busy shared one — the reason a model shipped with speculative decoding enabled is telling you it expects to be run alone. See <a class="xref" href="/concepts/speculative-decoding">speculative decoding</a>.</p>
+
+    <p><strong>Prefill is the cost you feel.</strong> On a device, decode is bounded by memory bandwidth and prefill by compute, and an agent loop re-reads a growing context on every step. Without cache reuse, step twelve pays for everything the first eleven steps produced. Local runtimes vary widely in whether they keep the KV cache warm across calls, and none of them keep it across an application restart, so a resumed session pays full prefill again. Budget for it explicitly — this is the mechanism described in <a class="xref" href="/concepts/prefill-and-decode">prefill, decode &amp; the KV cache</a>, with the hosted provider's prefix caching removed.</p>
+
+    <p><strong>Dense beats sparse when the GPU is yours.</strong> A mixture-of-experts model bills compute for the experts that fire and memory for all of them, which is a bargain on rented capacity and an expensive mistake on a 24 GB card. Dense models in the 7–30B range are the natural fit on-device for exactly this reason; see <a class="xref" href="/concepts/mixture-of-experts">mixture of experts</a>.</p>
+
+    <p><strong>The first token after idle is the one users judge.</strong> Weights get evicted from memory, the runtime cold-starts, and a "local, therefore instant" agent takes nine seconds to say hello. Keeping a small model resident and paging in the large one on demand is usually a better experience than one mid-sized model that is never warm.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The escalation gate, and why it should be a static rule.</h3>
+
+    <p>Almost every serious on-device agent is a hybrid. The interesting design question is what sends work off the device, and the tempting answer — let the local model judge whether a task is too hard for it — is the wrong one. Difficulty estimation is itself a hard judgement, it is made by the component you already suspect, and it fails in the direction that costs you most: a model that does not know a policy also does not know that it does not.</p>
+
+    <p>Route on a static property of the action instead. The rule that holds up in practice is <strong>escalate anything that binds the user</strong>:</p>
+
+    <ul>
+      <li>Anything irreversible — a purchase, a send, a delete, a booking.</li>
+      <li>Anything governed by a written policy the agent is expected to follow while a person argues with it. This is the axis on which small models are weakest, by a wide margin, and no amount of prompting closes it.</li>
+      <li>Anything that will be shown to a third party as if the user wrote it.</li>
+      <li>Anything where being wrong is expensive and being slow is not.</li>
+    </ul>
+
+    <p>Everything else — classify, extract, summarise, draft, rank, decide which tool to try — stays local. That is a routing table you can read, test and audit, which a learned difficulty estimator is not. It is the same conclusion <a class="xref" href="/concepts/model-routing">model routing &amp; cascades</a> reaches from the cost side: static routing by task captures most of the benefit with none of the fragility.</p>
+
+    <div class="callout">
+      <p>A second, quieter role for the local model is worth designing in deliberately: as the gatekeeper in front of the network. A local pre-classifier that decides whether a request needs the remote model at all is the highest-leverage component in a hybrid agent, because it is the only one that can turn a metered call into no call.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The trust boundary you actually have.</h3>
+
+    <p>Draw the real boundary and several assumptions break at once.</p>
+
+    <p><strong>Local model, remote tool, same leak.</strong> An agent that reads the user's mail locally and then calls a hosted summarisation-free tool — a calendar API, a maps lookup, a payment endpoint — has put user data on the network, in a request whose contents the user never approved individually. Running inference locally removes one egress path and leaves every other one exactly where it was. What controls this is an egress policy, not a deployment target; see <a class="xref" href="/operations/safety-and-security/egress-control-for-agents">egress control for agents</a> and <a class="xref" href="/concepts/data-residency-and-sovereignty">data residency &amp; sovereignty</a>.</p>
+
+    <p><strong>The local index becomes the crown jewel.</strong> Consolidating mail, files and message history into one embedded vector store creates an asset that did not previously exist in that shape. Any process on the device can read it, and unlike a server-side store there is no access log, no revocation and no incident response. Encrypt at rest with a key tied to the OS keychain, and think about what a device backup contains.</p>
+
+    <p><strong>Prompt injection is worse, not better, on-device.</strong> The agent reads the user's own untrusted content — email from strangers, downloaded documents, web pages — with the user's own credentials and no server-side proxy in the middle to inspect or refuse. Every mitigation in <a class="xref" href="/deep-dives/agent-security/prompt-injection-defense-2026">prompt-injection defense</a> that relies on a chokepoint has to be re-implemented on the client, where the attacker may also be standing.</p>
+
+    <p><strong>You cannot revoke.</strong> A compromised server-side agent is a deploy away from being stopped. A compromised on-device agent is a software update away, gated on the user installing it. Design the <a class="xref" href="/operations/agentops/kill-switches">kill switch</a> as a server-side capability check the client consults, not as a client-side flag, and accept that an offline device will not hear it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Operating a fleet you cannot see.</h3>
+
+    <p>The architectural work is the easy half. The operational half is that every practice you rely on for a hosted agent assumes a fleet you control, and you now have a fleet you can only ask questions of.</p>
+
+    <ul>
+      <li><strong>Version skew is permanent.</strong> A hosted agent runs one version. A shipped agent runs every version anyone declined to update, on hardware you did not choose, at quantizations the runtime picked for them. "Which model produced this trace" becomes a field you must record rather than a fact you know.</li>
+      <li><strong>Rollback is not a button.</strong> The <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout discipline</a> still applies, but the unit is an app release and the timeline is days. Feature-flag the behaviour from the server so you can change what the local model is asked to do without shipping new weights.</li>
+      <li><strong>Traces are consent-gated and sparse.</strong> You will see a biased sample: the users who opted in, and disproportionately the ones for whom things went badly enough to report. Build the local agent to keep a rich on-device trace the user can export with one action, and design the failure path around that export rather than around telemetry you will not receive.</li>
+      <li><strong>Evaluate per hardware class, not once.</strong> The same weights at 4-bit on a laptop and at 8-bit on a workstation are different models for evaluation purposes, and quantization degrades instruction-following before it degrades fluency — which is precisely the failure your eval suite is least likely to notice.</li>
+      <li><strong>The economics invert.</strong> There is no per-token bill and there is a support cost, a binary size, a battery budget and a class of hardware you now implicitly support. Model this as <a class="xref" href="/operations/economics-roi/unit-economics">unit economics</a> with the meter moved, not as free.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Start from the split, not from the model. Put the index on the device, because that is the privacy claim that is actually true; put the model on the device for cost and latency, and say so honestly rather than calling it privacy. Write the escalation rule as a static list of action properties — irreversible, policy-bound, third-party-visible — and keep it in code where it can be reviewed. Then write down your egress list: every host the agent can reach, tool by tool. If that list is long, the device boundary is decoration, and the work worth doing this quarter is on the list rather than on the weights.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/small-and-local-models">small &amp; local models</a> for choosing the model itself, <a class="xref" href="/operations/agentops/self-hosted-inference-for-agents">self-hosted inference for agents</a> for the server-side sibling of this problem, <a class="xref" href="/deep-dives/architectures-and-patterns/pattern-landscape">the agent design-pattern landscape</a> for where a hybrid split sits among the other patterns, and <a class="xref" href="/deep-dives/memory-and-context/memory-stores">memory stores</a> for what to put in that on-device index.</p>
+  </div>
+</section>
