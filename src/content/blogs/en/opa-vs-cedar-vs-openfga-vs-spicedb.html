@@ -1,0 +1,168 @@
+<p class="lede">Every one of these four engines can express "may this subject take this action on this resource", so the syntax argument is a distraction. The question that actually separates them is who supplies the facts the decision is made from — and when the caller is an agent whose context contains text an attacker wrote, the facts the caller supplies are precisely the ones you cannot trust.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Two of these are policy engines that evaluate a request you hand them. Two are Zanzibar-style relationship stores that hold the data and answer from their own graph. That split, not the policy language, is the decision.</p>
+
+  <table>
+    <thead>
+      <tr><th>Engine</th><th>Model</th><th>Origin</th><th>What it holds</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>OPA / Rego</td>
+        <td>Policy-as-code, ABAC and RBAC</td>
+        <td>Styra; CNCF graduated</td>
+        <td>Policy only — data arrives with the request or in a bundle</td>
+      </tr>
+      <tr>
+        <td>Cedar</td>
+        <td>Policy-as-code, purpose-built for authorization</td>
+        <td>AWS; open-sourced 2023 under Apache 2.0</td>
+        <td>Policy only — entities are passed in per call</td>
+      </tr>
+      <tr>
+        <td>OpenFGA</td>
+        <td>ReBAC, Google Zanzibar lineage</td>
+        <td>Created at Auth0; CNCF project</td>
+        <td>The relationship graph, as tuples</td>
+      </tr>
+      <tr>
+        <td>SpiceDB</td>
+        <td>ReBAC, Google Zanzibar lineage</td>
+        <td>AuthZed</td>
+        <td>The relationship graph, in a distributed datastore</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/opa-vs-cedar-vs-openfga-vs-spicedb/arch-where-the-facts-come-from.svg" alt="Two architecture lanes: an attribute-passing engine that receives subject, resource and context with the request, and a relationship store that reads its own graph and receives only a tuple to check." width="900" height="500" loading="lazy" />
+    <figcaption>The same policy, two trust boundaries. The lower lane is the one an agent cannot argue with.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/opa-vs-cedar-vs-openfga-vs-spicedb/data-model-matrix.svg" alt="Feature matrix scoring OPA, Cedar, OpenFGA and SpiceDB across five axes: holds the data, enumerates resources, models delegation, analysable, and light to run." width="900" height="400" loading="lazy" />
+    <figcaption>Where each one leans hardest. Nobody is strong on all five, and the two you need depend on what your agent does all day.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>The agent broke an assumption every one of these was built on</h2>
+  <p>Conventional application authorization assumes a trustworthy enforcement point. Your API handler knows who called it, because a token said so; it assembles the subject, the resource and whatever context the policy needs, and asks the engine. The engine trusts the handler completely, and that is fine, because the handler is code you wrote and an attacker cannot rewrite it by sending a cleverly worded email.</p>
+
+  <p>An agent dissolves that assumption in a specific way. The agent's context window contains retrieved documents, tool results, web pages and user messages — some of which an attacker controls. The agent then decides which tool to call and with what arguments. So if your enforcement path lets the agent's own output determine any input to the authorization decision, you have built a system where an injected instruction can widen its own permissions. This is not hypothetical: it is the shape of most of the high-severity agent CVEs of the past year, which is the argument we made in <a href="/blogs/agent-cves-are-authorization-bugs">agent CVEs are authorization bugs</a>.</p>
+
+  <p>Three consequences fall out, and they map directly onto the four products.</p>
+
+  <h3>1. The facts must come from outside the loop</h3>
+  <p>With OPA or Cedar, the decision is a pure function of the request. That is a genuine virtue — it is why Cedar can be formally analysed and why both are fast and stateless. But it means the quality of the check is exactly the quality of whatever built the request. Put the enforcement point inside the agent process, let it populate attributes from the model's tool-call arguments, and the engine will faithfully authorize whatever the injected text asked for. Both engines are perfectly capable of enforcing correct policy here; the failure is architectural, and it is easy to commit.</p>
+  <p>With OpenFGA or SpiceDB, the caller passes a tuple — subject, relation, object — and the engine answers from a graph it owns. The agent can ask any question it likes and cannot change the answer, because the facts were written by your provisioning path, not by this request. That property is not unavailable to the policy-as-code engines, but you have to build it; in the relationship stores it is the default.</p>
+
+  <h3>2. "On behalf of" is not "as"</h3>
+  <p>The mistake that produces the worst incidents is giving the agent the user's token and calling it delegation. An agent acting for Dana should hold its own identity, carry a subset of Dana's authority scoped to this task, and be revocable without touching Dana's account. OpenFGA publishes explicit modelling guidance for exactly this — the agent as a distinct subject type related to the principal it serves — which as of August 2026 is the most developed treatment among the four. Auth0's hosted FGA sits on top of the same engine, alongside the on-behalf-of token exchange it shipped in 2026.</p>
+  <p>Cedar has the clearest production story on the other side of the split: Amazon Bedrock AgentCore Policy, generally available since March 2026, evaluates Cedar policies at a gateway on each tool invocation, with the caller identity and the call's arguments as the unit of control. That is the right enforcement point — outside the agent, on the action — and it demonstrates that the attribute-passing shape works fine for agents when the attributes are assembled somewhere the model cannot reach.</p>
+
+  <h3>3. The check budget is a different order of magnitude</h3>
+  <p>A web request makes one authorization check. An agent task makes one per tool call, plus one per resource each tool touches, plus — if you are filtering retrieved documents by permission, which you must be — one per candidate chunk. That last case is where naive designs fall over.</p>
+
+  <figure>
+    <img src="/blogs/opa-vs-cedar-vs-openfga-vs-spicedb/data-check-budget.svg" alt="Log-scale bar chart of accumulated authorization latency per unit of work at five milliseconds per check: five milliseconds for one web request, sixty for a twelve-check agent task, three hundred for a sixty-check task, and five seconds for filtering a thousand retrieved chunks one at a time." width="900" height="400" loading="lazy" />
+    <figcaption>At a flat 5 ms a check, the bottom row is the one that ends the design review.</figcaption>
+  </figure>
+
+  <p>The fix for the bottom row is not a faster check — it is a different call. Both relationship stores can enumerate: ask "which documents may this subject read" and filter the retrieval candidates against the answer, or feed the list into the vector query as a pre-filter. OpenFGA calls it <code>ListObjects</code>; SpiceDB calls it <code>LookupResources</code>. Neither policy-as-code engine can do this, because neither holds the data to enumerate from — with Cedar or OPA you either pre-compute the accessible set yourself or accept per-item batch evaluation. If retrieval-time permission filtering is central to your product, this single capability decides the comparison and nothing else in this post matters much.</p>
+</section>
+
+<section>
+  <h2>Cross-cutting comparison</h2>
+
+  <h3>Where the latency comes from</h3>
+  <p>The two families fail differently under load. OPA and Cedar are effectively constant-time on the evaluation itself — the cost sits in assembling the request, which means fetching the attributes, which means the database calls you did not count. OpenFGA and SpiceDB do the fetching for you, so their latency is dominated by graph traversal depth: a shallow "user is a member of a team that owns this document" check is quick, and a deeply nested hierarchy with several levels of inherited groups is not. Neither family is faster in general; they move the cost to different places, and only one of those places shows up on the authorization service's dashboard.</p>
+
+  <h3>What each one costs you to operate</h3>
+  <p>Here the ordering is clean and it runs opposite to the capability ordering. Cedar as a library is close to free — it evaluates in-process, and if you want it managed, Amazon Verified Permissions exists. OPA is a sidecar plus a bundle-distribution pipeline you have to build and monitor, which is more moving parts than teams expect. OpenFGA is a service with a datastore behind it. SpiceDB is a distributed database with the consistency semantics that implies, and it is reportedly what OpenAI runs for ChatGPT Enterprise permissions at a scale measured in tens of billions — which tells you it goes the distance, and also that it is a system you should expect to staff. Pick the lightest one whose model actually answers your questions, not the heaviest one you can justify.</p>
+
+  <h3>How wrong you can be, and how fast you find out</h3>
+  <p>Cedar was designed for analysability, and it is the only one of the four where "prove this policy change grants nothing new" is a tractable question rather than an aspiration. Rego's expressiveness is the mirror image: it will let you write policy no tool can reason about, which is why it is the standard when one engine has to cover infrastructure and applications at once, and why it is a poor default when the policy is only about application resources. The relationship stores put the risk somewhere else entirely — a mis-modelled relation quietly grants a whole class of access, and you find it by reviewing the model and testing it, not by analysing a policy file. All three failure modes are survivable; they need different review rituals, and choosing an engine is partly choosing which ritual your team will actually perform.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>If your situation is…</th><th>Start with</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Agents filtering retrieved documents per user</td>
+        <td>OpenFGA or SpiceDB</td>
+        <td>Bulk enumeration is the only thing that makes per-chunk filtering affordable</td>
+      </tr>
+      <tr>
+        <td>Gating tool calls at a gateway, AWS-centric stack</td>
+        <td>Cedar</td>
+        <td>Analysable policy, in-process evaluation, and an existing agent-gateway integration</td>
+      </tr>
+      <tr>
+        <td>One policy engine across Kubernetes, CI and the app</td>
+        <td>OPA</td>
+        <td>The breadth is the product; nothing else covers infrastructure as well</td>
+      </tr>
+      <tr>
+        <td>Deep sharing hierarchies, folders inheriting from folders</td>
+        <td>SpiceDB</td>
+        <td>The most mature Zanzibar implementation, proven at very large permission counts</td>
+      </tr>
+      <tr>
+        <td>You need a delegation model before you need scale</td>
+        <td>OpenFGA</td>
+        <td>Published agent-authorization modelling, and a hosted path via Auth0 FGA</td>
+      </tr>
+      <tr>
+        <td>Small team, simple RBAC, wants it done this week</td>
+        <td>Cedar, or Cerbos</td>
+        <td>Lowest operational floor; revisit when a relationship question appears</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>One thing does not vary with the choice: the enforcement point belongs outside the agent. Put it at the tool gateway, populate the subject from the token rather than from the model's arguments, and log the decision with the trace. An engine cannot save a design that lets the caller name itself.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>Is this the same thing as agent authentication?</h3>
+  <p>No, and the two get conflated constantly. Authentication establishes which agent is calling and whose authority it carries — the identity-provider layer we compared in <a href="/blogs/auth0-vs-descope-vs-stytch-vs-workos-agent-auth">Auth0 vs Descope vs Stytch vs WorkOS</a>. Authorization decides whether that established identity may perform this specific action on this specific resource. You need both, and a perfect token proves nothing about whether the call should be allowed.</p>
+
+  <h3>Can I just put the permission rules in the system prompt?</h3>
+  <p>No. A prompt is a request, not a control: the same context window that carries your rules carries the attacker's text, and the model arbitrates between them. Prompt-level rules are useful for making the agent behave sensibly and useless as a security boundary. The check has to happen in code the model cannot influence.</p>
+
+  <h3>Do I need one of these at all, or is my framework's permission check enough?</h3>
+  <p>If your agent touches one system with a handful of roles, your existing checks are probably fine — adding a policy engine has a real cost and buys little. The signal that you have outgrown it is the arrival of a relationship question: "can this agent read a document because it was shared with a group its principal belongs to". That question is answerable with a hand-rolled check exactly once, and then it multiplies.</p>
+
+  <h3>What about Cerbos, Oso, Permify or Ory Keto?</h3>
+  <p>They are real options and they fall on the same split. Cerbos and Oso are policy-as-code alongside OPA and Cedar; Permify and Ory Keto are Zanzibar-style alongside OpenFGA and SpiceDB. Permit.io is a different category again — a management platform that runs OPA, Cedar or OpenFGA underneath, which is worth knowing because it means choosing it does not exempt you from the decision in this post.</p>
+
+  <h3>Does the relationship store become a single point of failure?</h3>
+  <p>Yes, deliberately, in the same way your identity provider already is. Plan for it: cache decisions with a short TTL where staleness is acceptable, fail closed on write paths and consider failing closed everywhere for agents, and load-test the authorization tier along with everything else — an agent workload puts an order of magnitude more traffic through it than the web application it sits next to.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/deep-dives/agent-security/policy-as-code-for-agents">Policy as code for agents</a> — the pattern these engines implement, independent of vendor.</li>
+    <li><a href="/operations/safety-and-security/scoped-credentials-for-agents">Scoped credentials for agents</a> — the other half: narrowing what a token can reach before any policy runs.</li>
+    <li><a href="/concepts/agent-identity-and-permissions">Agent identity &amp; permissions</a> — the concept-level introduction if the vocabulary here is new.</li>
+    <li><a href="/operations/governance-compliance/delegated-access-and-consent-records">Delegated access &amp; consent records</a> — what you must be able to show afterwards.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://www.openpolicyagent.org/">Open Policy Agent</a></li>
+    <li><a href="https://www.cedarpolicy.com/">Cedar policy language</a></li>
+    <li><a href="https://openfga.dev/docs/modeling/agents">OpenFGA — authorization for agents</a></li>
+    <li><a href="https://authzed.com/docs">SpiceDB documentation</a></li>
+  </ul>
+</section>
