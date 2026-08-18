@@ -1,0 +1,120 @@
+<p class="lede">Cloudflare's new headless browser uses three to seven times less CPU and memory than Chromium and takes about 1.7× longer to finish the same task — and almost every write-up stopped at the first half of that sentence. The number that changes an architecture is neither one: it is that a browser you can start per task, and destroy after it, removes the economic reason every browser-agent platform reuses sessions. Session reuse is where the state leaks are.</p>
+
+<section>
+  <h2>What actually shipped</h2>
+  <p>Announced on 6 August 2026 and available free in beta through Cloudflare's Browser Run, Kitesurf is a browser engine assembled from parts rather than a headless build of an existing one, and it runs inside Workers' V8 isolates instead of inside a container.</p>
+
+  <table>
+    <thead>
+      <tr><th>Attribute</th><th>Kitesurf</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Execution unit</td><td>Cloudflare Workers V8 isolate — no container, no Chromium process</td></tr>
+      <tr><td>Engine parts</td><td>Blitz (Rust layout/rendering), Stylo (Firefox's CSS engine), Parley (text shaping), blitz-paint (rasterisation)</td></tr>
+      <tr><td>JavaScript</td><td>V8, with Boa (a Rust ECMAScript engine) covering <code>eval</code>, which Workers does not allow natively</td></tr>
+      <tr><td>Compatibility claim</td><td>215,000+ Web Platform Tests at announcement — Cloudflare has since cited 235,000+ — at roughly 97% of DOM and 96% of HTML subtests</td></tr>
+      <tr><td>Client protocol</td><td>Chrome DevTools Protocol, so Playwright, Puppeteer and MCP clients connect unchanged</td></tr>
+      <tr><td>Output</td><td>JPEG, PNG or PDF rasterised server-side</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/kitesurf-makes-the-browser-disposable/data-resource-profile.svg" alt="Bar chart of Kitesurf relative to Chromium on common agentic tasks: CPU and memory between three and seven times lower, wall-clock time about 1.7 times higher." width="900" height="400" loading="lazy" />
+    <figcaption>Two of these bars point the same way and one points the other. Which one you care about depends on what your provider bills.</figcaption>
+  </figure>
+
+  <p>Cloudflare is explicit about where the wall-clock gap comes from: a JIT that has already warmed on the page beats a cold software renderer, and most of the difference sits in rasterisation and image encoding. That is a fixable engineering gap rather than an architectural one, and it is also mostly irrelevant to an agent that reads the DOM and never looks at a picture.</p>
+</section>
+
+<section>
+  <h2>The resource number matters because of what it bills, not what it saves</h2>
+  <p>A 3–7× reduction in CPU and memory sounds like a line item. It is really a change in the unit of allocation, and that is a bigger deal.</p>
+
+  <h3>A container is rented; an isolate is metered</h3>
+  <p>A headless Chromium instance is a process inside a container. You pay for it to exist — memory reserved, container resident — whether or not the page is doing anything, and it takes hundreds of milliseconds to a few seconds to become useful. Everything downstream of that fact is amortisation: pools of warm browsers, sessions that outlive a task, contexts recycled between jobs. An isolate is a different shape. It starts in single-digit milliseconds, occupies memory only while it runs, and bills CPU rather than residency. The 1.7× wall-time penalty barely dents that, because most of the wall time in a browser task is spent waiting on the network, and waiting is exactly what a rented container charges for and a metered isolate does not.</p>
+
+  <h3>Which means disposability stops costing anything</h3>
+  <p>Here is the part worth planning around. Once a fresh browser is free to start, the reason to reuse one disappears — and reuse is doing a lot of quiet damage. A reused context carries cookies, storage and service workers from the previous task. A page that injected instructions into one run leaves residue for the next. In a multi-tenant deployment, the pool that makes the economics work is also the thing standing between one customer's session and another's. Those are not hypotheticals; they are the failure modes catalogued in <a href="/deep-dives/architectures-and-patterns/browser-agent-failure-modes">browser-agent failure modes</a> and the reason <a href="/operations/agentops/multi-tenancy-for-agents">multi-tenancy for agents</a> spends most of its length on isolation boundaries.</p>
+
+  <figure>
+    <img src="/blogs/kitesurf-makes-the-browser-disposable/arch-pooled-vs-disposable.svg" alt="Diagram contrasting a pool of warm Chromium containers shared across tasks, where cookies and injected state carry between runs, with per-task isolates that are created and destroyed for each task so no state survives." width="900" height="500" loading="lazy" />
+    <figcaption>Left: the pool exists because starting a browser is expensive. Right: when it is not, the pool has no reason to exist — and neither does the leak.</figcaption>
+  </figure>
+
+  <p>This is the same pattern that played out in code execution. Nobody argues about whether to reuse a sandbox between untrusted runs any more, because a fresh one costs milliseconds — see <a href="/concepts/sandboxing-and-code-execution">sandboxing and code execution</a>. Browsing has been stuck one generation behind that, not for a security reason but for a cost one. Kitesurf is the first widely available thing that removes the cost reason.</p>
+</section>
+
+<section>
+  <h2>What you trade for it: compatibility is a tail, not a percentage</h2>
+  <p>Now the honest half. 97% of DOM subtests is a very strong result for a young engine and a very weak predictor of whether your target sites work, because those two things measure different objects.</p>
+
+  <h3>Per-feature conformance does not compose into per-site success</h3>
+  <p>A site does not use one feature; it uses hundreds, across a dependency tree it did not write. It fails if <em>any</em> of them diverges. High per-subtest conformance is compatible with a meaningful per-site failure rate, and the distribution is not random — the misses cluster in exactly the modern, framework-heavy, heavily-scripted pages that agents are most often pointed at. Chromium's real advantage was never spec conformance either. It is that a decade of sites were tested against Chromium's actual behaviour, bugs included.</p>
+
+  <h3>The failure is silent, and that is the expensive part</h3>
+  <p>A browser that crashes is a good outcome: you retry somewhere else. What you get instead is a page that parses, renders and returns a DOM in which one panel never hydrated, one price never updated, one list rendered empty. The agent reads that DOM, believes it, and acts. There is no error to catch, no exception in the trace, and the mistake surfaces later as a wrong extraction or a wrong click. Any browser agent that takes actions on the basis of what it read needs to treat "the page looked fine" as an unverified claim — the general form of that argument is in <a href="/playbooks/coding-and-computer-use-agents/browser-agents">browser agents</a>.</p>
+
+  <figure>
+    <img src="/blogs/kitesurf-makes-the-browser-disposable/data-engine-tradeoffs.svg" alt="Feature matrix comparing Chromium in a container against Kitesurf in an isolate across six axes: CPU and memory cost, wall-clock speed, spec conformance, real-site long-tail compatibility, per-task disposability, and fingerprint predictability." width="900" height="400" loading="lazy" />
+    <figcaption>Neither column dominates. The two rows differ on which risks they convert into which costs.</figcaption>
+  </figure>
+
+  <p>There is a third axis that cuts both ways: a non-Chromium engine presents a different fingerprint to bot detection. That is a fresh unknown rather than a strict downgrade — some targets will treat it more harshly, some detection stacks key on Chromium-specific automation artefacts that a different engine simply does not emit. It is measurable per target and unknowable in general, which is the theme of this whole section.</p>
+</section>
+
+<section>
+  <h2>What to actually do</h2>
+
+  <h3>Build the compatibility harness before the migration, not during it</h3>
+  <p>Agent web work is almost never "the web". It is thirty to a hundred target sites you already know. That turns an unanswerable question into an afternoon: run your real flows against both engines, diff the extracted fields, and count divergences per target. You now have a per-site allowlist instead of an argument, and you will keep the harness afterwards — target sites change under you regardless of which engine you chose, which is the drift problem in <a href="/operations/agentops/third-party-tool-drift">third-party tool drift</a>.</p>
+
+  <h3>Route by target, not by preference</h3>
+  <p>The CDP interface means both engines take the same Playwright script, so engine choice is a per-target configuration rather than a platform commitment. Send the sites that pass to the cheap disposable engine, keep Chromium for the ones that do not, and re-run the harness on a schedule. This is the same warm-second-candidate discipline that <a href="/operations/agentops/model-deprecation-and-migration">model deprecation and migration</a> recommends, applied one layer down.</p>
+
+  <h3>Spend the savings on isolation, not on volume</h3>
+  <p>The temptation with a cheaper browser is to browse more. The higher-value move is to stop reusing contexts: one isolate per task, destroyed after, no shared cookie jar, no pool. If you take only one thing from this launch, take that — and note it is worth doing on Chromium too, just at a price you now have a reason to compare against.</p>
+
+  <h3>Keep egress control where it was</h3>
+  <p>A lighter browser does not change what a compromised page can ask the browser to fetch. Allowlists, per-task credentials and outbound restrictions belong exactly where <a href="/operations/safety-and-security/egress-control-for-agents">egress control for agents</a> puts them, on both engines.</p>
+
+  <div class="callout tip">
+    <p>The durable principle underneath the launch: <strong>the cost of starting a fresh execution context is a security parameter, not just a bill.</strong> Every time that cost falls by an order of magnitude, a class of state-reuse vulnerability stops being a trade-off and becomes a choice — and the teams that benefit are the ones who noticed the trade-off was economic in the first place.</p>
+  </div>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>Is Kitesurf a Chromium replacement?</h3>
+  <p>Not for anything that needs pixel-accurate rendering or the long tail of site-specific behaviour. It is a replacement for the large fraction of agent browsing that is fetch, parse, read the DOM, click, extract — where the rendering fidelity that Chromium spends its resources on is not being consumed by anyone.</p>
+
+  <h3>Does the 1.7× slower wall time cancel out the resource savings?</h3>
+  <p>It depends entirely on your billing model. If you pay for container residency, wall time is the bill and the gap hurts. If you pay for CPU, the two numbers are measuring different things and the slower wall clock is largely time spent waiting on the network, which costs an isolate almost nothing. Work out which one your provider charges you for before quoting either number.</p>
+
+  <h3>Can I just point Playwright at it?</h3>
+  <p>Yes — it speaks the Chrome DevTools Protocol, so existing Playwright, Puppeteer and MCP-based clients connect without a rewrite. That low switching cost is exactly what makes the per-target routing strategy above practical, and it is also why the compatibility harness is worth building: the code will run, which tells you nothing about whether the extraction was right.</p>
+
+  <h3>How does this compare with the hosted browser platforms?</h3>
+  <p>Different layer. Browserbase, Steel, Hyperbrowser and the rest sell managed Chromium plus session infrastructure, stealth and observability; we compared them in <a href="/blogs/browserbase-vs-steel-vs-hyperbrowser-vs-anchor-browser">cloud browsers for agents</a>. Kitesurf changes what the browser under those platforms could be. If disposability becomes standard, the part of their pitch that is about warm-pool management gets less valuable and the part about anti-detection and debugging gets more so.</p>
+
+  <h3>Should we wait for it to be open-sourced?</h3>
+  <p>Cloudflare has said it plans to open source it, and that would matter for anyone who wants to self-host or audit the engine. It should not gate an evaluation: the compatibility harness you would build to decide is worth having regardless, and it is the only thing that will actually answer the question for your targets.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/playbooks/coding-and-computer-use-agents/browser-agents">Browser agents</a> — building the loop that reads and acts on a page.</li>
+    <li><a href="/deep-dives/architectures-and-patterns/browser-agent-failure-modes">Browser-agent failure modes</a> — including the ones that reused state causes.</li>
+    <li><a href="/concepts/sandboxing-and-code-execution">Sandboxing &amp; code execution</a> — the same disposability argument, one layer over.</li>
+    <li><a href="/operations/agentops/multi-tenancy-for-agents">Multi-tenancy for agents</a> — why the pool is also the boundary.</li>
+    <li><a href="/operations/safety-and-security/egress-control-for-agents">Egress control for agents</a> — unchanged by a lighter engine.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://blog.cloudflare.com/kitesurf/">Cloudflare — Introducing Kitesurf: the agent-first browser that runs in V8 isolates on Cloudflare Workers</a></li>
+    <li><a href="https://developers.cloudflare.com/browser-run/kitesurf/">Cloudflare Browser Run docs — Kitesurf</a></li>
+    <li><a href="https://techcrunch.com/2026/08/07/cloudflare-launches-kitesurf-a-browser-built-for-ai-agents/">TechCrunch — Cloudflare launches Kitesurf, a browser built for AI agents</a></li>
+  </ul>
+</section>
