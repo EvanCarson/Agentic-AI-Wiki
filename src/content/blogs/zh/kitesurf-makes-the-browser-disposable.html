@@ -1,0 +1,120 @@
+<p class="lede">Cloudflare 新的无头浏览器，CPU 与内存用量比 Chromium 少三到七倍，而完成同一件任务要多花约 1.7 倍的时间——几乎所有报道都停在了这句话的前半截。真正会改变架构的数字两个都不是：而是"一个可以为每个任务单独启动、用完即毁的浏览器"，抹掉了所有浏览器智能体平台复用会话的经济理由。而状态泄漏，正住在会话复用里。</p>
+
+<section>
+  <h2>实际发布的是什么</h2>
+  <p>2026 年 8 月 6 日发布，beta 期间可通过 Cloudflare 的 Browser Run 免费使用。Kitesurf 不是把某个现成浏览器编译成无头模式，而是用一堆零件拼出来的一个浏览器引擎，并且它跑在 Workers 的 V8 isolate 里，而不是跑在容器里。</p>
+
+  <table>
+    <thead>
+      <tr><th>属性</th><th>Kitesurf</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>执行单元</td><td>Cloudflare Workers 的 V8 isolate——没有容器，也没有 Chromium 进程</td></tr>
+      <tr><td>引擎零件</td><td>Blitz（Rust 布局/渲染）、Stylo（Firefox 的 CSS 引擎）、Parley（文本排版）、blitz-paint（栅格化）</td></tr>
+      <tr><td>JavaScript</td><td>V8；<code>eval</code> 由 Boa（一个 Rust 写的 ECMAScript 引擎）承担，因为 Workers 原生不允许 eval</td></tr>
+      <tr><td>兼容性声明</td><td>发布时通过 215,000+ 项 Web Platform Tests——Cloudflare 此后给出的数字是 235,000+——DOM 子测试约 97%、HTML 子测试约 96%</td></tr>
+      <tr><td>客户端协议</td><td>Chrome DevTools Protocol，因此 Playwright、Puppeteer 与 MCP 客户端无需改动即可接入</td></tr>
+      <tr><td>输出</td><td>服务端栅格化的 JPEG、PNG 或 PDF</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/kitesurf-makes-the-browser-disposable/data-resource-profile.svg" alt="柱状图：在常见智能体任务上，Kitesurf 相对于 Chromium 的表现——CPU 与内存低三到七倍，而墙钟时间高约 1.7 倍。" width="900" height="400" loading="lazy" />
+    <figcaption>三根柱子里两根朝一个方向、一根朝另一个方向。你在意哪一根，取决于你的服务商按什么计费。</figcaption>
+  </figure>
+
+  <p>Cloudflare 明确说了墙钟差距从哪来：一个已经在这个页面上热起来的 JIT，胜过一个冷启动的软件渲染器，而差距的大部分落在栅格化与图像编码上。这是一个工程上补得回来的差距，而不是架构性的；而且对于一个读 DOM、从不看图的智能体来说，这个差距基本无关紧要。</p>
+</section>
+
+<section>
+  <h2>资源数字之所以重要，在于它计的是什么费，而不在于它省了多少</h2>
+  <p>CPU 与内存降低 3–7 倍听起来像账单上的一行。它实际上是分配单位变了，而那是更大的一件事。</p>
+
+  <h3>容器是租的，isolate 是按表计的</h3>
+  <p>一个无头 Chromium 实例是容器里的一个进程。你为"它存在"付费——内存被预留、容器常驻——无论页面在不在干活；而且它要几百毫秒到几秒才变得可用。这个事实下游的一切都是摊销：热浏览器池、活得比任务还久的会话、在作业之间回收复用的上下文。isolate 是另一种形状：个位数毫秒启动、只在运行时占内存、按 CPU 而不是按常驻计费。1.7 倍的墙钟惩罚几乎伤不到这一点，因为浏览器任务的墙钟时间大部分花在等网络上，而"等待"恰恰是租来的容器要收钱、按表计的 isolate 不收钱的那件事。</p>
+
+  <h3>于是"用完即扔"不再有成本</h3>
+  <p>这才是值得据以规划的部分。一旦启动一个全新浏览器是免费的，复用一个浏览器的理由就消失了——而复用正在悄悄造成不少损害。被复用的上下文携带着上一个任务的 cookie、storage 与 service worker。某个页面在一次运行中注入的指令，会给下一次留下残渣。在多租户部署里，那个让经济账算得平的池子，同时也是隔在一位客户会话与另一位客户会话之间的唯一那道东西。这些都不是假设；它们正是<a href="/zh/deep-dives/architectures-and-patterns/browser-agent-failure-modes">浏览器智能体失败模式</a>里编录的失效方式，也是<a href="/zh/operations/agentops/multi-tenancy-for-agents">智能体的多租户</a>把大半篇幅花在隔离边界上的原因。</p>
+
+  <figure>
+    <img src="/blogs/kitesurf-makes-the-browser-disposable/arch-pooled-vs-disposable.svg" alt="对比图：左侧是被多个任务共享的热 Chromium 容器池，cookie 与被注入的状态在运行之间带过去；右侧是每个任务一个 isolate，用完即毁，没有状态留存。" width="900" height="500" loading="lazy" />
+    <figcaption>左边：池子存在，是因为启动一个浏览器很贵。右边：一旦不贵了，池子就没有存在的理由——那道泄漏也一样。</figcaption>
+  </figure>
+
+  <p>这与代码执行那边发生过的事是同一个模式。今天已经没人再争论"两次不可信运行之间要不要复用沙箱"了，因为开一个新的只要几毫秒——见<a href="/zh/concepts/sandboxing-and-code-execution">沙箱与代码执行</a>。浏览这件事一直卡在那之后一代，原因不是安全，而是成本。Kitesurf 是第一个广泛可用的、把这个成本理由拿掉的东西。</p>
+</section>
+
+<section>
+  <h2>你为此付出的代价：兼容性是一条长尾，不是一个百分比</h2>
+  <p>现在说诚实的那一半。97% 的 DOM 子测试通过率，对一个年轻引擎来说是非常强的成绩，同时也是一个非常弱的"你的目标站点能不能用"的预测指标，因为这两者量的是不同的东西。</p>
+
+  <h3>按特性算的合规度，不会累加成按站点算的成功率</h3>
+  <p>一个站点用的不是一个特性，而是几百个，分布在一棵不是它自己写的依赖树上。只要其中<em>任何一个</em>有偏差，它就挂。很高的逐项子测试合规度，完全可以与一个不容忽视的按站点失败率并存，而且这个分布并不随机——偏差恰恰聚集在那些现代的、框架密集的、脚本繁重的页面上，而那正是智能体最常被指过去的地方。Chromium 真正的优势也从来不是规范合规度，而是十年来的站点都是对着 Chromium 的实际行为（含 bug）测出来的。</p>
+
+  <h3>失败是静默的，而这才是昂贵的部分</h3>
+  <p>浏览器崩掉反倒是个好结果：你换个地方重试就是。你实际会拿到的，是一个能解析、能渲染、能返回 DOM 的页面，只不过其中某个面板没有 hydrate、某个价格没有更新、某个列表渲染成了空。智能体读了那份 DOM、信了它，然后动手。没有错误可以捕获，trace 里没有异常，而这个错误要到后来才以"抽取错了"或"点错了"的形式浮出来。任何基于"它读到了什么"来采取动作的浏览器智能体，都必须把"这页看起来没问题"当作一个未经核实的声明——这个论点的一般形式见<a href="/zh/playbooks/coding-and-computer-use-agents/browser-agents">浏览器智能体</a>。</p>
+
+  <figure>
+    <img src="/blogs/kitesurf-makes-the-browser-disposable/data-engine-tradeoffs.svg" alt="特性矩阵：容器里的 Chromium 与 isolate 里的 Kitesurf，在六条轴上对比——CPU 与内存成本、墙钟速度、规范合规度、真实站点长尾兼容性、按任务用完即扔，以及指纹可预测性。" width="900" height="400" loading="lazy" />
+    <figcaption>没有哪一栏全面胜出。两行的差别在于：它们各自把哪些风险换成了哪些成本。</figcaption>
+  </figure>
+
+  <p>还有第三条轴是双刃的：一个非 Chromium 引擎在机器人检测面前呈现的是另一份指纹。这是一个全新的未知数，而不是一次单纯的降级——有些目标会对它更严厉，而有些检测栈盯的是 Chromium 特有的自动化痕迹，另一个引擎干脆不会产生那些痕迹。它可以按目标测出来，但在一般意义上无法预知——这正是本节的主题。</p>
+</section>
+
+<section>
+  <h2>那么实际该做什么</h2>
+
+  <h3>在迁移之前、而不是迁移过程中，搭好兼容性测试台</h3>
+  <p>智能体的网页工作几乎从来不是"整个互联网"，而是你早就知道的三十到一百个目标站点。这就把一个无解的问题变成了一个下午的活：拿你真实的流程在两个引擎上各跑一遍，比对抽取出来的字段，按目标统计分歧数。你于是有了一份按站点的允许清单，而不是一场争论；而且这个测试台你之后还会一直留着——无论你选了哪个引擎，目标站点都会在你脚下变化，这就是<a href="/zh/operations/agentops/third-party-tool-drift">第三方工具漂移</a>里的那个漂移问题。</p>
+
+  <h3>按目标路由，而不是按偏好</h3>
+  <p>CDP 接口意味着两个引擎吃的是同一份 Playwright 脚本，所以引擎选择是一个按目标的配置项，而不是一次平台层面的承诺。把通过测试的站点发给便宜的用完即扔引擎，把没通过的留给 Chromium，并按周期重跑测试台。这与<a href="/zh/operations/agentops/model-deprecation-and-migration">模型退役与迁移</a>推荐的"备胎保持热身"是同一套纪律，只不过用在下面一层。</p>
+
+  <h3>把省下来的钱花在隔离上，而不是花在量上</h3>
+  <p>浏览器变便宜了，人的诱惑是多浏览一些。更高价值的动作是不再复用上下文：一个任务一个 isolate，用完即毁，不共享 cookie jar，不要池子。如果你从这次发布里只带走一件事，就带走这件——而且要注意，这件事在 Chromium 上同样值得做，只不过价格现在有了一个可以对比的参照。</p>
+
+  <h3>出网管控还留在原地</h3>
+  <p>更轻的浏览器并不改变一个被攻陷的页面能让浏览器去取什么。允许清单、按任务发放的凭据与出网限制，仍然应该放在<a href="/zh/operations/safety-and-security/egress-control-for-agents">智能体的出网管控</a>所指的位置上——两个引擎都一样。</p>
+
+  <div class="callout tip">
+    <p>这次发布底下那条经得起时间的原则：<strong>启动一个全新执行上下文的成本，是一个安全参数，而不只是一笔账单。</strong>每当这个成本下降一个数量级，就有一类"状态复用"漏洞从"权衡"变成"选择"——而受益的团队，是那些一开始就注意到这个权衡其实是经济性权衡的团队。</p>
+  </div>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+
+  <h3>Kitesurf 是 Chromium 的替代品吗？</h3>
+  <p>凡是需要像素级精确渲染、或者需要站点特有行为长尾的场景，都不是。它替代的是智能体浏览中占很大比例的那一块：取回、解析、读 DOM、点击、抽取——在这块里，Chromium 花掉大量资源换来的那份渲染保真度，根本没有任何人在消费。</p>
+
+  <h3>1.7 倍的墙钟时间会不会把资源节省抵消掉？</h3>
+  <p>这完全取决于你的计费模型。如果你按容器常驻付费，墙钟时间就是账单，这个差距会疼。如果你按 CPU 付费，这两个数字量的就是不同的东西，而更慢的墙钟里大部分是在等网络，那对一个 isolate 几乎不花钱。在引用任何一个数字之前，先弄清楚你的服务商到底按哪一个收你的钱。</p>
+
+  <h3>我能直接把 Playwright 指过去吗？</h3>
+  <p>能——它讲 Chrome DevTools Protocol，所以现有的 Playwright、Puppeteer 与基于 MCP 的客户端不用重写就能连上。正是这种极低的切换成本，让上面那套按目标路由的策略变得可行；而这也正是兼容性测试台值得搭的原因：代码会跑起来，而这件事完全没有告诉你抽取得对不对。</p>
+
+  <h3>它和那些托管浏览器平台怎么比？</h3>
+  <p>不在同一层。Browserbase、Steel、Hyperbrowser 这类卖的是托管 Chromium 加会话基础设施、反检测与可观测性；我们在<a href="/zh/blogs/browserbase-vs-steel-vs-hyperbrowser-vs-anchor-browser">面向智能体的云浏览器</a>里比较过它们。Kitesurf 改变的是这些平台底下那个浏览器可以是什么。如果"用完即扔"成为常态，它们卖点中关于热池管理的那部分会贬值，而关于反检测与调试的那部分会升值。</p>
+
+  <h3>我们该等它开源吗？</h3>
+  <p>Cloudflare 说过计划开源，这对任何想自托管或审计引擎的人都重要。但它不该成为评估的前置条件：你为了做决定而要搭的那个兼容性测试台，无论如何都值得拥有，而且它是唯一真能为你的目标站点回答这个问题的东西。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关：</h3>
+  <ul>
+    <li><a href="/zh/playbooks/coding-and-computer-use-agents/browser-agents">浏览器智能体</a>——构建那个读取页面并据以行动的循环。</li>
+    <li><a href="/zh/deep-dives/architectures-and-patterns/browser-agent-failure-modes">浏览器智能体失败模式</a>——包括状态复用造成的那些。</li>
+    <li><a href="/zh/concepts/sandboxing-and-code-execution">沙箱与代码执行</a>——同一个"用完即扔"的论点，在上面一层。</li>
+    <li><a href="/zh/operations/agentops/multi-tenancy-for-agents">智能体的多租户</a>——为什么那个池子同时也是那道边界。</li>
+    <li><a href="/zh/operations/safety-and-security/egress-control-for-agents">智能体的出网管控</a>——不因引擎变轻而改变。</li>
+  </ul>
+  <h3>信息来源：</h3>
+  <ul>
+    <li><a href="https://blog.cloudflare.com/kitesurf/">Cloudflare — Introducing Kitesurf: the agent-first browser that runs in V8 isolates on Cloudflare Workers</a></li>
+    <li><a href="https://developers.cloudflare.com/browser-run/kitesurf/">Cloudflare Browser Run 文档 — Kitesurf</a></li>
+    <li><a href="https://techcrunch.com/2026/08/07/cloudflare-launches-kitesurf-a-browser-built-for-ai-agents/">TechCrunch — Cloudflare launches Kitesurf, a browser built for AI agents</a></li>
+  </ul>
+</section>

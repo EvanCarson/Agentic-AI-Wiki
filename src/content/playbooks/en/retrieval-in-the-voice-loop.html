@@ -1,0 +1,105 @@
+<section class="phase">
+  <div class="phase-num">V12</div>
+  <div class="week">Playbook · Voice &amp; Realtime Agents</div>
+  <h2>Retrieval inside the voice turn: the pipeline you already built does not fit.</h2>
+  <p class="goal">A grounded answer in a voice call has to start coming out of the speaker roughly 800 milliseconds after the caller stops talking, and a conventional retrieve-rewrite-rerank chain spends most of that before the model has seen a single document — which is why voice agents that were accurate in the chat prototype start guessing on the phone. The fix is not a faster vector database. It is to start retrieving before the turn ends, precompute the head of the question distribution, and delete pipeline stages you were told were mandatory.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Do the arithmetic first: retrieval gets about 200 milliseconds, not 2 seconds.</h3>
+
+    <p>The <a class="xref" href="/playbooks/voice-realtime-agents/latency-budget">latency budget</a> for a natural-feeling turn is already fully allocated before retrieval is invited. Endpointing has to decide the caller finished, the model has to produce a first token, and the voice has to be synthesised and delivered through a transport you do not control.</p>
+
+    <ul>
+      <li><strong>Write down your own budget line by line and find the slack.</strong> In a typical cascade, semantic endpointing takes a few hundred milliseconds, model time-to-first-token a few hundred more, and TTS time-to-first-audio a hundred-plus — before the network. On a sub-second target that leaves something in the range of 150 to 300 milliseconds of genuinely free time, and only if retrieval overlaps nothing else.</li>
+      <li><strong>Now price the pipeline you have.</strong> Query rewriting is a model call — that alone is your whole budget. An embedding call is tens of milliseconds. A vector search is tens more. A cross-encoder <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">rerank</a> over fifty candidates is another hundred-plus. Multi-hop <a class="xref" href="/deep-dives/retrieval-and-rag/agentic-retrieval">agentic retrieval</a>, which is the right answer in a research agent, is several seconds and therefore simply not a candidate here.</li>
+      <li><strong>The overrun does not show up as slowness. It shows up as dead air, then as a wrong answer.</strong> Teams under latency pressure quietly lower the retrieval timeout, and a timed-out retrieval usually means the model answers from parametric memory instead — confidently, in a pleasant voice, with nothing grounding it. You did not build a slow voice agent; you built one that <a class="xref" href="/concepts/hallucination-and-grounding">hallucinates</a> under load.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The framing that makes the rest tractable: <strong>in voice, retrieval latency is not a performance metric, it is an accuracy metric.</strong> Every millisecond over budget converts, through a timeout you configured, into an ungrounded answer. Measure the two together or you will optimise one into the other.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Start retrieving before the caller finishes the sentence.</h3>
+
+    <p>The single largest win available is not making retrieval faster — it is moving it earlier. Streaming STT is already emitting partial transcripts hundreds of milliseconds before endpointing fires, and that window is dead time you are currently throwing away.</p>
+
+    <ul>
+      <li><strong>Fire a speculative query on the partial transcript.</strong> As soon as the partial contains enough content words to be a plausible question, issue the search. When the final transcript arrives, compare: if the intent is unchanged, the documents are already in hand and retrieval cost you zero perceived milliseconds. If it changed, discard and re-query — you have lost nothing but a little compute.</li>
+      <li><strong>Budget for waste, because waste is the mechanism.</strong> Expect to throw away a meaningful share of speculative queries; that is not a bug to tune out. Retrieval against a warm index is cheap relative to the turn, and buying hundreds of milliseconds of perceived latency with discarded queries is the best trade in the whole stack. Cap concurrency per call so a rambling caller cannot fan out indefinitely.</li>
+      <li><strong>Debounce on content, not on time.</strong> Re-issuing on every partial token burns the index for nothing. Re-issue when the partial gains a new entity or a new content word — the same signals that <a class="xref" href="/deep-dives/retrieval-and-rag/query-understanding-for-rag">query understanding</a> uses, applied incrementally.</li>
+      <li><strong>Do not let speculation act.</strong> Speculative <em>retrieval</em> is free to be wrong because nothing has happened yet. Speculative <em>tool calls</em> are not: a lookup that writes, charges or notifies must wait for a committed turn. The read/write split is the same one <a class="xref" href="/playbooks/voice-realtime-agents/voice-tooling-and-state">tool use and state in voice</a> draws.</li>
+      <li><strong>Barge-in must cancel the in-flight query.</strong> If the caller interrupts, the speculative retrieval that was running belongs to a turn that no longer exists. Wire cancellation into the same path as <a class="xref" href="/playbooks/voice-realtime-agents/turn-taking-and-barge-in">barge-in</a>, or you will occasionally answer a question nobody finished asking.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The head of the distribution is a cache, not a search.</h3>
+
+    <p>Voice traffic is far more concentrated than chat traffic. Callers ask about hours, order status, a fee, a policy, a return — and in most deployments a few dozen intents cover the large majority of turns. Searching for those answers every time is work you can do once, offline.</p>
+
+    <ul>
+      <li><strong>Precompute answers, not just documents.</strong> For your top intents, store the finished, spoken-length answer text — reviewed by a human, phrased for the ear — keyed by intent. The turn becomes classify-and-read, which is a fraction of the latency and considerably more reliable than a fresh generation over fresh chunks.</li>
+      <li><strong>Pre-synthesise the audio for the stable ones.</strong> Anything that does not vary per caller — opening hours, the returns policy, a disclosure you must read — can be cached as audio and start playing in single-digit milliseconds. This is the cheapest quality win in a voice stack and almost nobody does it.</li>
+      <li><strong>Warm the caller-specific context at call setup, not at first question.</strong> You usually know who is calling before they speak. Fetch the account, the last order, the open ticket while the greeting is playing; by the time the first question lands, the expensive lookup already happened during audio you were going to play anyway.</li>
+      <li><strong>Use semantic caching for the near-misses.</strong> "What time do you close?" and "are you open late today?" should hit the same entry. The mechanics and the invalidation traps are in <a class="xref" href="/concepts/semantic-caching">semantic caching</a> — the voice-specific caution is that a stale cached answer is read aloud with total confidence and is never skimmed past.</li>
+      <li><strong>Keep the tail on the live path.</strong> The point of covering the head is that you can afford to be slower and more careful on the rare, complicated question — which is exactly where a slower answer is also socially acceptable.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Cut stages; do not shrink them.</h3>
+
+    <p>The instinct is to keep the pipeline and tune each stage down. That fails, because the stages have fixed costs and because a rushed stage degrades quality without returning much time. Delete instead, and be deliberate about what you are giving up.</p>
+
+    <ul>
+      <li><strong>Drop the query-rewriting call.</strong> It is a full model round trip to fix a problem voice mostly does not have: the caller's question arrives as a spoken sentence, usually already well-formed, and conversation history can be carried in the retrieval query as raw text. If ambiguity is common in your domain, resolve it by asking a short clarifying question — cheaper in milliseconds and better for the caller than a hidden rewrite.</li>
+      <li><strong>Drop the cross-encoder rerank, or move it off the critical path.</strong> Reranking buys precision at the top of the list, and in a voice turn you are reading two or three passages, not twenty. Retrieve a small candidate set with a good hybrid first stage and accept its ordering. If you want the rerank, run it on the speculative result while the caller is still talking.</li>
+      <li><strong>Retrieve fewer, shorter passages.</strong> A voice answer is two or three sentences; ten thousand tokens of context does not improve it and does slow time-to-first-token measurably. Chunk your corpus for the answer length you actually speak.</li>
+      <li><strong>Keep one index and keep it warm.</strong> Cold caches, cold connections and lazily-loaded indexes turn a 30 ms search into a 400 ms one on exactly the first call after a quiet period. Pin it, warm it on deploy, and health-check it with a real query rather than a ping.</li>
+      <li><strong>Stream the answer as it grounds.</strong> The model can begin speaking the framing of an answer while later passages are still arriving. This is the same shape as streaming generation, and in voice it converts real latency into no perceived latency for the part of the sentence that carried no facts.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When you cannot be fast, be honest — and make the filler a designed instrument.</h3>
+
+    <p>Some lookups are slow and cannot be pre-warmed: a partner API, a mainframe, a human-approval step. Silence is the worst possible response, and the standard fix — a filler phrase — is only safe if it is designed rather than improvised.</p>
+
+    <ul>
+      <li><strong>Say what you are doing, specifically.</strong> "Let me pull up that order" sets an expectation and buys two seconds honestly. "Um, one moment" buys about half as much and sounds like a stall. Specificity is what converts waiting into progress.</li>
+      <li><strong>Trigger the filler on a timer, not on every lookup.</strong> If retrieval returns in 200 ms, a preamble makes the agent slower and chattier. Start the phrase only when the lookup crosses a threshold — a few hundred milliseconds — so fast paths stay crisp.</li>
+      <li><strong>Never promise a result you might not get.</strong> A preamble that says "I'm looking that up" followed by a failure lands much worse than a straight "I don't have that in front of me — I can connect you to someone who does." The commitment in the filler is a commitment.</li>
+      <li><strong>Cap the wait and pre-decide the exit.</strong> Set a hard ceiling — a few seconds — after which the agent stops waiting and takes a defined path: offer a callback, hand off, or answer the part it does know. Without a ceiling you get the latency death spiral catalogued in <a class="xref" href="/playbooks/voice-realtime-agents/voice-failure-modes">voice failure modes</a>, where each apology adds a turn.</li>
+      <li><strong>Vary the phrasing and keep it interruptible.</strong> The same eight words on every lookup reads as a machine within three turns. And a caller who says "actually, never mind" during the filler must be heard — filler audio is not an excuse to stop listening.</li>
+      <li><strong>"I don't know" needs a rehearsed script, in the caller's language.</strong> Retrieval that returns nothing relevant is a normal outcome, and the model's default is to fill the gap. Give it an explicit low-confidence path with a named destination, and treat a missing handoff target as a bug — <a class="xref" href="/playbooks/domain-playbooks/customer-support-agents">customer-support agents</a> covers the queue it lands in.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Grounding fails differently in voice, so measure it differently.</h3>
+
+    <p>A chat user sees the citation, skims the source, and catches the error. A caller hears one confident sentence with no footnote, no scrollback and no way to check. The verification affordance that carries most of the safety in text RAG is simply absent, so the measurement has to make up the difference.</p>
+
+    <ul>
+      <li><strong>Score entity-level correctness, not passage relevance.</strong> Retrieval metrics like recall@k tell you the document was there; they do not tell you the agent read the right number out of it. The numbers, names, dates and amounts spoken in the answer are the units that matter — the same argument <a class="xref" href="/playbooks/voice-realtime-agents/evaluating-voice-agents">evaluating voice agents</a> makes about entity error rate rather than word error rate.</li>
+      <li><strong>Build the eval set from recorded audio, not from typed questions.</strong> Real callers mumble, self-correct, use the wrong product name and speak over your prompts. A retrieval stack tuned on clean text queries will look excellent and then miss on a transcript that says "the, uh, the blue one, the four-hundred" — and the mis-transcription reaches the index, not just the model.</li>
+      <li><strong>Attribute in the trace even though you cannot cite in the audio.</strong> Record which passages were retrieved, which were in context, and which were speculative-but-discarded, keyed to the turn. This is how you answer "where did it get that" after a complaint, and it is the only bridge to a replayable eval. Standard <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">RAG evaluation</a> applies once the trace exists.</li>
+      <li><strong>Track timeout rate as a first-class quality signal.</strong> The percentage of turns where retrieval missed its budget and the model answered anyway is the closest thing you have to an ungrounded-answer rate, and it moves whenever your corpus, your traffic or your provider does.</li>
+      <li><strong>Offer the receipt in another channel.</strong> "I've texted you the link" is the voice-native substitute for a citation. It costs one message, and it converts an unverifiable spoken claim into something the caller can check after the call.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do this in order, and stop when the turn feels natural: pull the top forty questions out of last month's transcripts and precompute spoken answers for them; warm the caller's account context during the greeting; fire a speculative query on the partial transcript and cancel it on barge-in; then delete the query-rewrite call and the rerank from the live path. Only after all four is a faster vector database worth discussing. <strong>The stages you removed bought more latency than any stage you could have optimised, and in a voice turn latency is what grounding is made of.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/playbooks/voice-realtime-agents/speech-stack">STT, TTS &amp; speech-to-speech</a> for where the transcript you are searching with comes from, <a class="xref" href="/playbooks/voice-realtime-agents/realtime-architecture">realtime agent architecture</a> for where this loop lives, <a class="xref" href="/playbooks/voice-realtime-agents/multilingual-voice-agents">multilingual voice agents</a> for what happens to entity retrieval across languages, and <a class="xref" href="/concepts/what-is-rag">RAG explained</a> for the pipeline being cut down.</p>
+  </div>
+</section>
