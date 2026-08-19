@@ -1,0 +1,169 @@
+<p class="lede">你多半挑了一家沙箱厂商，然后以为决定已经做完了。并没有：他们每一家都是在转售四种隔离技术中的一种，而他们挑的那一种，决定了你的智能体到底能不能跑 <code>pip install</code>。真正要紧的那条轴不是"隔离有多强"——而是系统调用覆盖度与冷启动时间是反向移动的：那个一毫秒就能起来的边界，恰恰就是背后没有操作系统的那一个。</p>
+
+<section>
+  <h2>先看全貌</h2>
+  <p>这四者里，有两个给了智能体一个属于它自己的真 Linux 内核；一个给了它一份跑在用户态的 Linux 重新实现；还有一个干脆不给操作系统，并指望它不需要。</p>
+
+  <table>
+    <thead>
+      <tr><th>技术</th><th>智能体拿到什么</th><th>出身</th><th>生产环境可见于</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>WASM / V8 isolate</td>
+        <td>一个语言运行时，没有操作系统</td>
+        <td>Bytecode Alliance；V8</td>
+        <td>Cloudflare 基于 isolate 的执行</td>
+      </tr>
+      <tr>
+        <td>gVisor</td>
+        <td>一个应答系统调用的用户态内核</td>
+        <td>Google，开源</td>
+        <td>Modal</td>
+      </tr>
+      <tr>
+        <td>Firecracker</td>
+        <td>一台自带 guest 内核的 microVM</td>
+        <td>AWS，开源</td>
+        <td>E2B；AWS Lambda</td>
+      </tr>
+      <tr>
+        <td>Kata Containers</td>
+        <td>一台运行 OCI 容器的完整虚拟机</td>
+        <td>OpenInfra Foundation</td>
+        <td>多租户 Kubernetes 平台</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/gvisor-vs-firecracker-vs-kata-vs-wasm/arch-where-the-boundary-sits.svg" alt="共享宿主内核之上的四层栈：进程内的运行时沙箱、用户态内核、microVM 的 guest 内核，以及完整虚拟机的 guest 内核。" width="900" height="500" loading="lazy" />
+    <figcaption>从左往右看，智能体与宿主内核之间的机械层越来越多——而在智能体的第一行代码跑起来之前，要启动的东西也越来越多。</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/gvisor-vs-firecracker-vs-kata-vs-wasm/data-cold-start.svg" alt="已公布冷启动时间的对数条形图：isolate 约一毫秒，gVisor 五十到一百毫秒，Firecracker 约一百二十毫秒，Kata 一百五十到四百八十毫秒。" width="900" height="400" loading="lazy" />
+    <figcaption>这些是已公布的数字，不是一次受控基准测试。有用的是那两个数量级，而不是第三位有效数字。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>真正的问题是：这段代码被允许开口要什么</h2>
+  <p>每一种隔离技术，往下扒都是对同一个问题的回答：当智能体的代码发起一次系统调用时，由谁来处理它？这听着像实现细节，实际上却是产品差异的全部——因为系统调用正是代码打开文件、fork 进程、绑定套接字、映射内存的方式；也就是说，任何有意思的事情都是这么发生的。</p>
+
+  <p>普通容器把调用直接送给宿主内核，中间由 namespace 与 seccomp 把关。这很快，也是容器胜出的原因；但宿主内核是一大坨由机器上每个租户共享的 C 代码，而一个内核 bug 就是一次完整逃逸。对于一段模型刚刚写出来、且是在回应某段并非你所写的文本时写出来的代码，这是错误的威胁模型——这正是<a href="/zh/deep-dives/agent-security/sandbox-and-isolation-patterns">沙箱与隔离模式</a>要从那里讲起的原因。</p>
+
+  <p>这里的四个选项各自把那条边界挪到了别处，而付出的代价也各不相同。</p>
+
+  <h3>gVisor：把 Linux 在用户态重新实现一遍</h3>
+  <p>gVisor 的 Sentry 是一个用 Go 写的内核，它作为一个普通进程运行，自己服务被沙箱化应用的系统调用，只把一小撮经过审计的窄集合往下传给宿主。宿主内核的攻击面于是从数百个系统调用缩到寥寥几个。代价是 Sentry 毕竟是一次重新实现，覆盖度算好但不完整；而且这层间接并不免费：已公布的对比把启动时间放在 50 到 100 毫秒、内存开销约 30 MB，还有一个会让人意外的数字——网络吞吐上大约三分之一的折损。</p>
+
+  <p>最后这个数字，是你该拿去对照自己工作负载的那一个。一个做做思维链、写几个文件的智能体永远不会察觉；一个要拉 400 MB 数据集、或者要把长任务的日志流式送出去的智能体，会。</p>
+
+  <h3>Firecracker：给它一个真内核，把设备拿走</h3>
+  <p>Firecracker 走的是另一条路。它不去模拟 Linux，而是直接启动一个——虚拟机里一个货真价实的 guest 内核，配上一套刻意精简的设备模型（没有 BIOS、没有 PCI，只有少数几个 virtio 设备），于是通常让虚拟机变慢的那些东西干脆就不存在。已公布的数字把 512 MB 的 microVM 放在约 120 毫秒、每台 VM 约 5 MB 内存开销；而把智能体沙箱建在 Firecracker 上的 E2B，报出的启动时间也在同一个量级。</p>
+
+  <p>它对智能体的后果，正是决定大多数架构的那一条：guest 是一个真实的 Linux 系统，所以代码可以装包、可以起进程、可以往文件系统里写，可以表现得像自己就在一台机器上。关于这个沙箱，没有任何事情需要向模型解释。</p>
+
+  <h3>Kata Containers：同一台虚拟机，穿着容器的衣服</h3>
+  <p>Kata 同样是每个工作负载一台虚拟机，但它的设计目标是与容器生态的透明兼容——它以 OCI runtime 的身份接入，于是一个 Kubernetes pod 无需任何人改写清单就变成了一台虚拟机。代价付在启动时间上：已报出的数字从 150 到 300 毫秒不等，而一次与 Firecracker 1.5 的直接对比把 Kata 3.0 测到了 480 毫秒。作为交换，它更常规的设备模型让 I/O 更接近原生——同一次对比把它的网络吞吐折损放在 8% 左右，远小于 gVisor 挨的那一刀。</p>
+
+  <h3>WASM 与 V8 isolate：没有操作系统，而这正是重点</h3>
+  <p>isolate 不是一台小虚拟机，而是运行中的宿主进程内部的一个内存安全执行上下文——这就是为什么它的实例化以微秒到一毫秒计，而不是以内核启动计。Cloudflare 的执行模型把 isolate 用于毫秒级延迟的临时工作，把完整的 Linux microVM 用于任何有状态的场景——这相当直白地承认了：isolate 并不打算成为一台计算机。</p>
+
+  <p>这个取舍很剧烈，也很容易被说轻了。这里没有进程表、没有任意文件系统、没有原生二进制、没有 <code>subprocess</code>。智能体代码所需的一切，要么必须事先被编译成 WASM，要么必须由你写成宿主函数暴露出去。而且因为边界是运行时而非硬件，一次逃逸落进的是一个可能同时在服务其他租户的进程——隔离是真的，但它是进程级的，而这是一个比虚拟机管理程序弱得多的主张。</p>
+
+  <figure>
+    <img src="/blogs/gvisor-vs-firecracker-vs-kata-vs-wasm/data-capability-matrix.svg" alt="给 isolate、gVisor、Firecracker 与 Kata 在冷启动、内存成本、系统调用覆盖度与隔离深度四条轴上打分的特性矩阵。" width="900" height="400" loading="lazy" />
+    <figcaption>每一行里强的那两列，都是拿另外两列换来的。没有哪一行是通吃的。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>为什么排序会随着你问的问题而翻转</h2>
+  <p>按冷启动给这四个排序，你得到 isolate、gVisor、Firecracker、Kata。按"智能体实际拿到多少个 Linux 系统"排序，你得到的恰好是倒过来的顺序。这不是巧合，也是这里最值得内化的一件事：<em>启动时间就是操作系统本身</em>。Firecracker 比 isolate 多花的每一毫秒，都花在把一个内核拉起来上——而正是那个内核让 <code>apt-get</code> 能用。</p>
+
+  <p>所以决定性的问题不是"我需要多强的隔离"，那个问题脱离场景没人答得了。它是：<strong>智能体的代码能不能装东西？</strong>答了这个，整个选择面就塌缩了。</p>
+
+  <p>如果能——智能体写的 Python 会 import 一个它自己挑的库，或者跑一次构建，或者 shell 出去——那你需要一个真内核，而你是在运维理由而非安全理由上，于 Firecracker 与 Kata 之间做选择。如果不能——智能体只是在你提供的数据上求一个纯函数，能力集合由你固定暴露——那 isolate 的毫秒级启动就是变革性的，因为沙箱现在便宜到可以按每次工具调用来用，而不是按每个会话来用。</p>
+
+  <p>第二种情形值得多说两句，因为成本模型在那里发生了反转。用 120 毫秒的 microVM 启动去跑一个 20 毫秒的函数，意味着 86% 的墙钟时间和大部分账单花在了启动上。再乘上一个在一次任务里发起四十次工具调用的智能体，那么占住你延迟预算的就是沙箱而不是模型了。这与我们在<a href="/zh/blogs/together-vs-fireworks-vs-baseten-vs-modal">智能体打破按 token 计价</a>里描述的错配是同一个形状：对单次请求还合适的那个单位，对一个循环就是错的。</p>
+
+  <h3>没人给它留预算的那条逃生通道</h3>
+  <p>预热池能解决冷启动，同时也悄悄挪动了安全问题。一个预先启动好、随后交给第二个任务的沙箱，带着第一个任务留下的一切状态；于是你要么重置它——那会花掉你省下来的大部分——要么接受跨任务污染，而对一个处理不可信输入的智能体来说，那是一条数据外泄通道，不是一个卫生问题。宣称在基于虚拟机的隔离上做到 50 毫秒以内启动的厂商，几乎总是在描述一个预热池；该问他们的老实问题是：租户之间到底重置了什么。</p>
+</section>
+
+<section>
+  <h2>什么时候选哪个</h2>
+  <table>
+    <thead>
+      <tr><th>场景</th><th>选</th><th>因为</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>智能体写并运行任意代码，还要装包</td>
+        <td>Firecracker</td>
+        <td>真内核、虚拟机边界，而且是"两者兼得"的选项里启动最快的</td>
+      </tr>
+      <tr>
+        <td>你已经在跑多租户 Kubernetes，想就地加固 pod</td>
+        <td>Kata Containers</td>
+        <td>以 OCI runtime 直接接入；不必改写清单，且 I/O 接近原生</td>
+      </tr>
+      <tr>
+        <td>容器形态的工作负载，密度比吞吐更要紧</td>
+        <td>gVisor</td>
+        <td>不必每个负载一台虚拟机就能砍掉宿主系统调用面；接受那点网络折损</td>
+      </tr>
+      <tr>
+        <td>短小的纯函数，被高频调用，能力集合固定</td>
+        <td>WASM / isolate</td>
+        <td>按次沙箱化变得负担得起；其余选项都不在同一个数量级上</td>
+      </tr>
+      <tr>
+        <td>你还答不上"它到底装不装东西"</td>
+        <td>Firecracker，或者一家建在它上面的厂商</td>
+        <td>这是你日后最不可能被迫迁走的那个选项</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>有一件事不随选择而变：这些东西没有一个管得住网络。上述每一条边界都会痛快地允许智能体的代码开一个出网连接，把你的上下文窗口发到某处去，因为在这四种模型里那都是一次合法的系统调用。出网策略是一道你必须刻意另加的控制——见<a href="/zh/operations/safety-and-security/egress-control-for-agents">智能体的出网管控</a>。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+
+  <h3>普通的 Docker 容器真的不够吗？</h3>
+  <p>对你自己的代码，够用。对一段由模型写出、且写作时可能受到攻击者影响的文本所驱动的代码，共享的宿主内核离一次完整逃逸只差一个 bug；而容器当初被设计出来是为了隔离相互协作的负载，不是敌对的负载。在多租户服务里运行模型生成代码的实际下限是 gVisor，而多数处理真正不可信输入的团队最终落在 microVM 上。</p>
+
+  <h3>这个到底是我来选，还是我的沙箱厂商来选？</h3>
+  <p>你的厂商已经选了，而且值得搞清楚是哪一个——它能预测什么能用、什么不能用。E2B 是 Firecracker，Modal 用 gVisor，Cloudflare 的 isolate 模型则完全是另一种押注。<a href="/zh/blogs/e2b-vs-daytona-vs-modal-vs-cloudflare-sandboxes">E2B vs Daytona vs Modal vs Cloudflare Sandboxes</a> 那篇覆盖了叠在这四者之上的计费与 API 差异。</p>
+
+  <h3>文件系统在哪儿，它能活下来吗？</h3>
+  <p>在虚拟机类选项里，guest 有一份来自快照的自己的根文件系统，所以除非你挂了卷，写下的东西在销毁时就没了。gVisor 通过它的 gofer 进程呈现文件系统，短暂性类似。isolate 通常根本没有文件系统。在每一种情形下，持久状态都必须落在一个你刻意选定的地方——而智能体会把这个设计决定暴露得格外痛，因为它们不停地写文件。</p>
+
+  <h3>这些东西能挡住提示注入吗？</h3>
+  <p>不能，而把两者混为一谈是这个领域里最常见的错误。隔离限制的是代码跑起来之后能够到什么；对于"一段被检索到的文档里的指令说服智能体去调用一个它不该调的工具"，它毫无作用。那是一个授权问题，我们在<a href="/zh/blogs/agent-cves-are-authorization-bugs">智能体 CVE 其实是授权 bug</a> 里详细论证过。</p>
+
+  <h3>那把沙箱跑在用户自己的机器上呢？</h3>
+  <p>那样威胁模型是改变了，而不是消失了：代码运行时用户的数据就在可及范围内，而你在意的那条边界，是智能体与他文件系统其余部分之间的那一条。同样这四种技术都适用，但实际答案通常是一台虚拟机、或者一个显式挂载了工作目录的容器；纪律在于你挂了什么，而不在于你选了哪个 hypervisor。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关：</h3>
+  <ul>
+    <li><a href="/zh/deep-dives/agent-security/sandbox-and-isolation-patterns">沙箱与隔离模式</a> —— 这四种技术所实现的那些模式。</li>
+    <li><a href="/zh/concepts/sandboxing-and-code-execution">沙箱与代码执行</a> —— 概念层面的入门。</li>
+    <li><a href="/zh/playbooks/coding-and-computer-use-agents/sandboxing-and-execution">沙箱与安全执行</a> —— 把它建进一个编码智能体里。</li>
+    <li><a href="/zh/operations/safety-and-security/egress-control-for-agents">智能体的出网管控</a> —— 这些技术都不提供的那道控制。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://gvisor.dev/docs/">gVisor 文档</a></li>
+    <li><a href="https://firecracker-microvm.github.io/">Firecracker microVM</a></li>
+    <li><a href="https://katacontainers.io/">Kata Containers</a></li>
+    <li><a href="https://webassembly.org/">WebAssembly</a></li>
+  </ul>
+</section>

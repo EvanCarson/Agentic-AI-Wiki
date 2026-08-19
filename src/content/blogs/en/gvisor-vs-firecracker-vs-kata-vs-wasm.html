@@ -1,0 +1,169 @@
+<p class="lede">You probably chose a sandbox vendor and thought that was the decision. It wasn't: every one of them resells one of four isolation technologies, and the one they picked decides whether your agent can run <code>pip install</code> at all. The axis that matters is not how strong the isolation is — it is that syscall coverage and cold-start time move in opposite directions, so the boundary that starts in a millisecond is precisely the one with no operating system behind it.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Two of these give the agent a real Linux kernel of its own. One gives it a re-implementation of Linux running in user space. One gives it no operating system at all and hopes it doesn't need one.</p>
+
+  <table>
+    <thead>
+      <tr><th>Technology</th><th>What the agent gets</th><th>Origin</th><th>Seen in production at</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>WASM / V8 isolates</td>
+        <td>A language runtime, no OS</td>
+        <td>Bytecode Alliance; V8</td>
+        <td>Cloudflare's isolate-based execution</td>
+      </tr>
+      <tr>
+        <td>gVisor</td>
+        <td>A user-space kernel that answers syscalls</td>
+        <td>Google, open source</td>
+        <td>Modal</td>
+      </tr>
+      <tr>
+        <td>Firecracker</td>
+        <td>A microVM with its own guest kernel</td>
+        <td>AWS, open source</td>
+        <td>E2B; AWS Lambda</td>
+      </tr>
+      <tr>
+        <td>Kata Containers</td>
+        <td>A full VM running an OCI container</td>
+        <td>OpenInfra Foundation</td>
+        <td>Multi-tenant Kubernetes platforms</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/gvisor-vs-firecracker-vs-kata-vs-wasm/arch-where-the-boundary-sits.svg" alt="Four stacks above a shared host kernel: an in-process runtime sandbox, a user-space kernel, a microVM guest kernel, and a full VM guest kernel." width="900" height="500" loading="lazy" />
+    <figcaption>Reading left to right, more machinery sits between the agent and the host kernel — and more of it has to boot before the agent's first line runs.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/gvisor-vs-firecracker-vs-kata-vs-wasm/data-cold-start.svg" alt="Logarithmic bar chart of published cold-start times: isolates around one millisecond, gVisor fifty to one hundred, Firecracker around one hundred and twenty, Kata one hundred and fifty to four hundred and eighty." width="900" height="400" loading="lazy" />
+    <figcaption>Published figures, not a controlled benchmark. The useful observation is the two orders of magnitude, not the third digit.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>The question is what the code is allowed to ask for</h2>
+  <p>Every isolation technology is, underneath, an answer to one question: when the agent's code makes a system call, who handles it? That sounds like an implementation detail and it is actually the entire product difference, because a system call is how code opens a file, forks a process, binds a socket, or maps memory — which is to say, it is how anything interesting happens.</p>
+
+  <p>A plain container sends the call straight to the host kernel, mediated by namespaces and seccomp. That is fast and it is why containers won, but the host kernel is a very large piece of C shared by every tenant on the machine, and a kernel bug is a full escape. For code a model just wrote, in response to text you did not write, that is the wrong threat model — the reason <a href="/deep-dives/agent-security/sandbox-and-isolation-patterns">sandbox and isolation patterns</a> starts where it does.</p>
+
+  <p>The four options here each move that boundary somewhere else, and each pays for it differently.</p>
+
+  <h3>gVisor: reimplement Linux, in user space</h3>
+  <p>gVisor's Sentry is a kernel written in Go that runs as an ordinary process and services the sandboxed application's system calls itself, passing only a narrow, audited subset down to the host. The host kernel's attack surface shrinks from hundreds of syscalls to a handful. The cost is that Sentry is a re-implementation, so coverage is good but not complete, and the indirection is not free: published comparisons put startup around 50 to 100 milliseconds, memory overhead near 30 MB, and — the number that surprises people — a network throughput penalty in the region of a third.</p>
+
+  <p>That last figure is the one to check against your workload. An agent doing chain-of-thought and a few file writes will never notice. An agent pulling a 400 MB dataset, or streaming logs out of a long-running job, will.</p>
+
+  <h3>Firecracker: give it a real kernel and take away the devices</h3>
+  <p>Firecracker goes the other way. Rather than emulating Linux, it boots one — a genuine guest kernel in a virtual machine, with a deliberately minimal device model (no BIOS, no PCI, a handful of virtio devices) so the thing that normally makes VMs slow is simply absent. Published figures put a 512 MB microVM at around 120 milliseconds with roughly 5 MB of memory overhead per VM, and E2B, which builds its agent sandboxes on Firecracker, reports boots in the same neighbourhood.</p>
+
+  <p>The consequence for agents is the one that decides most architectures: the guest is a real Linux system, so the code can install packages, spawn processes, write to a filesystem and behave like it is on a machine. Nothing about the sandbox needs to be explained to the model.</p>
+
+  <h3>Kata Containers: the same VM, wearing a container's clothes</h3>
+  <p>Kata also runs a VM per workload, but its design goal is transparent compatibility with the container ecosystem — it plugs in as an OCI runtime so a Kubernetes pod becomes a VM without anyone rewriting a manifest. You pay for that in boot time: reported figures range from 150 to 300 milliseconds, and one direct comparison against Firecracker 1.5 measured Kata 3.0 at 480 milliseconds. In exchange, its more conventional device model keeps I/O closer to native — the same comparison put its network throughput penalty near 8%, against gVisor's much larger hit.</p>
+
+  <h3>WASM and V8 isolates: no operating system, and that's the point</h3>
+  <p>An isolate is not a small VM; it is a memory-safe execution context inside a running host process, which is why instantiation is measured in microseconds to a millisecond rather than in kernel boots. Cloudflare's execution model pairs isolates for millisecond-latency ephemeral work with full Linux microVMs for anything stateful — a fairly direct admission that the isolate is not trying to be a computer.</p>
+
+  <p>The trade is severe and easy to under-state. There is no process table, no arbitrary filesystem, no native binary, no <code>subprocess</code>. Anything the agent's code needs must have been compiled to WASM in advance or exposed as a host function you wrote. And because the boundary is the runtime rather than the hardware, an escape lands in a process that may be handling other tenants — the isolation is real, but it is process-level, which is a materially weaker claim than a hypervisor makes.</p>
+
+  <figure>
+    <img src="/blogs/gvisor-vs-firecracker-vs-kata-vs-wasm/data-capability-matrix.svg" alt="Feature matrix scoring isolates, gVisor, Firecracker and Kata across cold start, memory cost, syscall coverage and isolation depth." width="900" height="400" loading="lazy" />
+    <figcaption>The two columns each row is strong in are paid for in the other two. There is no row that wins.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Why the ordering flips depending on which question you ask</h2>
+  <p>Rank these four by cold start and you get isolates, gVisor, Firecracker, Kata. Rank them by how much of a Linux system the agent actually gets and you get precisely the reverse. That is not a coincidence, and it is the single most useful thing to internalise here: the boot time <em>is</em> the operating system. Every millisecond Firecracker spends that an isolate doesn't is spent bringing up a kernel, and that kernel is the thing that makes <code>apt-get</code> work.</p>
+
+  <p>So the decisive question is not "how much isolation do I need", which nobody can answer in the abstract. It is: <strong>does the agent's code get to install things?</strong> Answer that and the field collapses.</p>
+
+  <p>If yes — the agent writes Python that imports a library it chose, or runs a build, or shells out — you need a real kernel, and you are choosing between Firecracker and Kata on operational grounds rather than security ones. If no — the agent evaluates a pure function over data you supply, with a fixed set of capabilities you exposed — then an isolate's millisecond start is transformative, because now the sandbox is cheap enough to use per tool call rather than per session.</p>
+
+  <p>That second case is worth dwelling on, because it is where the cost model inverts. A 120-millisecond microVM boot to run a 20-millisecond function means 86% of the wall clock and most of the bill is boot. Multiply by an agent that makes forty tool calls in a task and the sandbox, not the model, becomes your latency budget. This is the same shape of error as the per-token pricing mismatch we described in <a href="/blogs/together-vs-fireworks-vs-baseten-vs-modal">agents break per-token pricing</a>: the unit that was fine for one request is wrong for a loop.</p>
+
+  <h3>The escape hatch nobody budgets for</h3>
+  <p>Warm pools fix cold start and quietly move the security question. A pre-booted sandbox handed to a second task has whatever state the first one left in it, so either you reset it — which costs most of what you saved — or you accept cross-task contamination, which for an agent processing untrusted input is a data-exfiltration path rather than a hygiene issue. Vendors who advertise sub-50-millisecond starts on VM-based isolation are almost always describing a warm pool, and the honest question to ask them is what gets reset between tenants.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Agent writes and runs arbitrary code with package installs</td>
+        <td>Firecracker</td>
+        <td>Real kernel, VM boundary, and the fastest boot of the options that give you both</td>
+      </tr>
+      <tr>
+        <td>You already run multi-tenant Kubernetes and want pods hardened in place</td>
+        <td>Kata Containers</td>
+        <td>Drops in as an OCI runtime; no manifest rewrite, and I/O stays close to native</td>
+      </tr>
+      <tr>
+        <td>Container-shaped workloads, throughput matters less than density</td>
+        <td>gVisor</td>
+        <td>Cuts host syscall surface without a VM per workload; accept the network penalty</td>
+      </tr>
+      <tr>
+        <td>Short pure functions, called constantly, from a fixed capability set</td>
+        <td>WASM / isolates</td>
+        <td>Per-call sandboxing becomes affordable; nothing else is in the same order of magnitude</td>
+      </tr>
+      <tr>
+        <td>You cannot answer "does it install things" yet</td>
+        <td>Firecracker, or a vendor on it</td>
+        <td>It is the option you are least likely to have to migrate off later</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>One thing does not vary with the choice: none of these controls the network. Every one of these boundaries will happily let the agent's code open an outbound connection and post your context window somewhere, because that is a legitimate syscall in all four models. Egress policy is a separate control that you have to add on purpose — see <a href="/operations/safety-and-security/egress-control-for-agents">egress control for agents</a>.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>Is a plain Docker container really not enough?</h3>
+  <p>For your own code, it is fine. For code a model wrote in response to text an attacker may have influenced, the shared host kernel is a single bug away from a full escape, and containers were designed to isolate cooperating workloads rather than hostile ones. The practical floor for running model-generated code in a multi-tenant service is gVisor, and most teams handling genuinely untrusted input land on a microVM.</p>
+
+  <h3>Do I pick this at all, or does my sandbox vendor?</h3>
+  <p>Your vendor already picked, and it is worth knowing which — it predicts what will and won't work. E2B is Firecracker; Modal uses gVisor; Cloudflare's isolate model is a different bet entirely. The vendor comparison in <a href="/blogs/e2b-vs-daytona-vs-modal-vs-cloudflare-sandboxes">E2B vs Daytona vs Modal vs Cloudflare Sandboxes</a> covers the billing and API differences that sit on top of these four.</p>
+
+  <h3>Where does the filesystem live, and does it survive?</h3>
+  <p>In the VM options the guest has its own root filesystem from a snapshot, so anything written vanishes on teardown unless you mount a volume. gVisor presents a filesystem through its gofer process with similar ephemerality. Isolates typically have no filesystem at all. In every case the durable state has to be somewhere you chose deliberately, which is a design decision agents make painfully visible because they write files constantly.</p>
+
+  <h3>Does any of this stop prompt injection?</h3>
+  <p>No, and conflating the two is the most common mistake in this area. Isolation limits what the code can reach once it runs; it does nothing about an instruction in a retrieved document convincing the agent to call a tool it shouldn't. That is an authorization problem, argued at length in <a href="/blogs/agent-cves-are-authorization-bugs">agent CVEs are authorization bugs</a>.</p>
+
+  <h3>What about running the sandbox on the user's own machine?</h3>
+  <p>Then the threat model changes rather than disappears: the code is running with the user's data reachable, and the boundary you care about is the one between the agent and the rest of their filesystem. The same four technologies apply, but the practical answer is usually a VM or a container with an explicitly mounted working directory, and the discipline is in what you mount rather than in which hypervisor you chose.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/deep-dives/agent-security/sandbox-and-isolation-patterns">Sandbox &amp; isolation patterns</a> — the patterns these four technologies implement.</li>
+    <li><a href="/concepts/sandboxing-and-code-execution">Sandboxing &amp; code execution</a> — the concept-level introduction.</li>
+    <li><a href="/playbooks/coding-and-computer-use-agents/sandboxing-and-execution">Sandboxing &amp; safe execution</a> — building it into a coding agent.</li>
+    <li><a href="/operations/safety-and-security/egress-control-for-agents">Egress control for agents</a> — the control none of these gives you.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://gvisor.dev/docs/">gVisor documentation</a></li>
+    <li><a href="https://firecracker-microvm.github.io/">Firecracker microVM</a></li>
+    <li><a href="https://katacontainers.io/">Kata Containers</a></li>
+    <li><a href="https://webassembly.org/">WebAssembly</a></li>
+  </ul>
+</section>
