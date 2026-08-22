@@ -1,0 +1,128 @@
+<p class="lede">The 2026-07-28 revision of the Model Context Protocol deleted the two things that made an MCP server stateful: the <code>initialize</code>/<code>initialized</code> handshake and the <code>Mcp-Session-Id</code> header. A remote server can now sit behind a plain round-robin load balancer with no shared session store — a genuine operational win. But "stateless" describes the wire, not the system. The session's bookkeeping did not vanish; it moved onto every request and into your application. And the durability that long-running agents actually need came straight back through a new extension. Read the pivot as a relocation of state, not a deletion of it, and the migration gets a lot less surprising.</p>
+
+<section>
+  <h2>What changed</h2>
+  <p>The headline of the 2026-07-28 spec is a stateless protocol core. Previously an MCP client opened a session with an <code>initialize</code> exchange, received an <code>Mcp-Session-Id</code>, and every later request rode on that session — which meant the transport was stateful and the infrastructure had to keep a client pinned to the server instance that held its session. That handshake and that header are both gone. Every request now carries its own protocol version, client identity, and capabilities inline, so any request can land on any instance.</p>
+
+  <table>
+    <thead>
+      <tr><th>Concern</th><th>Before (stateful core)</th><th>After (2026-07-28)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Session setup</td><td><code>initialize</code> / <code>initialized</code> handshake</td><td>None — every request is self-describing</td></tr>
+      <tr><td>Session identity</td><td><code>Mcp-Session-Id</code> header</td><td>Removed</td></tr>
+      <tr><td>Per-request metadata</td><td>Negotiated once at init</td><td><code>MCP-Protocol-Version</code>, <code>Mcp-Method</code>, <code>Mcp-Name</code>, and a <code>_meta</code> object carrying <code>clientInfo</code></td></tr>
+      <tr><td>Capability discovery</td><td>Returned by the handshake</td><td>Optional <code>server/discover</code> call, or cached by the client</td></tr>
+      <tr><td>Load balancing</td><td>Sticky sessions, shared session store</td><td>Plain round-robin, route on <code>Mcp-Method</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>Alongside the stateless core, the revision formalised an extensions framework (Tasks and MCP Apps join the existing Enterprise Managed Authorization), hardened authorization, and — quietly the most useful line for anyone operating a server — added a formal deprecation policy with a twelve-month minimum window. Roots, Sampling, and Logging are the first features to go on that clock.</p>
+</section>
+
+<section>
+  <h2>The operational win is real</h2>
+  <figure>
+    <img src="/blogs/mcp-went-stateless-the-state-moved/arch-stateless-shift.svg" alt="Two panes. Left: a stateful MCP server. The client does an initialize handshake, gets a session id, and a sticky load balancer must route every later request to the one instance that holds that session, backed by a shared session store. Right: a stateless server. Each request is self-describing via headers and a meta field, a plain round-robin load balancer sends it to any instance, and there is no session store." width="900" height="500" loading="lazy" />
+    <figcaption>Delete the handshake and the session id, and the request stops needing to find the instance that remembers it.</figcaption>
+  </figure>
+
+  <p>If you have ever run a stateful remote server at scale, the appeal is immediate. Sticky routing is a tax that shows up everywhere: the load balancer needs session affinity, a restarted instance drops every session pinned to it, autoscaling has to drain rather than just terminate, and a shared session store becomes a availability dependency of its own. A self-describing request removes all of it. Any instance can serve any call, a deploy is a rolling restart with no session migration, and the gateway can route on the <code>Mcp-Method</code> header without cracking open the body. For a server that is mostly <code>tools/list</code> and <code>tools/call</code>, this is the difference between running like a normal HTTP API and running like a WebSocket fleet.</p>
+
+  <p>None of that is marketing. It is the same reason REST APIs are stateless: statelessness at the transport is what lets horizontal scale be boring. The mistake is to conclude that because the transport forgot the session, the system no longer has one.</p>
+</section>
+
+<section>
+  <h2>Statelessness is a property of the wire, not of the problem</h2>
+  <p>A protocol can be stateless while the interaction it carries is not. The client still needs to know which protocol version and capabilities are in play; the spec's answer is that this now travels inline on every request, in <code>_meta</code> and the new headers, instead of being agreed once. That is not less state — it is the same state, re-sent, with the client responsible for carrying it and, if it wants to avoid a discovery round-trip, for caching the server's capabilities itself.</p>
+
+  <p>So the ledger of who-holds-what shifted rather than shrank:</p>
+
+  <figure>
+    <img src="/blogs/mcp-went-stateless-the-state-moved/data-responsibility-ledger.svg" alt="A responsibility matrix with four rows and two columns. Rows: session identity, capability discovery, long-running work, load balancing. Left column, the 2025 stateful core: session identity held by the server, discovery returned at handshake, long-running work sat awkwardly in the core, load balancing needed sticky sessions. Right column, the 2026-07-28 stateless core plus Tasks: session identity now carried inline by the client on every request, discovery cached by the client or fetched on demand, long-running work moved into the Tasks extension as durable handles, load balancing is plain round-robin." width="900" height="400" loading="lazy" />
+    <figcaption>Every row moved. None of the concerns went away — the protocol stopped owning them and pushed them to the client, an extension, or your own tool contracts.</figcaption>
+  </figure>
+
+  <p>This is a familiar trade, and usually a good one: a simpler core with more responsibility at the edges. But it is worth being honest that the edges are now yours. The server no longer remembers your client between calls, which means anything the interaction needs to remember — a multi-step negotiation, a partially built request, the fact that this is the same agent as a second ago — is your application's job to thread through, or the extensions' job to hold.</p>
+</section>
+
+<section>
+  <h2>Tasks bought the durability back — as handles</h2>
+  <p>The clearest evidence that the state did not disappear is that the spec had to add a place to put it. Tasks — one of the first official extensions, contributed by AWS — moved out of the experimental core into <code>io.modelcontextprotocol/tasks</code> specifically to support reliable, long-running agents. A long-running tool call is the most stateful thing MCP does: you start work, you come back later, you expect it to still be there. A stateless core cannot express that on its own, so Tasks does, with poll-based <code>tasks/get</code> and <code>tasks/update</code> calls and an opt-in <code>subscriptions/listen</code> stream for change notifications.</p>
+
+  <p>The mechanism is the tell. The protocol stays stateless because the state lives behind an explicit <strong>handle</strong>: a tool returns a task handle, the client stores it, and passes it back to poll or update. The durable work is real and server-side; what makes it compatible with a stateless wire is that the reference to it is a value the client carries, exactly like the <code>_meta</code> block carries the session facts. The pattern is consistent across the whole revision — <em>the model of "server remembers you" was replaced everywhere by "you carry a reference the server can resolve."</em></p>
+
+  <figure>
+    <img src="/blogs/mcp-went-stateless-the-state-moved/compare-where-state-lives.svg" alt="Three columns showing where state lives after the pivot. Column one, the stateless core: per-request facts carried inline in headers and the meta field, no memory between calls. Column two, the Tasks extension: durable long-running work held server-side, addressed by a task handle the client stores and passes back. Column three, your application: any multi-step or cross-call context the interaction needs, now threaded by you through tool arguments and handles." width="900" height="300" loading="lazy" />
+    <figcaption>Three homes for what used to be one session. The core forgets, the extension remembers on request, and the rest is yours.</figcaption>
+  </figure>
+
+  <p>This is a better design than a stateful core that tried to serve both the trivial <code>tools/list</code> call and the hour-long agent job with one session model. But "MCP is stateless now" is a half-sentence. The full one is: the core is stateless, durability is an opt-in extension, and cross-call context is a client responsibility — three answers where there used to be one, each better suited to its job, and none of them free.</p>
+</section>
+
+<section>
+  <h2>The parts that will bite quietly</h2>
+  <p>The stateless pivot is what everyone will talk about, but two less-loud changes in the same revision are the ones likely to break a real deployment.</p>
+
+  <ul>
+    <li><strong>Authorization hardening changes correct clients.</strong> Authorization servers must now return the <code>iss</code> parameter per RFC 9207 and clients must validate it before redeeming an authorization code — a real fix for authorization-server mix-up attacks, and a behavioural requirement your client either meets or fails. Dynamic Client Registration is now formally deprecated in favour of Client ID Metadata Documents (CIMD), though DCR still works for now, and credentials are bound to their issuing authorization server so you cannot reuse them across servers.</li>
+    <li><strong>The deprecation clock is now a feature you can plan against — if you read it.</strong> A twelve-month minimum window is a gift compared to the old "it changed, react" cadence, but Roots, Sampling, and Logging are already on it. If your server or client leans on any of the three, the migration is now dated, and pretending it is not just means doing it in a hurry later.</li>
+  </ul>
+
+  <p>Neither of these is a stateless-core problem; both ride in on the same revision, and both are the kind of change that passes CI and fails in production against a real authorization server or an old feature you forgot you used.</p>
+</section>
+
+<section>
+  <h2>What to actually do</h2>
+
+  <h3>If you run an MCP server</h3>
+  <p>Audit for session assumptions before you upgrade — anything that expected a client to be pinned to an instance, or that stashed per-client state keyed by session id, has to move to a shared store the client addresses by handle, or go away. The reward is that once it does, you can drop sticky routing and the session store entirely and run the server like a normal stateless service. Decide separately whether you need the Tasks extension: if your tools are fast request/response calls you may never touch it; if you expose long-running work, adopt it rather than reinventing durable jobs on the side.</p>
+
+  <h3>If you build an MCP client or host</h3>
+  <p>Your client now owns capability caching and the per-request metadata it used to receive once. Implement the <code>iss</code> validation now — it is not optional for a correct OAuth flow — and plan the move from DCR to CIMD on the twelve-month clock rather than the day it is removed. If you rely on Roots, Sampling, or Logging, put the migration on a roadmap with a date, because the spec now gives you one.</p>
+
+  <h3>If you are choosing an MCP stack</h3>
+  <p>Prefer implementations that already speak 2026-07-28 and ship it in their SDKs — the release came with updated TypeScript, Python, Go, and C# SDKs, so "supports the latest spec" is a checkable claim, not a promise. And treat statelessness as the operational feature it is, not as a reason to skip designing where your interaction's state will live. It will live somewhere; the only question the spec settled is that it will not be in the core.</p>
+
+  <div class="callout tip">
+    <p>The durable principle: <strong>a protocol going stateless relocates state, it does not remove it.</strong> The 2026-07-28 core is genuinely simpler to operate, and that simplicity is worth taking. But the session's job got redistributed — inline onto every request, into the Tasks extension as handles, and into your application as cross-call context — and the teams that get burned will be the ones who read "stateless" as "I no longer have to think about state." You do; you just get to choose where it lives now.</p>
+  </div>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>Does upgrading to the 2026-07-28 spec break my existing MCP integration?</h3>
+  <p>It can. The removed <code>initialize</code> handshake and <code>Mcp-Session-Id</code> header mean any client or server that assumed a persistent session must change, and the new <code>iss</code> validation is a hard requirement for a correct OAuth flow. Fast tool servers and simple clients port easily; anything that stored per-session state, or relied on Dynamic Client Registration, needs work.</p>
+
+  <h3>Is a stateless protocol just worse for long-running agents?</h3>
+  <p>No — that is what the Tasks extension is for. Long-running work stays durable and server-side; the stateless core is compatible with it because the client holds a task handle and polls or subscribes, rather than the server keeping the client pinned. You get durability without sticky sessions.</p>
+
+  <h3>Do I have to adopt the Tasks extension?</h3>
+  <p>Only if you expose long-running work. If your server is fast request/response tool calls, the stateless core alone is enough and you may never touch Tasks. Extensions are opt-in by design; the point of moving Tasks out of the core was so servers that do not need it do not carry it.</p>
+
+  <h3>What is the practical benefit of dropping the session handshake?</h3>
+  <p>A remote server can run behind a plain round-robin load balancer with no session affinity and no shared session store, route on the <code>Mcp-Method</code> header without parsing the body, and treat a deploy as an ordinary rolling restart. It is the same reason stateless REST APIs are easier to scale than stateful connections.</p>
+
+  <h3>What is CIMD and why is DCR deprecated?</h3>
+  <p>Client ID Metadata Documents let a client be identified by a URL that resolves to its metadata, rather than registering dynamically with each authorization server (Dynamic Client Registration). DCR still works for backward compatibility but is now formally deprecated; combined with binding credentials to their issuing server, the change closes a set of client-registration and mix-up weaknesses.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/what-is-mcp">What is the Model Context Protocol?</a> — the model, hosts, clients and servers.</li>
+    <li><a href="/deep-dives/mcp/mcp-streamable-http-deep-dive">Streamable HTTP: the current MCP transport</a> — the transport this revision reshapes.</li>
+    <li><a href="/deep-dives/mcp/mcp-auth-oauth21">MCP Auth: the OAuth 2.1 profile</a> — the base the authorization hardening builds on.</li>
+    <li><a href="/deep-dives/mcp/mcp-ops-in-production">MCP Ops in Production</a> — running servers, now without sticky sessions.</li>
+    <li><a href="/operations/agentops/durable-state-and-resumability">Durable State &amp; Resumability</a> — the pattern Tasks formalises.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://blog.modelcontextprotocol.io/posts/2026-07-28/">Model Context Protocol Blog — The 2026-07-28 Specification</a></li>
+    <li><a href="https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/">Model Context Protocol Blog — The 2026-07-28 Release Candidate</a></li>
+    <li><a href="https://developers.googleblog.com/scaling-ai-agent-infrastructure-with-the-mcp-stateless-updates/">Google Developers Blog — Scaling AI agent infrastructure with the MCP stateless updates</a></li>
+    <li><a href="https://agentgateway.dev/blog/2026-08-03-new-mcp-spec-revision/">agentgateway — Support for the 2026-07-28 MCP specification</a></li>
+  </ul>
+</section>
