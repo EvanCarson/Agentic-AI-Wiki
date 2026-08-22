@@ -1,0 +1,128 @@
+<p class="lede">2026-07-28 版的模型上下文协议删掉了让一个 MCP 服务器有状态的两样东西：<code>initialize</code>/<code>initialized</code> 握手，以及 <code>Mcp-Session-Id</code> 头。一个远端服务器现在可以坐在一台普通的轮询负载均衡器后面、不需要任何共享会话存储——这是一个货真价实的运维胜利。但"无状态"描述的是线路，而不是系统。会话的记账没有消失；它挪到了每一个请求上、也挪进了你的应用。而长时间运行的智能体真正需要的那份持久性，又通过一个新扩展径直回来了。把这次转向读成"状态被重新安置"、而不是"被删除"，这次迁移就会少很多意外。</p>
+
+<section>
+  <h2>发生了什么</h2>
+  <p>2026-07-28 版规范的头条是一个无状态的协议核心。此前一个 MCP 客户端要用一次 <code>initialize</code> 交换来开启会话、拿到一个 <code>Mcp-Session-Id</code>，之后每一个请求都搭在那个会话上——这意味着传输层是有状态的，基础设施必须把一个客户端钉在持有它会话的那个服务器实例上。那次握手和那个头如今都没了。每一个请求现在都把自己的协议版本、客户端身份与能力内联携带，于是任何请求都能落在任何实例上。</p>
+
+  <table>
+    <thead>
+      <tr><th>关切点</th><th>之前（有状态核心）</th><th>之后（2026-07-28）</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>会话建立</td><td><code>initialize</code> / <code>initialized</code> 握手</td><td>没有——每个请求自描述</td></tr>
+      <tr><td>会话标识</td><td><code>Mcp-Session-Id</code> 头</td><td>已移除</td></tr>
+      <tr><td>逐请求元数据</td><td>init 时协商一次</td><td><code>MCP-Protocol-Version</code>、<code>Mcp-Method</code>、<code>Mcp-Name</code>，以及一个携带 <code>clientInfo</code> 的 <code>_meta</code> 对象</td></tr>
+      <tr><td>能力发现</td><td>由握手返回</td><td>可选的 <code>server/discover</code> 调用，或由客户端缓存</td></tr>
+      <tr><td>负载均衡</td><td>粘性会话、共享会话存储</td><td>普通轮询，按 <code>Mcp-Method</code> 路由</td></tr>
+    </tbody>
+  </table>
+
+  <p>在无状态核心之外，这次修订还把一个扩展框架正式化（Tasks 与 MCP Apps 加入既有的 Enterprise Managed Authorization）、强化了授权，并且——对任何运营服务器的人来说，这悄悄是最有用的一行——加上了一份带十二个月最短窗口的正式弃用政策。Roots、Sampling 与 Logging 是最先被摆上这个倒计时的功能。</p>
+</section>
+
+<section>
+  <h2>运维上的胜利是真的</h2>
+  <figure>
+    <img src="/blogs/mcp-went-stateless-the-state-moved/arch-stateless-shift.svg" alt="两个面板。左侧是有状态的 MCP 服务器：客户端做一次 initialize 握手、拿到会话 id，于是一台粘性负载均衡器必须把之后每一个请求路由到持有该会话的那一个实例上，背后还有一个共享会话存储。右侧是无状态服务器：每个请求通过头部与 meta 字段自描述，一台普通的轮询负载均衡器把它送到任意实例，也没有会话存储。" width="900" height="500" loading="lazy" />
+    <figcaption>删掉握手与会话 id，请求就不再需要去找那个记得它的实例。</figcaption>
+  </figure>
+
+  <p>只要你规模化地运营过一个有状态的远端服务器，这份吸引力立刻就懂。粘性路由是一笔到处冒头的税：负载均衡器需要会话亲和、一个重启的实例会丢掉钉在它上面的每一个会话、自动扩缩必须"排空"而不能直接终止，而一个共享会话存储本身又成了一个可用性依赖。一个自描述的请求把这些统统去掉。任何实例都能服务任何调用，一次部署就是一次滚动重启、无需会话迁移，而网关可以按 <code>Mcp-Method</code> 头路由、无需撬开请求体。对一个大多是 <code>tools/list</code> 与 <code>tools/call</code> 的服务器来说，这就是"像一个普通 HTTP API 那样运行"与"像一支 WebSocket 队伍那样运行"之间的差别。</p>
+
+  <p>这些都不是营销话术。这和 REST API 之所以无状态是同一个理由：传输层的无状态，正是让横向扩展变得平淡无奇的东西。错误在于据此断定：既然传输层忘掉了会话，系统就不再有会话了。</p>
+</section>
+
+<section>
+  <h2>无状态是线路的性质，不是问题的性质</h2>
+  <p>一个协议可以是无状态的，而它承载的那次交互并不是。客户端仍然需要知道当前在用哪个协议版本、哪些能力；规范的答案是，这些如今在每一个请求上内联传递、放在 <code>_meta</code> 和新头部里，而不是一次谈妥。这不是更少的状态——这是同样的状态、被重新发送，只不过由客户端负责携带；而如果它想省掉一次发现往返，还要由客户端自己去缓存服务器的能力。</p>
+
+  <p>于是"谁持有什么"这本账是挪了位、而不是缩了水：</p>
+
+  <figure>
+    <img src="/blogs/mcp-went-stateless-the-state-moved/data-responsibility-ledger.svg" alt="一张四行两列的职责矩阵。行为：会话标识、能力发现、长时间运行的工作、负载均衡。左列是 2025 年的有状态核心：会话标识由服务器持有、发现在握手时返回、长时间运行的工作别扭地待在核心里、负载均衡需要粘性会话。右列是 2026-07-28 的无状态核心加 Tasks：会话标识如今由客户端在每个请求上内联携带、发现由客户端缓存或按需获取、长时间运行的工作以持久句柄的形式挪进 Tasks 扩展、负载均衡是普通轮询。" width="900" height="400" loading="lazy" />
+    <figcaption>每一行都挪了。没有一个关切点消失——协议不再拥有它们，而是把它们推给了客户端、一个扩展，或你自己的工具契约。</figcaption>
+  </figure>
+
+  <p>这是一笔熟悉的交易，通常也是好交易：一个更简单的核心，把更多职责放到边缘。但值得诚实地讲：这些边缘如今是你的了。服务器在两次调用之间不再记得你的客户端，这意味着这次交互需要记住的任何东西——一次多步协商、一个搭了一半的请求、"这和一秒前是同一个智能体"这件事——都要由你的应用去穿针引线，或由扩展去持有。</p>
+</section>
+
+<section>
+  <h2>Tasks 把持久性买了回来——以句柄的形式</h2>
+  <p>状态没有消失的最清楚证据，是规范不得不新添一个地方来放它。Tasks——最早的官方扩展之一，由 AWS 贡献——正是为了支持可靠、长时间运行的智能体，从实验性核心挪进了 <code>io.modelcontextprotocol/tasks</code>。一次长时间运行的工具调用，是 MCP 做的最有状态的事：你启动工作、稍后回来、期望它还在那儿。一个无状态核心自己表达不了这件事，于是 Tasks 来表达它——用基于轮询的 <code>tasks/get</code> 与 <code>tasks/update</code> 调用，以及一个可选加入的 <code>subscriptions/listen</code> 流来推送变更通知。</p>
+
+  <p>那个机制正是破绽所在。协议之所以保持无状态，是因为状态活在一个显式的<strong>句柄</strong>之后：一个工具返回一个任务句柄，客户端把它存起来，再传回去做轮询或更新。持久的工作是真实的、在服务器端；让它与无状态线路相容的，是"指向它的引用"是一个由客户端携带的值，恰如 <code>_meta</code> 块携带会话事实。这个模式贯穿整次修订——<em>"服务器记得你"这个模型，处处被替换成了"你携带一个服务器能解析的引用"。</em></p>
+
+  <figure>
+    <img src="/blogs/mcp-went-stateless-the-state-moved/compare-where-state-lives.svg" alt="三栏，展示转向之后状态住在哪里。第一栏是无状态核心：逐请求的事实内联携带在头部与 meta 字段里，两次调用之间没有记忆。第二栏是 Tasks 扩展：持久的长时间运行工作保留在服务器端，由一个客户端存下并传回的任务句柄来寻址。第三栏是你的应用：这次交互所需的任何多步或跨调用上下文，如今由你通过工具参数与句柄来穿引。" width="900" height="300" loading="lazy" />
+    <figcaption>曾经的一个会话，如今有了三个家。核心遗忘，扩展按需记住，其余归你。</figcaption>
+  </figure>
+
+  <p>这比一个试图用同一套会话模型既服务琐碎的 <code>tools/list</code> 调用、又服务长达一小时的智能体作业的有状态核心，是更好的设计。但"MCP 现在无状态了"是半句话。整句是：核心是无状态的，持久性是一个可选加入的扩展，而跨调用上下文是客户端的职责——曾经的一个答案，如今成了三个，各自更适配自己的活，而且没有一个是免费的。</p>
+</section>
+
+<section>
+  <h2>会悄悄咬你一口的那些部分</h2>
+  <p>无状态转向是人人都会谈的，但同一次修订里两个更小声的变化，才是更可能弄坏一个真实部署的东西。</p>
+
+  <ul>
+    <li><strong>授权强化改变了"正确"的客户端。</strong>授权服务器现在必须按 RFC 9207 返回 <code>iss</code> 参数，而客户端必须在兑换授权码之前校验它——这是对授权服务器混淆攻击的一个真实修复，也是一项你的客户端要么满足、要么失败的行为要求。动态客户端注册（DCR）如今被正式弃用，转而使用 Client ID Metadata Documents（CIMD），尽管 DCR 目前仍可用；而凭据被绑定到它的签发授权服务器上，因此你无法跨服务器复用它们。</li>
+    <li><strong>弃用倒计时如今是一个你能据以规划的特性——只要你去读它。</strong>相比过去"它变了、你去应对"的节奏，一个十二个月的最短窗口是一份礼物，但 Roots、Sampling 与 Logging 已经在上头了。如果你的服务器或客户端倚赖这三者中的任何一个，迁移如今有了日期，而假装它没有，只不过意味着日后手忙脚乱地去做。</li>
+  </ul>
+
+  <p>这两件都不是无状态核心的问题；它们都搭着同一次修订进来，而且都是那种"能过 CI、却在生产里对着一个真实授权服务器、或一个你忘了自己在用的旧功能"翻车的变化。</p>
+</section>
+
+<section>
+  <h2>到底该做什么</h2>
+
+  <h3>如果你运营一个 MCP 服务器</h3>
+  <p>在升级之前先审计会话假设——任何期望客户端被钉在一个实例上的东西，或任何按会话 id 存放逐客户端状态的东西，都必须挪到一个客户端按句柄寻址的共享存储里，或者干脆去掉。回报是：一旦挪完，你就能彻底丢掉粘性路由与会话存储，把服务器当作一个普通的无状态服务来跑。是否需要 Tasks 扩展则另做决定：如果你的工具是快速的请求/响应调用，你可能永远碰不到它；如果你暴露长时间运行的工作，就采用它，而不是在旁边重新发明持久作业。</p>
+
+  <h3>如果你构建一个 MCP 客户端或宿主</h3>
+  <p>你的客户端现在拥有能力缓存，以及它过去只收一次的逐请求元数据。现在就把 <code>iss</code> 校验实现掉——对一个正确的 OAuth 流程它不是可选项——并按那个十二个月的倒计时来规划从 DCR 到 CIMD 的迁移，而不是等它被移除的那一天。如果你倚赖 Roots、Sampling 或 Logging，把迁移放进一份带日期的路线图，因为规范如今给了你一个日期。</p>
+
+  <h3>如果你在选一套 MCP 技术栈</h3>
+  <p>优先选那些已经讲 2026-07-28、并在各自 SDK 里发布它的实现——这次发布随附了更新的 TypeScript、Python、Go 与 C# SDK，所以"支持最新规范"是一个可核对的说法，而不是一句承诺。并且把无状态当作它本来的运维特性来对待，而不是当作一个"可以跳过设计交互状态住在哪里"的理由。它总会住在某处；规范敲定的唯一一件事，是它不会住在核心里。</p>
+
+  <div class="callout tip">
+    <p>那条经久的原则：<strong>一个协议走向无状态，是把状态重新安置，而不是把它移除。</strong>2026-07-28 的核心确实更好运维，这份简单值得拿。但会话的活被重新分配了——内联到每一个请求上、以句柄的形式进了 Tasks 扩展、以跨调用上下文的形式进了你的应用——而会被烫到的团队，是那些把"无状态"读成"我再也不用去想状态"的团队。你还得想；你只是如今可以选它住在哪里。</p>
+  </div>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>升级到 2026-07-28 规范会弄坏我现有的 MCP 集成吗？</h3>
+  <p>有可能。被移除的 <code>initialize</code> 握手与 <code>Mcp-Session-Id</code> 头，意味着任何假设了持久会话的客户端或服务器都得改，而新的 <code>iss</code> 校验对一个正确的 OAuth 流程是一项硬性要求。快速的工具服务器与简单的客户端很好移植；任何存放逐会话状态、或倚赖动态客户端注册的东西，都需要动工。</p>
+
+  <h3>无状态协议对长时间运行的智能体来说是不是更糟？</h3>
+  <p>不是——那正是 Tasks 扩展的用武之地。长时间运行的工作保持持久、在服务器端；无状态核心与它相容，是因为客户端持有一个任务句柄去轮询或订阅，而不是服务器把客户端钉住。你得到了持久性，又不必要粘性会话。</p>
+
+  <h3>我必须采用 Tasks 扩展吗？</h3>
+  <p>只有当你暴露长时间运行的工作时才需要。如果你的服务器是快速的请求/响应工具调用，光是无状态核心就够了，你可能永远碰不到 Tasks。扩展在设计上就是可选加入的；把 Tasks 挪出核心的意义，正是让不需要它的服务器不必背着它。</p>
+
+  <h3>丢掉会话握手，实际好处是什么？</h3>
+  <p>一个远端服务器可以跑在一台普通的轮询负载均衡器后面、无需会话亲和、无需共享会话存储，可以按 <code>Mcp-Method</code> 头路由而不必解析请求体，并且可以把一次部署当作一次普通的滚动重启。这和无状态的 REST API 之所以比有状态连接更好扩展是同一个理由。</p>
+
+  <h3>CIMD 是什么，为什么 DCR 被弃用了？</h3>
+  <p>Client ID Metadata Documents 让一个客户端可以由一个解析到其元数据的 URL 来标识，而不必向每一个授权服务器动态注册（即动态客户端注册，DCR）。DCR 为了向后兼容仍然可用，但如今被正式弃用；再配上"把凭据绑定到其签发服务器上"，这次变化关掉了一组客户端注册与混淆方面的弱点。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关：</h3>
+  <ul>
+    <li><a href="/zh/concepts/what-is-mcp">什么是模型上下文协议？</a>——模型、宿主、客户端与服务器。</li>
+    <li><a href="/zh/deep-dives/mcp/mcp-streamable-http-deep-dive">Streamable HTTP：当前的 MCP 传输</a>——这次修订重塑的那个传输。</li>
+    <li><a href="/zh/deep-dives/mcp/mcp-auth-oauth21">MCP 授权：OAuth 2.1 profile</a>——授权强化所建立其上的基座。</li>
+    <li><a href="/zh/deep-dives/mcp/mcp-ops-in-production">生产中的 MCP 运维</a>——运营服务器，如今不再需要粘性会话。</li>
+    <li><a href="/zh/operations/agentops/durable-state-and-resumability">持久状态与可恢复性</a>——Tasks 所正式化的那个模式。</li>
+  </ul>
+  <h3>来源：</h3>
+  <ul>
+    <li><a href="https://blog.modelcontextprotocol.io/posts/2026-07-28/">Model Context Protocol Blog — The 2026-07-28 Specification</a></li>
+    <li><a href="https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/">Model Context Protocol Blog — The 2026-07-28 Release Candidate</a></li>
+    <li><a href="https://developers.googleblog.com/scaling-ai-agent-infrastructure-with-the-mcp-stateless-updates/">Google Developers Blog — Scaling AI agent infrastructure with the MCP stateless updates</a></li>
+    <li><a href="https://agentgateway.dev/blog/2026-08-03-new-mcp-spec-revision/">agentgateway — Support for the 2026-07-28 MCP specification</a></li>
+  </ul>
+</section>
