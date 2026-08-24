@@ -1,0 +1,111 @@
+<section class="phase">
+  <div class="phase-num">O19</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Re-indexing and embedding migrations.</h2>
+  <p class="goal">An embedding model is a schema, and it is the only schema in your stack with no in-place migration: vectors from two models occupy different spaces, so there is no partial cutover, no dual-read, no five-per-cent canary — you either have a complete second index or you have nothing. That single property invalidates every deployment pattern your team already knows, and it is why the first embedding migration is usually the one that discovers the retrieval pipeline was never reproducible in the first place.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why this is not like swapping a generation model.</h3>
+
+    <p>Changing the model that writes your answers is a rollout: route one per cent of traffic, compare, ramp or revert, and the two versions coexist happily because they consume the same inputs. <a class="xref" href="/operations/agentops/model-deprecation-and-migration">Model deprecation and migration</a> covers that case, and none of it transfers here.</p>
+
+    <p>An embedding model defines a coordinate system. A vector produced by model A and a vector produced by model B are not comparable, not approximately comparable, and not repairable by a projection you fit in an afternoon — a nearest-neighbour search across a mixed index returns confident nonsense rather than an error, which is the worst available failure mode. So the migration has exactly one shape: build a complete second index, evaluate it offline, and cut over atomically.</p>
+
+    <p>That forces three things most teams have not budgeted for:</p>
+
+    <ul>
+      <li><strong>Double storage and double write capacity</strong> for the duration, since both indexes must exist. If the new model has a larger dimension the second index is also larger per vector, and dimension drives memory, index build time and cost more directly than corpus size does.</li>
+      <li><strong>A cutover, not a ramp.</strong> The blast radius is every retrieval-backed feature at once. You can shadow-read the new index and compare, but you cannot serve half your users from each and call it a canary — the two populations are not getting variants of the same system, they are getting different systems.</li>
+      <li><strong>A rollback that is only free if you keep the old index alive.</strong> Deleting it the day after cutover is the mistake, because the regressions that matter surface on the query distribution's tail, over days. Keep it until an eval window you decided in advance has closed.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The trigger is usually not your decision.</h3>
+
+    <p>Teams plan for the voluntary case — a better model appears, retrieval quality improves, you choose to move. In practice the calendar is set by someone else, and the notice window has historically been months rather than years:</p>
+
+    <ul>
+      <li><strong>The provider retires the endpoint,</strong> or moves it to legacy status where it still answers but stops being improved and eventually stops being supported. You are now migrating on their schedule.</li>
+      <li><strong>Your chunking or parsing changes.</strong> A new document parser, a different chunk size, added metadata — all of these change what was embedded, which means the index no longer matches the code that queries it. This is the trigger people fail to recognise as a migration at all, and it is the most common one.</li>
+      <li><strong>Compliance moves the data.</strong> A residency requirement or a self-hosting decision means a different model, because the one you were using is not available in the region or on-premises.</li>
+      <li><strong>The corpus changes shape.</strong> You started with English support articles and now index code, transcripts and three more languages. The model that was right is no longer the model that is right.</li>
+    </ul>
+
+    <p>Which sets the actual operational requirement, and it is not "have a migration plan." It is: <strong>be able to rebuild the index from source, on demand, without archaeology.</strong> If a full rebuild is a two-week project involving someone who left, you do not have a retrieval system, you have an artefact — and when the deprecation email arrives you will be doing the rebuild anyway, under time pressure, with worse judgement.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The re-index is never the same corpus with new vectors, and that ruins your attribution.</h3>
+
+    <p>Here is the failure that actually costs teams their quarter. You swap the embedding model, rebuild, evaluate, and quality drops. You conclude the new model is worse. It usually is not.</p>
+
+    <p>Between the day the first index was built and the day you rebuild it, the pipeline drifted. The chunker was tuned. The HTML stripper learned to drop navigation. Someone added a heading-prefix to each chunk to improve context. Three hundred documents were deleted at source and were still sitting in the old index because nothing ever propagated the deletion. The old index was built from a snapshot of a corpus that no longer exists, by code that no longer exists — so a rebuild changes the model <em>and</em> the chunking <em>and</em> the cleaning <em>and</em> the document set, all at once, and the quality delta cannot be attributed to any of them.</p>
+
+    <p>The discipline that prevents this is ordinary and unglamorous:</p>
+
+    <ul>
+      <li><strong>Version the pipeline, not just the model.</strong> Parser version, chunker version and parameters, cleaning rules, metadata schema, and model — one identifier, stamped on every vector. If two vectors in one index carry different pipeline versions, that index is already inconsistent and you did not know.</li>
+      <li><strong>Keep the raw source, not only the chunks.</strong> You cannot re-chunk from chunks. Re-embedding requires the original documents, which means retention on the source corpus is a hard operational dependency, not a nice-to-have — the parsing decisions this constrains are in <a class="xref" href="/deep-dives/retrieval-and-rag/document-parsing-for-rag">document parsing for RAG</a>.</li>
+      <li><strong>Change one variable per rebuild.</strong> If you are migrating models, keep the chunking identical even where you know it is wrong. Fix the chunking in a separate rebuild afterwards. Two rebuilds cost compute; one un-attributable regression costs a month of argument.</li>
+      <li><strong>Rehearse the rebuild on a schedule.</strong> Rebuild from source quarterly, into a scratch index, and diff it against production. Whatever differs is drift you did not know you had. This is the same argument <a class="xref" href="/concepts/reproducibility-and-determinism">reproducibility</a> makes about runs, applied to the index.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Cost and time are dominated by the corpus, and you will pay them more than once.</h3>
+
+    <p>The estimate people write down is one pass over the corpus at the provider's per-token embedding price. The real bill has four more terms, and the last one is the one that hurts:</p>
+
+    <ul>
+      <li><strong>Chunk expansion.</strong> You are not embedding the corpus once; you are embedding every chunk, and overlap means the token count exceeds the corpus token count, often substantially.</li>
+      <li><strong>Extraction, not just embedding.</strong> If your pipeline runs a model to parse PDFs, summarise chunks, or extract entities for a graph, that is usually the larger line item — embedding itself is the cheap end of modern inference.</li>
+      <li><strong>Index build and storage.</strong> Building a vector index over tens of millions of vectors is a real compute job with a real wall-clock time, and it is the term that decides whether cutover is an afternoon or a weekend.</li>
+      <li><strong>The reruns.</strong> The first rebuild will fail partway through, or finish and evaluate badly, or reveal that the chunking change slipped in. Budget three passes, not one. A pipeline that cannot resume from a checkpoint turns each failure into a full re-pay.</li>
+    </ul>
+
+    <p>Two levers materially change this arithmetic. Batch inference endpoints are meaningfully cheaper than synchronous ones and a bulk re-embed is the ideal batch workload — there is no user waiting. And if your model supports dimension truncation, a shorter vector cuts storage and index build time; validate the quality cost on your own eval set rather than the published one, because the loss is corpus-dependent. Fold both into the forecast per <a class="xref" href="/operations/economics-roi/forecasting-agent-spend">forecasting agent spend</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Agent memory has no quiet moment, so the migration has to be a dual-write.</h3>
+
+    <p>A document corpus can be re-indexed from a snapshot: freeze, rebuild, cut over, accept that a few hours of updates queue behind it. <a class="xref" href="/deep-dives/memory-and-context/memory-stores">Agent memory</a> does not offer that window. It is written on every turn, by every session, continuously, and the writes are not append-only — they merge, invalidate and rewrite existing entries. A snapshot rebuild starts going stale at the first turn after the snapshot.
+
+    </p>
+
+    <p>The pattern that works is the one from any online database migration, adapted:</p>
+
+    <ul>
+      <li><strong>Dual-write from the moment the migration starts.</strong> Every new memory is written to both the old and the new index, in both embedding spaces. This is the whole trick, and it costs one extra embedding call per write for the duration.</li>
+      <li><strong>Backfill the history in the background,</strong> oldest first, with a checkpoint so a failure resumes rather than restarts.</li>
+      <li><strong>Read from old until the backfill is verifiably complete,</strong> then cut reads over, then stop dual-writing after the rollback window closes. Three separate decisions, three separate deploys — collapsing them is where the data loss happens.</li>
+      <li><strong>Reconcile before cutover.</strong> Count and spot-check: does the new index contain an entry for every entry in the old one? Silent drops during a backfill are common and invisible, because a memory that fails to retrieve looks exactly like a memory the agent never had.</li>
+    </ul>
+
+    <p>Per-user memory makes this easier, not harder: migrate tenant by tenant, and the blast radius of a mistake is one customer. Take that option whenever the architecture allows it, per <a class="xref" href="/operations/agentops/multi-tenancy-for-agents">multi-tenancy for agents</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Decide the cutover on a frozen eval set, agreed before you start.</h3>
+
+    <p>The migration will produce a quality number, and the argument about whether to ship it is unwinnable unless the criterion was written down first. Fix the eval set and the threshold before the rebuild begins, because after it you will be reasoning about sunk compute.</p>
+
+    <ul>
+      <li><strong>Use a query set frozen from production traffic,</strong> including the tail — the rare, long, multilingual and badly-spelled queries. Retrieval regressions concentrate exactly there, and a curated set of well-formed questions will show you a wash. The construction is in <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">evaluating RAG</a>.</li>
+      <li><strong>Score retrieval directly, not end-to-end answers.</strong> Recall at k against known-relevant documents isolates the thing that changed. A generation model that is good at recovering from mediocre context will mask a real retrieval regression until the day you change the generation model too.</li>
+      <li><strong>Report per-segment, not in aggregate.</strong> The characteristic outcome of an embedding migration is "better overall, worse on code" or "better on English, worse on everything else." An aggregate improvement can hide a segment that got much worse, and that segment has users.</li>
+      <li><strong>Shadow-read for a week before cutting over.</strong> Query both indexes on live traffic, log both result sets, ship neither. It is the closest thing to a canary this migration allows, and it costs one extra query per request — see <a class="xref" href="/operations/evaluation-and-observability/quality-regression-detection">quality regression detection</a> for reading the comparison.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>The one thing to build before you ever need it: <strong>make "rebuild the entire index from source" a routine, checkpointed, one-command job, and run it on a schedule whether or not you are migrating.</strong> Every hard part of an embedding migration — the double storage, the atomic cutover, the dual-write, the eval — is tractable engineering. What turns it into a quarter-long project is discovering that nobody can reproduce the current index: the chunker changed, the source snapshot is gone, and the quality delta cannot be attributed. A team that rebuilds quarterly has already paid that cost in small pieces and can treat a provider deprecation as a scheduled task. A team that has never rebuilt will find out, on the provider's timetable, that their retrieval quality was an accident nobody can reproduce.</p>
+    </div>
+  </div>
+</section>
