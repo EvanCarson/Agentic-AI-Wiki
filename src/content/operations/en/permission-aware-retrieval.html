@@ -1,0 +1,103 @@
+<section class="phase">
+  <div class="phase-num">S17</div>
+  <div class="week">Operation · Safety, Alignment &amp; Agentic Security</div>
+  <h2>Permission-aware retrieval: the index is a permission-flattening machine.</h2>
+  <p class="goal">Indexing takes documents that had different audiences, chops them into chunks, strips the container they inherited their access rules from, and stores the pieces in one collection your agent queries with a single service credential — so retrieval quietly becomes the widest read your system performs, and it is performed on behalf of whoever is talking to the bot. The fix is not a filter on the answer: anything the model saw is disclosed whether or not it made it into the response, which means access control has to happen before the search, and the freshness of the permission data you copied at index time <em>is</em> your revocation latency.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The index inherits nothing, so it defaults to the union of everything.</h3>
+
+    <p>In the source systems, access control is structural. The document lives in a folder, a site, a repository, a channel; the container carries the rules; the rules are enforced by the system that stores it. Every one of those properties is discarded at ingestion. What lands in the vector store is text, an embedding, and whatever metadata your loader happened to copy — and a chunk has no folder.</p>
+
+    <p>Then the agent queries it with one credential, because that is what the client library expects and because there is exactly one connection to configure. At that moment your retrieval layer holds a superset of every user's permissions, and the only thing standing between a curious question and the compensation spreadsheet is whether the query embedding happens to land near it. This is the confused-deputy shape from <a class="xref" href="/operations/safety-and-security/data-exfiltration-risks">data exfiltration and tool misuse</a>, but arriving through a path teams do not classify as a permission boundary at all, because they think of the index as a search feature.</p>
+
+    <p>Note what this is not. It is not the poisoning-and-injection problem — retrieved text as untrusted input is covered in <a class="xref" href="/operations/safety-and-security/rag-security">RAG pipeline security</a>, and it is a different failure with a different fix. This page is about the opposite direction: not what the corpus does to your agent, but what your agent does with the corpus on behalf of someone who should not see all of it.</p>
+
+    <div class="callout">
+      <p>One question settles whether you have this problem: if user B asks a question whose best-matching chunk comes from a document only user A may read, what stops it? If the answer names a step that happens after the search — a filter on results, a check in the prompt, a judgement by the model — you do not have access control, you have a preference.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Filtering after the model has seen it is not a control.</h3>
+
+    <p>The tempting architecture is to retrieve widely, then let a downstream step remove what the user should not see. It fails on three separate levels, and each one is enough on its own.</p>
+
+    <ul>
+      <li><strong>Disclosure has already happened.</strong> Text in the context window is text the system processed on this user's behalf and, on any provider you do not run yourself, text that left your boundary. Whether it survived into the answer is beside the point — and it will influence the answer anyway, because a model that has read the document will phrase, hedge and prioritise differently even when told not to quote it.</li>
+      <li><strong>The suppression is probabilistic.</strong> Asking the model to ignore what it just read is an instruction competing with everything else in the context, and instructions lose that competition often enough to be unusable as a boundary. The general principle — enforcement belongs below the model, not in it — is the same one behind <a class="xref" href="/operations/safety-and-security/scoped-credentials-for-agents">scoped credentials</a>.</li>
+      <li><strong>Side channels leak the rest.</strong> "I found 14 relevant documents but can only show you 2" discloses that eleven more exist and roughly how relevant they were. So does a citation count, a confidence score, a latency difference, and the tell-tale contrast between a genuine "nothing matches" and a filtered "nothing I can show you". Existence is information, and in an acquisition, a layoff plan or a legal matter it is often the whole of the information.</li>
+    </ul>
+
+    <p>Assume the rule: <strong>if the model saw it, treat it as disclosed and log it as an access.</strong> That single assumption forces the architecture into the right shape, because it makes the wide retrieve expensive rather than convenient.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Three places to enforce, and the trade-off is recall against storage.</h3>
+
+    <p>Access control has to happen at or before the search. There are three workable positions, and most production systems end up combining two.</p>
+
+    <ul>
+      <li><strong>Pre-filtered search.</strong> The query carries the user's principals — groups, roles, tenant, clearance — and the store restricts candidates to chunks whose access key set intersects them before ranking. This is the default answer and every serious vector store now supports metadata filtering. The cost is real and often unmeasured: approximate nearest-neighbour indexes are built for unfiltered traversal, and a highly selective filter either degrades recall, because the graph walk keeps landing on candidates that are then discarded, or silently falls back to a brute-force scan. Both show up as a latency or quality regression that nobody attributes to permissions. Measure recall <em>with</em> your filters, on your real ACL distribution — the index-choice consequences are in <a class="xref" href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">choosing a vector database</a>.</li>
+      <li><strong>Partitioned indexes.</strong> One collection per tenant, per sensitivity tier, or per broad audience. Simple, fast, and structurally safe at the boundary you partitioned on — a cross-tenant leak becomes a wiring bug rather than a filter bug. It does not scale to per-user granularity, and it makes documents visible to two audiences an operational question rather than a modelling one.</li>
+      <li><strong>Late-binding authorisation.</strong> Retrieve candidates, then ask the source system whether this user may read each one before any of it enters the context. This is the only variant that is exactly correct, because the source system is the authority, and it is the only one that revokes instantly. It costs a round trip per candidate, which batches well against most APIs and is entirely affordable at the top-k that actually reaches the model.</li>
+    </ul>
+
+    <p>The combination worth defaulting to: partition on the coarse boundary you can never get wrong (tenant), pre-filter on the principals you copied, and late-bind on the handful of chunks that survive to the prompt. The first two make it fast, the third makes it correct.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Your ACL copy is a cache, and its staleness is your revocation latency.</h3>
+
+    <p>Pre-filtering works from permission data copied into the index at ingestion. That copy is a cache of somebody else's authoritative state, and it goes stale the way every cache does — except the failure here is not a wrong answer, it is a disclosure.</p>
+
+    <p>The arithmetic is unforgiving. If you re-index nightly, a person removed from a project on Monday morning can retrieve that project's documents until Tuesday. If you re-index weekly, it is a week. Nobody writes down "our revocation SLA is seven days", and yet that is what a weekly rebuild means, and it is the number a security review will eventually extract from you.</p>
+
+    <p>Two design choices shrink it to nothing:</p>
+
+    <ul>
+      <li><strong>Store the permission <em>key</em>, not the resolved member list.</strong> Index the chunk with <code class="inline">acl: ["group:eng-payments", "user:1421"]</code> and resolve the asking user's group membership at query time from the identity provider. Group membership then changes in one place and takes effect on the next query; only a change to the document's own ACL requires touching the index. This one decision converts most of your revocation lag into zero.</li>
+      <li><strong>Treat document-ACL changes as an event, not a batch.</strong> Subscribe to the change feed where the source system offers one and update the affected chunks' metadata in place. Metadata updates do not require re-embedding, so this is cheap — much cheaper than the full rebuilds discussed in <a class="xref" href="/operations/agentops/reindexing-and-embedding-migrations">re-indexing and embedding migrations</a>, which you need for other reasons.</li>
+    </ul>
+
+    <p>Also decide what deletion means. A document removed from the source is still in your index until something removes it there, and "the agent cited a document that no longer exists" is the polite version of that incident; the impolite version is that it cited one that was deleted for a reason.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Derived artefacts inherit no permissions at all, and agents create them constantly.</h3>
+
+    <p>Even a perfectly filtered retrieval path leaks if the agent is allowed to write down what it read. Every derived artefact is a fresh copy of the content with no ACL attached, and an agent produces them as a matter of course:</p>
+
+    <ul>
+      <li><strong>Agent memory.</strong> A summary written after reading a restricted document, then recalled for a different user, is an exfiltration path with a delay fuse. Memory must carry the access constraints of its sources or be scoped strictly per user — the storage-shape trade-offs are in <a class="xref" href="/deep-dives/memory-and-context/memory-stores">memory stores</a>, and the deletion consequences in <a class="xref" href="/operations/governance-compliance/erasure-against-agent-memory">erasure against agent memory</a>.</li>
+      <li><strong>Caches.</strong> Semantic caches keyed on the question rather than on the questioner are the sharpest version: user B asks a similar question and is served user A's authorised answer at speed. If you cache, the principal set is part of the key.</li>
+      <li><strong>Summaries, digests and reports.</strong> The weekly digest assembled from everything the agent could reach acquires the union of permissions and is then distributed on a mailing list.</li>
+      <li><strong>Traces and eval fixtures.</strong> Restricted content flows into your observability backend and your test corpus, both of which are typically readable by every engineer. This is usually the largest unmanaged copy in the whole system, and it is discovered during an audit rather than by design.</li>
+      <li><strong>Multi-hop retrieval.</strong> An agent that retrieves, then uses what it found to construct the next query, can walk from a document it may read to one it may not — enforcement must sit on every hop, not the first. The pattern is described in <a class="xref" href="/deep-dives/retrieval-and-rag/agentic-retrieval">agentic retrieval</a>; the security consequence is that "top-k with a filter" has to be a property of the retrieval tool itself.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Test it like an authorisation system, because that is what it is.</h3>
+
+    <p>Retrieval quality is tested with relevance metrics, and relevance metrics have nothing to say about disclosure. Permission behaviour needs its own suite, and it is cheap to build:</p>
+
+    <ul>
+      <li><strong>Differential tests as the core.</strong> Two users with deliberately different access, the same question, in CI. Assert that A gets the restricted content and B does not. This catches the entire class in one test shape, and it fails loudly when someone adds a caching layer or a new retrieval path.</li>
+      <li><strong>Canary documents per tier.</strong> Seed each sensitivity tier with a document containing a unique, unguessable string, and assert that the string never appears in an unauthorised user's context — the context, not just the answer. A canary that turns up is unambiguous, which is exactly what you want from an alarm.</li>
+      <li><strong>Assert on the context window, not the response.</strong> The response is filtered; the context is the truth. Your test harness should capture what was assembled, because that is the boundary that matters.</li>
+      <li><strong>Revocation timing tests.</strong> Remove a user from a group, then assert that access stops within your stated window. If nobody has stated a window, this test is the forcing function that produces one.</li>
+      <li><strong>Log retrieval as access.</strong> Every chunk that entered a context, with the principal it was assembled for. Without it you cannot answer the only question that matters after an incident — who saw what — and you will be asked, as <a class="xref" href="/operations/governance-compliance/data-governance">data governance for agents</a> lays out.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you do one thing, move the check in front of the search and make the identity travel with the query. <strong>Retrieval executes with the asking user's principals, never with a service credential that can read everything; the index stores permission keys rather than resolved member lists so revocation lands on the next query; and the handful of chunks that survive to the prompt get a late-binding check against the source system.</strong> Then write the two tests that keep it true: a differential test where the same question returns different, correct results for two users, and a canary string per sensitivity tier asserted against the assembled context. Everything else — reranking, chunking strategy, hybrid search — is quality work. This is the part where a bug is not a worse answer, it is a disclosure, and the difference between the two is that nobody files a ticket about the second one.</p>
+    </div>
+  </div>
+</section>
