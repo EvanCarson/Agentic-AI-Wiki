@@ -1,0 +1,74 @@
+<section class="phase">
+  <div class="phase-num">F19</div>
+  <div class="week">Concepts · AI Foundations</div>
+  <h2>Constrained decoding.</h2>
+  <p class="goal">A 100% valid-JSON rate is not a 100% correct-answer rate, and the machinery that buys you the first can quietly cost you the second — because a model that is masked into your schema can no longer fail to fill a field, so it fills the field even when the input never supported one. Constrain the shape of the answer; never constrain the thinking that produces it, and always leave the schema a way to say "I don't know".</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What the mask actually does.</h3>
+
+    <p>Constrained decoding compiles your schema or grammar into an automaton and runs it alongside generation. At every decode step the engine walks the automaton to work out which tokens could still lead to a valid string, sets the logits of every other token to negative infinity, and samples from what remains. Validity stops being something the model achieves and becomes something the sampler cannot violate — see <a class="xref" href="/concepts/prefill-and-decode">prefill &amp; decode</a> for where in the loop this happens, and <a class="xref" href="/concepts/temperature-and-sampling">temperature &amp; sampling</a> for what the mask is applied on top of.</p>
+
+    <ul>
+      <li><strong>The cost is no longer the objection.</strong> XGrammar — the default structured-generation backend in vLLM, SGLang and TensorRT-LLM — reports per-token mask overhead under 40 microseconds, which disappears next to the forward pass. "Constrained output is too slow" was a 2024 argument.</li>
+      <li><strong>Two engine families, different ceilings.</strong> FSM-based engines (Outlines) cover regular languages and either reject a recursive schema or flatten it to a fixed depth. CFG-based engines (XGrammar, llguidance) handle genuine recursion. If your schema contains a tree — a nested expression, a comment thread, a folder — you need the second kind.</li>
+      <li><strong>"Structured outputs" is a marketing term, not a mechanism.</strong> One vendor's flag means true token masking; another's means generate-then-validate-then-retry; a third's means nothing more than an instruction plus a JSON-ish decoding mode. Those give you different guarantees and very different tail behaviour. Check which one you bought — <a class="xref" href="/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">JSON Schema subsets per vendor</a> has the comparison.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The same machinery is what makes <a class="xref" href="/concepts/tool-calling-explained">tool calling</a> reliable: a tool call is a constrained generation against the tool's parameter schema. Everything on this page about fabricated fields applies to tool arguments too, where it is worse — a wrong argument is an action, not a string.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Syntax is free. Semantics is not.</h3>
+
+    <p>The mask guarantees exactly one thing: the bytes will parse. It says nothing about whether the values are true, and it removes the model's most honest failure mode. An unconstrained model that has nothing to say can trail off, hedge, or answer in prose. A constrained model must emit the next legal token, and the next legal token is never silence.</p>
+
+    <ul>
+      <li><strong>Forced-field fabrication.</strong> A required <code class="inline">invoice_total</code> on a document that has no total is not left blank — the automaton demands a number, so a number appears. This is the single most common way constrained pipelines produce confident nonsense, and it looks identical to success in every dashboard that counts parse rate.</li>
+      <li><strong>Enum coercion.</strong> Given a closed label set that does not contain the right answer, the model picks the nearest legal member. You do not get an error; you get a plausible wrong category, with the "none of these" signal masked out of existence.</li>
+      <li><strong>Early closing.</strong> When the automaton allows <code class="inline">}</code>, a model running low on budget or confidence will take it. Arrays come back with two of the seven items and no indication that five are missing.</li>
+    </ul>
+
+    <p>The fix is not to abandon constraints — it is to put the escape hatch <em>inside</em> the schema. Nullable fields for anything the source may not contain, an explicit <code class="inline">"unknown"</code> member in every enum, and a top-level branch the model can take to decline. If the schema has no way to say no, the model has no way to say no, and you have engineered abstention out of your system. See <a class="xref" href="/concepts/hallucination-and-grounding">hallucination &amp; grounding</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Where the "does it hurt quality" argument actually lives.</h3>
+
+    <p>There is a real mechanism behind the worry. Masking can force a non-canonical tokenization — a byte sequence the tokenizer would normally have merged differently — so the model finds itself continuing a token path it almost never saw in training. That is a genuine distribution shift, and it is why the question keeps coming back. See <a class="xref" href="/concepts/tokens-and-tokenization">tokens &amp; tokenization</a>.</p>
+
+    <p>The empirical picture is contested. The EMNLP 2024 study <em>Let Me Speak Freely?</em> reported that format restrictions hurt reasoning tasks while helping classification; dottxt's <em>Say What You Mean</em> could not reproduce it on the same model and attributed the gap to prompt and parsing artifacts rather than to the mask. Both can be read honestly, and neither settles it — which is exactly why you should not design around the disputed part.</p>
+
+    <p>Design around the undisputed part instead: <strong>a schema that starts at token one takes away the scratchpad.</strong> Whatever the mask does or does not cost, forcing the first token of the response to be <code class="inline">{</code> means the model must commit to an answer before it has generated any of the intermediate text it would otherwise use to get there. Separate the channels:</p>
+
+    <ul>
+      <li><strong>Reason unconstrained, then constrain.</strong> A <a class="xref" href="/concepts/reasoning-models">reasoning model</a>'s thinking channel is not schema-bound, and shouldn't be. Apply the grammar to the final answer only.</li>
+      <li><strong>Or run two passes.</strong> A free-form call that solves the problem, then a cheap, small-model extraction call under constraint that turns the prose into the object. Two calls, and the expensive one is unconstrained.</li>
+      <li><strong>Or keep the reasoning inside the schema, in the right order</strong> — which is the next step.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Design the schema for the decoder, not for your database.</h3>
+
+    <p>Under constrained decoding the schema is not a validation contract that runs after the fact — it is the generation plan. Field order is generation order, nesting is branching, and every keyword you add is a place the automaton can force the model's hand.</p>
+
+    <ul>
+      <li><strong>Order fields so evidence precedes conclusions.</strong> <code class="inline">{"quote": …, "reason": …, "label": …}</code> lets the model condition its label on text it has already written. <code class="inline">{"label": …, "reason": …}</code> makes the reason a post-hoc rationalisation of a label chosen with nothing behind it. This is the cheapest accuracy improvement on this page and it costs one line of schema.</li>
+      <li><strong>Flatter and shorter.</strong> Every nesting level and every verbose field name is tokens you pay for on a path the model did not choose. Reshape into your storage model afterwards, in code.</li>
+      <li><strong>Enums for closed sets — plus the escape member.</strong> A closed set is where masking earns the most, and where an omitted "none of these" does the most damage.</li>
+      <li><strong>Stay inside the supported subset.</strong> Strict modes accept a subset of JSON Schema; unsupported keywords are variously rejected loudly or dropped silently, and the silent case gives you a constraint you believe in but do not have. <a class="xref" href="/deep-dives/tool-capability-design/structured-outputs-vs-tool-calls">Structured outputs vs tool calls</a> covers when to use which surface.</li>
+      <li><strong>Measure two rates, not one.</strong> Parse rate will be 100% and tells you nothing. Track field-level accuracy, and separately the abstention rate on a set of inputs where the correct output is "no answer".</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Build the negative eval set first: thirty inputs where the honest answer is "not present", "not applicable" or "none of these". Then add the escape hatches — nullable fields, an <code class="inline">"unknown"</code> enum member — and reorder your schema evidence-first. If your valid-JSON rate is 100% and your abstention rate is 0%, you have not shipped structure; you have shipped confident filler that happens to parse. Details in <a class="xref" href="/concepts/structured-outputs">structured outputs</a> and <a class="xref" href="/concepts/evals-101">evals 101</a>.</p>
+    </div>
+  </div>
+</section>

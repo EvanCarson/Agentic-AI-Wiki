@@ -1,0 +1,74 @@
+<section class="phase">
+  <div class="phase-num">F19</div>
+  <div class="week">概念 · AI 基础</div>
+  <h2>受约束解码。</h2>
+  <p class="goal">100% 的 JSON 合法率并不等于 100% 的答案正确率，而为你换来前者的那套机制，很可能悄悄让后者变差——因为被掩码逼进你 schema 的模型，已经不可能「填不出某个字段」了，于是即便输入根本不支持某个值，它也会填出一个。约束答案的形状，但绝不要约束产生答案的思考过程；并且永远给 schema 留一条说「我不知道」的路。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>掩码到底做了什么。</h3>
+
+    <p>受约束解码会把你的 schema 或语法编译成一台自动机，与生成过程并行运行。每一个解码步，引擎都走一遍自动机，算出哪些 token 仍有可能通向一个合法字符串，把其余所有 token 的 logits 置为负无穷，再从剩下的部分采样。于是「合法」不再是模型努力达成的结果，而是采样器无法违反的约束——这一步发生在循环的哪个位置见<a class="xref" href="/zh/concepts/prefill-and-decode">预填充与解码</a>，掩码叠加在什么之上见<a class="xref" href="/zh/concepts/temperature-and-sampling">温度与采样</a>。</p>
+
+    <ul>
+      <li><strong>开销已经不是反对理由了。</strong>XGrammar——vLLM、SGLang 与 TensorRT-LLM 的默认结构化生成后端——报告的每 token 掩码开销低于 40 微秒，与一次前向传播相比可以忽略。「受约束输出太慢」是 2024 年的论据。</li>
+      <li><strong>两类引擎，天花板不同。</strong>基于 FSM 的引擎（Outlines）覆盖正则语言，遇到递归 schema 要么拒绝，要么压平到固定深度。基于 CFG 的引擎（XGrammar、llguidance）能处理真正的递归。如果你的 schema 里有一棵树——嵌套表达式、评论楼层、文件夹——你需要的是后者。</li>
+      <li><strong>「结构化输出」是一个营销词，不是一种机制。</strong>某家厂商的这个开关意味着真正的 token 掩码；另一家意味着先生成、再校验、失败重试；第三家不过是一句指令加上一个类 JSON 的解码模式。它们给出的保证不同，尾部行为差别更大。搞清楚你买到的是哪一种——对照见 <a class="xref" href="/zh/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">各厂商的 JSON Schema 子集</a>。</li>
+    </ul>
+
+    <div class="callout">
+      <p>让<a class="xref" href="/zh/concepts/tool-calling-explained">工具调用</a>可靠的正是同一套机制：一次工具调用就是针对该工具参数 schema 的一次受约束生成。本页关于「被逼出来的字段」的每一句话同样适用于工具参数，而且在那里后果更重——一个错误的参数是一个动作，不只是一个字符串。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>语法是白送的，语义不是。</h3>
+
+    <p>掩码只保证一件事：这串字节能被解析。它对这些值是否为真只字未提，而且它拿走了模型最诚实的那种失败方式。一个不受约束、又确实无话可说的模型，可以说着说着停下、可以打太极、可以用散文回答。一个受约束的模型必须吐出下一个合法 token，而下一个合法 token 永远不会是沉默。</p>
+
+    <ul>
+      <li><strong>被逼出来的字段。</strong>一份根本没有合计金额的单据，遇上必填的 <code class="inline">invoice_total</code>，得到的不是空值——自动机要一个数字，于是一个数字就出现了。这是受约束流水线产出「自信的胡说」最常见的方式，而在任何只统计解析成功率的看板上，它和成功长得一模一样。</li>
+      <li><strong>枚举挤压。</strong>给定一个并不包含正确答案的封闭标签集，模型会挑最接近的那个合法成员。你不会拿到一个报错，你拿到的是一个貌似合理的错误分类，而「以上皆非」这个信号已经被掩码从存在中抹掉了。</li>
+      <li><strong>提前收尾。</strong>只要自动机允许 <code class="inline">}</code>，一个预算或信心告急的模型就会顺势收尾。七项里回来两项，而且没有任何迹象表明少了五项。</li>
+    </ul>
+
+    <p>解法不是放弃约束，而是把那条退路放进 schema <em>内部</em>：凡是源文档可能没有的内容一律可空，每个枚举都显式加一个 <code class="inline">"unknown"</code> 成员，再给一个模型可以走的顶层「拒答」分支。如果 schema 没有办法说不，模型就没有办法说不——你等于把「弃答」这项能力从系统里工程性地删掉了。参见<a class="xref" href="/zh/concepts/hallucination-and-grounding">幻觉与接地</a>。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>「这会不会伤害质量」的争论真正在哪里。</h3>
+
+    <p>这种担心背后确有机制。掩码可能逼出一种非规范的分词——一段字节序列，分词器本来会以另一种方式合并——于是模型发现自己正在续写一条它在训练中几乎没见过的 token 路径。这是真实的分布偏移，也是这个问题反复被提起的原因。参见 <a class="xref" href="/zh/concepts/tokens-and-tokenization">令牌与分词</a>。</p>
+
+    <p>实证结论则有争议。EMNLP 2024 的研究 <em>Let Me Speak Freely?</em> 报告格式限制会损害推理类任务、却有助于分类任务；dottxt 的 <em>Say What You Mean</em> 在同一模型上无法复现，并把差距归因于提示词与解析环节的处理方式，而非掩码本身。两边都可以被诚实地阅读，谁也没有定论——所以正确的做法是：别把设计押在有争议的那一半上。</p>
+
+    <p>押在没有争议的那一半上：<strong>一个从第一个 token 就开始的 schema，等于收走了草稿纸。</strong>无论掩码本身是否有代价，强制响应的第一个 token 是 <code class="inline">{</code>，就意味着模型必须在还没生成任何中间文字之前就先承诺一个答案——而那些中间文字，本来正是它推导出答案的过程。把通道分开：</p>
+
+    <ul>
+      <li><strong>先不受约束地推理，再施加约束。</strong><a class="xref" href="/zh/concepts/reasoning-models">推理模型</a>的思考通道不受 schema 束缚，也不该受。只把语法施加在最终答案上。</li>
+      <li><strong>或者跑两趟。</strong>一次自由形式的调用把问题解掉，再用一次便宜的小模型抽取调用在约束下把散文变成对象。两次调用，而贵的那次是不受约束的。</li>
+      <li><strong>又或者把推理留在 schema 内部，但要排对顺序</strong>——这正是下一步的内容。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>为解码器设计 schema，而不是为你的数据库。</h3>
+
+    <p>在受约束解码之下，schema 不是事后运行的校验合同，而是生成计划本身。字段顺序就是生成顺序，嵌套就是分支，你每多加一个关键字，就多给自动机一处可以掰动模型的地方。</p>
+
+    <ul>
+      <li><strong>让证据排在结论之前。</strong><code class="inline">{"quote": …, "reason": …, "label": …}</code> 让模型可以基于自己已经写下的文字来决定标签。<code class="inline">{"label": …, "reason": …}</code> 则把理由变成对一个凭空选定的标签的事后合理化。这是本页最便宜的一次准确率提升，代价是 schema 里的一行。</li>
+      <li><strong>更扁、更短。</strong>每一层嵌套、每一个啰嗦的字段名，都是你在一条并非模型自选的路径上付出的 token。之后在代码里再整形成你的存储模型。</li>
+      <li><strong>封闭集用枚举——外加那个逃生成员。</strong>封闭集是掩码收益最高的地方，也是漏掉「以上皆非」时伤害最大的地方。</li>
+      <li><strong>待在受支持的子集里。</strong>严格模式只接受 JSON Schema 的一个子集；不受支持的关键字有的会被高声拒绝，有的被悄悄丢掉，而后一种给你的是一个你以为存在、实际并不存在的约束。什么时候用哪个接口，见<a class="xref" href="/zh/deep-dives/tool-capability-design/structured-outputs-vs-tool-calls">结构化输出 vs 工具调用</a>。</li>
+      <li><strong>要看两个比率，而不是一个。</strong>解析成功率会是 100%，它什么也说明不了。要盯字段级准确率，以及在「正确输出就是没有答案」的那批输入上单独统计弃答率。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>先把负例评测集建起来：三十条输入，其诚实答案是「文中没有」「不适用」或「以上皆非」。然后加上逃生口——可空字段、枚举里的 <code class="inline">"unknown"</code> 成员——并把 schema 改成证据优先的顺序。如果你的 JSON 合法率是 100%、弃答率是 0%，那你交付的不是结构，而是恰好能被解析的自信填充物。细节见<a class="xref" href="/zh/concepts/structured-outputs">结构化输出</a>与<a class="xref" href="/zh/concepts/evals-101">评测入门</a>。</p>
+    </div>
+  </div>
+</section>
