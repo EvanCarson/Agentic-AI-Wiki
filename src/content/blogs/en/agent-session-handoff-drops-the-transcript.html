@@ -1,0 +1,222 @@
+<p class="lede">Moving a half-finished refactor from Claude Code to Codex looks like a file-conversion job — both CLIs keep every session as append-only JSONL on disk. It is not. An assistant turn is not a record of what happened; it is a claim conditioned on a system prompt, a tool schema, a model and a warm cache that the receiving agent does not have, so replaying it verbatim hands over a false memory rather than a head start. There are four layers you can actually hand a session over on, and every one that works throws the transcript away and keeps something the receiver can re-check against the repo.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>The question "how do I share my session between agents?" has four real answers, and they are not competing implementations of the same idea. They sit at different distances from the session itself, and the distance is the whole trade.</p>
+
+  <table>
+    <thead>
+      <tr><th>Layer</th><th>What it is</th><th>What crosses</th><th>What it costs</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1 · Instruction file</td><td><code>AGENTS.md</code>, <code>CLAUDE.md</code></td><td>Standing project rules, re-read at every startup</td><td>Nothing about <em>this</em> session</td></tr>
+      <tr><td>2 · Handoff artifact</td><td>A written state file</td><td>Decisions, open threads, the next step</td><td>Only what someone wrote down</td></tr>
+      <tr><td>3 · Transcript conversion</td><td>Parser and writer over the on-disk JSONL</td><td>Every turn, in order, as prose</td><td>Tool calls, identifiers, cache — and a format the vendor may break</td></tr>
+      <tr><td>4 · Live protocol or store</td><td>ACP client, A2A peer, MCP memory server</td><td>Continuous shared state</td><td>Both ends must already speak it</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-four-layers.svg" alt="Agent A on the left and Agent B on the right, connected by four horizontal lanes. Layer one, the instruction file, carries standing project rules and nothing about the session. Layer two, the handoff artifact, carries claims the receiver can re-verify against the repo. Layer three, transcript conversion, carries prose only — tool calls, ids and the cache do not survive. Layer four, a live protocol or shared store, carries continuous state if both ends already speak it." width="900" height="500" loading="lazy" />
+    <figcaption>The further down you go, the more of this session crosses — and the fewer pairs of agents it crosses between.</figcaption>
+  </figure>
+
+  <p>Score them and the shape of the problem falls out. One row carries the whole session. It is the weakest row on every other axis, and that is not an implementation gap waiting to be closed.</p>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/data-feature-matrix.svg" alt="A matrix of the four layers against five axes: cross-vendor reach, how much of this session it carries, whether the receiver can verify it, whether it survives a version bump, and setup cost. The instruction file and handoff artifact are strong everywhere except carrying the session. Transcript conversion is strong only on carrying every turn and weak on the other four axes. Live protocols and shared stores sit in the middle throughout." width="900" height="400" loading="lazy" />
+    <figcaption>Fidelity to the transcript and usefulness to the receiver point in opposite directions.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Where a session actually lives</h2>
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-where-sessions-live.svg" alt="Three columns of on-disk session storage. Claude Code writes JSONL under a projects directory keyed by encoded working directory, with subagents in their own sidechain files. Codex CLI writes date-partitioned rollout JSONL that its context manager replays on resume. Gemini CLI writes session JSON under a temporary project directory. Below, a band notes what all three share: append-only JSONL, one line per turn, each linked to its parent. A final band notes what none of them share: entry semantics." width="900" height="500" loading="lazy" />
+    <figcaption>Three agents, three paths, one shape — and no shared meaning underneath it.</figcaption>
+  </figure>
+
+  <p>The three major CLI agents are close to identical in storage strategy. Claude Code writes <code>~/.claude/projects/&lt;project&gt;/&lt;session-id&gt;.jsonl</code>, where <code>&lt;project&gt;</code> is the working directory path with non-alphanumeric characters replaced by hyphens; each line is a JSON object for a message, tool use or metadata entry, and subagents get their own sidechain transcripts. Codex CLI writes <code>~/.codex/sessions/YYYY/MM/DD/rollout-&lt;timestamp&gt;-&lt;uuid&gt;.jsonl</code>, a rollout stream its context manager replays to rebuild model state when you run <code>codex resume</code>. Gemini CLI keeps session JSON under <code>~/.gemini/tmp/</code>. All three are local-first, append-only, and readable with <code>jq</code>.</p>
+
+  <p>That similarity is exactly what makes the file-conversion intuition so appealing, and there are two documented facts that should kill it before you write a line of code.</p>
+
+  <p>The first is that the format is not a contract. Anthropic's own session documentation says the entry format "is internal to Claude Code and changes between versions, so scripts that parse these files directly can break on any release," and points you at <code>/export</code> or the scripting interfaces instead. A converter built on the raw JSONL is not integrating with a format; it is depending on an implementation detail that its vendor has explicitly reserved the right to change.</p>
+
+  <p>The second is subtler and more telling. Claude Code will resume a session ID started in a different project directory — but the cross-project search resolves the ID only when exactly one other project holds a transcript with messages for it, so <em>a hand-copied duplicate makes it report not-found rather than resume an arbitrary copy</em>. The vendor treats the transcript as an identity, not a portable document. Copying the file does not copy the session, and the tool is built to say so.</p>
+</section>
+
+<section>
+  <h2>Layer 1 — the instruction file, which carries none of the session</h2>
+  <p><code>AGENTS.md</code> is the closest thing the ecosystem has to a settled standard. OpenAI released it in August 2025 and handed it to the Linux Foundation's Agentic AI Foundation alongside MCP; by 2026 it is read by 30-plus agents and lives in 60,000-plus repositories. Claude Code is the notable holdout — as of August 2026 it still loads <code>CLAUDE.md</code>, which you resolve by pointing one file at the other with an import line rather than maintaining two.</p>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/data-standards-timeline.svg" alt="Three parallel timelines from June 2025 to August 2026. AGENTS.md: released by OpenAI, to the Linux Foundation, 60k-plus repos. ACP: created by Zed, registry with JetBrains, 40-plus agents listed. A2A: to the Linux Foundation, 150-plus organisations at one year, version 1.0." width="900" height="400" loading="lazy" />
+    <figcaption>Instructions, editor integration and delegation all standardised inside fifteen months. The session transcript did not.</figcaption>
+  </figure>
+
+  <p>Nothing about your current session crosses this layer, which is precisely why it is the highest-leverage place to start. Before you build a bridge, audit what you actually keep re-explaining. A large share of it — the build command, the directory that is off-limits, the test that is flaky on CI, the reason the codebase uses advisory locks — is standing knowledge that has been misfiled as episodic. It does not need to be transferred between sessions because it should never have been session-scoped in the first place. The cheapest session transfer is the one you do not need.</p>
+
+  <p>What is left after that audit is genuinely task-local, and that is the real handoff problem. It is much smaller than it looked.</p>
+</section>
+
+<section>
+  <h2>Layer 2 — the handoff artifact, and the rule that makes it work</h2>
+  <p>The pattern practitioners actually run is unglamorous: the outgoing agent writes a state file, the incoming agent is told to read it in full before doing anything else. People reach for it when a quota runs out mid-task, when a specific model is better at the next step, or when the work crosses a person. Published versions converge on a similar shape — a handful of fixed sections, updated on state <em>transitions</em> rather than on a timer, with a hard rule to re-verify the last step before trusting it.</p>
+
+  <p>That re-verification rule is not a safety belt bolted onto the pattern. It <em>is</em> the pattern, and it generalises into a test you can apply line by line: every line in a handoff file is either a fact with a command that re-checks it, or a decision, labelled as one. There is no third category. Anything that is neither is decoration, and decoration is where a handoff quietly goes wrong — the receiving agent treats a stale assertion as ground truth and builds on it.</p>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-handoff-anatomy.svg" alt="Two columns. On the left, three things a handoff claims: a migration is applied, a named test is the failing one, and advisory locks were chosen over Redis. On the right, what lets the receiver trust each: a single command for the first two; for the third, nothing — so it must be labelled a decision, to be accepted or re-opened rather than discovered mid-work." width="900" height="500" loading="lazy" />
+    <figcaption>Facts get a command. Decisions get a label. Everything else is decoration.</figcaption>
+  </figure>
+
+  <p>Written out, the whole thing fits on a screen:</p>
+
+<pre><code># HANDOFF 2026-08-28T14:20Z · from: claude-code · to: codex
+
+## Goal
+Retry-with-backoff on the email sender. Must not double-send.
+
+## Verified facts — each line names the command that re-checks it
+- migration 0042 applied      psql -c '\dt' | grep audit_log
+- 4 of 5 sender tests pass     pytest tests/test_sender.py
+- lint clean on this branch    ruff check services/email
+
+## Decisions — nothing re-checks these; accept or re-open
+- Postgres advisory locks, not Redis: the lock must die with the transaction.
+- Backoff capped at 5 attempts: the SLA is 15 minutes, not durability.
+
+## Open
+- test_retry fails: the fake clock does not advance inside the retry loop.
+
+## Do not touch
+- services/billing/* — unrelated migration in flight.
+</code></pre>
+
+  <p>Two details earn their place. Updating on state transitions rather than on a timer matters because the transitions <em>are</em> the events; a file written every five minutes is stale in a way nobody can detect, while a file written when the test suite went green is either current or obviously not. And the "do not touch" section does work that no summary does — it transfers a constraint the receiving agent has no way to infer from the repository.</p>
+</section>
+
+<section>
+  <h2>Layer 3 — the converter that deletes the most valuable-looking data</h2>
+  <p>Tools that move sessions between CLIs do exist, and their architecture is the same one you would design: a parser per agent, a writer per agent, and a neutral intermediate form between them, so adding a CLI means adding one module on each side rather than another entry in an N-by-N matrix. One published implementation is around 600 lines of Python with no network component — it reads the three session directories and writes the target's format.</p>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-transcript-pipeline.svg" alt="A left-to-right pipeline: the source agent's JSONL, a per-agent parser, a neutral session form holding ordered turns plus prose summaries of tool calls, a per-agent writer, and the target agent's resumable session. A dashed arrow drops from the parser into a band labelled dropped on purpose, listing tool use blocks, tool result blocks, reasoning traces, absolute paths and credentials, the warm prompt cache, and the system prompt behind them." width="900" height="500" loading="lazy" />
+    <figcaption>The pipeline's neutral form is prose. The structured part of the transcript is discarded on the way in.</figcaption>
+  </figure>
+
+  <p>The interesting decision is what the neutral form holds: an ordered list of user and assistant turns, plus <em>prose summaries</em> of the tool calls. Tool invocations are not mapped across agents — they are stripped and narrated. A recorded edit becomes the string <code>edited services/email/sender.py:82-94</code> sitting alongside the assistant turn. The stated reason is that the receiving model needs understanding, not replay capability.</p>
+
+  <p>Read that as an admission and it is the most useful sentence in this whole area. The richest, most structured, most faithful part of the transcript — the exact record of what the agent did — is the part a working converter deliberately destroys. That is not a shortcut taken for schedule reasons. It is the correct design, and the reason why is worth being precise about.</p>
+
+  <p>It also matches what the vendors ship. Claude Code's own <code>/export</code> produces a rendered transcript for a person to read, not a structured artifact for another agent to ingest; the structured interfaces it documents — <code>claude -p --output-format json</code>, the <code>transcript_path</code> that hooks receive, the Agent SDK — are for scripting against your own running session, not for handing history to a different vendor's CLI. Nobody is shipping the lossless bridge because there is nothing coherent to ship.</p>
+</section>
+
+<section>
+  <h2>What breaks on the way across</h2>
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/compare-what-breaks.svg" alt="Three columns. The tool schema breaks first: a recorded call names Edit while the receiver has apply_patch, and every tool result points at an id that no longer resolves. The system prompt breaks quietly: each assistant turn answered instructions the receiver never read, so it keeps its authority and loses its reason. Cache and environment never made the file: the prompt cache is keyed to one provider's exact prefix, and MCP config, added directories and settings were never in the transcript at all." width="900" height="300" loading="lazy" />
+    <figcaption>Three independent failures, and only the first one is a format problem.</figcaption>
+  </figure>
+
+  <p>The <strong>tool schema</strong> breaks first and most visibly. A Claude Code transcript contains <code>tool_use</code> blocks naming that harness's tools, each with an id, and <code>tool_result</code> blocks referencing those ids. Codex has a different tool surface. You have two options and both are bad: map tool-for-tool, which is a combinatorial job that breaks every time either side ships a new tool or renames an argument, or delete the calls. Converters delete them, and the dangling ids are why.</p>
+
+  <p>The <strong>system prompt</strong> breaks quietly, and this is the failure that actually costs you. Every assistant turn in that transcript was generated in response to instructions the receiving agent never read — a different harness prompt, different tool descriptions, a different model's disposition. Replayed into a new agent, those turns arrive in the <code>assistant</code> role, which is the role a model treats as its own past reasoning. The turn keeps its authority and loses its justification. The receiving agent now "remembers" doing work it did not do, under rules it never saw, and has no mechanism to doubt it. That is a false memory in the precise sense: confidently held, structurally indistinguishable from a real one, and wrong.</p>
+
+  <p>The <strong>cache and the environment</strong> were never in the file at all. Claude Code's documentation is blunt about this even for its own resumes: a resumed session does not restore <code>--mcp-config</code>, <code>--settings</code>, <code>--plugin-dir</code>, <code>--fallback-model</code>, or directories added with <code>--add-dir</code>; you pass them again. If a same-agent, same-machine resume cannot reconstruct the environment from the transcript, a cross-vendor one certainly cannot. And the economics bite in the same place: when you resume a Claude Code session that has been idle for about an hour and runs over 100,000 tokens, it offers to summarise precisely because the prompt cache has expired and the next request will reprocess the full history once regardless of which option you pick. A cross-agent transfer pays that bill by construction — you are re-sending the entire conversation to a provider that has never seen it, with no prefix to hit.</p>
+
+  <p>Only the first of these three is a format problem. The other two survive any format you invent, which is why "someone should standardise this" is not the answer it sounds like.</p>
+</section>
+
+<section>
+  <h2>Layer 4 — the live options, and what each one is actually for</h2>
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-live-protocols.svg" alt="Three panels. ACP: an editor drives Claude Code through an adapter and Gemini CLI natively; it solves one editor driving many agents, but session ids belong to the agent that minted them. A2A: a client agent delegates a task under a context id to a remote agent that returns artifacts; it crosses vendor boundaries but transfers deliverables, not history. MCP: two agents both read and write a shared memory server, which holds what was deliberately saved rather than a transcript." width="900" height="500" loading="lazy" />
+    <figcaption>Three genuinely live options. None of them moves a transcript, and none of them is trying to.</figcaption>
+  </figure>
+
+  <h3>ACP standardises the socket, not the state</h3>
+  <p>Zed's Agent Client Protocol, created in August 2025, does for editors and agents what LSP did for editors and languages: JSON-RPC over stdio, so any client can drive any agent. JetBrains joined, the two co-launched a registry in January 2026, and 40-plus agents are listed. Claude Code and Codex CLI both reach it through Zed-built adapters; Gemini CLI is native.</p>
+
+  <p>The session methods look promising and then do not deliver what you want. <code>session/new</code> opens a context, <code>session/load</code> reconnects to a stored one, and <code>session/resume</code> reconnects without replay. But loading means the <em>agent</em> replays the conversation to the <em>client</em> as a stream of update notifications, so the editor can repaint the thread — and it only responds once every entry has been streamed. The history belongs to the agent that produced it; the client is being brought up to date, not handed the state. Running Claude Code and Codex side by side in one Zed window gives you two agents in two threads, not one shared session. ACP solved editor-to-agent, which was a real N-by-M problem, and it does not claim to have solved agent-to-agent.</p>
+
+  <p>One naming trap worth flagging: this is not the only ACP. An Agent Communication Protocol also existed, went to the Linux Foundation in July 2025, and folded into A2A — search results still cheerfully mix the two, so check which one a page means before you take its advice.</p>
+
+  <h3>A2A transfers deliverables, deliberately</h3>
+  <p>A2A reached v1.0 under Linux Foundation governance, having been contributed in June 2025 and passed 150 organisations at its one-year mark. Its model is delegation: a client agent sends a task to a remote agent, a server-generated <code>contextId</code> groups related tasks into one interaction, and results come back as artifacts. What does not come back is the remote agent's reasoning or history — the peer is opaque by design, because the whole point is crossing an organisational boundary where you neither can nor should inspect the other side's internals. A2A is the right protocol for "have that agent do this thing," and structurally the wrong one for "become me."</p>
+
+  <h3>Shared memory moves facts, and the choosing is the work</h3>
+  <p>MCP memory servers are the most practical live option today, because any MCP client can connect to one. Write a fact in Codex, read it in Claude Code. Implementations differ in how they store it — file-backed markdown with URL addressing on one end, managed semantic stores on the other — but the shape is common: a durable pool both agents read and write.</p>
+
+  <p>The catch is the same one as layer 2, wearing better clothes. A memory server holds what someone chose to save, and choosing is the hard part. Swapping a markdown file for a database does not decide what belongs in it. Every live option converges on the same conclusion from a different direction: agents share <em>facts</em>, not <em>turns</em>.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Reach for</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>You re-explain the same thing every session</td><td>Instruction file</td><td>It was never session state; stop transferring it</td></tr>
+      <tr><td>Quota died mid-task; continue in another CLI</td><td>Handoff artifact</td><td>Minutes to write, works between any two agents, re-checkable</td></tr>
+      <tr><td>Handing work to a teammate</td><td>Handoff artifact, plus the branch</td><td>A person needs the decisions, not the keystrokes</td></tr>
+      <tr><td>You want the same thread in your editor</td><td>ACP client</td><td>One UI over many agents — still one session per agent</td></tr>
+      <tr><td>Facts should outlive every session</td><td>MCP memory server</td><td>Durable, cross-client, and worth the setup at team scale</td></tr>
+      <tr><td>Another team's agent should do a piece of work</td><td>A2A</td><td>Delegation across a trust boundary; artifacts come back</td></tr>
+      <tr><td>You want the literal conversation moved</td><td>Reconsider</td><td>The receiver inherits authority without justification</td></tr>
+    </tbody>
+  </table>
+
+  <p>If you take one operational habit from this: write the handoff file <em>as you work</em>, not when you need it. A file assembled at the moment the quota dies is written by an agent that has already lost the thread. A file updated at each state transition is written by one that still has it.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Can I copy a session JSONL to another machine and resume it?</h3>
+  <p>Not reliably, and Claude Code is built to refuse. Its cross-project session lookup resolves an ID only when exactly one project holds a transcript for it, so a hand-copied duplicate reports not-found rather than resuming an arbitrary copy. Add that the entry format is documented as internal and able to change on any release, and file-copying is the least durable option available.</p>
+
+  <h3>Is there an official cross-agent session format?</h3>
+  <p>No, and the gap is not an oversight. <code>AGENTS.md</code> standardised instructions, ACP standardised editor-to-agent communication, A2A standardised delegation. None of them standardises a transcript, because a transcript's meaning depends on a system prompt and a tool schema that are agent-specific by construction.</p>
+
+  <h3>Does ACP let my editor hand a Claude Code session to Codex?</h3>
+  <p>No. ACP session IDs are minted and stored by the agent that created them, and <code>session/load</code> replays history from the agent to the client for display. Running both agents in one Zed window gives you two threads side by side, not one shared session.</p>
+
+  <h3>Is pasting the output of <code>/compact</code> good enough?</h3>
+  <p>It is layer 2 done carelessly. A compaction summary is prose without provenance: the receiving agent cannot tell which lines are current facts and which are stale assertions. Add the re-check command after each factual claim and label the decisions, and the same summary becomes a real handoff.</p>
+
+  <h3>Does an MCP memory server remove the need for a handoff file?</h3>
+  <p>It removes the need to re-state standing facts, which is layer 1's job done with better plumbing. It does not capture the state of the task you are in the middle of — what you just verified, what you decided, what is still broken. Those are still yours to write down.</p>
+
+  <h3>Will better tooling eventually make lossless transfer work?</h3>
+  <p>Format conversion will keep improving, and it will keep dropping tool calls. Two of the three failures — inherited authority from a foreign system prompt, and a cache that only exists on one provider's side — are properties of how language models consume context, not defects in a serialiser.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/agent-interoperability">Agent Interoperability</a> — the standards layer this post keeps bumping into.</li>
+    <li><a href="/concepts/context-engineering">Context Engineering</a> — deciding what belongs in the window in the first place.</li>
+    <li><a href="/concepts/prompt-caching">Prompt Caching</a> — why a transfer has a token bill attached.</li>
+    <li><a href="/concepts/agent-harness">The Agent Harness</a> — the system prompt and tool surface that a transcript silently assumes.</li>
+    <li><a href="/deep-dives/protocols-and-interop/interop-problem">Why Interop Matters: The M×N Problem</a> — the structure ACP and A2A are each solving one slice of.</li>
+    <li><a href="/deep-dives/protocols-and-interop/acp-and-what-happened">ACP: What Happened</a> — the <em>other</em> ACP, and why search results conflate them.</li>
+    <li><a href="/deep-dives/memory-and-context/context-compaction">Context Compaction</a> — what survives a summary, and what does not.</li>
+    <li><a href="/deep-dives/multi-agent-systems/shared-memory-and-blackboard">Shared Memory &amp; Blackboard</a> — the multi-agent version of the same question.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://code.claude.com/docs/en/sessions">Claude Code Docs — Manage sessions</a></li>
+    <li><a href="https://agentclientprotocol.com/protocol/session-setup">Agent Client Protocol — Session Setup</a></li>
+    <li><a href="https://agentclientprotocol.com/get-started/agents">Agent Client Protocol — Agents</a></li>
+    <li><a href="https://zed.dev/blog/claude-code-via-acp">Zed Blog — Claude Code: Now in Beta in Zed</a></li>
+    <li><a href="https://github.com/openai/codex/discussions/3827">openai/codex — Session / Rollout Files</a></li>
+    <li><a href="https://a2a-protocol.org/latest/topics/key-concepts/">A2A Protocol — Core Concepts</a></li>
+    <li><a href="https://www.linuxfoundation.org/press/a2a-protocol-surpasses-150-organizations-lands-in-major-cloud-platforms-and-sees-enterprise-production-use-in-first-year">Linux Foundation — A2A surpasses 150 organizations</a></li>
+    <li><a href="https://authsec.ai/blogs/stop-re-explaining-bridge-claude-codex-gemini">AuthSec — Transfer Claude Code sessions to Codex and Gemini</a></li>
+    <li><a href="https://ai-muninn.com/en/blog/claude-code-codex-handoff-protocol">ai-muninn — A live-state handoff protocol for Claude Code and Codex</a></li>
+    <li><a href="https://www.jona.ca/2026/05/exporting-claude-code-session-to-codex.html">Jon Aquino — Exporting a Claude Code session to Codex</a></li>
+    <li><a href="https://mem0.ai/blog/introducing-openmemory-mcp">Mem0 — Introducing OpenMemory MCP</a></li>
+  </ul>
+</section>
