@@ -1,0 +1,222 @@
+<p class="lede">把一次做到一半的重构从 Claude Code 搬到 Codex，看上去像个文件格式转换的活儿——两个 CLI 都把每次会话以只追加的 JSONL 存在磁盘上。其实不是。一条 assistant 轮次并不是“发生了什么”的记录；它是一项断言，其成立条件是一份系统提示、一套工具 schema、一个模型和一份热缓存，而接收方一样都没有。于是逐字重放交出去的不是领先起跑，而是一段虚假记忆。真正可以承载交接的层只有四个，而其中每一个奏效的做法，都把逐字记录扔掉，只留下接收方能对着仓库重新核验的东西。</p>
+
+<section>
+  <h2>一览</h2>
+  <p>“我怎么在两个智能体之间共享会话？”这个问题有四个真实答案，而它们并不是同一个想法的几种实现。它们与会话本身的距离各不相同，而这个距离就是全部的权衡。</p>
+
+  <table>
+    <thead>
+      <tr><th>层</th><th>它是什么</th><th>什么会过去</th><th>代价是什么</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1 · 指令文件</td><td><code>AGENTS.md</code>、<code>CLAUDE.md</code></td><td>长期有效的项目规则，每次启动都重新读取</td><td>关于<em>这一次</em>会话的信息，一点都不过去</td></tr>
+      <tr><td>2 · 交接产物</td><td>一份写下来的状态文件</td><td>决策、未决线索、下一步</td><td>只有有人写下来的那部分</td></tr>
+      <tr><td>3 · 逐字记录转换</td><td>对磁盘上 JSONL 的 parser 与 writer</td><td>每一轮，按顺序，压成散文</td><td>工具调用、标识符、缓存——外加一个厂商随时可能改的格式</td></tr>
+      <tr><td>4 · 实时协议或共享存储</td><td>ACP 客户端、A2A 对端、MCP 记忆服务器</td><td>持续的共享状态</td><td>两端都必须已经会说这门话</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-four-layers.svg" alt="左边是智能体 A，右边是智能体 B，中间由四条横向通道相连。第一层指令文件承载长期项目规则，不承载任何会话信息。第二层交接产物承载接收方能对着仓库重新核验的断言。第三层逐字记录转换只承载散文——工具调用、标识符与缓存都活不下来。第四层实时协议或共享存储承载持续状态，前提是两端都已经会说这门话。" width="900" height="500" loading="lazy" />
+    <figcaption>越往下走，这次会话过去得越多——而能在其间通行的智能体组合也越少。</figcaption>
+  </figure>
+
+  <p>给它们打分，问题的形状就浮现出来了。有一行承载了整个会话。它在其余每一根轴上都是最弱的一行，而这并不是一个等着被补上的实现缺口。</p>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/data-feature-matrix.svg" alt="四个层与五根轴构成的矩阵：跨厂商覆盖面、承载多少本次会话、接收方能否核验、能否扛过一次版本升级、启动所需的搭建成本。指令文件与交接产物在除“承载会话”以外的每一项上都很强。逐字记录转换只在“承载每一轮”上强，在其余四根轴上都弱。实时协议与共享存储全程居中。" width="900" height="400" loading="lazy" />
+    <figcaption>对逐字记录的忠实度，与对接收方的有用程度，指向相反的方向。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>会话究竟存在哪里</h2>
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-where-sessions-live.svg" alt="三列磁盘上的会话存储。Claude Code 按编码后的工作目录在 projects 目录下写 JSONL，子智能体各有自己的 sidechain 文件。Codex CLI 写按日期分区的 rollout JSONL，其上下文管理器在恢复时重放它们。Gemini CLI 在临时项目目录下写会话 JSON。下方一条带子指出三者共有的形状：只追加的 JSONL，每轮一行，每行链到它的父行。最后一条带子指出三者都不共有的东西：条目语义。" width="900" height="500" loading="lazy" />
+    <figcaption>三个智能体，三条路径，一种形状——而底下没有共通的含义。</figcaption>
+  </figure>
+
+  <p>三大 CLI 智能体在存储策略上几乎一模一样。Claude Code 写 <code>~/.claude/projects/&lt;project&gt;/&lt;session-id&gt;.jsonl</code>，其中 <code>&lt;project&gt;</code> 是把工作目录路径里的非字母数字字符换成连字符得来的；每一行是一个 JSON 对象，对应一条消息、一次工具使用或一条元数据条目，子智能体另有自己的 sidechain 逐字记录。Codex CLI 写 <code>~/.codex/sessions/YYYY/MM/DD/rollout-&lt;timestamp&gt;-&lt;uuid&gt;.jsonl</code>，这是一条 rollout 流，运行 <code>codex resume</code> 时由它的上下文管理器重放以重建模型状态。Gemini CLI 把会话 JSON 放在 <code>~/.gemini/tmp/</code> 下。三者都是本地优先、只追加，并且能用 <code>jq</code> 直接读。</p>
+
+  <p>正是这份相似性，让“这就是个格式转换问题”的直觉如此诱人；而有两个有据可查的事实，应该在你写下第一行代码之前就把这个直觉打消。</p>
+
+  <p>第一，这个格式不是契约。Anthropic 自家的会话文档写着，条目格式“是 Claude Code 内部的，会在版本之间发生变化，因此直接解析这些文件的脚本可能在任何一次发布中失效”，并让你改用 <code>/export</code> 或那些脚本接口。一个建立在原始 JSONL 之上的转换器，并不是在对接一个格式；它依赖的是一处实现细节，而其厂商已经明确保留了随时更改它的权利。</p>
+
+  <p>第二个事实更微妙，也更说明问题。Claude Code 可以恢复一个在别的项目目录里开始的会话 ID——但那次跨项目查找只在<em>恰好只有一个</em>其他项目持有该 ID 的逐字记录时才解析成功，因此<em>一份手工拷贝出来的副本会让它报告“找不到”，而不是恢复某个随意的拷贝</em>。厂商把逐字记录当成一个身份，而不是一份可搬运的文档。拷贝文件并不等于拷贝会话，而工具就是照着这个前提造的。</p>
+</section>
+
+<section>
+  <h2>第一层——指令文件，它一点会话都不承载</h2>
+  <p><code>AGENTS.md</code> 是这个生态里最接近既成标准的东西。OpenAI 在 2025 年 8 月发布了它，随后连同 MCP 一起交给了 Linux 基金会旗下的 Agentic AI Foundation；到 2026 年，已有 30 多个智能体会读它，它出现在 6 万多个仓库里。Claude Code 是那个显眼的例外——截至 2026 年 8 月它仍然加载 <code>CLAUDE.md</code>，解法是用一行 import 让一个文件指向另一个，而不是维护两份。</p>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/data-standards-timeline.svg" alt="从 2025 年 6 月到 2026 年 8 月的三条平行时间线。AGENTS.md：由 OpenAI 发布、交给 Linux 基金会、6 万以上仓库。ACP：由 Zed 创建、与 JetBrains 共同推出注册表、列出 40 个以上智能体。A2A：交给 Linux 基金会、一周年时超过 150 家组织、发布 1.0 版。" width="900" height="400" loading="lazy" />
+    <figcaption>指令、编辑器集成与任务委派，都在十五个月内完成了标准化。会话逐字记录没有。</figcaption>
+  </figure>
+
+  <p>你当前会话的任何内容都不会经由这一层过去，而这恰恰是它最值得先动手的原因。在你动手造桥之前，先盘一盘你到底在反复解释些什么。其中很大一部分——构建命令、那个碰不得的目录、那个在 CI 上很不稳定的测试、这套代码库为什么用 advisory lock——都是长期有效的知识，只是被错误地归档成了情景性的。它不需要在会话之间传递，因为它一开始就不该被限定在某次会话里。最便宜的会话迁移，是那次你根本不需要做的迁移。</p>
+
+  <p>做完这次盘点之后剩下的，才是真正属于当前任务的部分，也才是真正的交接问题。它比看上去小得多。</p>
+</section>
+
+<section>
+  <h2>第二层——交接产物，以及让它奏效的那条规则</h2>
+  <p>从业者实际在跑的那个模式并不花哨：交出去的智能体写一份状态文件，接手的智能体被要求“在做任何事之前先完整读一遍”。人们会在配额中途耗尽、下一步换个模型更合适、或者工作要交给另一个人的时候用到它。公开的各个版本都收敛到相似的形状——若干固定小节，在状态<em>发生跃迁</em>时更新而不是按定时器更新，并附一条硬性规定：在信任上一步之前先重新核验它。</p>
+
+  <p>那条“重新核验”的规则并不是给这个模式外挂的安全带。它<em>就是</em>这个模式本身，而且可以推广成一条能逐行套用的检验：交接文件里的每一行，要么是一个事实、后面跟着重新核验它的命令，要么是一个决策、并被明确标记为决策。没有第三类。既不是事实也不是决策的，都是装饰；而交接悄悄出错的地方正是装饰——接手的智能体把一句过期的断言当成了确凿事实，然后在上面继续盖楼。</p>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-handoff-anatomy.svg" alt="两列。左边是交接所主张的三件事：某个迁移已经应用、某个具名测试是那个仍在失败的、以及选择了 advisory lock 而非 Redis。右边是让接收方得以信任它们的依据：前两条各有一条命令；第三条什么都没有——所以它必须被标记为决策，供接收方接受或重新讨论，而不是在做到一半时才发现差异。" width="900" height="500" loading="lazy" />
+    <figcaption>事实配一条命令。决策配一个标记。剩下的都是装饰。</figcaption>
+  </figure>
+
+  <p>写出来，整份东西一屏就装得下：</p>
+
+<pre><code># HANDOFF 2026-08-28T14:20Z · from: claude-code · to: codex
+
+## Goal
+Retry-with-backoff on the email sender. Must not double-send.
+
+## Verified facts — each line names the command that re-checks it
+- migration 0042 applied      psql -c '\dt' | grep audit_log
+- 4 of 5 sender tests pass     pytest tests/test_sender.py
+- lint clean on this branch    ruff check services/email
+
+## Decisions — nothing re-checks these; accept or re-open
+- Postgres advisory locks, not Redis: the lock must die with the transaction.
+- Backoff capped at 5 attempts: the SLA is 15 minutes, not durability.
+
+## Open
+- test_retry fails: the fake clock does not advance inside the retry loop.
+
+## Do not touch
+- services/billing/* — unrelated migration in flight.
+</code></pre>
+
+  <p>有两处细节值得留意。按状态跃迁而不是按定时器更新之所以重要，是因为跃迁<em>就是</em>那些事件；每五分钟写一次的文件，会以没人察觉得到的方式过期，而在测试套件转绿那一刻写下的文件，要么是最新的，要么一眼就看得出不是。而“不要动”那一节做的事是任何摘要都做不到的——它传递了一条约束，接手的智能体没有任何办法从仓库里推断出来。</p>
+</section>
+
+<section>
+  <h2>第三层——那个把看上去最宝贵的数据删掉的转换器</h2>
+  <p>在 CLI 之间搬会话的工具确实存在，而它们的架构正是你会设计出来的那一种：每个智能体一个 parser、每个智能体一个 writer，中间夹一个中立的中间形式，于是新增一个 CLI 意味着两边各加一个模块，而不是往一张 N×N 的矩阵里再填一格。一个公开的实现大约 600 行 Python，没有任何网络部分——它读那三个会话目录，然后写出目标方的格式。</p>
+
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-transcript-pipeline.svg" alt="一条从左到右的流水线：源智能体的 JSONL、每个智能体各自的 parser、一个持有有序轮次加工具调用散文摘要的中立会话形式、每个智能体各自的 writer，以及目标智能体可恢复的会话。一条虚线箭头从 parser 落到下方一条标着“有意丢弃”的带子里，列出 tool use 块、tool result 块、推理轨迹、绝对路径与凭据、热提示缓存，以及它们背后的系统提示。" width="900" height="500" loading="lazy" />
+    <figcaption>流水线的中立形式是散文。逐字记录里结构化的那部分，在进来的路上就被丢掉了。</figcaption>
+  </figure>
+
+  <p>真正有意思的决定，是这个中立形式里装了什么：一份有序的 user 与 assistant 轮次列表，外加工具调用的<em>散文摘要</em>。工具调用并不会被跨智能体映射——它们被剥掉，然后被叙述出来。一次记录在案的编辑，变成挨着 assistant 轮次的一句 <code>edited services/email/sender.py:82-94</code>。给出的理由是：接收端的模型需要的是理解，不是重放能力。</p>
+
+  <p>把这句话读成一份供认，它就是这整个领域里最有用的一句。逐字记录中最丰富、最结构化、最忠实的那一部分——关于智能体究竟做了什么的精确记录——正是一个能用的转换器有意销毁的部分。这不是因为排期紧而抄的近路。这是正确的设计，而其中的原因值得说清楚。</p>
+
+  <p>厂商实际交付的东西也印证了这一点。Claude Code 自己的 <code>/export</code> 产出的是给人读的渲染后逐字记录，而不是给另一个智能体摄入的结构化产物；它记录在案的那些结构化接口——<code>claude -p --output-format json</code>、hooks 收到的 <code>transcript_path</code>、Agent SDK——都是用来对你自己正在运行的会话做脚本处理的，而不是把历史交给另一家厂商的 CLI。没有人在交付那座无损的桥，因为压根没有一座讲得通的桥可交付。</p>
+</section>
+
+<section>
+  <h2>在过桥的路上，什么会坏掉</h2>
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/compare-what-breaks.svg" alt="三列。工具 schema 最先坏：记录下来的调用叫 Edit，而接收方有的是 apply_patch，并且每个 tool result 都指向一个不再能解析的 id。系统提示悄悄地坏：每条 assistant 轮次回应的是接收方从未读过的指令，于是它保留了权威、失去了理由。缓存与环境根本没进过文件：提示缓存绑定在某一家厂商的精确前缀上，而 MCP 配置、追加的目录与设置从来就不在逐字记录里。" width="900" height="300" loading="lazy" />
+    <figcaption>三处相互独立的失效，而只有第一处是格式问题。</figcaption>
+  </figure>
+
+  <p><strong>工具 schema</strong> 最先坏，也坏得最显眼。一份 Claude Code 逐字记录里含有指名该 harness 工具的 <code>tool_use</code> 块，每个都带一个 id，还有引用这些 id 的 <code>tool_result</code> 块。Codex 的工具面不一样。你只有两个选择，而且都很糟：逐个工具做映射——这是一件组合爆炸的活儿，任何一边新增一个工具或改一个参数名它就散架；或者把这些调用删掉。转换器选择删掉，那些悬空的 id 就是原因。</p>
+
+  <p><strong>系统提示</strong>坏得悄无声息，而这正是真正让你付出代价的那处失效。那份逐字记录里的每一条 assistant 轮次，都是在回应接收方从未读过的指令——一份不同的 harness 提示、不同的工具描述、另一个模型的性情。被重放进一个新智能体之后，这些轮次以 <code>assistant</code> 角色抵达，而那正是模型当作“自己过去的推理”来对待的角色。这条轮次保留了它的权威，却丢掉了它的依据。接手的智能体现在“记得”自己做过并没有做过的工作，依据的是它从未见过的规则，而且没有任何机制去怀疑它。这在精确的意义上就是虚假记忆：被笃信、在结构上与真记忆无从区分、而且是错的。</p>
+
+  <p><strong>缓存与环境</strong>则根本没进过那个文件。Claude Code 的文档就连对自家的恢复也说得很直白：恢复后的会话不会还原 <code>--mcp-config</code>、<code>--settings</code>、<code>--plugin-dir</code>、<code>--fallback-model</code>，也不会还原用 <code>--add-dir</code> 追加的目录；你得重新传一遍。如果同一个智能体、同一台机器上的恢复都无法从逐字记录里重建环境，跨厂商的那种就更不可能。经济账也咬在同一个地方：当你恢复一个闲置约一小时、且超过 10 万 token 的 Claude Code 会话时，它之所以提议做摘要，正是因为提示缓存已经过期，而无论你选哪个选项，下一次请求都会把完整历史重新处理一遍。跨智能体的迁移天然要付这笔账——你是在把整段对话重新发给一个从未见过它的厂商，没有任何前缀可命中。</p>
+
+  <p>这三处里只有第一处是格式问题。另外两处在你发明的任何格式下都会存活，这也正是为什么“该有人把这个标准化一下”并不是它听起来的那个答案。</p>
+</section>
+
+<section>
+  <h2>第四层——那些实时选项，以及每一个究竟是干什么用的</h2>
+  <figure>
+    <img src="/blogs/agent-session-handoff-drops-the-transcript/arch-live-protocols.svg" alt="三个面板。ACP：一个编辑器通过适配器驱动 Claude Code、原生驱动 Gemini CLI；它解决了一个编辑器驱动多个智能体，但会话 id 仍归铸造它的那个智能体所有。A2A：客户端智能体在一个 context id 下向远端智能体委派任务，远端返回产物；它跨越了厂商边界，但传递的是交付物而非历史。MCP：两个智能体共同读写一台共享记忆服务器，它保存的是有人特意存下来的内容，而不是一份逐字记录。" width="900" height="500" loading="lazy" />
+    <figcaption>三个真正实时的选项。没有一个在搬运逐字记录，也没有一个想要这么做。</figcaption>
+  </figure>
+
+  <h3>ACP 标准化的是接口，不是状态</h3>
+  <p>Zed 的 Agent Client Protocol 创建于 2025 年 8 月，它对编辑器与智能体做的事，正是 LSP 对编辑器与语言做过的事：基于 stdio 的 JSON-RPC，于是任何客户端都能驱动任何智能体。JetBrains 加入进来，两家在 2026 年 1 月共同推出了一个注册表，已列出 40 多个智能体。Claude Code 与 Codex CLI 都是通过 Zed 构建的适配器接入的；Gemini CLI 是原生支持。</p>
+
+  <p>那几个会话方法看着很有希望，然后并没有给出你想要的东西。<code>session/new</code> 开一个上下文，<code>session/load</code> 重连到一个已存储的会话，<code>session/resume</code> 则是不重放地重连。但"load"的含义是由<em>智能体</em>把对话以一串 update 通知重放给<em>客户端</em>，好让编辑器把线程重新画出来——而且它要等每一条条目都推送完毕才回应这次请求。历史归产生它的那个智能体所有；客户端是被同步到最新，而不是被交付了状态。在同一个 Zed 窗口里并排跑 Claude Code 和 Codex，你得到的是两个线程里的两个智能体，不是一个共享的会话。ACP 解决的是编辑器到智能体，那确实是一个实打实的 N×M 问题；它并没有声称解决了智能体到智能体。</p>
+
+  <p>有一个命名陷阱值得点出来：这并不是唯一的 ACP。还存在过一个 Agent Communication Protocol，它在 2025 年 7 月被交给 Linux 基金会，随后并入了 A2A——搜索结果至今仍然乐此不疲地把两者混为一谈，所以在采纳一个页面的建议之前，先确认它说的是哪一个。</p>
+
+  <h3>A2A 传递的是交付物，而且是刻意如此</h3>
+  <p>A2A 已在 Linux 基金会治理下发布 1.0 版；它于 2025 年 6 月被贡献出来，并在一周年时超过 150 家组织。它的模型是委派：一个客户端智能体把任务发给一个远端智能体，由服务端生成的 <code>contextId</code> 把相关任务归拢成一次交互，结果以产物的形式回来。不会回来的是远端智能体的推理或历史——对端在设计上就是不透明的，因为这件事的全部意义就在于跨越一条组织边界，在那条边界上你既不能、也不该去检视对方的内部。对于“让那个智能体去做这件事”，A2A 是对的协议；对于“变成我”，它在结构上就是错的那个。</p>
+
+  <h3>共享记忆搬的是事实，而“选什么”才是真正的工作</h3>
+  <p>MCP 记忆服务器是今天最实用的实时选项，因为任何 MCP 客户端都能连上一台。在 Codex 里写下一个事实，在 Claude Code 里读到它。各家实现在存储方式上有差异——一端是带 URL 寻址的文件式 markdown，另一端是托管的语义存储——但形状是共通的：一个两个智能体都读写的持久池。</p>
+
+  <p>问题和第二层是同一个，只不过穿得体面些。记忆服务器保存的是有人特意存下来的内容，而“特意”才是难的那部分。把 markdown 文件换成数据库，并不能替你决定什么该放进去。每一个实时选项都从不同方向收敛到同一个结论：智能体共享的是<em>事实</em>，不是<em>轮次</em>。</p>
+</section>
+
+<section>
+  <h2>什么时候选哪个</h2>
+  <table>
+    <thead>
+      <tr><th>情形</th><th>该用</th><th>为什么</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>你每次会话都在重复解释同一件事</td><td>指令文件</td><td>它从来就不是会话状态；别再传它了</td></tr>
+      <tr><td>配额中途耗尽，要换个 CLI 接着做</td><td>交接产物</td><td>几分钟就能写完，任何两个智能体之间都能用，且可复核</td></tr>
+      <tr><td>把工作交给同事</td><td>交接产物，外加那条分支</td><td>人需要的是决策，不是按键记录</td></tr>
+      <tr><td>你想在编辑器里看到同一个线程</td><td>ACP 客户端</td><td>一个界面统管多个智能体——但每个智能体仍是一个会话</td></tr>
+      <tr><td>有些事实应该比任何一次会话活得久</td><td>MCP 记忆服务器</td><td>持久、跨客户端，在团队规模下值得那点搭建成本</td></tr>
+      <tr><td>让另一个团队的智能体做一块工作</td><td>A2A</td><td>跨信任边界的委派；回来的是产物</td></tr>
+      <tr><td>你想把字面意义上的对话搬过去</td><td>再想想</td><td>接收方继承了权威，却没继承依据</td></tr>
+    </tbody>
+  </table>
+
+  <p>如果只从本文带走一个操作习惯：<em>边做边写</em>那份交接文件，而不是等到需要用的时候才写。在配额耗尽那一刻拼凑出来的文件，是由一个已经丢了线索的智能体写的；在每次状态跃迁时更新的文件，是由一个还抓着线索的智能体写的。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>我能不能把 .jsonl 拷到另一台机器上再恢复？</h3>
+  <p>不能指望它可靠，而且 Claude Code 就是照着拒绝这件事造的。它的跨项目会话查找只在恰好有一个项目持有该 ID 的逐字记录时才解析成功，因此一份手工拷贝出来的副本会报告“找不到”，而不是恢复某个随意的拷贝。再加上条目格式被明确记为内部的、可能在任何一次发布中变化，拷文件是所有选项里最不耐久的那个。</p>
+
+  <h3>有没有官方的跨智能体会话格式？</h3>
+  <p>没有，而且这个缺口不是疏忽。<code>AGENTS.md</code> 标准化了指令，ACP 标准化了编辑器到智能体的通信，A2A 标准化了委派。没有一个去标准化逐字记录，因为一份逐字记录的含义取决于一份系统提示和一套工具 schema，而这两样在构造上就是各个智能体特有的。</p>
+
+  <h3>ACP 能让我的编辑器把 Claude Code 会话交给 Codex 吗？</h3>
+  <p>不能。ACP 的会话 ID 由创建它的那个智能体铸造并存储，而 <code>session/load</code> 是把历史从智能体重放给客户端用于显示。在同一个 Zed 窗口里跑两个智能体，你得到的是并排的两个线程，不是一个共享的会话。</p>
+
+  <h3>把 <code>/compact</code> 的输出粘过去够不够？</h3>
+  <p>那是第二层的马虎版。压缩摘要是没有出处的散文：接收方分不清哪些行是当下的事实、哪些是过期的断言。给每个事实性论断后面补上重新核验的命令，并把决策标出来，同一份摘要就成了一次真正的交接。</p>
+
+  <h3>有了 MCP 记忆服务器，还需要交接文件吗？</h3>
+  <p>它免去了你重述长期事实的必要，那其实是用更好的管道去做第一层的活。它并不捕捉你正做到一半的那个任务的状态——你刚刚核验了什么、你决定了什么、什么还坏着。那些仍然得你自己写下来。</p>
+
+  <h3>更好的工具最终会让无损迁移成立吗？</h3>
+  <p>格式转换会不断改进，而且会继续丢掉工具调用。那三处失效里有两处——从一份外来系统提示继承来的权威，以及只存在于某一家厂商那一侧的缓存——是语言模型消费上下文的方式所固有的性质，而不是某个序列化器的缺陷。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关：</h3>
+  <ul>
+    <li><a href="/zh/concepts/agent-interoperability">智能体互操作性</a>——本文一路撞上的那个标准层。</li>
+    <li><a href="/zh/concepts/context-engineering">上下文工程</a>——先决定什么该进入上下文窗口。</li>
+    <li><a href="/zh/concepts/prompt-caching">提示缓存</a>——为什么一次迁移会附带一张 token 账单。</li>
+    <li><a href="/zh/concepts/agent-harness">智能体 harness</a>——逐字记录默默假定存在的那份系统提示与工具面。</li>
+    <li><a href="/zh/deep-dives/protocols-and-interop/interop-problem">互操作为何重要：M×N 问题</a>——ACP 与 A2A 各自解决其中一片的那个结构。</li>
+    <li><a href="/zh/deep-dives/protocols-and-interop/acp-and-what-happened">ACP：后来怎么了</a>——<em>另一个</em> ACP，以及搜索结果为何把两者混为一谈。</li>
+    <li><a href="/zh/deep-dives/memory-and-context/context-compaction">上下文压缩</a>——一次摘要之后什么活下来、什么没有。</li>
+    <li><a href="/zh/deep-dives/multi-agent-systems/shared-memory-and-blackboard">共享记忆与黑板</a>——同一个问题的多智能体版本。</li>
+  </ul>
+  <h3>来源：</h3>
+  <ul>
+    <li><a href="https://code.claude.com/docs/en/sessions">Claude Code Docs — Manage sessions</a></li>
+    <li><a href="https://agentclientprotocol.com/protocol/session-setup">Agent Client Protocol — Session Setup</a></li>
+    <li><a href="https://agentclientprotocol.com/get-started/agents">Agent Client Protocol — Agents</a></li>
+    <li><a href="https://zed.dev/blog/claude-code-via-acp">Zed Blog — Claude Code: Now in Beta in Zed</a></li>
+    <li><a href="https://github.com/openai/codex/discussions/3827">openai/codex — Session / Rollout Files</a></li>
+    <li><a href="https://a2a-protocol.org/latest/topics/key-concepts/">A2A Protocol — Core Concepts</a></li>
+    <li><a href="https://www.linuxfoundation.org/press/a2a-protocol-surpasses-150-organizations-lands-in-major-cloud-platforms-and-sees-enterprise-production-use-in-first-year">Linux Foundation — A2A surpasses 150 organizations</a></li>
+    <li><a href="https://authsec.ai/blogs/stop-re-explaining-bridge-claude-codex-gemini">AuthSec — Transfer Claude Code sessions to Codex and Gemini</a></li>
+    <li><a href="https://ai-muninn.com/en/blog/claude-code-codex-handoff-protocol">ai-muninn — A live-state handoff protocol for Claude Code and Codex</a></li>
+    <li><a href="https://www.jona.ca/2026/05/exporting-claude-code-session-to-codex.html">Jon Aquino — Exporting a Claude Code session to Codex</a></li>
+    <li><a href="https://mem0.ai/blog/introducing-openmemory-mcp">Mem0 — Introducing OpenMemory MCP</a></li>
+  </ul>
+</section>
