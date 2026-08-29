@@ -1,0 +1,117 @@
+<section class="phase">
+  <div class="phase-num">U20</div>
+  <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
+  <h2>Infrastructure-as-code agents.</h2>
+  <p class="goal">Every other coding agent has to build its own oracle before it can be trusted; this one is handed a good one for free, because <code class="inline">terraform plan</code> tells you what would happen to real infrastructure without touching it. That inverts the design: the agent's deliverable is not code, it is a plan whose every line falls into a class you have already agreed to auto-apply — and the entire engineering problem is that the plan is silent about precisely the four things that cause the outages.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The oracle already exists. Design around it, not around the code.</h3>
+
+    <p>A <a class="xref" href="/playbooks/coding-and-computer-use-agents/test-generation-agents">test-generation agent</a> has to invent a specification. A <a class="xref" href="/playbooks/coding-and-computer-use-agents/debugging-and-triage-agents">debugging agent</a> has to build a reproduction before it knows anything. An infrastructure agent gets something neither can buy: a dry run that queries the live provider API, diffs it against declared state, and prints the exact set of creates, updates, replacements and destroys that an apply would perform. Terraform calls it <code class="inline">plan</code>; Pulumi calls it <code class="inline">preview</code>; the same primitive is <code class="inline">cdk diff</code>, <code class="inline">kubectl diff</code>, <code class="inline">helm diff</code>, and <code class="inline">az deployment what-if</code>.</p>
+
+    <p>It is cheap, read-only, and repeatable, which makes it the loop rather than the check at the end. So write the task down as a plan assertion and not as an instruction:</p>
+
+    <pre class="standalone">Task: give the ingest service read access to the events bucket.
+
+Done when `terraform plan` shows:
+  - exactly 1 resource to add (aws_iam_role_policy)
+  - 0 to change, 0 to destroy
+  - no diff outside module.ingest</pre>
+
+    <p>Written that way, "did the agent succeed" is a parse, not a judgement. Written the other way — "add read access to the bucket" — you are back to reviewing code and hoping, which is the failure mode <a class="xref" href="/playbooks/coding-and-computer-use-agents/spec-driven-agent-development">spec-driven development</a> exists to name.</p>
+
+    <div class="callout">
+      <p>Corollary worth stating early: the agent should be able to run <code class="inline">plan</code> as many times as it wants, and <code class="inline">apply</code> never. Plan is a read; give it the credentials to do that freely and let it iterate. Apply is the side effect, and it belongs to the pipeline that runs after a human or a policy engine has classified the plan — not to the process that wrote it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>What the plan does not tell you — the four gaps that produce the incidents.</h3>
+
+    <p>A plan is a partial oracle, and its blind spots are not randomly distributed. They cluster exactly where the expensive mistakes are.</p>
+
+    <ul>
+      <li><strong><code class="inline">(known after apply)</code>.</strong> Any value derived from a resource that does not exist yet is unknown at plan time, and it propagates: a security group id that is unknown makes every rule referencing it unknown too. The plan will confidently show you a change whose actual content it cannot compute. Worse, unknown values cannot be expanded, so a <code class="inline">for_each</code> over them fails or defers — meaning the number of resources in the real apply is not always the number in the plan.</li>
+      <li><strong>Server-side behaviour.</strong> The provider sends a request; the cloud decides what to do with it. Defaults get filled in, values get normalised, some changes are applied as a replace even when the plan showed an update, and quota and eventual-consistency failures happen only on apply. The plan models the provider's intent, not the API's response.</li>
+      <li><strong>Destruction, announced in the same tone as everything else.</strong> <code class="inline">-/+ destroy and then create replacement</code> is one line of output that can mean a new tag, or an empty database. The plan is accurate here and completely fails to be alarming, which for a human reviewer at 200 lines of diff is the same as being silent.</li>
+      <li><strong>Everything outside the state file.</strong> Resources created by hand, by another stack, or by a controller reconciling in the background are invisible; drift is only caught to the extent the refresh caught it, and a plan run against a stale refresh is a plan against a fiction. Cross-stack ordering — this stack's plan is clean, and it breaks the one applied after it — is outside the frame entirely.</li>
+    </ul>
+
+    <p>None of this argues against using the plan. It argues that the plan must be <em>classified</em> rather than read, which is the next step and the core of the playbook.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Classify the plan mechanically. Humans review the class, not the diff.</h3>
+
+    <p>Emit the plan as JSON — <code class="inline">terraform show -json tfplan</code> gives you every resource change as structured data with its action, address, type and before/after attributes — and run a policy over it. This is the one place in an agent pipeline where a deterministic rule engine beats a model outright, and it is exactly the <a class="xref" href="/deep-dives/agent-security/policy-as-code-for-agents">policy-as-code</a> pattern applied to a diff:</p>
+
+    <ul>
+      <li><strong>Class A — auto-apply.</strong> Creates and in-place updates on stateless resource types, no deletes, no replacements, no IAM, no changes outside the module the task named, and no <code class="inline">(known after apply)</code> on any attribute the policy cares about.</li>
+      <li><strong>Class B — human approval, normal review.</strong> Any in-place update on a stateful type, any change to networking reachability, anything that touches a resource the plan says is shared.</li>
+      <li><strong>Class C — human approval, named reviewer.</strong> Every <code class="inline">delete</code> and every <code class="inline">replace</code> of a data-bearing type (databases, volumes, buckets, DNS zones, certificates), and every change to IAM, security groups, public exposure or encryption settings. These get their own reviewer list because they are the two categories from which unrecoverable outcomes come.</li>
+      <li><strong>Class D — reject, do not show a human.</strong> The plan errored, the plan is empty when the task required a change, or the diff includes resources the task never mentioned. Bounce it back to the agent.</li>
+    </ul>
+
+    <p>The value is not the taxonomy, it is the shift in what a reviewer is asked to do. "Read 300 lines of HCL diff and tell me if it is safe" is a task humans are measurably bad at and get worse at with volume — the precision-over-recall argument from <a class="xref" href="/playbooks/coding-and-computer-use-agents/code-review-agents">code review agents</a>, arriving here as review fatigue. "This plan is Class C because it replaces <code class="inline">aws_db_instance.primary</code>; approve or reject" is a task humans are good at.</p>
+
+    <div class="callout tip">
+      <p>Write the classifier before you write the agent. It is a day of work, it is useful on human-authored pull requests from the moment it exists, and it is the artefact that decides whether this programme can ever run unattended. An agent without it is a machine that generates plans for a queue of tired reviewers.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Give it schemas and state, because its memory of your provider is a year old.</h3>
+
+    <p>The most common low-grade failure is not dangerous, just expensive: the agent writes an argument that does not exist, or uses one that was renamed two provider versions ago, and burns four plan cycles discovering it. Providers ship breaking changes on their own schedule and the model's weights do not.</p>
+
+    <ul>
+      <li><strong>Dump the schema and put it in the loop.</strong> <code class="inline">terraform providers schema -json</code> emits every resource type, attribute, and whether it forces replacement. Retrieving the relevant slice of that beats any amount of prompting about "use the correct arguments", and the <code class="inline">forces replacement</code> flag is directly the input the agent needs to avoid writing a Class C change by accident.</li>
+      <li><strong>Give it the module catalogue, not the whole repo.</strong> Your organisation has approved modules with opinionated defaults; an agent that has not been shown them will write raw resources that pass plan and fail review. This is the same reuse problem as design-to-code, and the same fix: hand over the typed interface before the task.</li>
+      <li><strong>Let it read state, carefully.</strong> The agent needs to know what exists. State files contain secrets in plaintext — that is a documented property of Terraform, not a misconfiguration — so read through <code class="inline">terraform state list</code> and targeted <code class="inline">show</code> calls rather than handing over the state blob, and treat plan JSON as sensitive for the same reason. Posting a full plan into a public pull-request comment is a credential leak waiting for its first repeat.</li>
+    </ul>
+
+    <p>Run the whole thing with credentials scoped to plan-time reads, in the isolation the <a class="xref" href="/playbooks/coding-and-computer-use-agents/sandboxing-and-execution">sandboxing and safe execution</a> page describes. An IaC agent holds cloud credentials by construction; that makes it the highest-value prompt-injection target in your engineering org, and a third-party module's README is attacker-reachable text.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Three edits the agent must never make, and one decision it must never take.</h3>
+
+    <p>The gaps in Step 2 are tolerable because the plan is otherwise honest. There are exactly three ways to make it dishonest, and they are all one-line changes that look like progress and make a red plan go green:</p>
+
+    <ul>
+      <li><strong><code class="inline">lifecycle { ignore_changes = [...] }</code></strong> — tells Terraform to stop reporting drift on an attribute. The diff disappears; the divergence does not. An agent that has been asked to "make the plan clean" will find this.</li>
+      <li><strong><code class="inline">terraform state rm</code></strong> — removes a resource from state, so the plan stops mentioning it. The resource keeps running and keeps billing, now unmanaged and invisible.</li>
+      <li><strong><code class="inline">-target</code></strong> — narrows the plan to one address, which makes the rest of the diff vanish from the output rather than from reality. HashiCorp documents it as a troubleshooting tool for exactly this reason.</li>
+    </ul>
+
+    <p>Ban all three in the classifier, as a hard Class D on the diff of the configuration itself, not as a prompt instruction. This is the same lesson as "never let the agent delete an assertion to make the suite pass" from <a class="xref" href="/playbooks/coding-and-computer-use-agents/patch-generation-and-tests">patch generation and test-driven loops</a>: when the reward is a green signal, every path to green is in scope, and the cheapest paths are the ones that break the signal.</p>
+
+    <p>The decision the agent must not take is <strong>drift reconciliation direction</strong>. When reality and code disagree, there are two repairs — change the code to match reality, or apply the code and revert reality — and they have opposite consequences. One of them ratifies an emergency fix somebody made at 3am; the other undoes it, possibly during the incident it was fixing. No amount of context tells the model which. Have the agent produce the drift report, propose both diffs, and stop; a human picks the direction. This is the boundary that <a class="xref" href="/playbooks/domain-playbooks/devops-sre-agents">DevOps and SRE agents</a> draws around the same class of judgement.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Ship it on an environment ladder, and measure the one number that is not vanity.</h3>
+
+    <p>Roll out by consequence, not by capability. The order that works:</p>
+
+    <ul>
+      <li><strong>Plan-only, everywhere.</strong> The agent opens pull requests and the classifier labels them; nothing applies automatically. You are measuring the classifier and the agent's plan quality against real work, at zero risk, and this stage is where you find out that a third of your repository does not plan cleanly today.</li>
+      <li><strong>Auto-apply Class A in ephemeral environments.</strong> Preview stacks, test accounts, anything you can delete and rebuild. A wrong apply costs a rebuild.</li>
+      <li><strong>Auto-apply Class A in production; everything else queued.</strong> Only after the previous stage has produced weeks of Class A applies with no rollback, and only with the <a class="xref" href="/operations/agentops/kill-switches">kill switch</a> and the staged-rollout discipline from <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout and versioning</a> already in place.</li>
+    </ul>
+
+    <p>Instrument two numbers and ignore the rest. <em>Class A rate</em> — the share of agent runs whose plan lands in the auto-apply class with no human edit to the code — is the honest measure of whether this saves anyone time; a run that reaches a Class C plan has generated review work, not removed it. <em>Applies requiring rollback</em> is the safety number, and it should be countable on one hand, because the recovery story for infrastructure is worse than for application code: an apply that destroyed a resource is not revertible by reverting the commit, and you are into the manual, judgement-heavy repair described in <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing what the agent already did</a>. Plans generated, pull requests opened and lines of HCL written are all vanity.</p>
+
+    <div class="callout tip">
+      <p>If you build one thing from this page, build the plan classifier. <strong>The agent is a swappable component that produces plans; the classifier is the thing that decides whether a plan can proceed without a human, and it is the only part of this system whose correctness you can actually establish.</strong> With it, an infrastructure agent is a well-bounded automation whose worst realistic outcome is a rejected pull request. Without it, you have moved the cloud's destroy button behind a language model and put a tired reviewer in front of it — and the reviewer's error rate, not the model's, is what will set your incident count.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/playbooks/coding-and-computer-use-agents/dependency-upgrade-agents">dependency upgrade agents</a> for the same evidence-policy argument on a different diff, <a class="xref" href="/playbooks/coding-and-computer-use-agents/background-coding-agents">background coding agents</a> for the review-queue arithmetic, and <a class="xref" href="/concepts/human-in-the-loop">human in the loop</a> for where an approval gate earns its latency.</p>
+  </div>
+</section>
