@@ -1,0 +1,117 @@
+<section class="phase">
+  <div class="phase-num">U20</div>
+  <div class="week">实战手册 · 编码与计算机操作智能体</div>
+  <h2>基础设施即代码智能体。</h2>
+  <p class="goal">别的编码智能体都得先自己造出判据才谈得上被信任；这一个却白得了一个好判据——因为 <code class="inline">terraform plan</code> 能在完全不动真实基础设施的前提下，告诉你「如果执行会发生什么」。这把整个设计翻了过来：智能体的交付物不是代码，而是一份「每一行都落进你事先约定可自动执行的类别」的计划——而全部工程难度在于，这份计划对造成故障的那四件事，恰恰只字不提。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>判据已经存在。围着它设计，别围着代码设计。</h3>
+
+    <p><a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/test-generation-agents">测试生成智能体</a>得先发明一份规格。<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/debugging-and-triage-agents">调试智能体</a>得先搭出复现才知道任何事情。而基础设施智能体拿到的，是那两者花钱也买不到的东西：一次会去查询实时云厂商 API、与已声明状态做差分、并打印出「执行时将发生的全部新建、更新、替换与销毁」的空跑。Terraform 管它叫 <code class="inline">plan</code>，Pulumi 叫 <code class="inline">preview</code>；同一个原语还包括 <code class="inline">cdk diff</code>、<code class="inline">kubectl diff</code>、<code class="inline">helm diff</code> 和 <code class="inline">az deployment what-if</code>。</p>
+
+    <p>它便宜、只读、可反复跑，所以它该是那个循环本身，而不是末尾的一道检查。因此，把任务写成一条关于计划的断言，而不是一句指示：</p>
+
+    <pre class="standalone">Task: give the ingest service read access to the events bucket.
+
+Done when `terraform plan` shows:
+  - exactly 1 resource to add (aws_iam_role_policy)
+  - 0 to change, 0 to destroy
+  - no diff outside module.ingest</pre>
+
+    <p>这样写，「智能体成功了吗」就是一次解析，而不是一次判断。换成另一种写法——「给这个桶加上读权限」——你就又回到了「审代码并且祈祷」，而这正是<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/spec-driven-agent-development">以规格驱动的开发</a>之所以存在、要去点名的那个失败模式。</p>
+
+    <div class="callout">
+      <p>有一条推论值得早点说明：智能体想跑多少次 <code class="inline">plan</code> 都行，而 <code class="inline">apply</code> 一次也不行。plan 是一次读取，那就把凭据给它、让它自由迭代。apply 是副作用，它属于「人或策略引擎给这份计划定完级之后」才跑的那条流水线，不属于写出这份计划的那个进程。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>计划不会告诉你的事——催生事故的那四个盲区。</h3>
+
+    <p>计划是一个局部判据，而它的盲区并不是随机分布的。它们恰好聚集在代价最高的错误所在之处。</p>
+
+    <ul>
+      <li><strong><code class="inline">(known after apply)</code>。</strong>任何派生自「尚不存在的资源」的值，在 plan 阶段都是未知的，而且会传染：一个未知的安全组 id，会让所有引用它的规则也变成未知。计划会自信地给你看一处变更，而它算不出这处变更的真实内容。更糟的是，未知值没法展开，所以在其上做 <code class="inline">for_each</code> 会失败或被推迟——也就是说，真实 apply 时的资源数量，未必等于计划里的数量。</li>
+      <li><strong>服务端行为。</strong>provider 发出请求，云厂商自己决定拿它怎么办。默认值会被补齐、取值会被归一化、有些变更即便计划显示为「更新」也会以「替换」落地，而配额与最终一致性引发的失败只在 apply 时才发生。计划建模的是 provider 的意图，不是 API 的回应。</li>
+      <li><strong>销毁，用和其他一切相同的语气宣布。</strong><code class="inline">-/+ destroy and then create replacement</code> 只是一行输出，它可能意味着一个新标签，也可能意味着一个空掉的数据库。计划在这里是准确的，却完全没能做到「刺眼」；而对一个面对 200 行 diff 的人类评审者来说，不刺眼等同于没说。</li>
+      <li><strong>状态文件之外的一切。</strong>手工创建的资源、另一个 stack 创建的资源、后台某个控制器正在调谐的资源，都是不可见的；漂移只在 refresh 抓到的范围内被抓到，而基于一次陈旧 refresh 跑出来的计划，是针对一个虚构世界的计划。跨 stack 的顺序问题——这个 stack 的计划干干净净，坏的是排在它之后 apply 的那个——则完全在画面之外。</li>
+    </ul>
+
+    <p>这些都不构成「别用计划」的理由。它们构成的理由是：计划必须被<em>分类</em>，而不是被通读——这就是下一步，也是本手册的核心。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>用机器给计划定级。人评审的是级别，不是 diff。</h3>
+
+    <p>把计划导成 JSON——<code class="inline">terraform show -json tfplan</code> 会把每一处资源变更以结构化数据给出，带上动作、地址、类型与前后属性——然后在它上面跑一套策略。这是智能体流水线里少有的、确定性规则引擎完胜模型的地方，也正是把<a class="xref" href="/zh/deep-dives/agent-security/policy-as-code-for-agents">策略即代码</a>这一模式套用到一份 diff 上：</p>
+
+    <ul>
+      <li><strong>A 级——自动执行。</strong>无状态资源类型上的新建与原地更新，没有删除、没有替换、不涉及 IAM、不越出任务指名的那个模块，并且策略在意的任何属性上都没有 <code class="inline">(known after apply)</code>。</li>
+      <li><strong>B 级——需人工批准，常规评审。</strong>有状态类型上的任何原地更新、任何改变网络可达性的变更、任何触及计划标记为共享的资源的变更。</li>
+      <li><strong>C 级——需人工批准，且指名评审人。</strong>承载数据的类型（数据库、卷、桶、DNS 区、证书）上的每一次 <code class="inline">delete</code> 与 <code class="inline">replace</code>，以及每一次对 IAM、安全组、公网暴露或加密设置的变更。它们要有自己的评审人名单，因为不可挽回的后果正是从这两类里长出来的。</li>
+      <li><strong>D 级——驳回，不要拿给人看。</strong>计划报错、任务明明要求有变更而计划却是空的、或者 diff 里出现了任务从未提及的资源。把它退回给智能体。</li>
+    </ul>
+
+    <p>价值不在这套分类法本身，而在于它改变了「你请人做什么」。「读 300 行 HCL diff，告诉我安不安全」是一件人类可测量地做不好、而且随着量增大越做越差的事——这就是<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/code-review-agents">代码评审智能体</a>里「精确率高于召回率」的论点，换到这里以评审疲劳的形态出现。而「这份计划是 C 级，因为它要替换 <code class="inline">aws_db_instance.primary</code>；批准还是驳回」是一件人类做得很好的事。</p>
+
+    <div class="callout tip">
+      <p>先写分类器，再写智能体。它是一天的工作量，从落地那一刻起就对人写的 pull request 一样有用，而且它才是决定这套东西能不能有一天无人值守运行的那件产物。没有它的智能体，就是一台不断给一群疲惫评审者造计划的机器。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>把 schema 和 state 交给它，因为它对你这套 provider 的记忆是一年前的。</h3>
+
+    <p>最常见的低级失败并不危险，只是费钱：智能体写了一个并不存在的参数，或者用了两个 provider 版本之前就已改名的参数，然后烧掉四轮 plan 才发现。provider 按自己的节奏发布破坏性变更，而模型的权重不会跟着走。</p>
+
+    <ul>
+      <li><strong>把 schema 导出来，放进循环里。</strong><code class="inline">terraform providers schema -json</code> 会输出每一种资源类型、每一个属性，以及该属性是否会强制替换。把其中相关的那一片检索出来喂进去，胜过任何数量的「请使用正确的参数」这类提示；而 <code class="inline">forces replacement</code> 这个标记，正是智能体避免误写出一处 C 级变更所需要的那个输入。</li>
+      <li><strong>给它模块目录，而不是整个仓库。</strong>你们组织里有一批经过审批、带着既定默认值的模块；没被展示过这些模块的智能体，会写出能通过 plan、却过不了评审的裸资源。这和「设计稿转代码」里的复用问题是同一个，解法也是同一个：在任务之前先把带类型的接口交出去。</li>
+      <li><strong>让它读 state，但要小心。</strong>智能体需要知道现在有什么。state 文件以明文保存密钥——这是 Terraform 有文档记载的性质，不是一处配置错误——所以要通过 <code class="inline">terraform state list</code> 与有针对性的 <code class="inline">show</code> 调用去读，而不是把整个 state 二进制块交出去；同理，plan 的 JSON 也要按敏感数据对待。把一份完整计划贴进公开的 pull request 评论里，是一次只等着有人复现的凭证泄露。</li>
+    </ul>
+
+    <p>整套东西都用「仅限 plan 期读取」的受限凭据来跑，隔离方式按<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/sandboxing-and-execution">沙箱与安全执行</a>那一页所述。IaC 智能体在构造上就握着云凭证；这让它成为你整个工程组织里价值最高的提示词注入目标，而一个第三方模块的 README 是攻击者够得着的文本。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>智能体绝不能做的三处改动，和绝不能替你做的一个决定。</h3>
+
+    <p>STEP 2 里那些盲区之所以还能忍，是因为计划在其余方面是诚实的。而让它变得不诚实的方式恰好有三种，它们全都是看起来像进展、能把红的计划变绿的一行改动：</p>
+
+    <ul>
+      <li><strong><code class="inline">lifecycle { ignore_changes = [...] }</code></strong>——告诉 Terraform 别再报告某个属性上的漂移。diff 消失了，分歧没有。一个被要求「把计划弄干净」的智能体，一定会找到这一招。</li>
+      <li><strong><code class="inline">terraform state rm</code></strong>——把资源从 state 里移除，于是计划不再提它。资源照跑照计费，只是从此不受管理、也不可见。</li>
+      <li><strong><code class="inline">-target</code></strong>——把计划收窄到一个地址，于是 diff 的其余部分是从输出里消失了，不是从现实里消失了。HashiCorp 正是因此把它记录为一件排障工具。</li>
+    </ul>
+
+    <p>把这三样在分类器里禁掉——作为对「配置本身的 diff」判定的硬性 D 级，而不是作为一句提示词里的告诫。这和<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/patch-generation-and-tests">补丁生成与测试驱动循环</a>里「绝不能让智能体靠删断言把测试跑绿」是同一个教训：当奖励是一个绿色信号时，通往绿色的每一条路都在射程之内，而最便宜的那几条，走的都是把信号本身弄坏。</p>
+
+    <p>智能体不能替你做的那个决定，是<strong>漂移调和的方向</strong>。当现实与代码不一致时，有两种修法——改代码去匹配现实，或者执行代码把现实改回去——而它们后果相反。其中一种是把某人凌晨三点做的应急处置正式追认下来；另一种是把它撤销，而且很可能正撤在它当初要修的那场故障里。再多上下文也不能告诉模型该选哪一个。让智能体产出漂移报告、把两份 diff 都提出来，然后停下；方向由人来选。这就是<a class="xref" href="/zh/playbooks/domain-playbooks/devops-sre-agents">DevOps 与 SRE 智能体</a>围绕同一类判断划下的那条界。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>按环境阶梯上线，并且只盯那个不是虚荣指标的数字。</h3>
+
+    <p>按后果推进，而不是按能力推进。管用的顺序是：</p>
+
+    <ul>
+      <li><strong>全域仅 plan。</strong>智能体开 pull request，分类器给它们打标签；什么都不会自动执行。你是在真实工作上、以零风险衡量分类器与智能体的计划质量；而正是在这一阶段，你会发现你仓库里有三分之一今天根本 plan 不干净。</li>
+      <li><strong>在临时环境里自动执行 A 级。</strong>预览栈、测试账号，一切你删掉重建也无所谓的地方。一次错误的 apply 只值一次重建。</li>
+      <li><strong>在生产里自动执行 A 级，其余一律排队。</strong>只在上一阶段已经产出了数周「无需回滚的 A 级 apply」之后才可以，而且必须先备好<a class="xref" href="/zh/operations/agentops/kill-switches">紧急停止开关</a>，以及<a class="xref" href="/zh/operations/agentops/rollout-and-versioning">灰度与版本管理</a>里那套分阶段发布纪律。</li>
+    </ul>
+
+    <p>只盯两个数字，其余全部忽略。<em>A 级比例</em>——智能体运行中计划落进自动执行类别、且代码无需任何人工改动的那部分占比——才是「这玩意有没有替谁省下时间」的诚实度量；一次拿到 C 级计划的运行，生产的是评审工作，不是省掉了评审工作。<em>需要回滚的 apply 次数</em>是安全数字，它应该一只手数得完，因为基础设施的恢复故事比应用代码难看得多：一次销毁了资源的 apply，不是把提交 revert 掉就能还原的，你会一头栽进<a class="xref" href="/zh/operations/agentops/repairing-agent-side-effects">修复智能体已经做过的事</a>里描述的那种手工的、重判断的修补。生成了多少份计划、开了多少个 PR、写了多少行 HCL，全是虚荣指标。</p>
+
+    <div class="callout tip">
+      <p>如果你从这一页只做一件事，那就把计划分类器建起来。<strong>智能体是一个产出计划的可替换部件；分类器才是那个决定「一份计划能否不经人工就往下走」的东西，也是这整套系统里唯一一个你真能确立其正确性的部分。</strong>有了它，基础设施智能体就是一件边界清晰的自动化，其现实中最坏的结果不过是一个被驳回的 pull request。没有它，你等于把云的销毁按钮挪到了一个语言模型背后，再在前面放一位疲惫的评审者——而决定你事故数量的，将是这位评审者的出错率，不是模型的。</p>
+    </div>
+
+    <p>延伸：<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/dependency-upgrade-agents">依赖升级智能体</a>把同一套证据规程用在另一种 diff 上，<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/background-coding-agents">后台编码智能体</a>讲评审队列的算术，而<a class="xref" href="/zh/concepts/human-in-the-loop">人在回路</a>讲一道审批关卡在什么时候配得上它带来的延迟。</p>
+  </div>
+</section>
