@@ -1,0 +1,117 @@
+<section class="phase">
+  <div class="phase-num">S18</div>
+  <div class="week">Operation · Safety, Alignment &amp; Agentic Security</div>
+  <h2>Detecting agent compromise: the tell is the shape of the trajectory, not the text.</h2>
+  <p class="goal">Every control you bought inspects content — the injection classifier on the way in, the output scanner on the way out — and every one of them fails open, which means the day one gets past is the day you have no detection at all. What survives that is behavioural: a compromised agent's tool-call sequence stops resembling the sequences that task type produces, and it usually abandons the user's task in the process. The catch is that a healthy agent is wildly anomalous by ordinary SOC standards, so a generic user-behaviour baseline yields nothing but noise. Baseline per task type, alert on trajectory shape, and you get a control that still works after the classifier misses.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Content inspection is prevention, and prevention has no detection story.</h3>
+
+    <p>The standard stack is an input classifier scoring retrieved text for injection, plus an output filter looking for exfiltration patterns. Both are worth having. Neither tells you that an agent <em>has been</em> compromised, and the reason is structural rather than a question of model quality.</p>
+
+    <ul>
+      <li><strong>The classifier's miss is silent.</strong> A detector at 98% recall is a good detector and it still passes one attempt in fifty with no event emitted. There is no second signal, because the same component decides both "is this an attack" and "was there an attack".</li>
+      <li><strong>After the fact, the instruction is indistinguishable from context.</strong> Once injected text is in the transcript it is just tokens the model read, and every subsequent step looks like the model reasoning over its context — which is exactly what it is. Scanning later steps for the injection finds nothing, because the injection already worked and has no reason to persist.</li>
+      <li><strong>Output filters are downstream of the interesting exfiltration paths.</strong> A markdown image URL that the client fetches never passes through your text filter as text; see <a class="xref" href="/operations/safety-and-security/rendering-agent-output-safely">rendering agent output safely</a>.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The useful framing: content controls reduce the rate of compromise, behavioural controls reduce the <em>duration</em>. You need a number for both. Most teams have only the first and quote its recall as though it were coverage.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Your agent is anomalous by construction, so generic baselines are worthless.</h3>
+
+    <p>Point an off-the-shelf user-behaviour analytics product at a service account that happens to be an agent and it lights up permanently. The agent reads hundreds of documents an hour, calls a dozen APIs in sequence, works at 3 a.m., and its volume varies by an order of magnitude with the task it was given. Every one of those is a textbook insider-threat indicator, and every one of them is correct behaviour. Teams respond by widening the thresholds until the alerts stop, at which point the control is off.</p>
+
+    <p>The fix is to change the unit of baselining. The comparison that discriminates is not <em>this identity versus its history</em> — it is <em>this run versus other runs of the same task type</em>. A run of <code class="inline">summarise-ticket</code> has a characteristic shape: roughly this many steps, these tools in roughly this order, this breadth of reads, egress to these hosts. That distribution is tight, because the task is fixed, and a run that leaves it is interesting even when the identity's rolling averages look normal.</p>
+
+    <ul>
+      <li>Tag every run with its task type at dispatch. If you cannot, you have no denominator and nothing below works.</li>
+      <li>Build the baseline from successful production runs, refreshed on a rolling window, not from a design document about what the agent should do.</li>
+      <li>Keep per-task-type baselines separate per tenant where tenant data shapes differ enough to matter; otherwise your largest customer defines "normal".</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Five signals that discriminate, in order of how much they earn.</h3>
+
+    <p>These are ranked by signal-to-noise in practice, not by how sophisticated they sound. The first one is nearly free and catches the majority of successful injections, because a hijacked agent has to spend its remaining steps on the attacker's goal rather than the user's.</p>
+
+    <ul>
+      <li><strong>Task abandonment.</strong> Compare the run's terminal state against the task it was dispatched with: did it produce the artefact it was asked for? An injected agent typically returns a plausible-looking non-answer, or succeeds at something adjacent. Cheap to compute, and unusually hard for an attacker to avoid — completing the user's task <em>as well</em> costs the attacker steps and context.</li>
+      <li><strong>Tool-sequence novelty.</strong> Score the run's sequence of tool names against the n-grams observed for that task type. A <code class="inline">read → read → summarise</code> task that suddenly contains <code class="inline">read → list_keys → http_post</code> scores as unseen. Bigrams over tool names catch most of it; you do not need a sequence model.</li>
+      <li><strong>Egress destination novelty.</strong> First contact with a host, first use of a tool that can reach outside, an unusual ratio of bytes out to bytes in. This is the highest-severity signal and the lowest-volume, and it belongs next to <a class="xref" href="/operations/safety-and-security/egress-control-for-agents">egress control</a> — where the allowlist blocks, the detector records what tried.</li>
+      <li><strong>Read-set expansion.</strong> The count and diversity of documents, rows or repositories touched relative to the task type's distribution. Staged data collection before an exfiltration attempt shows up here first, and it is also how a <a class="xref" href="/operations/safety-and-security/permission-aware-retrieval">retrieval permission bug</a> announces itself.</li>
+      <li><strong>Authorisation friction.</strong> Denied calls, scope errors, refused tools, retries against the same forbidden endpoint. A healthy agent rarely gets told no twice for the same thing; something probing its boundaries does. Log denials as events in their own right — most stacks throw them away at the policy layer.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you implement exactly one of these, implement task abandonment. It requires no new telemetry beyond what a dispatcher already knows, it is interpretable when it fires, and it is the signal an attacker pays the most to suppress.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>None of it is computable unless the loop emits the right fields.</h3>
+
+    <p>Most agent traces are built for debugging: prompts, completions, latencies. Detection needs a different projection of the same run — a compact per-step record whose fields are comparable <em>across</em> runs. Emit it from inside the tool-call path, not from a wrapper the agent's own errors can skip.</p>
+
+    <pre class="standalone"><span class="c-cm"># detect/step_record.py — emitted on every tool call, before dispatch</span>
+<span class="c-kw">def</span> <span class="c-fn">record</span>(run, step, tool, args, result):
+    emit({
+        <span class="c-st">"run_id"</span>:      run.id,
+        <span class="c-st">"task_type"</span>:   run.task_type,      <span class="c-cm"># the baseline key</span>
+        <span class="c-st">"principal"</span>:   run.on_behalf_of,   <span class="c-cm"># human, not service account</span>
+        <span class="c-st">"step"</span>:        step,
+        <span class="c-st">"tool"</span>:        tool,               <span class="c-cm"># name only — the n-gram unit</span>
+        <span class="c-st">"dest"</span>:        egress_host(args),  <span class="c-cm"># None for local tools</span>
+        <span class="c-st">"read_ids"</span>:    hashed(result.ids), <span class="c-cm"># breadth, never content</span>
+        <span class="c-st">"bytes_out"</span>:   size(args),
+        <span class="c-st">"denied"</span>:      result.denied,      <span class="c-cm"># keep policy refusals</span>
+        <span class="c-st">"ctx_source"</span>:  args.provenance,    <span class="c-cm"># which retrieved doc drove this</span>
+    })</pre>
+
+    <p>Two fields carry more than their weight. <code class="inline">principal</code> keeps the human the run acts for, so a compromise can be scoped to the people affected rather than to the one service account everything shares — the argument in <a class="xref" href="/operations/safety-and-security/agent-identity">agent identity</a>. <code class="inline">ctx_source</code> keeps the provenance of the text that preceded the step, which is what converts "this run went sideways" into "this document turns agents", and that is the finding that protects every other tenant. Hash identifiers rather than storing content; the detector needs breadth and shape, and retaining the documents themselves turns your detection store into the richest target on the network. Retention follows <a class="xref" href="/operations/evaluation-and-observability/trace-sampling-and-retention">trace sampling and retention</a> — and note that sampling a percentage of runs is exactly wrong here, because the run you dropped is the one you needed. Sample spans for cost, keep the step record for every run.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>A detector that only opens tickets has not shortened anything.</h3>
+
+    <p>Detection buys you nothing until it is wired to an action that outruns a human. Agents complete their remaining steps in seconds; a page that arrives in fifteen minutes arrives after the run finished. Build a ladder and put the cheap rungs in the loop itself.</p>
+
+    <ul>
+      <li><strong>Degrade.</strong> On a moderate score, drop the run to read-only tools and finish. Most false positives end here costing one degraded run, which is what makes an aggressive threshold affordable.</li>
+      <li><strong>Gate.</strong> On egress or authorisation signals, require approval for the next state-changing call. The approval surface already exists if you have <a class="xref" href="/operations/safety-and-security/human-in-the-loop">human-in-the-loop</a>; this reroutes into it rather than building something new.</li>
+      <li><strong>Halt.</strong> On a high score, stop the run and checkpoint it. This is the <a class="xref" href="/operations/agentops/kill-switches">kill switch</a> at run scope, and it needs to be callable by the detector without a human in the path.</li>
+      <li><strong>Quarantine the source.</strong> When <code class="inline">ctx_source</code> points at a specific document, block it for every run pending review. One poisoned page reaches every agent that retrieves it, so the containment unit is the document, not the run.</li>
+    </ul>
+
+    <p>Set thresholds by what a false positive costs at each rung, not by a fixed percentile. Degrade can afford to fire on a few percent of runs; halt cannot. Route confirmed hits into <a class="xref" href="/operations/agentops/incident-response-for-agents">incident response</a>, and expect the first cleanup to be partial — a channel closed at the tool layer is often reopened somewhere less obvious.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Measure mean time to detect, or you are guessing.</h3>
+
+    <p>An unexercised detector is a belief. The measurement is cheap: plant benign canaries and count steps, not minutes.</p>
+
+    <ul>
+      <li><strong>Put a canary instruction in a document the agent will retrieve</strong> — one that asks it to call a harmless internal endpoint you control. Run it weekly against production configuration in a staging tenant. Your metric is the number of steps between the agent reading it and the detector firing.</li>
+      <li><strong>Track detection stage.</strong> Which rung caught it, or whether the run completed uncaught. Detection-at-halt and detection-after-completion are different products.</li>
+      <li><strong>Vary the payload.</strong> One that exfiltrates, one that quietly abandons the task, one that escalates scope. Each exercises a different signal, and the abandonment case is the one most detectors fail.</li>
+      <li><strong>Report both numbers.</strong> Rate of compromise from the classifier, duration from the behavioural stack. A programme reporting only the first has no evidence about what happens after a miss.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do these three this quarter, in order: tag every run with a task type, compare terminal state against the dispatched task, and log policy denials as events. That is roughly a day of work and it converts your agent fleet from unobservable to baselined. Tool-sequence scoring and egress novelty are worth building next, and both need the task-type tag to mean anything — so the tag is the dependency to land first, not the model.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/deep-dives/agent-security/prompt-injection-defense-2026">prompt-injection defence</a> for the prevention half, <a class="xref" href="/operations/safety-and-security/data-exfiltration-risks">data exfiltration risks</a> for what the egress signal is protecting, <a class="xref" href="/operations/evaluation-and-observability/failure-taxonomy-and-triage">failure taxonomy and triage</a> for separating compromise from ordinary failure, and <a class="xref" href="/deep-dives/agent-security/decision-receipts-and-audit">decision receipts</a> for the record you will want when explaining what happened.</p>
+  </div>
+</section>
