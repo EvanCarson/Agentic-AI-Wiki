@@ -1,0 +1,133 @@
+<p class="lede">Four projects call themselves MCP gateways and only one question separates them: when the call reaches the upstream server, whose identity is on it? The MCP specification settles the negative — as of revision 2026-07-28 a server <strong>MUST NOT</strong> pass through the token it received from its client — but leaves the positive mechanism, RFC 8693 token exchange, sitting on the roadmap under a working group that is still forming. So each of these four answers it differently, a feature table that reads "OAuth ✅" across the row tells you nothing, and one of the four has no multi-user identity at all. Decide on that axis and the rest is deployment preference.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>All four are open source, which is unusual for this category and means every claim below was checked in the repository rather than on a pricing page. They are not, however, the same kind of thing.</p>
+  <table>
+    <thead>
+      <tr><th>Project</th><th>Shape</th><th>Identity reaching the upstream server</th><th>Licence</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>agentgateway</td><td>Rust proxy, Linux Foundation project</td><td>Exchanged token — RFC 8693 in the config surface</td><td>Apache 2.0</td></tr>
+      <tr><td>ContextForge (IBM)</td><td>Python/FastAPI registry and proxy</td><td>Exchanged token, or a gated header passthrough</td><td>Apache 2.0</td></tr>
+      <tr><td>Obot</td><td>Self-hosted control plane, Kubernetes or Docker</td><td>The user's stored upstream OAuth token</td><td>MIT, open-core</td></tr>
+      <tr><td>Docker MCP Gateway</td><td>Go CLI plugin behind Docker Desktop's MCP Toolkit</td><td>Nothing user-specific — there is no user</td><td>MIT</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/agentgateway-vs-contextforge-vs-obot-vs-docker-mcp-gateway/arch-where-identity-stops.svg" alt="Diagram of four MCP gateways showing where the caller's identity stops. In agentgateway and ContextForge the user's token is exchanged at the gateway for a fresh audience-bound token carrying an actor claim, so the upstream server sees the user acting through the gateway. In Obot the gateway authenticates the user against an identity provider and then attaches that user's separately stored upstream OAuth token, so the upstream server sees the user but learns nothing about the gateway. In Docker MCP Gateway the inbound connection is authenticated by a single shared static bearer token with no user concept, and the outbound credential is an OAuth grant the gateway brokered for the workstation, so the upstream server sees one machine." width="900" height="500" loading="lazy" />
+    <figcaption>The four boxes on the right are what the upstream server's access log actually contains.</figcaption>
+  </figure>
+
+  <p>agentgateway is written in Rust, is a Linux Foundation project, and describes itself as a next-generation agentic proxy: JWT, API-key and OAuth authentication, fine-grained RBAC driven by a CEL policy engine, rate limiting, TLS and OpenTelemetry. ContextForge is IBM's, federating MCP alongside A2A and REST/gRPC APIs behind one registry, and shipping virtual servers that bundle a chosen subset of tools. Obot is a self-hosted governance platform of which the gateway is one component, with the most developed audit story of the four. Docker's is the one most engineers already have installed, because it arrives with Docker Desktop.</p>
+</section>
+
+<section>
+  <h2>What the specification settles, and what it leaves to you</h2>
+  <p>The current protocol revision is 2026-07-28, and its authorization security-considerations page is unusually direct. Two obligations matter here, both quoted from the spec:</p>
+
+  <blockquote>MCP servers <strong>MUST</strong> only accept tokens specifically intended for themselves and <strong>MUST</strong> reject tokens that do not include them in the audience claim or otherwise verify that they are the intended recipient of the token.</blockquote>
+
+  <blockquote>If the MCP server makes requests to upstream APIs, it may act as an OAuth client to them. The access token used at the upstream API is a separate token, issued by the upstream authorization server. The MCP server <strong>MUST NOT</strong> pass through the token it received from the MCP client.</blockquote>
+
+  <p>Note the subject: these are obligations on <em>MCP servers</em>. A gateway is an MCP server to everything upstream of it, so it inherits them, but the spec never addresses gateways as a category — which is exactly why four of them can be compliant in four different ways. The spec's own best-practices page names the anti-pattern and its consequence: forwarding an unmodified token creates the confused-deputy problem, and the downstream server's logs "may show requests that appear to come from a different source with a different identity". Audit corruption, not just authorisation bypass.</p>
+
+  <p>Now the gap. The spec <em>requires</em> RFC 8707 resource indicators — clients must send the <code>resource</code> parameter so tokens are bound to the server they are for. It does not require RFC 8693. Token exchange appears in the repository exactly once outside prose, in the development roadmap, as future work for an Agent Identity working group that is still forming, alongside Workload Identity Federation and the ID-JAG grant. So the mechanism that turns "don't pass the token through" into "here is what to do instead" is not yet part of the protocol. Every gateway below has had to decide without it, and that is the honest reason the four answers diverge.</p>
+</section>
+
+<section>
+  <h2>The four answers</h2>
+  <figure>
+    <img src="/blogs/agentgateway-vs-contextforge-vs-obot-vs-docker-mcp-gateway/data-identity-matrix.svg" alt="Feature matrix with four projects as rows and four identity axes as columns: RFC 8693 token exchange, per-user credential brokering, tool-level filtering, and per-user audit attribution. agentgateway is strong on token exchange and keeps only a short-lived in-memory cache of exchange results rather than a stored per-user credential, and offers strong CEL-based policy control. ContextForge is strong on token exchange, strong on user-scoped OAuth tokens, and strong on virtual servers for tool filtering. Obot is medium on token exchange because its released documentation describes it and the current main branch has replaced it with stored per-user tokens, strong on per-user brokering, medium on tool filtering through accept-reject-mutate filters, and strong on per-user audit. Docker MCP Gateway is weak or absent on all four because it has no multi-user identity model." width="900" height="400" loading="lazy" />
+    <figcaption>The identity column is the one that forecloses architecture. The rest can be added later.</figcaption>
+  </figure>
+
+  <p><strong>agentgateway and ContextForge exchange the token.</strong> Both carry RFC 8693 in code rather than in marketing. agentgateway's configuration protobuf defines a token-exchange type with <code>subject_token_type</code>, <code>actor_token</code> and <code>actor_token_type</code> fields; it also implements cross-app access, the ID-JAG shape the MCP roadmap points at. ContextForge implements the exchange in its tool and gateway services, keyed on a gateway configured with <code>grant_type == "token-exchange"</code>, and refuses the call outright when no authenticated user is present — the error is "User authentication required for token-exchange gateway", which is the right failure and a good sign the path is real rather than aspirational.</p>
+
+  <p><strong>ContextForge also ships the forbidden pattern, deliberately and behind a gate.</strong> Its header-passthrough feature renames an inbound <code>X-Upstream-Authorization</code> to <code>Authorization</code> and forwards it. This is passthrough, and the documentation says so with a warning at the top of the page: the feature is disabled by default, must be turned on with <code>ENABLE_HEADER_PASSTHROUGH=true</code>, and <code>Authorization</code> is deliberately excluded from the default header list with a note about token-leakage risk. That is a defensible piece of engineering — real MCP servers exist that support nothing else — and it is also the sharpest illustration of this whole comparison. Whether your deployment complies with the spec is decided by an environment variable, not by which product you bought.</p>
+
+  <p><strong>Obot brokers a stored per-user token, and is visibly mid-migration.</strong> Its v0.25.0 documentation describes an MCP Server Shim performing an RFC 8693 exchange, with exchange credentials living in the shim and never exposed to the MCP server. The current main branch has deleted the shim and that language: the gateway now "obtains the user's stored upstream OAuth token when the target server requires one, and proxies the request". Both are legitimate — a stored per-user token is emphatically not passthrough, since it was issued to the user for that upstream — but they are different security properties, and a token exchanged per request is narrower than a refresh token held at rest. If you are evaluating Obot, pin the version, because the answer changed between the released docs and the branch.</p>
+
+  <p><strong>Docker has no answer, because it has no user.</strong> Inbound authentication is a single static bearer token read from <code>MCP_GATEWAY_AUTH_TOKEN</code> or generated at startup, compared in constant time; there is no concept of a calling user anywhere in the gateway package, and <code>--allow-unauthenticated</code> is an explicit opt-out that logs a warning. Outbound, it acts as its own OAuth client with dynamic client registration and PKCE, and it does send the RFC 8707 <code>resource</code> parameter — so it is audience-correct — but the identity it obtains belongs to the workstation, not to a person. This is not a deficiency. It is a workstation tool being honest about its scope, and the failure mode is only that teams install it first and later discover it cannot become the fleet gateway.</p>
+</section>
+
+<section>
+  <h2>Docker is playing a different sport, and winning it</h2>
+  <figure>
+    <img src="/blogs/agentgateway-vs-contextforge-vs-obot-vs-docker-mcp-gateway/compare-two-categories.svg" alt="Three columns contrasting what each layer controls. The workstation layer, represented by Docker MCP Gateway, controls container isolation, signed images verified by digest, resource limits, egress and SSRF guards, and secret scanning, but has no user identity. The fleet layer, represented by agentgateway, ContextForge and Obot, controls user identity, token exchange, policy and per-user audit, but generally does not run the servers. The third column notes that the two layers are complements, that most organisations end up needing both, and that neither vendor sells the other half." width="900" height="300" loading="lazy" />
+    <figcaption>Two layers, not four competitors. The overlap is smaller than the category name suggests.</figcaption>
+  </figure>
+
+  <p>Judge Docker's gateway on the axis it actually competes on and it has the strongest story here by a distance, because it is the only one of the four that runs the MCP servers rather than merely routing to them. Signature verification is on by default for images in Docker Hub's <code>mcp/</code> namespace, which must then be referenced by digest and are verified before pull or run — third-party images outside that namespace are not covered, which is worth knowing rather than assuming. Containers start with Docker isolation, <code>no-new-privileges</code>, and configured CPU and memory limits. Remote URLs must be public HTTPS by default and loopback, private, link-local and metadata-service ranges are rejected, which is SSRF defence most proxies leave to the network. Host binds are read-only by default and must resolve under allowlisted roots. Secret blocking is on by default and scans both tool-call arguments and text responses.</p>
+
+  <p>Set against that, the enterprise proxies mostly do not run anything. Obot is the exception and the comparison is instructive: each server gets its own Kubernetes pod, and per-server domain allowlists exist but are enforced through an external controller whose only supported provider today is Aviatrix — the built-in NetworkPolicy is explicitly "not domain-aware". So the honest architecture for a company is both layers, not a winner: identity, policy and audit at the fleet gateway, isolation and supply chain at whatever runs the server process. Neither vendor sells you the other half, and the seam between them is where your <a href="/operations/safety-and-security/egress-control-for-agents">egress control</a> has to live.</p>
+</section>
+
+<section>
+  <h2>Audit is downstream of identity, which is why it is the honest tiebreaker</h2>
+  <p>An audit log can only record an identity the gateway possessed. That makes logging a derived property rather than an independent axis, and it collapses the shortlist quickly for anyone with a compliance obligation.</p>
+
+  <p>Obot's is the most developed: MCP requests and responses with the user who made them, filterable by date, user, server, operation and status, deleted after 90 days by default with an export path. Its access model is the part worth stealing regardless of what you deploy — request and response bodies are visible <em>only</em> to an Auditor role, and every other role including Owner and Admin sees metadata only. That is a separation-of-duties design most in-house implementations do not think to build, and it is the difference between an audit log and a second copy of your data with wider access than the original.</p>
+
+  <p>Docker's, again, is coherent for its scope and useless for compliance: call logging is on by default, but the documentation is explicit that logs record the tool name and argument shape metadata only, and that raw argument keys and values must not be logged. Excellent for a workstation where the arguments are your own secrets. Not a record of who did what.</p>
+
+  <p>The pattern generalises past these four. If a gateway cannot name the human on whose behalf a tool call was made, no amount of log volume produces an audit trail — which is the same argument the <a href="/concepts/ambient-authority">ambient authority</a> problem makes from the other direction, and the reason <a href="/operations/governance-compliance/delegated-access-and-consent-records">delegated access and consent records</a> keep turning up in agent regulation.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>One developer, local servers, wants isolation and supply-chain safety</td><td>Docker MCP Gateway</td><td>Best container isolation, signed images by digest, SSRF and secret guards — and no identity model you would have to unpick later, because there is none</td></tr>
+      <tr><td>Fleet deployment, identity provider in place, needs per-request narrowing</td><td>agentgateway</td><td>RFC 8693 exchange plus cross-app access in the config surface, CEL-based RBAC, and a Linux Foundation governance story if that matters to your procurement</td></tr>
+      <tr><td>Federating MCP alongside A2A and existing REST APIs</td><td>ContextForge</td><td>The only one of the four that treats non-MCP backends as first class; virtual servers give tool-level scoping without deploying anything — just leave header passthrough off</td></tr>
+      <tr><td>Compliance obligation, self-hosted Kubernetes, audit is the deliverable</td><td>Obot</td><td>Per-user audit with an Auditor role gating payload visibility, per-server pods and egress allowlists — pin the version and confirm which identity model that version ships</td></tr>
+      <tr><td>You have not yet decided who your agents act as</td><td>None of them yet</td><td>Every option above encodes an answer to that question. Decide it first; the gateway is the enforcement point, not the decision</td></tr>
+    </tbody>
+  </table>
+
+  <p>What should not decide it: the star count, which tracks category attention rather than fit, and whether the README says "enterprise-ready". What should: run the one you are considering against a server that requires OAuth, then read the upstream server's access log. If it shows your gateway's service identity where you expected a person, you have found the answer before it becomes an incident.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Is a stored per-user OAuth token the same as token passthrough?</h3>
+  <p>No, and the distinction is the whole point. Passthrough forwards the token the client presented <em>to the gateway</em>, which was issued for the gateway's audience and therefore arrives upstream as a confused deputy. A stored per-user token was issued by the upstream authorization server to that user for that upstream, through a consent the user gave. It is compliant. It is also broader than an exchanged token, because it sits at rest with a refresh token attached rather than being minted per request.</p>
+
+  <h3>Does the MCP specification require RFC 8693?</h3>
+  <p>No. It requires clients to use RFC 8707 resource indicators, and it forbids servers from passing through the token they received. RFC 8693 token exchange appears in the roadmap as future work for the Agent Identity working group, alongside Workload Identity Federation and ID-JAG. Anyone telling you a gateway is "spec-compliant because it does RFC 8693" is describing a good implementation of something the spec has not asked for yet.</p>
+
+  <h3>Can I just run Docker's gateway in production?</h3>
+  <p>For a single-tenant workload where the credential legitimately belongs to a machine — a build agent, a scheduled job, one team's shared automation — yes, and you get isolation nothing else here matches. For anything acting on behalf of named humans, no: there is no user concept to attribute an action to, so you cannot scope a compromise, cannot revoke one person's access, and cannot produce an audit trail.</p>
+
+  <h3>What breaks when an MCP server does not support OAuth at all?</h3>
+  <p>You end up with a shared credential somewhere, and the only question is where. The good version is the gateway holding it, with per-user policy on the gateway side deciding who may invoke which tool, so the loss of user identity stops at a boundary you control and is recorded. The bad version is header passthrough turned on globally, which loses the identity and corrupts the upstream audit trail at the same time. Both look identical on a feature matrix.</p>
+
+  <h3>Do I need a gateway at all if my agents call MCP servers directly?</h3>
+  <p>Not until the second team, the second environment, or the first auditor. The gateway earns its place when you need one enforcement point for who may call which tool, one place tokens are exchanged rather than shared, and one log that names the human — the same consolidation argument as an <a href="/concepts/ai-gateways">AI gateway</a>, applied to tool calls instead of model calls. Before that it is infrastructure you are operating for its own sake.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/deep-dives/mcp/mcp-auth-oauth21">MCP auth with OAuth 2.1</a> — the authorization model these gateways implement.</li>
+    <li><a href="/deep-dives/mcp/mcp-ops-in-production">MCP ops in production</a> — what running servers at fleet scale actually involves.</li>
+    <li><a href="/deep-dives/mcp/mcp-security-anti-patterns">MCP security anti-patterns</a> — confused deputy and its neighbours.</li>
+    <li><a href="/deep-dives/mcp/mcp-registry-and-distribution">MCP registry &amp; distribution</a> — where the servers behind the gateway come from.</li>
+    <li><a href="/operations/safety-and-security/agent-identity">Agent identity</a> — deciding who the agent acts as, which the gateway only enforces.</li>
+    <li><a href="/operations/governance-compliance/delegated-access-and-consent-records">Delegated access &amp; consent records</a> — the record regulators are converging on.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://github.com/modelcontextprotocol/modelcontextprotocol">modelcontextprotocol/modelcontextprotocol</a> — the specification, revision 2026-07-28.</li>
+    <li><a href="https://github.com/agentgateway/agentgateway">agentgateway/agentgateway</a></li>
+    <li><a href="https://github.com/IBM/mcp-context-forge">IBM/mcp-context-forge</a> — ContextForge.</li>
+    <li><a href="https://github.com/obot-platform/obot">obot-platform/obot</a></li>
+    <li><a href="https://github.com/docker/mcp-gateway">docker/mcp-gateway</a></li>
+  </ul>
+</section>
