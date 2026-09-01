@@ -34,7 +34,41 @@ const PUBLIC_ROOT = fileURLToPath(new URL('../../public/', import.meta.url));
 // apply to inline SVG and are dropped — accessibility is preserved by
 // each SVG's own <title>+<desc>+role="img" markup. If a referenced file
 // is missing, the original <img> tag is left untouched.
+// Each diagram carries its own <style> block, and inlining splices them all
+// into ONE document — where an SVG <style> is not scoped to its own <svg>.
+// Two diagrams in a post that both define `.sub` do not each get their own:
+// the file appearing later in the article wins for both. Worse, the cascade
+// resolves per PROPERTY, so a later `.sub` that simply omits `text-anchor`
+// cannot undo an earlier `.sub { text-anchor: middle }` — it leaks in and
+// re-anchors labels that were authored left-aligned, shifting each one left
+// by half its width. That silently pushed 35 labels across 10 posts outside
+// their viewBox (where the root <svg>'s default `overflow: hidden` clips
+// them) and collided two more. Scoping each file's rules to the element they
+// came from makes a class name mean the same thing in every diagram.
+//
+// Safe as a mechanical transform because every rule in every one of the 349
+// diagrams is a single class selector (`.foo { … }`): no at-rules, no element
+// or id selectors, no combinators, no comments, one <style> per file. Every
+// SVG also defines every class it uses, so none depends on a sibling's rules.
+function scopeSvgStyles(svg: string, scope: string): string {
+  return svg.replace(
+    /(<style[^>]*>)([\s\S]*?)(<\/style>)/g,
+    (_m, open, css, close) =>
+      open +
+      // Only the selector half of each rule is rewritten. Declarations are
+      // left byte-identical, which matters: `opacity: .65` would otherwise
+      // look like a class selector to a naive global replace.
+      css.replace(/([^{}]+)(\{[^{}]*\})/g, (_rule: string, sel: string, decls: string) =>
+        sel.split(',').map((s) => s.trim()).filter(Boolean).map((s) => `.${scope} ${s}`).join(', ') + ' ' + decls,
+      ) +
+      close,
+  );
+}
+
 function inlineSvgs(html: string): string {
+  // Local, not module-level, so the same body always produces the same
+  // markup regardless of how many pages the build rendered first.
+  let svgSeq = 0;
   return html.replace(
     /<img\b([^>]*)\/?>/g,
     (originalTag, attrs) => {
@@ -48,6 +82,9 @@ function inlineSvgs(html: string): string {
       let svg = readFileSync(filePath, 'utf8').replace(/^\s*<\?xml[^>]*\?>\s*/i, '').trim();
       if (!svg.startsWith('<svg')) return originalTag;
 
+      const scope = `svgs-${++svgSeq}`;
+      svg = scopeSvgStyles(svg, scope);
+
       const transfer: string[] = [];
       const w = attrs.match(/\bwidth="([^"]+)"/);
       const h = attrs.match(/\bheight="([^"]+)"/);
@@ -55,10 +92,11 @@ function inlineSvgs(html: string): string {
       const sty = attrs.match(/\bstyle="([^"]+)"/);
       if (w)   transfer.push(`width="${w[1]}"`);
       if (h)   transfer.push(`height="${h[1]}"`);
-      if (cls) transfer.push(`class="${cls[1]}"`);
+      // The scope class rides along with any class the <img> carried, so the
+      // scoped rules above have something on the <svg> root to match against.
+      transfer.push(`class="${cls ? `${cls[1]} ${scope}` : scope}"`);
       if (sty) transfer.push(`style="${sty[1]}"`);
 
-      if (transfer.length === 0) return svg;
       return svg.replace(/<svg\b/, `<svg ${transfer.join(' ')}`);
     },
   );
