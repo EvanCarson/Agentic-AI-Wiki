@@ -10,8 +10,18 @@ export interface BlogPost {
   date: string;
   /** kebab-case, unique across posts. Must equal the filename slug. */
   slug: string;
-  /** Bilingual post title. */
+  /** Bilingual post title. Rendered as the on-page <h1> exactly as written. */
   title: Localized;
+  /**
+   * Optional per-locale override for the `<title>` tag only — never the <h1>.
+   *
+   * Set this when the headline is too long for a result list and has no
+   * usable pre-colon head for `metaTitleFor()` to promote: headline-only posts
+   * ("Stripe bought the meter, not the router") and posts whose head is a
+   * cryptic fragment. Omit the locale that does not need one — Chinese
+   * headlines are usually already inside the width budget.
+   */
+  searchTitle?: { en?: string; zh?: string };
   /** Bilingual 1–2-sentence summary. Used on cards and as <meta description>. */
   summary: Localized;
   /** Tag strings (lowercase kebab-case). Non-empty. */
