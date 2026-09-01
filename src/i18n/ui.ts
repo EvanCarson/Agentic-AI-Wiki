@@ -6,7 +6,7 @@ export interface UIStrings {
   nav: { fieldGuide: string; concepts: string; deepDives: string; playbooks: string; operations: string; blog: string; changelog: string; about: string;
          menu: string; menuOpen: string; menuClose: string };
   switcher: { en: string; zh: string; aria: string };
-  footer: { sections: string; project: string; language: string; privacy: string; nav: string };
+  footer: { sections: string; project: string; language: string; privacy: string; nav: string; follow: string };
   search: {
     open: string;        // accessible label / tooltip for the trigger button
     label: string;       // visible short label next to the icon
@@ -70,6 +70,7 @@ export interface UIStrings {
            missionH: string; missionHtml: string;
            coveredH: string; coveredHtml: string;
            maintainerH: string; maintainerHtml: string;
+           authorshipH: string; authorshipHtml: string;
            contactH: string; contactHtml: string };
   changelog: { kicker: string; metaTitle: string; metaDesc: string; h1: string; intro: string; jumpTo: string };
   og: { tagline: string };
@@ -84,7 +85,7 @@ export const ui: Record<Locale, UIStrings> = {
     nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', blog: 'AI Blog', changelog: 'Changelog', about: 'About',
            menu: 'Menu', menuOpen: 'Open navigation menu', menuClose: 'Close navigation menu' },
     switcher: { en: 'EN', zh: '中文', aria: 'Language' },
-    footer: { sections: 'Sections', project: 'Project', language: 'Language', privacy: 'Privacy', nav: 'Site' },
+    footer: { sections: 'Sections', project: 'Project', language: 'Language', privacy: 'Privacy', nav: 'Site', follow: 'Follow' },
     search: {
       open: 'Search the wiki',
       label: 'Search',
@@ -198,6 +199,8 @@ export const ui: Record<Locale, UIStrings> = {
       coveredHtml: 'The <a href="%FG%" style="color:var(--accent);">Field Guide</a> is a hands-on, end-to-end engineering course for building and shipping agents. <a href="%CONCEPTS%" style="color:var(--accent);">Concepts</a> is a plain-language encyclopedia for newcomers and intermediates. <a href="%DEEP%" style="color:var(--accent);">Deep-Dives</a> are advanced essays on architectures, protocols, memory, and agentic security. Everything is bilingual (English / 中文).',
       maintainerH: 'Who maintains it',
       maintainerHtml: 'Built and maintained by <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">Chen Qian</a> as an independent, open project.',
+      authorshipH: 'How it is written',
+      authorshipHtml: 'A scheduled AI agent drafts part of this site. Each day it reads the section manifests and the changelog to find the gaps, researches the topic against primary sources, writes both language versions, runs the site’s verification gates, and opens a pull request that merges on its own. Its prompt is version-controlled in the <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/tree/main/docs/routines" rel="noopener" style="color:var(--accent);">repository</a> rather than living in a console, and every batch it ships is itemised in the <a href="%CHANGELOG%" style="color:var(--accent);">changelog</a>. The standard it is held to, the review of what lands, and the corrections remain the maintainer’s — please report anything that reads wrong.',
       contactH: 'Contributing & contact',
       contactHtml: 'Corrections, suggestions, and new entries are welcome — open an issue or pull request on <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a>, or reach out via <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a>.' },
     changelog: { jumpTo: 'Jump to', kicker: 'Changelog', metaTitle: 'Changelog — Agentic AI Wiki',
@@ -218,7 +221,7 @@ export const ui: Record<Locale, UIStrings> = {
     nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', blog: 'AI 博客', changelog: '更新日志', about: '关于',
            menu: '菜单', menuOpen: '打开导航菜单', menuClose: '关闭导航菜单' },
     switcher: { en: 'EN', zh: '中文', aria: '语言' },
-    footer: { sections: '内容板块', project: '关于本站', language: '语言', privacy: '隐私政策', nav: '站点导航' },
+    footer: { sections: '内容板块', project: '关于本站', language: '语言', privacy: '隐私政策', nav: '站点导航', follow: '订阅与关注' },
     search: {
       open: '搜索本维基',
       label: '搜索',
@@ -332,6 +335,8 @@ export const ui: Record<Locale, UIStrings> = {
       coveredHtml: '<a href="%FG%" style="color:var(--accent);">实战指南</a> 是端到端、动手构建并交付智能体的工程课程。<a href="%CONCEPTS%" style="color:var(--accent);">概念</a> 是面向新手与进阶者的白话百科。<a href="%DEEP%" style="color:var(--accent);">深度剖析</a> 是关于架构、协议、记忆与智能体安全的进阶文章。全部内容均为双语（English / 中文）。',
       maintainerH: '维护者',
       maintainerHtml: '由 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">Chen Qian</a> 独立构建与维护的开放项目。',
+      authorshipH: '本站如何写成',
+      authorshipHtml: '本站有一部分内容由一个定时运行的 AI 智能体起草。它每天读取各板块的内容清单与更新日志，找出其中的缺口，对照一手资料做研究，写出中英两个版本，跑完本站的校验关卡，然后开出一个会自行合并的 pull request。它的提示词与代码一起版本化保存在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/tree/main/docs/routines" rel="noopener" style="color:var(--accent);">仓库</a> 里，而不是躺在某个后台控制台中；它每一批交付的内容，都逐条记录在 <a href="%CHANGELOG%" style="color:var(--accent);">更新日志</a> 上。它所遵循的标准、对落地内容的复核，以及纠错的责任，仍然在维护者身上 — 读到不对劲的地方，欢迎告知。',
       contactH: '贡献与联系',
       contactHtml: '欢迎纠错、建议与新增词条 — 在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a> 提交 issue 或 pull request，或通过 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a> 联系。' },
     changelog: { jumpTo: '快速跳转', kicker: '更新日志', metaTitle: '更新日志 — Agentic AI 维基',
