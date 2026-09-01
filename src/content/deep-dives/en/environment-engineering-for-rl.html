@@ -1,0 +1,108 @@
+<section class="phase">
+  <div class="phase-num">T11</div>
+  <div class="week">Deep Dive · Training Agentic Models</div>
+  <h2>In agentic RL the GPU is not the bottleneck — the environment is, and it is also the only part of the run you get to keep.</h2>
+  <p class="goal">Teams budget an RL run in GPU-hours and then watch the accelerators sit idle while a container boots, a test suite runs, or one straggler trajectory holds a synchronous batch hostage. Rollout time, not gradient time, sets the bill — and the artifact that produces those rollouts, the environment, is the one thing in the run that survives the model you trained it on. Build the environment first, measure its p99 before you rent a GPU, and treat its verifier as the reward function it actually is.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>An environment is four contracts, and only one of them is code you enjoy writing.</h3>
+
+    <p>"Environment" arrived from classic RL carrying Gym's connotation of a simulator you step in a loop. For an LLM agent it is something less glamorous and more specific: four contracts that together decide whether a training run means anything.</p>
+
+    <ul>
+      <li><strong>A task distribution.</strong> Not one task — a sampleable population of them, with enough spread that a policy cannot memorise its way through, and a held-out split you never train on. This is the part that looks like data work, takes the longest, and is skipped most often.</li>
+      <li><strong>An action and observation surface.</strong> What the agent may call and what comes back. In 2026 this converged on tools rather than a discrete action space, and increasingly on <a class="xref" href="/concepts/what-is-mcp">MCP</a> as the wire format — HUD's environment SDK is essentially "wrap the real software as an MCP server and attach a reward," which means the interface your agent trains against can be the interface it ships against.</li>
+      <li><strong>A verifier.</strong> A function from a finished trajectory to a scalar. This is the reward. Step 3 is about why that sentence is the whole essay.</li>
+      <li><strong>Reset and isolation semantics.</strong> How a fresh episode is created, what state it inherits, and what it can reach. A task you cannot reset deterministically is a demo, not an environment.</li>
+    </ul>
+
+    <p>The packaging convention that emerged around Prime Intellect's <code class="inline">verifiers</code> library is worth copying even if you never touch their stack: an environment is a Python module with its own <code class="inline">pyproject.toml</code>, distributed as a wheel, exposing a dataset, a rollout function and a rubric. That makes an environment installable, versionable and pinnable — three properties your eval set needs anyway, and three properties a folder of scripts in your training repo will never have.</p>
+
+    <div class="callout">
+      <p>The library churn is real. <code class="inline">verifiers</code> moved from a <code class="inline">v0</code> API to a rewritten <code class="inline">v1</code> namespace during 2026, and community environments written against the old abstractions did not all follow. Pin the framework version alongside the environment version, or a re-run six months from now will not reproduce the number you are about to publish.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The accelerators are idle, and that is the invoice.</h3>
+
+    <p>Run the arithmetic on a single agentic rollout. The policy emits a few hundred tokens, then the environment executes something — a shell command, a browser action, a database query, a test suite — and the model waits. Then a few hundred more tokens. On a multi-turn coding or computer-use task, wall-clock is dominated by the environment, and the GPU holding the policy has nothing to do for most of it.</p>
+
+    <p>Synchronous on-policy RL makes this much worse than it sounds. A batch of rollouts is dispatched, gradients wait for all of them, and rollout durations in an agentic environment are wildly heavy-tailed: one trajectory that opens a slow page or triggers a two-minute test run stalls the entire step. The public work on this problem through 2026 — ROSE's cooperative elasticity, TideRL's readiness-aware scheduling, Google's Tunix rollout orchestrator, and the async designs surveyed across the open-source RL libraries — converges on the same architectural answer: disaggregate inference from training onto separate pools, put a rollout buffer between them, and let generation continue for other trajectories while one waits on its environment.</p>
+
+    <ul>
+      <li><strong>Measure rollout latency as a distribution, never a mean.</strong> The number that sets your GPU idle time is p99, because a synchronous step waits for the slowest member of the batch. A p50 of eight seconds with a p99 of four minutes is a straggler problem, not a fast environment.</li>
+      <li><strong>Give every rollout a wall-clock budget, and score the timeout.</strong> The tempting fix — drop trajectories that exceed the budget — silently biases the gradient toward short, easy episodes, which is exactly the behaviour you did not want to reinforce. Return a defined low reward instead, so "took too long" is a thing the policy learns about rather than a sample that vanishes.</li>
+      <li><strong>Concurrency is an environment property.</strong> How many episodes can you run at once before your fixture database, your container host or your rate-limited third-party API becomes the constraint? That ceiling, not your GPU count, is your throughput.</li>
+      <li><strong>Cache the deterministic prefix.</strong> Episodes in one task family share a system prompt and a tool catalogue; the same <a class="xref" href="/concepts/prompt-caching">prefix-caching</a> discipline that pays in production pays in rollouts, where the prefix is re-sent thousands of times per epoch.</li>
+    </ul>
+
+    <p>The practical consequence for planning: a team that buys GPU time before profiling its environment usually discovers that it bought idle time. Profile the environment on a hosted API model first — you can generate thousands of rollouts against a commercial endpoint for less than a day of the cluster you were about to reserve, and the latency distribution you get is the one that will govern the real run.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Your verifier is your reward function, so optimise it for precision.</h3>
+
+    <p>Everything <a class="xref" href="/deep-dives/training-agentic-models/reward-design-and-hacking">reward design and hacking</a> says about proxies applies with a sharper edge here, because in an agentic environment the proxy is a piece of software you wrote in an afternoon. A verifier that accepts a wrong trajectory does not cost you a little accuracy. It teaches the policy that the wrong trajectory is the goal, and gradient descent is extremely good at finding whatever your check forgot to look at.</p>
+
+    <ul>
+      <li><strong>False positives are catastrophic; false negatives are merely expensive.</strong> A verifier that misses a genuinely good trajectory wastes a rollout. A verifier that passes a bad one installs a shortcut. When the two trade off — and they always do — buy precision.</li>
+      <li><strong>Grade the artifact, not the transcript.</strong> Check that the tests pass, the file exists, the row was written, the invariant holds. Anything that scores what the model <em>said</em> it did is scoring a story, for the reasons <a class="xref" href="/concepts/chain-of-thought-faithfulness">chain-of-thought faithfulness</a> lays out.</li>
+      <li><strong>Assume the environment itself is exploitable.</strong> Agents find the network access you forgot to close, the fixture file the grader also reads, the retry that resets a counter. Read your top-scoring trajectories by hand — not the mean, the maximum — because a reward-hacking policy hides at the top of the distribution, not in the average.</li>
+      <li><strong>Label a calibration set before you trust the number.</strong> Fifty trajectories, hand-scored, compared against what your verifier said. If agreement is below the high eighties you are training on noise; the machinery for measuring that lives in <a class="xref" href="/deep-dives/evaluating-agents/judge-calibration-and-meta-evaluation">judge calibration</a>.</li>
+    </ul>
+
+    <p>When a task has no programmatic check — writing, research, open-ended tool use — the 2026 fallback is a relative judge rather than an absolute one. OpenPipe's RULER is the clearest expression of it: score a group of trajectories by ranking them against each other rather than against a rubric, which works because GRPO normalises within the group and only the ordering survives. It removes the hand-written reward and it moves the entire question of correctness into a model you now have to calibrate. That is a real trade, not a free lunch; make it deliberately.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Non-determinism in the environment shows up as variance in the advantage.</h3>
+
+    <p>Group-relative methods — GRPO and its descendants, the <a class="xref" href="/deep-dives/training-agentic-models/rlvr-and-grpo-for-agents">canonical 2026 recipe</a> — estimate an advantage by comparing trajectories sampled from the same starting state. If that starting state is not actually the same, you are attributing environment noise to policy differences, and the gradient learns whatever the noise correlates with.</p>
+
+    <ul>
+      <li><strong>Pin the seed and the fixture.</strong> The database snapshot, the file tree, the clock, the random seed, the model of every auxiliary component. Two rollouts of the same task should differ only in the policy's sampling.</li>
+      <li><strong>Pin the container digest, not the tag.</strong> <code class="inline">latest</code> is a moving reward function. A dependency upgrade inside the image can change which trajectories pass, which is a silent reward change mid-run.</li>
+      <li><strong>Close the network unless the network is the task.</strong> A live third-party API makes your reward a function of somebody else's availability and rate limits, and it is the most common source of "the run got worse on Tuesday". Record and replay it if the task genuinely needs it.</li>
+      <li><strong>Version the environment and carry the version with every score.</strong> An environment is a benchmark, and a benchmark result without a version is not comparable to anything — the point <a class="xref" href="/deep-dives/evaluating-agents/benchmark-contamination">benchmark contamination</a> makes about the (model, benchmark, date) triple applies unchanged.</li>
+    </ul>
+
+    <p>There is a residual you cannot remove: inference itself is not bit-reproducible under batching, which is the subject of <a class="xref" href="/concepts/reproducibility-and-determinism">reproducibility and nondeterminism</a>. That is fine. The goal is not a deterministic run; it is that every source of variance you <em>can</em> control is controlled, so the variance you measure is the policy's.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The environment you build is your eval, which is the reason to build it even if you never train.</h3>
+
+    <p>A task distribution with a programmatic verifier and deterministic reset is exactly what an <a class="xref" href="/operations/evaluation-and-observability/eval-driven-agent-development">eval harness</a> needs. The same artifact scores a prompt change, gates a model upgrade in CI, and — if you later want it to — produces a reward signal. This is the strongest practical argument for environment work, and it inverts the usual sequencing: you do not build an environment because you decided to do RL. You build one because you needed to know whether your agent works, and RL becomes available as a side effect.</p>
+
+    <p>It also gives a clean readiness test. If you cannot state, today, what fraction of your top thirty real tasks your agent completes, you do not have a verifier, which means you do not have a reward, which means an RL project would be training against a number nobody has validated. Fix the measurement first; the ordering is not negotiable, and the same discipline is what <a class="xref" href="/deep-dives/training-agentic-models/prompt-finetune-or-rl">prompt, fine-tune or RL</a> uses to decide whether you needed RL at all.</p>
+
+    <p>On reuse: Prime Intellect's Environments Hub carries thousands of community environments, and pulling one is genuinely faster than writing one. Two things come with it. The verifier is someone else's judgement about what counts as correct, which you inherit unexamined unless you read it. And a public environment is a plausible pre-training contaminant — if a frontier model already scores well on it, you cannot tell capability from exposure. Community environments are excellent for the infrastructure shakedown and for tasks nobody's business depends on; the environment that represents your actual product is one you write.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to build first.</h3>
+
+    <p>Pick your single highest-volume task class — the one where a two-point reliability gain is worth real money — and build one environment for it, in this order, stopping at any step that fails.</p>
+
+    <ul>
+      <li><strong>Thirty real tasks, held out from everything.</strong> Drawn from production traffic, not invented. This is the task distribution and the eval set at the same time.</li>
+      <li><strong>A verifier, and its calibration.</strong> Hand-score all thirty; compare. Report the false-positive rate as the headline number, because that is the one that will hurt you.</li>
+      <li><strong>Deterministic reset, pinned image, closed network.</strong> Run the same task twice with the same seed and diff the observations. Any difference is a bug you will otherwise attribute to the policy.</li>
+      <li><strong>A latency profile under concurrency.</strong> p50, p95, p99 of episode wall-clock at the parallelism you would actually train at, plus the concurrency ceiling where your fixtures start contending.</li>
+      <li><strong>Only then, a training run.</strong> And spend the first one on the smallest open-weight model that can do the task at all, because you are debugging the environment, not the policy.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Two numbers, on a wall, before any GPU is reserved: your verifier's false-positive rate on a hand-labelled set, and your environment's p99 episode duration at target concurrency. The first bounds how much of your reward is real; the second bounds how much of your cluster will be doing anything. Every team that skipped these discovered them anyway — after the invoice.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/deep-dives/training-agentic-models/rl-for-tool-use">RL for tool use</a> for the credit-assignment problem the environment hands you, <a class="xref" href="/deep-dives/evaluating-agents/eval-variance-and-statistical-power">eval variance and statistical power</a> for how many tasks and runs a difference needs before it exists, and <a class="xref" href="/operations/economics-roi/cost-of-evaluation">the cost of evaluation</a> for what running all this repeatedly does to a budget.</p>
+  </div>
+</section>
