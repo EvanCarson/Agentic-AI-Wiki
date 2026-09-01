@@ -76,6 +76,8 @@ export interface UIStrings {
   og: { tagline: string };
   theme: { ariaLight: string; ariaDark: string; ariaAuto: string };
   seriesTitle: string;
+  /** Heading for the module listing AI Blog posts that cite this page. */
+  relatedPosts: string;
 }
 
 export const ui: Record<Locale, UIStrings> = {
@@ -214,6 +216,7 @@ export const ui: Record<Locale, UIStrings> = {
       ariaAuto:  'Theme: Auto. Click to cycle.',
     },
     seriesTitle: 'The Agentic AI Field Guide',
+    relatedPosts: 'Discussed in the AI Blog',
   },
   zh: {
     brand: 'Agentic AI 维基',
@@ -350,5 +353,6 @@ export const ui: Record<Locale, UIStrings> = {
       ariaAuto:  '主题：跟随系统。点击切换。',
     },
     seriesTitle: 'Agentic AI 实战指南',
+    relatedPosts: 'AI 博客中的相关讨论',
   },
 };
