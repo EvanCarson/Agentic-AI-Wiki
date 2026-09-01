@@ -74,5 +74,15 @@ export function buildFeed(locale: Locale, site: URL): string {
   ].join('\n');
 }
 
-/** Response headers shared by both feed routes. */
+/**
+ * Response headers shared by both feed routes.
+ *
+ * These apply under `astro dev` only. In a static build the endpoint's Response
+ * is written to `dist/rss.xml` and its headers are discarded, so production
+ * served whatever the host maps `.xml` to — Vercel's default is
+ * `application/xml`. Readers accept that, but the charset is then implicit,
+ * which is the wrong thing to leave to chance on a feed that is half Chinese.
+ * The production value is pinned by the matching `Content-Type` rule in
+ * `vercel.json`; keep the two in step.
+ */
 export const FEED_HEADERS = { 'Content-Type': 'application/rss+xml; charset=utf-8' };
