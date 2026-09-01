@@ -82,7 +82,10 @@ export function buildFeed(locale: Locale, site: URL): string {
  * served whatever the host maps `.xml` to — Vercel's default is
  * `application/xml`. Readers accept that, but the charset is then implicit,
  * which is the wrong thing to leave to chance on a feed that is half Chinese.
- * The production value is pinned by the matching `Content-Type` rule in
- * `vercel.json`; keep the two in step.
+ * The production value is pinned by the matching `Content-Type` rules in
+ * `vercel.json` — one literal `source` per feed. Do not fold them into
+ * `/(zh/)?rss.xml`: Vercel matched that against `/zh/rss.xml` but not against
+ * `/rss.xml`, so the English feed silently kept the default type while the
+ * Chinese one changed. Adding a third feed means adding a third rule.
  */
 export const FEED_HEADERS = { 'Content-Type': 'application/rss+xml; charset=utf-8' };
