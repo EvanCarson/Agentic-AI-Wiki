@@ -114,6 +114,7 @@ Fix whatever fails. **Do not merge red, and never weaken, skip or delete a test 
 ## 7. Ship
 
 - Branch `content/batch-<YYYY-MM-DD>`, ONE pull request, squash-merge to `main`. `main` is protected — a PR is required and direct pushes are rejected.
+- You do not need to do anything to get the new pages indexed: on merge, CI announces every changed URL to the IndexNow engines (Bing, Yandex) automatically.
 - After opening the pull request, wait for the required `gates` check to finish: `gh pr checks <number> --watch --fail-fast` (about 6–8 minutes). Merge only once it is green — `main` requires it, and `gh pr merge` is refused while it is pending or red. If it is red, fix the cause on the branch and push again; never merge around it.
 - Merging auto-deploys to production. Afterwards confirm every new page returns HTTP 200 on https://menuagentic.com in BOTH locales, using the URL shapes in §1: blog posts at `/blogs/<slug>/`, Concepts at `/concepts/<slug>/`, and Deep-Dives / Playbooks / Operations at `/<section>/<group-key>/<slug>/` — each also under `/zh/`.
 - If `gh` is not authenticated and you cannot merge, push the branch, open the PR if possible, and clearly report that it awaits a manual merge. Do not force anything.
