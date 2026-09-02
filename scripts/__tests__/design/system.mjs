@@ -111,6 +111,18 @@ after(async () => {
 });
 
 /**
+ * Every navigation goes through here. `load` does not wait for lazily-loaded
+ * font faces, and the guard measures rendered text — prose measure, contrast,
+ * label geometry — so on a cold runner a measurement could see the fallback
+ * face and produce an intermittent red that nobody can reproduce locally.
+ * design-guard-navigation.test.mjs fails if a page.goto() appears anywhere else.
+ */
+async function goto(page, path) {
+  await page.goto(server.url + path, { waitUntil: 'load' });
+  await page.evaluate(() => document.fonts.ready);
+}
+
+/**
  * Collect every element painted with the emphasis surface (--surface-inverse),
  * along with what it sits on and what edge it draws.
  *
@@ -241,7 +253,7 @@ describe('design system', () => {
         const page = await ctx.newPage();
         const failures = [];
         for (const path of PAGES) {
-          await page.goto(server.url + path, { waitUntil: 'load' });
+          await goto(page, path);
           for (const el of await auditPage(page)) {
             const ratio = contrastRatio(parseColor(el.color).slice(0, 3), composite(el.layers));
             const need = requiredRatio(el.px, el.weight);
@@ -262,7 +274,7 @@ describe('design system', () => {
     const page = await ctx.newPage();
     const bad = [];
     for (const path of PAGES) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const over = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
       if (over) bad.push(path);
     }
@@ -275,7 +287,7 @@ describe('design system', () => {
     const page = await ctx.newPage();
     const bad = [];
     for (const path of PAGES) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
       if (over) bad.push(path);
     }
@@ -292,7 +304,7 @@ describe('design system', () => {
     const page = await ctx.newPage();
     const bad = [];
     for (const path of PAGES) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
       if (over) bad.push(path);
     }
@@ -308,7 +320,7 @@ describe('design system', () => {
     const page = await ctx.newPage();
     const bad = [];
     for (const path of PAGES) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
       if (over) bad.push(path);
     }
@@ -321,7 +333,7 @@ describe('design system', () => {
     const page = await ctx.newPage();
     const bad = [];
     for (const path of PAGES) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
       if (over) bad.push(path);
     }
@@ -332,7 +344,7 @@ describe('design system', () => {
   test('mobile header is a single row', async () => {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
     const page = await ctx.newPage();
-    await page.goto(server.url + '/concepts/prompt-caching/', { waitUntil: 'load' });
+    await goto(page, '/concepts/prompt-caching/');
     const h = await page.evaluate(() => {
       const el = document.querySelector('.site-header');
       // Count rows only among links that are IN the header's flow. The
@@ -364,7 +376,7 @@ describe('design system', () => {
   test('tap targets are at least 44px on mobile', async () => {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
     const page = await ctx.newPage();
-    await page.goto(server.url + '/concepts/prompt-caching/', { waitUntil: 'load' });
+    await goto(page, '/concepts/prompt-caching/');
     const small = await page.evaluate(() =>
       [...document.querySelectorAll('.site-header a, .site-header button')]
         .map((el) => {
@@ -388,7 +400,7 @@ describe('design system', () => {
     // which is exactly why this needs its own assertion.
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
     const page = await ctx.newPage();
-    await page.goto(server.url + '/concepts/prompt-caching/', { waitUntil: 'load' });
+    await goto(page, '/concepts/prompt-caching/');
     const squeezed = await page.evaluate(() => {
       const measure = document.createElement('canvas').getContext('2d');
       return [...document.querySelectorAll('.site-header .brand, .site-header nav a, .lang-switch a')]
@@ -500,7 +512,7 @@ describe('design system', () => {
       const bad = [];
       let total = 0;
       for (const path of MEASURE_PAGES) {
-        await page.goto(server.url + path, { waitUntil: 'load' });
+        await goto(page, path);
         const { max, worst, seen } = await page.evaluate(measureChars);
         total += seen;
         // A page with no multi-line prose at this width is not a failure —
@@ -528,7 +540,7 @@ describe('design system', () => {
       for (const w of MEASURE_WIDTHS) {
         const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
         const page = await ctx.newPage();
-        await page.goto(server.url + path, { waitUntil: 'load' });
+        await goto(page, path);
         const { seen } = await page.evaluate(measureChars);
         await ctx.close();
         if (seen > 0) { covered = true; break; }
@@ -551,7 +563,7 @@ describe('design system', () => {
       '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
       '/zh/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
     ]) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const got = await page.evaluate(() => {
         const el = [...document.querySelectorAll('.blog-article p')].find((x) => x.innerText.trim().length > 250);
         if (!el) return null;
@@ -592,7 +604,7 @@ describe('design system', () => {
     const page = await ctx.newPage();
     const found = new Map(); // class name -> [{ color, bg }]
     for (const path of SYNTAX_PAGES) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const rows = await page.evaluate((classes) => {
         const out = [];
         document.querySelectorAll('pre').forEach((pre) => {
@@ -714,7 +726,7 @@ describe('design system', () => {
       const failures = [];
       let seen = 0;
       for (const path of PAGES) {
-        await page.goto(server.url + path, { waitUntil: 'load' });
+        await goto(page, path);
         for (const row of await collectEmphasisSurfaces(page)) {
           seen++;
           const sep = separation(row);
@@ -746,7 +758,7 @@ describe('design system', () => {
       test(`every primary nav link is reachable @ ${w}px ${path.startsWith('/zh') ? 'zh' : 'en'}`, async () => {
         const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
         const page = await ctx.newPage();
-        await page.goto(server.url + path, { waitUntil: 'load' });
+        await goto(page, path);
 
         const collapsed = await page.evaluate(() => {
           const b = document.getElementById('nav-toggle');
@@ -808,7 +820,7 @@ describe('design system', () => {
       const failures = [];
       let seen = 0;
       for (const path of PAGES) {
-        await page.goto(server.url + path, { waitUntil: 'load' });
+        await goto(page, path);
         const rows = await page.evaluate(() => {
           const out = [];
           document.querySelectorAll('body *').forEach((el) => {
@@ -859,7 +871,7 @@ describe('design system', () => {
     const failures = [];
     let seen = 0;
     for (const path of ZH_PAGES) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const rows = await page.evaluate((cjkSource) => {
         const cjk = new RegExp(cjkSource);
         const out = [];
@@ -903,7 +915,7 @@ describe('design system', () => {
     const failures = [];
     let seen = 0;
     for (const path of ZH_PAGES) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const rows = await page.evaluate((cjkSource) => {
         const cjk = new RegExp(cjkSource);
         const out = [];
@@ -973,7 +985,7 @@ describe('design system', () => {
       const page = await ctx.newPage();
       const bad = [];
       for (const path of ['/field-guide/llm-mental-model/', '/concepts/prompt-caching/', '/zh/concepts/prompt-caching/']) {
-        await page.goto(server.url + path, { waitUntil: 'load' });
+        await goto(page, path);
         const pct = await page.evaluate(() => {
           const el = document.querySelector('.chapter-shell');
           if (!el) return null;
@@ -1000,7 +1012,7 @@ describe('design system', () => {
     ]) {
       const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
       const page = await ctx.newPage();
-      await page.goto(server.url + '/field-guide/llm-mental-model/', { waitUntil: 'load' });
+      await goto(page, '/field-guide/llm-mental-model/');
       const got = await page.evaluate(() => {
         const railed = (sel) => {
           const el = document.querySelector(sel);
@@ -1056,7 +1068,7 @@ describe('design system', () => {
     ]) {
       const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
       const page = await ctx.newPage();
-      await page.goto(server.url + '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/', { waitUntil: 'load' });
+      await goto(page, '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/');
       const got = await page.evaluate(() => {
         const el = document.querySelector('.blog-toc');
         if (!el) return { present: false };
@@ -1133,7 +1145,7 @@ describe('design system', () => {
       const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
       const page = await ctx.newPage();
       for (const path of PROSE_PAGES) {
-        await page.goto(server.url + path, { waitUntil: 'load' });
+        await goto(page, path);
         const got = await page.evaluate((sels) => {
           // No length threshold: computed font-size does not depend on text
           // length, and a floor tuned for the measure test would never match a
@@ -1189,7 +1201,7 @@ describe('design system', () => {
       '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
       '/zh/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
     ]) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const got = await page.evaluate(() => {
         const shell = document.querySelector('.chapter-shell');
         const main = document.querySelector('.chapter-main');
@@ -1255,7 +1267,7 @@ describe('design system', () => {
       for (const [w, want] of expectations) {
         const ctx = await browser.newContext({ viewport: { width: w, height: 900 } });
         const page = await ctx.newPage();
-        await page.goto(server.url + path, { waitUntil: 'load' });
+        await goto(page, path);
         const cols = await page.evaluate((s) => {
           const el = document.querySelector(s);
           if (!el) return null;
@@ -1276,7 +1288,7 @@ describe('design system', () => {
     const page = await ctx.newPage();
     const bad = [];
     for (const path of ['/', '/concepts/', '/blogs/', '/changelog/', '/zh/concepts/']) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       const pct = await page.evaluate(() => {
         const els = [...document.querySelectorAll('.wrap')].filter((e) => !e.classList.contains('wrap--prose'));
         if (!els.length) return null;
@@ -1399,7 +1411,7 @@ describe('design system', () => {
     let seen = 0;
     let rectsSeen = 0;
     for (const path of BLOG_PAGES) {
-      await page.goto(server.url + path, { waitUntil: 'load' });
+      await goto(page, path);
       // One evaluate call per post (one page load, per the plan) walks every
       // inlined SVG in the article and every <text> inside each — collisions
       // are only meaningful WITHIN a single SVG, so texts are grouped by svg.
