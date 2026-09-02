@@ -313,3 +313,16 @@ gate rejected were genuinely clipped for roughly seven readers in ten, and had b
 - **Expect layers.** Fixing the collision revealed the viewBox escapes; the memory of this
   repository already records that the suite's assertions run in sequence and one failure hides the
   next. Budget for more than one round.
+
+### 9.2 The gate caught a live production defect on its first day
+
+While this branch was in review the daily routine merged PR #187 (2026-09-02 08:47 UTC) and
+deployed it. Its `arch-what-the-licence-bought` diagram carried a closing caption running **41px
+past the right edge of its viewBox**, clipped for every reader, and the routine's own report said
+every gate passed — because the two gates that measure geometry were the ones nothing enforced.
+
+CI on a `pull_request` tests the **merge result**, not the branch, so this branch's run picked
+the defect up from `main` within minutes of it landing and refused to go green. That is the
+whole design working before it was even required: the gap in §1 is not hypothetical, it was
+shipping defects the same week. The caption is fixed here (centred, so the platform width
+difference cannot reach an edge) because this branch cannot merge while the merge result is red.
