@@ -271,3 +271,10 @@ decisions:
   `gh pr checks <n> --watch --fail-fast` and merge only when green. Repository auto-merge
   (`allow_auto_merge`) was left disabled; enabling it is a repository-setting change outside
   this design.
+- **The first run found a Linux-only collision, and Linux is the platform that counts.** Locally
+  (macOS, Inter loaded, fonts awaited) two labels in the pgvector architecture diagram sat 4.9px
+  apart; on `ubuntu-latest` the same text rendered ~2.6% wider and they overlapped by 0.5px. The
+  label was 118px of text centred in a 100px box, so the diagram was the defect, not the guard:
+  the text was shortened to fit its box with margin. Rule for the future: the CI runner is the
+  enforcement platform, so a collision that reproduces only there is real and is fixed in the
+  diagram, not tolerated in the test. Expect text to measure a few percent wider on Linux.
