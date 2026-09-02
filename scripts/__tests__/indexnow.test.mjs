@@ -94,3 +94,15 @@ test('the key file is present, and its contents are exactly the key the script s
   const file = readFileSync(new URL(`../../public/${key}.txt`, import.meta.url), 'utf8');
   assert.equal(file.trim(), key, 'the hosted file must contain the key and nothing else');
 });
+
+test('a pending key verification is handled as a wait, not as a failure', () => {
+  const script = readFileSync(new URL('../indexnow-submit.mjs', import.meta.url), 'utf8');
+  // The engines fetch the key file on their own schedule, so the first push
+  // after adopting IndexNow is answered 403 SiteVerificationNotCompleted. That
+  // must not fail the run — it is the expected state, not a defect.
+  const branch = /if \(res\.status === 403 && detail\.includes\('SiteVerificationNotCompleted'\)\) \{[\s\S]*?\n\}/.exec(script)?.[0];
+  assert.ok(branch, 'the pending-verification case is handled explicitly');
+  assert.ok(branch.includes('process.exit(0)'), 'and it exits successfully');
+  // Any other 403 still fails: a key file that is missing or wrong is a real defect.
+  assert.match(script, /console\.error\(`indexnow: \$\{res\.status\}[\s\S]*?\nprocess\.exit\(1\);/);
+});

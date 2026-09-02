@@ -90,8 +90,9 @@ try {
 }
 
 // 200 accepted, 202 accepted pending key validation. 429 is rate limiting —
-// theirs to apply, ours to shrug at. 400/403/422 mean this script or the key
-// file is wrong, which is a defect worth failing on.
+// theirs to apply, ours to shrug at. 400/422, and a 403 that is not the
+// pending-verification case below, mean this script or the key file is wrong,
+// which is a defect worth failing on.
 if (res.status === 200 || res.status === 202) {
   console.log(`indexnow: ${res.status} — ${submit.length} URLs accepted`);
   process.exit(0);
@@ -100,6 +101,19 @@ if (res.status === 429) {
   console.log('indexnow: 429 rate limited; nothing to fix here');
   process.exit(0);
 }
-console.error(`indexnow: ${res.status} ${res.statusText} — ${(await res.text()).slice(0, 300)}`);
-console.error('400 invalid format · 403 key not found at keyLocation · 422 URL/host mismatch');
+const detail = (await res.text()).slice(0, 300);
+
+// Key validation is asynchronous: the engine fetches the key file on its own
+// schedule, and until it has, a correct submission is answered
+// "SiteVerificationNotCompleted". That is a wait, not a defect — and it is what
+// the first push after adopting IndexNow, and any later key rotation, will hit.
+// Failing the run there reports a bug that does not exist.
+if (res.status === 403 && detail.includes('SiteVerificationNotCompleted')) {
+  console.log('indexnow: 403 SiteVerificationNotCompleted — the engines have not fetched the key file yet.');
+  console.log(`  Check it is reachable at https://${HOST}/${KEY}.txt; the next content push submits normally.`);
+  process.exit(0);
+}
+
+console.error(`indexnow: ${res.status} ${res.statusText} — ${detail}`);
+console.error('400 invalid format · 403 key not found or not yet fetched · 422 URL/host mismatch');
 process.exit(1);
