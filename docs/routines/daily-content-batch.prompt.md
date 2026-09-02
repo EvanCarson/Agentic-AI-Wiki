@@ -109,11 +109,12 @@ grep -o '"@type":"BlogPosting"' dist/blogs/<slug>/index.html   # must match
 grep -o '"@type":"FAQPage"'     dist/blogs/<slug>/index.html   # must match if the post has a FAQ
 ```
 
-Fix whatever fails. **Do not merge red, and never weaken, skip or delete a test to make it pass.** Note: `test:design` drives a real browser via Playwright; if the browser binary cannot be installed in this environment, say so explicitly in your report and continue with the other gates — that specific infrastructure failure is acceptable for a content-only change, but a genuine assertion failure is not.
+Fix whatever fails. **Do not merge red, and never weaken, skip or delete a test to make it pass.** Note: `test:design` drives a real browser via Playwright. If the browser binary cannot be installed in this environment, say so explicitly in your report and continue with the other gates: CI runs `npm test` and `npm run test:design` on every pull request as the required `gates` check (`.github/workflows/ci.yml`), so the guard still runs before anything merges. A genuine assertion failure — locally or in CI — is not acceptable; fix it on the branch.
 
 ## 7. Ship
 
 - Branch `content/batch-<YYYY-MM-DD>`, ONE pull request, squash-merge to `main`. `main` is protected — a PR is required and direct pushes are rejected.
+- After opening the pull request, wait for the required `gates` check to finish: `gh pr checks <number> --watch --fail-fast` (about 6–8 minutes). Merge only once it is green — `main` requires it, and `gh pr merge` is refused while it is pending or red. If it is red, fix the cause on the branch and push again; never merge around it.
 - Merging auto-deploys to production. Afterwards confirm every new page returns HTTP 200 on https://menuagentic.com in BOTH locales, using the URL shapes in §1: blog posts at `/blogs/<slug>/`, Concepts at `/concepts/<slug>/`, and Deep-Dives / Playbooks / Operations at `/<section>/<group-key>/<slug>/` — each also under `/zh/`.
 - If `gh` is not authenticated and you cannot merge, push the branch, open the PR if possible, and clearly report that it awaits a manual merge. Do not force anything.
 

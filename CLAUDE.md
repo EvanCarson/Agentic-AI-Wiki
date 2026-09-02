@@ -110,6 +110,10 @@ npm run verify    # bilingual completeness / no orphans
 npm test          # extraction unit tests
 ```
 
+CI (`.github/workflows/ci.yml`) runs `npm test` and `npm run test:design` on every
+pull request as the required `gates` status check. `main` refuses a merge until it is
+green, so after opening a PR wait with `gh pr checks <n> --watch` before merging.
+
 ## Workflow
 
 - Work on a feature branch in an isolated git worktree under `.worktrees/`
