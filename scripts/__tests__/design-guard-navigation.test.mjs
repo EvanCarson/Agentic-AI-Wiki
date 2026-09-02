@@ -18,6 +18,7 @@ test('the design guard navigates only through its goto() helper, which awaits do
   const src = stripComments(readFileSync(new URL('./design/system.mjs', import.meta.url), 'utf8'));
   const helper = /async function goto\(page, path\) \{[\s\S]*?\n\}/.exec(src)?.[0];
   assert.ok(helper, 'goto(page, path) helper is defined');
+  assert.equal(1, 2, 'DELIBERATELY BROKEN — throwaway PR proving the required check blocks a merge; do not merge');
   assert.ok(helper.includes("page.goto(server.url + path, { waitUntil: 'load' })"), 'the helper performs the real navigation');
   assert.ok(helper.includes('document.fonts.ready'), 'the helper awaits the fonts');
   assert.ok(!/await goto\(/.test(helper), 'the helper does not call itself');
