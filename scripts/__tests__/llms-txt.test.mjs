@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildLlmsTxt } from '../../src/lib/llms-txt.ts';
+import { buildLlmsTxt, SECTION_NAMES } from '../../src/lib/llms-txt.ts';
 
 const L = (en, zh) => ({ en, zh });
 const SITE = new URL('https://menuagentic.com');
@@ -144,6 +144,7 @@ const built = existsSync(join(DIST, 'llms.txt'));
 
 test('every same-origin URL in the built files resolves to a built page, and both editions list the same number of links', { skip: !built && 'dist/llms.txt not built — run `npm run build` first' }, () => {
   const counts = [];
+  const paths = [];
   for (const file of ['llms.txt', 'zh/llms.txt']) {
     const text = readFileSync(join(DIST, file), 'utf8');
     const missing = urls(text)
@@ -155,6 +156,37 @@ test('every same-origin URL in the built files resolves to a built page, and bot
       });
     assert.deepEqual(missing, [], `${file}: unresolved paths`);
     counts.push(linkLines(text).length);
+    paths.push(urls(text).filter(u => u.startsWith(SITE.origin)).map(u => new URL(u).pathname.replace(/^\/zh(?=\/)/, '')));
   }
   assert.equal(counts[0], counts[1], 'en and zh list the same number of links');
+  assert.deepEqual(paths[0], paths[1], 'en and zh list the same pages in the same order, modulo /zh/');
+});
+
+test('a Concepts entry without a group lists under the bare section name, and a group with no entries renders no heading', () => {
+  const text = buildLlmsTxt('en', SITE, {
+    ...SOURCES,
+    concepts: [{ slug: 'loose', title: L('Loose', '散'), summary: L('No group.', '无组。') }],
+    deepDives: [{ key: 'empty', name: L('Empty', '空'), entries: [] }],
+  });
+  assert.ok(headings(text).includes('## Concepts'), 'bare section heading');
+  assert.ok(!text.includes('## Concepts: '), 'no dangling separator');
+  assert.ok(!headings(text).some(h => h.startsWith('## Deep-Dives')), 'empty group renders no heading');
+  assert.match(lines(text)[2], /\b6 pages\b/, 'the empty group adds nothing to the count');
+});
+
+// The section names are copied from the nav strings rather than imported —
+// ui.ts imports without file extensions and cannot load under node — so this
+// reads ui.ts as text and pins the copy to the original.
+test('the section names equal the nav strings in src/i18n/ui.ts', () => {
+  const ui = readFileSync(new URL('../../src/i18n/ui.ts', import.meta.url), 'utf8');
+  const navLines = ui.split('\n').filter(l => /^\s*nav: \{ fieldGuide: '/.test(l));
+  assert.equal(navLines.length, 2, 'one nav object per locale');
+  for (const line of navLines) {
+    const nav = Object.fromEntries([...line.matchAll(/(\w+): '([^']*)'/g)].map(m => [m[1], m[2]]));
+    const locale = nav.fieldGuide === 'Field Guide' ? 'en' : 'zh';
+    assert.deepEqual(SECTION_NAMES[locale], {
+      concepts: nav.concepts, deepDives: nav.deepDives, playbooks: nav.playbooks,
+      operations: nav.operations, fieldGuide: nav.fieldGuide, blog: nav.blog,
+    });
+  }
 });

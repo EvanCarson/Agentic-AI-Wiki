@@ -1,7 +1,7 @@
 # llms.txt: a generated map of the site for the tools that now send readers
 
 **Date:** 2026-09-01
-**Status:** implementing (standing autonomous-shipping directive; issue #184)
+**Status:** implemented, shipped 2026-09-01 (issue #184, PR #185)
 **Scope:** `src/lib/llms-txt.ts`, `src/pages/llms.txt.ts`, `src/pages/zh/llms.txt.ts`,
 `scripts/__tests__/llms-txt.test.mjs`, one sentence in `src/i18n/ui.ts` (About copy) and
 its placeholder in `src/components/pages/AboutView.astro`, one changelog entry.

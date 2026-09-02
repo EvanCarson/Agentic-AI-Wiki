@@ -115,6 +115,9 @@ const STRINGS: Record<Locale, Strings> = {
   },
 };
 
+/** The section names per locale — exported so a test can pin them to the nav strings. */
+export const SECTION_NAMES: Record<Locale, Strings['sections']> = { en: STRINGS.en.sections, zh: STRINGS.zh.sections };
+
 /** Lay the manifests out as sections, in reading order, for one locale. */
 export function catalogFor(locale: Locale, s: Sources): LlmsDoc {
   const t = STRINGS[locale];
@@ -190,7 +193,12 @@ function linkLine(l: LlmsLink, site: URL): string {
 export function renderLlmsTxt(doc: LlmsDoc, site: URL): string {
   const out: string[] = [`# ${doc.title}`, '', `> ${oneLine(doc.summary)}`, ''];
   for (const d of doc.details) out.push(oneLine(d), '');
-  for (const s of doc.sections) out.push(`## ${s.heading}`, '', ...s.links.map(l => linkLine(l, site)), '');
+  // A group with no entries gets no heading: an empty section is noise to a
+  // reader and would count as a cluster that does not exist.
+  for (const s of doc.sections) {
+    if (s.links.length === 0) continue;
+    out.push(`## ${s.heading}`, '', ...s.links.map(l => linkLine(l, site)), '');
+  }
   out.push('## Optional', '', ...doc.optional.map(l => linkLine(l, site)), '');
   return out.join('\n');
 }
