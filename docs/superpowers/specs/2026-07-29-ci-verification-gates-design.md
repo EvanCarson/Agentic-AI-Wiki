@@ -282,3 +282,34 @@ decisions:
   change touched only CI and docs; fixing the pgvector diagram made it a content change, and the
   two precedents for a diagram-only fix (PR #178, PR #170) both carry an entry. The entry covers
   the gate and the defect it caught.
+
+### 9.1 What the first runs found: Linux renders the same webfont ~3–8% wider
+
+The gate failed three times before it passed, each failure a real defect that no local run
+would have shown. Worth recording, because it changes how diagrams should be authored here.
+
+**The measurement is trustworthy — this was checked, not assumed.** A temporary diagnostic step
+ran on the runner and reported: all 22 font files present in `dist/fonts`, every `.woff2`
+fetched `200`, the label's computed family `Inter`, and a canvas probe distinguishing Inter
+from `sans-serif` (`same: false`). So CI measures with the real webfont, exactly as a reader's
+browser does. Yet the same string measures **139px on `ubuntu-latest` against 135.2px on macOS**
+— identical font file, different text shaping (CoreText's subpixel advances against
+FreeType/HarfBuzz). Across the five failures the spread was **3.8% to 7.7%**.
+
+**Which platform is right? Neither — but Linux is closer to the audience.** Vercel Analytics for
+the 30 days to 2026-09-01 puts visitors at **46% Windows, 25% Linux, 17% Mac**. A diagram tuned
+until it just fits on the author's Mac overflows for most people who read it. The five labels the
+gate rejected were genuinely clipped for roughly seven readers in ten, and had been for months.
+
+**Consequences for authoring, which the routine prompt already implies but should be read here:**
+
+- **Leave slack.** A label that fits its box exactly on macOS does not fit anywhere else. Treat
+  the local measurement as the floor and assume 8% more.
+- **Pin the edge that overflows.** Two of the five were fixed without touching the words: a
+  right-hand note became `text-anchor: end` at a fixed x, and a rotated axis label became
+  `text-anchor: middle` at the axis midpoint. Anchoring to the constrained edge makes width
+  differences push into empty space instead of past the boundary, which is immune to the platform
+  question entirely. Prefer this over shortening text where the geometry allows it.
+- **Expect layers.** Fixing the collision revealed the viewBox escapes; the memory of this
+  repository already records that the suite's assertions run in sequence and one failure hides the
+  next. Budget for more than one round.
