@@ -143,6 +143,9 @@ export const entries: Entry[] = [
 
   // --- 2026-08-29: the trained preference everyone mistakes for an access check ---
   { page: 'instruction-hierarchy', slug: 'instruction-hierarchy', title: L('The Instruction Hierarchy','指令层级'), summary: L('Your system prompt outranks a fetched web page because the model was trained to prefer it, which gives it a failure rate where an access check has a return value — and the injections that work do not conflict with your instructions at all, they fit inside them. Keep the hierarchy as one layer, never promote retrieved text into the system message, and put the boundary you rely on at the tool.','你的系统提示词能压过抓回来的网页，是因为模型被训练成偏向它；于是它有的是失败率，而权限检查有的才是返回值——而真正得手的注入根本不与你的指令冲突，它们严丝合缝地装在里面。把这套层级当一层来用，绝不要把检索到的文本提拔进系统消息，并把你真正依赖的边界放在工具上。'), group: L('Agentic AI','智能体 AI') },
+
+  // --- 2026-09-02: the signed authorisation record, not the rail ---
+  { page: 'agent-payments', slug: 'agent-payments', title: L('Agent Payments','智能体支付'), summary: L('A card number is a bearer credential, so the ceiling, the merchant and the purpose all live in a prompt the agent can reinterpret — which is why the 2026 protocols added a mandate rather than a faster rail: a signed, bounded record of what one named human authorised, verifiable by a party that does not trust your agent. Move the cap out of the system prompt and into a credential that cannot exceed it.','卡号是一张持有即有效的凭据，于是额度、商户与用途全都活在一段智能体可以重新诠释的提示词里——这正是 2026 年这批协议补上的是「授权书」而不是更快的通道的原因：一份签过名、划定边界、写明某位具名的人授权了什么的记录，且能被一个并不信任你的智能体的第三方验证。把上限从系统提示词里挪出来，放进一张根本超不过它的凭据。'), group: L('Agentic AI','智能体 AI') },
 ];
 
 /** Flat, ordered list of all entries (mirrors field-guide CHAPTERS). */
