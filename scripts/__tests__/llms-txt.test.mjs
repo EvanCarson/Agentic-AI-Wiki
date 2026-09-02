@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildLlmsTxt } from '../../src/lib/llms-txt.ts';
 
 const L = (en, zh) => ({ en, zh });
@@ -129,4 +132,29 @@ test('square brackets in a title are escaped and a multi-line summary is flatten
 test('the link-line count is the page count plus the Optional links', () => {
   assert.equal(linkLines(en).length, PAGES + OPTIONAL_LINKS);
   assert.equal(linkLines(zh).length, PAGES + OPTIONAL_LINKS);
+});
+
+// Integration: the built files against the built site. Skipped, not failed,
+// without a build so `npm test` passes in a fresh worktree (the same pattern
+// as search-index.test.mjs). This is what guards the group segment in
+// Deep-Dives / Playbooks / Operations URLs — a wrong segment is a 404 that
+// every other gate is blind to.
+const DIST = fileURLToPath(new URL('../../dist/', import.meta.url));
+const built = existsSync(join(DIST, 'llms.txt'));
+
+test('every same-origin URL in the built files resolves to a built page, and both editions list the same number of links', { skip: !built && 'dist/llms.txt not built — run `npm run build` first' }, () => {
+  const counts = [];
+  for (const file of ['llms.txt', 'zh/llms.txt']) {
+    const text = readFileSync(join(DIST, file), 'utf8');
+    const missing = urls(text)
+      .filter(u => u.startsWith(SITE.origin))
+      .map(u => new URL(u).pathname)
+      .filter(p => {
+        const base = join(DIST, p.replace(/^\/+/, ''));
+        return !(p.endsWith('/') ? existsSync(join(base, 'index.html')) : existsSync(base));
+      });
+    assert.deepEqual(missing, [], `${file}: unresolved paths`);
+    counts.push(linkLines(text).length);
+  }
+  assert.equal(counts[0], counts[1], 'en and zh list the same number of links');
 });
