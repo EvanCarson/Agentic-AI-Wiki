@@ -1,7 +1,7 @@
 # CI: make the verification gates actually block a merge
 
 **Date:** 2026-07-29
-**Status:** approved, not yet implemented
+**Status:** implemented 2026-09-01 — see §9 for what changed between approval and implementation
 **Scope:** `.github/workflows/ci.yml` (new), `scripts/__tests__/design/system.mjs`,
 `docs/routines/daily-content-batch.prompt.md`, and the `Protect Main` repository ruleset
 
@@ -245,3 +245,29 @@ concurrent browsers, so the local 4× will not reproduce in CI.
 - Notifying on failure — opening an issue automatically when a run fails. Considered and deferred;
   the routine's own report already surfaces a stall.
 - Any change to `vercel.json`.
+
+---
+
+## 9. Implementation notes (2026-09-01)
+
+Implemented five weeks after approval. Four things differ from the text above, none from its
+decisions:
+
+- **CI runs `npm run build` before `npm test`.** Since July, `npm test` gained tests that read
+  `dist/` and skip without a build (the llms.txt link-resolution test, the OG catalogue check).
+  Running them skipped would make the check green without the guard they carry. `test:design`
+  still rebuilds afterwards; the duplicate build costs ~20s on the runner.
+- **§4's residual risk is gone.** The webfonts were self-hosted in PR #182 (2026-09-01), so CI no
+  longer depends on `fonts.googleapis.com`. The `goto()` helper awaiting `document.fonts.ready`
+  is still required — the `load` event does not wait for lazily-loaded font faces — and is
+  guarded by `scripts/__tests__/design-guard-navigation.test.mjs`, which fails if any navigation
+  bypasses the helper.
+- **Renaming the job stalls merges; it does not silently unenforce.** §3 said a renamed `gates`
+  job would leave the ruleset "claiming to require a check that no longer reports". GitHub's
+  actual behaviour is the opposite failure: a required check that never reports shows as
+  *Expected* and blocks every merge until someone notices. The workflow comment says so.
+- **The routine waits for the check rather than merging past it.** `gh pr merge` is refused while
+  a required check is pending, so the prompt now tells the routine to run
+  `gh pr checks <n> --watch --fail-fast` and merge only when green. Repository auto-merge
+  (`allow_auto_merge`) was left disabled; enabling it is a repository-setting change outside
+  this design.
