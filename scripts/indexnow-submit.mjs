@@ -47,10 +47,15 @@ if (flag('all')) {
     changed = execFileSync('git', ['diff', '--name-only', `${base}..${head}`], { encoding: 'utf8' })
       .split('\n').map(s => s.trim()).filter(Boolean);
   } catch {
-    // A force-push or a shallow clone can leave `base` unreachable. Publishing
-    // nothing is the right failure here: the next content push submits anyway.
-    console.log('indexnow: cannot diff that range (shallow clone or rewritten history); nothing submitted');
-    process.exit(0);
+    // Exiting 0 here once hid this step doing nothing at all: the default
+    // `actions/checkout` clone is one commit deep, so the range never
+    // resolved and every push silently submitted nothing while the run stayed
+    // green. An unresolvable range means we cannot know what changed, which is
+    // a defect worth seeing. `main` forbids non-fast-forward pushes, so the
+    // one legitimate cause — rewritten history — cannot happen there.
+    console.error(`indexnow: cannot diff ${base}..${head}`);
+    console.error('  In CI this means the checkout is shallow — set fetch-depth: 0 on actions/checkout.');
+    process.exit(1);
   }
   const fgPages = fieldGuidePageMap(readFileSync('src/content/field-guide/manifest.ts', 'utf8'));
   submit = urlsForChangedFiles(changed, urls, fgPages);
@@ -90,8 +95,9 @@ try {
 }
 
 // 200 accepted, 202 accepted pending key validation. 429 is rate limiting —
-// theirs to apply, ours to shrug at. 400/403/422 mean this script or the key
-// file is wrong, which is a defect worth failing on.
+// theirs to apply, ours to shrug at. 400/422, and a 403 that is not the
+// pending-verification case below, mean this script or the key file is wrong,
+// which is a defect worth failing on.
 if (res.status === 200 || res.status === 202) {
   console.log(`indexnow: ${res.status} — ${submit.length} URLs accepted`);
   process.exit(0);
@@ -100,6 +106,19 @@ if (res.status === 429) {
   console.log('indexnow: 429 rate limited; nothing to fix here');
   process.exit(0);
 }
-console.error(`indexnow: ${res.status} ${res.statusText} — ${(await res.text()).slice(0, 300)}`);
-console.error('400 invalid format · 403 key not found at keyLocation · 422 URL/host mismatch');
+const detail = (await res.text()).slice(0, 300);
+
+// Key validation is asynchronous: the engine fetches the key file on its own
+// schedule, and until it has, a correct submission is answered
+// "SiteVerificationNotCompleted". That is a wait, not a defect — and it is what
+// the first push after adopting IndexNow, and any later key rotation, will hit.
+// Failing the run there reports a bug that does not exist.
+if (res.status === 403 && detail.includes('SiteVerificationNotCompleted')) {
+  console.log('indexnow: 403 SiteVerificationNotCompleted — the engines have not fetched the key file yet.');
+  console.log(`  Check it is reachable at https://${HOST}/${KEY}.txt; the next content push submits normally.`);
+  process.exit(0);
+}
+
+console.error(`indexnow: ${res.status} ${res.statusText} — ${detail}`);
+console.error('400 invalid format · 403 key not found or not yet fetched · 422 URL/host mismatch');
 process.exit(1);
