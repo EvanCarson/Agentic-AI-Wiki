@@ -47,10 +47,15 @@ if (flag('all')) {
     changed = execFileSync('git', ['diff', '--name-only', `${base}..${head}`], { encoding: 'utf8' })
       .split('\n').map(s => s.trim()).filter(Boolean);
   } catch {
-    // A force-push or a shallow clone can leave `base` unreachable. Publishing
-    // nothing is the right failure here: the next content push submits anyway.
-    console.log('indexnow: cannot diff that range (shallow clone or rewritten history); nothing submitted');
-    process.exit(0);
+    // Exiting 0 here once hid this step doing nothing at all: the default
+    // `actions/checkout` clone is one commit deep, so the range never
+    // resolved and every push silently submitted nothing while the run stayed
+    // green. An unresolvable range means we cannot know what changed, which is
+    // a defect worth seeing. `main` forbids non-fast-forward pushes, so the
+    // one legitimate cause — rewritten history — cannot happen there.
+    console.error(`indexnow: cannot diff ${base}..${head}`);
+    console.error('  In CI this means the checkout is shallow — set fetch-depth: 0 on actions/checkout.');
+    process.exit(1);
   }
   const fgPages = fieldGuidePageMap(readFileSync('src/content/field-guide/manifest.ts', 'utf8'));
   submit = urlsForChangedFiles(changed, urls, fgPages);
