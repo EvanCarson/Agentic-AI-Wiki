@@ -278,3 +278,7 @@ decisions:
   the text was shortened to fit its box with margin. Rule for the future: the CI runner is the
   enforcement platform, so a collision that reproduces only there is real and is fixed in the
   diagram, not tolerated in the test. Expect text to measure a few percent wider on Linux.
+- **A changelog entry was added after all**, reversing §2's decision. That decision held while the
+  change touched only CI and docs; fixing the pgvector diagram made it a content change, and the
+  two precedents for a diagram-only fix (PR #178, PR #170) both carry an entry. The entry covers
+  the gate and the defect it caught.
