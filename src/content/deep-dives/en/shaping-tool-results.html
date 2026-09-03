@@ -1,0 +1,119 @@
+<section class="phase">
+  <div class="phase-num">K13</div>
+  <div class="week">Deep Dive · Tool &amp; Capability Design</div>
+  <h2>Shaping tool results: the half of the tool contract nobody specifies.</h2>
+  <p class="goal">A tool definition costs a few hundred tokens and you pay for it once per turn; a single unshaped tool result can cost forty thousand and you pay for it on every turn that follows. Teams spend weeks trimming schemas and then return whatever the upstream API happened to send — which is not only the largest line on the bill but the single largest untrusted text block in the context window. The result deserves a contract as strict as the arguments: a byte budget the harness enforces, a projection the tool author chooses, and a handle for everything that did not fit.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The asymmetry: schemas are bounded, results are not.</h3>
+
+    <p>Both halves of a tool live in the same context window, and almost every optimisation effort goes to the half that cannot surprise you.</p>
+
+    <ul>
+      <li><strong>A schema has a known worst case.</strong> You wrote it. It is 200–500 tokens, it does not change between runs, and it sits in the stable prefix where <a class="xref" href="/concepts/prompt-caching">prompt caching</a> makes it nearly free after the first call.</li>
+      <li><strong>A result has no worst case at all.</strong> <code class="inline">list_issues</code> returns eleven items in your test fixture and 1,400 in the customer account that filed the ticket. The size is chosen by data you do not control, on a day you are not watching.</li>
+      <li><strong>Results land after the cache boundary and are re-sent forever.</strong> Every tool result is appended to the transcript and re-submitted on each subsequent step. A 40,000-token payload fetched at step 3 is still being paid for at step 12 — the quadratic growth <a class="xref" href="/concepts/agent-cost-control">agent cost control</a> describes, sourced almost entirely from results rather than definitions.</li>
+      <li><strong>The published wins are result-side wins.</strong> The Google Drive-to-Salesforce workflow that dropped from 150,000 tokens to 2,000 did so by keeping intermediate <em>data</em> out of context, as <a class="xref" href="/deep-dives/tool-capability-design/code-as-action">code as action</a> covers. Anthropic's Tool Search Tool trims the definitions and reports around 85% savings on that half — real, and a different half.</li>
+      <li><strong>Long results degrade the model before they exhaust the window.</strong> Retrieval accuracy inside a long context falls well before the advertised limit, per <a class="xref" href="/deep-dives/memory-and-context/long-context-effective-vs-advertised">effective vs advertised context</a>. A 40k-token dump does not just cost money; it makes the model worse at using the 800 tokens that mattered.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Put the ratio somewhere you will see it: in a mature agent, tool definitions are typically single-digit percentages of tokens consumed and tool results are the majority. Optimisation attention is usually allocated the other way round.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The result is the most privileged untrusted text you will ever inject.</h3>
+
+    <p>This is the reason shaping is not merely a cost exercise. Arguments flow from the model outward and are validated at the boundary; results flow inward, unvalidated, and arrive wearing the system's authority.</p>
+
+    <ul>
+      <li><strong>Everything the model reads that it did not write comes through here.</strong> Issue bodies, web pages, file contents, email, CRM notes, another agent's output. Every documented indirect prompt-injection chain has a tool result somewhere in the middle — the mechanism <a class="xref" href="/deep-dives/agent-security/prompt-injection-defense-2026">prompt-injection defense</a> starts from.</li>
+      <li><strong>Unshaped means unbounded attacker budget.</strong> If a tool returns a full document body, an attacker who controls that document controls an arbitrarily long span of your context. A 200-token projection of the same document caps what they can say inside your prompt at 200 tokens.</li>
+      <li><strong>The fields you did not need are the fields that hurt.</strong> API responses carry HTML descriptions, user-supplied labels, embedded URLs and free-text notes because programs ignore what they do not read. A model cannot ignore a field. It pays for it and it may act on it.</li>
+      <li><strong>Provenance has to survive the trip.</strong> Wrap returned content in an explicit, consistent delimiter and label it as data from a named source. It is not a defence on its own — the <a class="xref" href="/concepts/instruction-hierarchy">instruction hierarchy</a> is advisory, not enforced — but a model asked to distinguish content from instruction cannot do it at all if the transcript does not mark the boundary.</li>
+      <li><strong>Shaping is a control you can measure.</strong> "Maximum attacker-controlled tokens per tool call" is a number you can compute per tool from its projection and budget, and it belongs in the same review as its permissions.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Four moves, in order of how much they pay and how rarely they are used.</h3>
+
+    <p>These compose, and the ordering matters: projecting first means everything downstream operates on a smaller, cleaner object.</p>
+
+    <ul>
+      <li><strong>Project — an explicit field allowlist, chosen by the tool author.</strong> Decide which fields a model could plausibly need to make the next decision and drop the rest at the boundary. This is the single largest win and the one almost nobody implements, because the default — hand back the upstream JSON — requires writing no code. A GitHub issue is roughly 40 fields; an agent triaging issues needs about six.</li>
+      <li><strong>Rank, then truncate.</strong> Truncation is only safe if the tail you drop is the least useful part, which requires ordering the collection <em>before</em> cutting it. Truncating an unsorted list is a coin flip on whether the answer survived.</li>
+      <li><strong>Paginate with a stable cursor.</strong> Offsets over a mutating collection silently duplicate and skip records across turns. Return an opaque cursor and say plainly how many remain, so continuing is a decision the model makes rather than a guess.</li>
+      <li><strong>Hand back a reference.</strong> Store the full payload outside the transcript, return a handle plus a short summary, and give the model a second tool that re-opens the handle with a query. This is the pattern that makes 40k-token artifacts tractable — the same asymmetry <a class="xref" href="/deep-dives/tool-capability-design/code-as-action">code as action</a> exploits, available without a sandbox.</li>
+      <li><strong>Aggregate, when the model only needs the shape.</strong> "1,412 issues, 87% opened in the last 30 days, top three labels" answers "is this repository healthy" in thirty tokens. Returning rows to answer a question about counts is a category error the tool author is better placed to catch than the model.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The one-line test for a projection: <strong>could the model take the next action with this field removed?</strong> If yes, remove it — and if you find yourself unsure for most fields, the tool is doing too much and the fix is in <a class="xref" href="/deep-dives/tool-capability-design/tool-granularity">tool granularity</a>, not here.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Silent truncation is how shaping turns into a correctness bug.</h3>
+
+    <p>Every failure below comes from the same root: the model was handed a partial answer that was formatted like a complete one, and nothing in the transcript said otherwise.</p>
+
+    <ul>
+      <li><strong>Never cut mid-structure.</strong> Slicing a JSON string at a byte offset produces a fragment the model will still try to parse, and it will confabulate the closing shape. Truncate on record boundaries and re-serialise; if that is impossible, return the omission notice instead of the fragment.</li>
+      <li><strong>An unmarked cut is a lie about completeness.</strong> "Processed all matching records" is a claim a model will make from a truncated list, because a truncated list looks exactly like a short list. The marker has to be inside the result the model reads, not in a log line.</li>
+      <li><strong>Put the omission and the remedy in the same sentence.</strong> <code class="inline">"showing 20 of 1412; call again with cursor=… for the next page"</code> tells the model what happened and what to do. <code class="inline">"[truncated]"</code> tells it only that it has failed, which is the same defect <a class="xref" href="/deep-dives/tool-capability-design/tool-error-messages">error messages as prompts</a> catalogues.</li>
+      <li><strong>Budget the tool, not the request.</strong> One tool returning 30k tokens has consumed the whole step. Per-tool ceilings enforced by the harness beat per-tool discipline enforced by convention, because the tool that blows the budget is usually the one written last by someone who never read this page.</li>
+      <li><strong>Log what you dropped.</strong> When an eval regresses, "the result was truncated at 4k and the matching record was at index 63" is the entire diagnosis, and you can only make it if the span recorded the pre-shaping size and the cut point.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>One envelope for every tool beats a clever shape per tool.</h3>
+
+    <p>Consistency is worth more than per-tool optimality, because the model's recovery behaviour is learned from the shape of what it reads. A uniform envelope means one set of habits covers every tool you will ever add.</p>
+
+    <pre class="standalone"><span class="c-cm"># Same five keys from every tool, always in this order.</span>
+{
+  <span class="c-st">"status"</span>: <span class="c-st">"partial"</span>,          <span class="c-cm"># ok | partial | empty | error</span>
+  <span class="c-st">"summary"</span>: <span class="c-st">"20 of 1412 open issues, sorted by last update"</span>,
+  <span class="c-st">"data"</span>: [ <span class="c-cm">/* projected records only — six fields, not forty */</span> ],
+  <span class="c-st">"omitted"</span>: {<span class="c-st">"count"</span>: <span class="c-st">1392</span>, <span class="c-st">"reason"</span>: <span class="c-st">"result_budget"</span>},
+  <span class="c-st">"next"</span>: <span class="c-st">"cursor:eyJvIjoyMH0"</span>   <span class="c-cm"># null when nothing remains</span>
+}</pre>
+
+    <ul>
+      <li><strong><code class="inline">summary</code> is read first and is often read alone.</strong> Write it for a model that will act on that line without parsing <code class="inline">data</code>, because on a long transcript that is exactly what happens.</li>
+      <li><strong><code class="inline">status: "empty"</code> is not <code class="inline">status: "error"</code>.</strong> Conflating them is why agents retry a correct query five times. Zero results is a finding; say so and stop.</li>
+      <li><strong><code class="inline">omitted</code> makes the invisible visible.</strong> The model can now reason about whether 1,392 unseen records could change its answer — a judgement it cannot make when the omission is unrecorded.</li>
+      <li><strong>The envelope belongs to the harness.</strong> Enforce it in the layer that dispatches tool calls, so a new tool inherits budgets, markers and cursors without its author opting in. On the server side of <a class="xref" href="/deep-dives/mcp/mcp-tool-design">MCP tool design</a> the same rule applies, one layer further out.</li>
+      <li><strong>Prose beats JSON for anything the model only reads.</strong> Structured output earns its brackets when something parses it. If only the model consumes the result, a compact sentence carries the same information for fewer tokens and fewer chances to mis-parse.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Fitting it to the budget you actually have.</h3>
+
+    <p>Shaping is a per-tool decision made against a whole-run budget, and the numbers should be written down rather than discovered in production.</p>
+
+    <ul>
+      <li><strong>Start from the run, not the call.</strong> Decide what fraction of the window may be tool results at the end of a long run — a third is a defensible starting point — then divide by expected calls to get a per-call ceiling. <a class="xref" href="/deep-dives/memory-and-context/context-budgeting">Context budgeting</a> is where this arithmetic lives.</li>
+      <li><strong>Measure before you tune.</strong> Record pre-shaping and post-shaping token counts per tool on every span. The two or three tools responsible for most of your bill will be obvious within a day, and they are rarely the ones anyone suspected.</li>
+      <li><strong>Shape before compaction, not instead of it.</strong> Compaction is a lossy recovery from having admitted too much; shaping stops it entering. Both are needed, and doing the first well makes the second rare.</li>
+      <li><strong>Re-shape when the model changes.</strong> A projection tuned for a model that tolerated terse fields can under-inform a different one. Budgets and projections are configuration, not constants, and they belong in the same review as prompts.</li>
+      <li><strong>Treat a new tool's result as a new attack surface.</strong> Before it ships, ask what an adversary who controls the upstream data can write into your context and how many tokens they get. If the answer is "the whole document", the projection is missing.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do this in the order that pays: put one envelope and one harness-enforced per-tool ceiling in front of every tool this week, record pre- and post-shaping token counts on every span, then write explicit field allowlists for the two tools that turn out to dominate the bill. You will usually take the majority of your result tokens out on the first pass, and the same edit caps how much an attacker-controlled document can say inside your prompt. <strong>Arguments get a schema because the model is not trusted to produce them; results deserve one for exactly the same reason, in the other direction.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/deep-dives/tool-capability-design/tool-schemas-and-contracts">schemas, contracts and defaults</a> for the half of the contract that is already specified, <a class="xref" href="/deep-dives/tool-capability-design/tool-design-antipatterns">tool-design anti-patterns</a> for the shapes this replaces, <a class="xref" href="/concepts/context-engineering">context engineering</a> for the wider budget, and <a class="xref" href="/deep-dives/memory-and-context/context-compaction">context compaction</a> for what you still need when shaping is not enough.</p>
+  </div>
+</section>
