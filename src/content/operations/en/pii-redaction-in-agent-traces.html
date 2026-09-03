@@ -1,0 +1,106 @@
+<section class="phase">
+  <div class="phase-num">E18</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>Redacting PII from agent traces.</h2>
+  <p class="goal">Turning on content capture in your tracing SDK creates a second, ungoverned copy of your most sensitive data inside a system your observability vendor operates — and unlike the database it came from, nobody wrote a retention rule for it. The reflex fix, redact everything globally, quietly destroys the only artefact that can explain a hard failure. Redaction and debuggability are one dial, and the way out is not a better global setting but two tiers: redact in-process before the span leaves, and buy reproducibility back with a short-lived break-glass tier sized against your actual detection time.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Content capture is off by default, and turning it on is a data-processing decision.</h3>
+
+    <p>The OpenTelemetry GenAI semantic conventions make every attribute that can hold prompt or completion content opt-in, precisely so that content never appears because someone forgot a flag. That default is the last cheap moment in this whole process.</p>
+
+    <ul>
+      <li><strong>Metadata alone is safe and nearly useless for agents.</strong> Model name, token counts, latency and status tell you a run was slow. They cannot tell you why the agent called the refund tool with the wrong account, which is the class of question agent tracing exists to answer.</li>
+      <li><strong>Agent traces hold categories your database never did.</strong> The user's raw phrasing, the retrieved documents, tool arguments, tool results and the model's reasoning content. The last one is the sharpest: it may restate sensitive input in paraphrase, which no field-based rule will catch.</li>
+      <li><strong>The blast radius is a vendor, not a table.</strong> Once captured, that content sits in a SaaS backend with its own access model, its own support engineers and its own sub-processors — a scope your DPA for the observability vendor was probably not written against.</li>
+      <li><strong>Flip the burden of proof.</strong> Enabling content capture is not a debugging convenience; it is a decision to process personal data in a new system. Treat it as one — name the lawful basis, the retention period and the access list before the flag goes to <code class="inline">true</code>, which is the discipline <a class="xref" href="/operations/governance-compliance/data-governance">data governance</a> already asks for elsewhere.</li>
+      <li><strong>Decide it per environment, not per organisation.</strong> Full capture in staging against synthetic data costs nothing and answers most questions. Production is where the dial has to be earned.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Redact in the SDK, because the collector is already too late.</h3>
+
+    <p>The common architecture puts redaction in the collector or as a processing rule in the backend, and it is wrong for a reason that is easy to say and hard to walk back: by then the data has left your process and, in most deployments, your network.</p>
+
+    <ul>
+      <li><strong>Egress has already happened at the collector.</strong> If the span travelled over the wire with the raw prompt inside it, you have exported personal data and then deleted it — which is a different event, with different obligations, from never having exported it.</li>
+      <li><strong>Backend-side masking is display-layer redaction.</strong> The raw value is in the store, in backups, in the search index and in whatever the vendor's own logs captured on ingest. A masked view does not make it absent.</li>
+      <li><strong>In-process means the span attribute is built already redacted.</strong> One span processor in the SDK, running before the exporter, so the unredacted string exists only as a local variable for the lifetime of a function call.</li>
+      <li><strong>Fail closed on the redactor.</strong> If the redactor throws, drop the content attribute and keep the span — never ship the raw value because the sanitiser errored. This is the single most common way a careful design leaks in production.</li>
+      <li><strong>Cover every sink, not just the tracer.</strong> The same minute also lands in your eval dataset, your prompt-logging table, your feedback store and your LLM-judge's inputs. One redactor, one version, in front of all of them — the failure mode <a class="xref" href="/operations/safety-and-security/data-exfiltration-risks">exfiltration risk</a> keeps finding is the sink nobody inventoried.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Say the rule in one line so it survives a design review: <strong>the unredacted string must never cross a process boundary.</strong> Every architecture that puts redaction downstream is arguing about how quickly to delete something it has already sent.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Tokenise deterministically — a mask throws away the analysis you traced for.</h3>
+
+    <p>Replacing everything with <code class="inline">[REDACTED]</code> is the cheapest implementation and it destroys most of the value of having a trace at all. The choice of replacement is where redaction is either a tax or a design.</p>
+
+    <ul>
+      <li><strong>Deterministic tokens preserve joins.</strong> A keyed hash means the same email becomes the same <code class="inline">usr_7f2a</code> in every span, so "did this user hit the failure twice", "how many distinct users are affected" and "is this one customer or a systemic bug" all remain answerable without anyone learning who they are.</li>
+      <li><strong>Keep the type in the token.</strong> <code class="inline">&lt;EMAIL_7f2a&gt;</code> rather than <code class="inline">&lt;REDACTED&gt;</code> preserves the structure a debugger needs: you can still see that the tool was called with an email where an account ID belonged.</li>
+      <li><strong>Tokens make erasure tractable.</strong> A deletion request maps to a token you can search for across traces, evals and feedback stores. With an irreversible mask you cannot even confirm you complied — which is why <a class="xref" href="/operations/governance-compliance/erasure-against-agent-memory">erasure against agent memory</a> keeps ending up as a manual archaeology exercise.</li>
+      <li><strong>Store the mapping only if you need re-identification, and store it elsewhere.</strong> A separate keyed store with its own access control and its own shorter retention. If nobody needs to reverse it, do not keep it — the token still does the join.</li>
+      <li><strong>Rotate the key deliberately, and know what it costs.</strong> Rotation is a privacy improvement and it breaks longitudinal joins across the boundary. Rotate on a schedule that matches how far back your analyses actually look.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Recall is a number you must measure, because free text has no schema.</h3>
+
+    <p>Structured PII is the easy half. The hard half is the same fact written by a person in a sentence, and a detector that has never been measured is a compliance claim with no evidence behind it.</p>
+
+    <ul>
+      <li><strong>Build a labelled corpus from real spans.</strong> A few hundred production spans, hand-annotated per entity type, held in a controlled location. Without it you have opinions about your redactor, not a recall figure.</li>
+      <li><strong>Report recall per entity type, never in aggregate.</strong> "97% overall" typically hides 99% on emails and 60% on free-text addresses and account numbers. The aggregate is dominated by the easy classes and tells you nothing about the ones that matter.</li>
+      <li><strong>Run it as a regression test in CI.</strong> The redactor is code with a version. A change that drops recall on any entity type fails the build, exactly as a broken unit test would.</li>
+      <li><strong>New tools are new leaks.</strong> The day someone adds a tool returning a payload shape the redactor has not seen, recall on that path is untested. Make "run the redaction eval against a sample of its results" part of the tool-onboarding checklist alongside the <a class="xref" href="/operations/agentops/tool-catalog-lifecycle">tool catalogue</a> steps.</li>
+      <li><strong>Watch precision too, in a specific way.</strong> Over-redaction that eats identifiers, error codes and stack frames turns a trace into a page of tokens. Track how often a redacted span was insufficient for triage — your engineers already know; ask them.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The break-glass tier, and the number that makes it real.</h3>
+
+    <p>Redaction removes exactly the detail that explains the hardest failures. Recovering it needs a second tier, and that tier is either sized against a measured number or it is theatre.</p>
+
+    <ul>
+      <li><strong>Size the TTL off your detection time, not off comfort.</strong> If unredacted spans live 24 hours and your median time to notice a quality regression is nine days, the tier will be empty every single time you need it. Measure MTTD from your own incident history and set the TTL above it.</li>
+      <li><strong>Access is a request with a reason, an approver and an expiry.</strong> Named individuals, a linked incident, a session that expires, and an entry in the access log the subject could in principle be shown. Standing access to unredacted traces is the same authorisation smell as standing production database access.</li>
+      <li><strong>Scope the grant to a trace, not to a tier.</strong> "This investigator, these 40 spans, for four hours" beats "the SRE group can read raw traces". The narrower grant is barely harder to implement and vastly easier to defend.</li>
+      <li><strong>Log the access as loudly as the incident.</strong> A break-glass read is an event worth alerting on — it is one of the few signals that distinguishes an investigation from the <a class="xref" href="/operations/safety-and-security/insider-misuse-of-agents">sanctioned-and-inbound misuse</a> pattern, where everything is individually permitted.</li>
+      <li><strong>Keep the tier out of the vendor by default.</strong> The redacted stream goes to your observability SaaS; the short-lived raw stream stays in your own account. That split is what makes the whole design explainable to a regulator, an auditor or a works council in one sentence.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Redaction is not retention, and neither one covers the other.</h3>
+
+    <p>The two controls are routinely substituted for each other, and each substitution leaves a real gap that shows up at the worst moment.</p>
+
+    <ul>
+      <li><strong>Redacted data is still personal data, often.</strong> A trace of one user's session, tokenised but complete, is frequently re-identifiable from its content. Redaction lowers the risk class; it rarely takes you out of scope, so the retention policy still applies — as <a class="xref" href="/operations/evaluation-and-observability/trace-sampling-and-retention">sampling and retention</a> sets out.</li>
+      <li><strong>Sampling is not a privacy control either.</strong> Keeping 5% of traces means the 5% you kept are whole. It reduces volume, not sensitivity.</li>
+      <li><strong>Legal hold beats your TTL and you should know where.</strong> When a hold lands, automated expiry must stop for the covered scope without stopping everywhere — the coordination <a class="xref" href="/operations/governance-compliance/retention-and-legal-hold">retention and legal hold</a> describes, now applied to a store your vendor operates.</li>
+      <li><strong>Eval datasets outlive traces and inherit nothing.</strong> A failure promoted into a regression suite in March is still there in December, long after the trace expired, carrying whatever was in it. Redact on promotion, and re-run the redactor when its version changes.</li>
+      <li><strong>Rehearse the deletion, do not assert it.</strong> Once a quarter, take one subject and time how long it actually takes to remove them from traces, evals, feedback and the judge's inputs. The gap between the policy and the stopwatch is the finding.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Concretely, this quarter: put one versioned redactor in the SDK in front of every sink, emitting deterministic typed tokens rather than masks; build a few-hundred-span labelled corpus and run per-entity recall as a CI gate; then add a break-glass raw tier in your own cloud account with a TTL set above your measured MTTD and per-trace, time-boxed, alerted access. <strong>You are not choosing between privacy and debuggability — you are choosing whether that trade is made once, globally, by whoever set a flag, or deliberately, per investigation, by someone who has to sign for it.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a> for what the spans should contain, <a class="xref" href="/operations/evaluation-and-observability/otel-genai-semantic-conventions">the OTel GenAI conventions</a> for the attribute names this gates, <a class="xref" href="/operations/evaluation-and-observability/failure-taxonomy-and-triage">failure taxonomies and triage</a> for the work redaction must not block, and <a class="xref" href="/concepts/agent-observability">agent observability</a> for the concept underneath.</p>
+  </div>
+</section>
