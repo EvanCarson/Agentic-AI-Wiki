@@ -146,6 +146,9 @@ export const entries: Entry[] = [
 
   // --- 2026-09-02: the signed authorisation record, not the rail ---
   { page: 'agent-payments', slug: 'agent-payments', title: L('Agent Payments','智能体支付'), summary: L('A card number is a bearer credential, so the ceiling, the merchant and the purpose all live in a prompt the agent can reinterpret — which is why the 2026 protocols added a mandate rather than a faster rail: a signed, bounded record of what one named human authorised, verifiable by a party that does not trust your agent. Move the cap out of the system prompt and into a credential that cannot exceed it.','卡号是一张持有即有效的凭据，于是额度、商户与用途全都活在一段智能体可以重新诠释的提示词里——这正是 2026 年这批协议补上的是「授权书」而不是更快的通道的原因：一份签过名、划定边界、写明某位具名的人授权了什么的记录，且能被一个并不信任你的智能体的第三方验证。把上限从系统提示词里挪出来，放进一张根本超不过它的凭据。'), group: L('Agentic AI','智能体 AI') },
+
+  // --- 2026-09-04: the poison is counted in documents, not percentages ---
+  { page: 'data-poisoning', slug: 'data-poisoning', title: L('Data Poisoning','数据投毒'), summary: L('Poison is counted in documents, not percentages — roughly 250 malicious documents backdoored models from 600M to 13B parameters, so "our corpus is enormous" was never the defence anyone thought it was. Injection steers one session; poisoning writes into a store that is re-served to everyone, and the cheap surfaces are the ones you own: the index, the memory, the skill files.','毒是按篇数算的，不是按比例算的——大约 250 篇恶意文档就给 6 亿到 130 亿参数的模型都植入了后门，所以「我们的语料库大得很」从来就不是大家以为的那道防线。注入操纵的是一个会话；投毒写进的是一个会被重新端给所有人的存储，而便宜的那些面恰恰是你自己拥有的：索引、记忆、技能文件。'), group: L('Agentic AI','智能体 AI') },
 ];
 
 /** Flat, ordered list of all entries (mirrors field-guide CHAPTERS). */
