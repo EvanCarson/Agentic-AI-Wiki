@@ -149,6 +149,9 @@ export const entries: Entry[] = [
 
   // --- 2026-09-04: the poison is counted in documents, not percentages ---
   { page: 'data-poisoning', slug: 'data-poisoning', title: L('Data Poisoning','数据投毒'), summary: L('Poison is counted in documents, not percentages — roughly 250 malicious documents backdoored models from 600M to 13B parameters, so "our corpus is enormous" was never the defence anyone thought it was. Injection steers one session; poisoning writes into a store that is re-served to everyone, and the cheap surfaces are the ones you own: the index, the memory, the skill files.','毒是按篇数算的，不是按比例算的——大约 250 篇恶意文档就给 6 亿到 130 亿参数的模型都植入了后门，所以「我们的语料库大得很」从来就不是大家以为的那道防线。注入操纵的是一个会话；投毒写进的是一个会被重新端给所有人的存储，而便宜的那些面恰恰是你自己拥有的：索引、记忆、技能文件。'), group: L('Agentic AI','智能体 AI') },
+
+  // --- 2026-09-05: the card certifies a configuration, not a capability ---
+  { page: 'system-cards', slug: 'system-cards', title: L('System Cards','系统卡'), summary: L('A system card is a safety-testing record about one checkpoint, written by the vendor — it certifies a configuration you may not be served, so read the elicitation methodology and the refusal boundary and keep your own pinned acceptance eval for everything else.','系统卡是一份关于某一个检查点的安全测试记录，由厂商自己撰写——它为一个你未必被服务到的配置背书，所以只读能力激发方法与拒答边界，其余一切都交给你自己那套钉死版本的验收评测。'), group: L('AI Ecosystem','AI 生态') },
 ];
 
 /** Flat, ordered list of all entries (mirrors field-guide CHAPTERS). */
