@@ -1,0 +1,121 @@
+<section class="phase">
+  <div class="phase-num">U22</div>
+  <div class="week">实战手册 · 编码与计算机操作智能体</div>
+  <h2>数据库迁移智能体：交付物是「正在跑的代码依然装得进去」的那个 schema。</h2>
+  <p class="goal">模型几乎每次都能一次写对 DDL——而这恰恰是它成为最可能把生产打趴下的那类编码智能体任务的原因：语句没问题，错的是<em>顺序</em>；而你的测试套件是在一张空表上、没有别人连着的情况下跑它的。请把这台智能体建成「输出一段有序且可逆的序列」——现在扩展、把回填当作一个作业、在之后的某个版本里收缩——并且用「在一份生产形态的克隆上的锁持有时间」给它打分，而不是用「迁移有没有跑通」。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>先弄清它擅长的是哪一半，因为核验器只覆盖那一半。</h3>
+
+    <p>编码智能体之所以能成立，是因为有一个便宜的检查能抓住它的错误（<a class="xref" href="/zh/concepts/generator-verifier-gap">生成-核验落差</a>）。而迁移正是这样一个案例：可用的检查在语法上很强，在后果上完全失明。</p>
+
+    <ul>
+      <li><strong>CI 确实核验的：</strong>迁移能解析、能在一个全新数据库上应用、之后 ORM 模型对得上、down 迁移能逆回去、测试套件在新 schema 上通过。这些智能体都能稳定通过。</li>
+      <li><strong>CI 并不核验的：</strong>这条语句在一张四亿行的表上会把锁持有多久；在迁移落地到下一次部署完成之间，当前已部署的应用代码还读不读得了这个 schema；回填会不会把复制打满；这次重写需不需要你并没有的磁盘空间。在一个 200 行、一条连接的测试库上，这些一样也看不见。</li>
+    </ul>
+
+    <p>所以整份手册的设计原则是：别再试图让智能体对第二张清单变得更聪明，而是<em>把条目从第二张清单搬进第一张</em>——一次会报告锁持有时长的影子应用、一个直接拒掉某一类语句的 linter、一条「迁移必须与上一个版本兼容」的规则。这些每一项，都把一次判断题变成了一次检查。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>教会它「扩展-收缩」是三次变更，并拒收一步到位的那版。</h3>
+
+    <p>你能写进智能体指令里最值钱的一句话是：schema 变更不是一次变更，而是一段序列，在其中每一个中间时刻，新旧两版应用代码都必须是正确的。重命名列是那个经典例子：<code class="inline">ALTER TABLE ... RENAME COLUMN</code> 是一条语句，也是一次故障——因为三十秒前部署上去的那份代码，仍在按旧名字做查询。</p>
+
+    <ul>
+      <li><strong>扩展。</strong>加上新列，可空，不要带上会重写整张表的默认值。用 concurrently 加新索引。约束先以 <code class="inline">NOT VALID</code> 加上。现有的一切都不会坏，因为现有的一切都没被改动。</li>
+      <li><strong>迁移代码。</strong>双写、仍读旧的，然后把读切换到新列上、藏在开关后面（<a class="xref" href="/zh/operations/agentops/feature-flags-for-agents">功能开关</a>、<a class="xref" href="/zh/operations/agentops/rollout-and-versioning">灰度与版本管理</a>）。这一步是跨版本的，而这也正是智能体会跳过的那一步。</li>
+      <li><strong>收缩。</strong>删掉旧列——作为一次独立的变更、放在之后的版本里、等过了你事先选定的保留期之后。</li>
+    </ul>
+
+    <p>让智能体在同一个 PR 里产出这三件产物，作为可分别部署的独立迁移，带明确的先后次序和一个写清楚的最小版本间隔；并把「哪些应用版本在中间态 schema 上能正确运行」设成 PR 正文里的必填字段。如果工具链支持，宁可选一个强制执行这个模式的系统，而不是把它写成文档——<code class="inline">pgroll</code> 用带版本的视图让两个 schema 版本同时存活，正是为了这件事；在 MySQL 上，<code class="inline">gh-ost</code> 与 <code class="inline">pt-online-schema-change</code> 之所以存在，就是因为等价的 <code class="inline">ALTER</code> 在规模之下是活不下来的。</p>
+
+    <div class="callout">
+      <p>把智能体的默认输出设成<em>只增不减</em>。任何会移除或收窄的东西——删列、删表、重命名、把类型收紧、给已有数据加 <code class="inline">NOT NULL</code>——都属于另一类工作，有人类归属，并且有自己的发版。这一条规则就消掉了「自主迁移变得不可挽回」的绝大多数路径，而它的代价只是「记得开一张后续工单」这点纪律。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>把站点打趴下的是锁队列，不是那条语句。</h3>
+
+    <p>让团队吃惊的失败，不是一条慢 <code class="inline">ALTER</code>。而是这个：你的 DDL 要申请 <code class="inline">ACCESS EXCLUSIVE</code> 锁，一条跑了很久的 <code class="inline">SELECT</code> 正持有冲突的锁；而由于 Postgres 按 FIFO 队列授予锁，此后这张表上的每一条查询都排到了你的迁移后面——而你的迁移自己也在等。一条本该两毫秒完成的语句，就这样按某个人的分析查询的时长把站点拖垮了。</p>
+
+    <p>缓解手段是机械性的，也就意味着可以让智能体每次都把它产出来：</p>
+
+    <pre class="standalone">-- Fail fast instead of queueing the whole table behind us.
+SET lock_timeout = '3s';
+SET statement_timeout = '30s';
+
+ALTER TABLE orders ADD COLUMN fulfilled_at timestamptz;   -- metadata only
+
+-- Long-running work never holds a table lock:
+CREATE INDEX CONCURRENTLY idx_orders_fulfilled_at ON orders (fulfilled_at);
+
+-- Two-phase constraint: cheap lock now, full scan without blocking writes.
+ALTER TABLE orders ADD CONSTRAINT orders_fulfilled_ck
+  CHECK (fulfilled_at IS NULL OR fulfilled_at &gt;= created_at) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_fulfilled_ck;</pre>
+
+    <p>由此得出三条规则，而它们该写进智能体的系统提示词和 linter 里，而不是写进一个没人回头再读的 wiki 页面。给每一个迁移会话都设一个短的 <code class="inline">lock_timeout</code>，好让一次锁争用失败的是迁移而不是应用——并且要配一次重试，因为「快速失败」只有在「有东西会再试一次」时才是安全的。在活表上永远不要不带 <code class="inline">CONCURRENTLY</code> 就跑 <code class="inline">CREATE INDEX</code>，并且要知道它没法跑在大多数迁移框架给你的文件包上的那个事务里。以及，把任何会重写整张表的语句——多数类型变更、老引擎上的易变默认值——当成「需要一个在线变更工具」的迁移，而不是「需要一个更长的维护窗口」。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>给它一个真判据：在生产形态的数据上做影子应用。</h3>
+
+    <p>这一步把这份手册从建议变成工程。在有人去读 diff 之前，迁移先自动在一份行数达到生产规模、并施加了合成负载的克隆上跑一遍，然后由流水线把四个数字回贴到 PR 上：<strong>每条语句的最大锁持有时长</strong>、<strong>总运行时长</strong>、<strong>被阻塞的查询数</strong>、<strong>写入字节数</strong>。这些正是评审者从 diff 里得不到、而智能体靠推理也得不到的事实。</p>
+
+    <ul>
+      <li><strong>用还原，不要用生成。</strong>从近期备份还原出来的克隆、或者一个生产分支，才带着让迁移变慢的那些行数、索引膨胀和数据分布。种子数据没有这些，而一次在种子数据上跑绿的结果，正是你本想避开的那次误接受。</li>
+      <li><strong>要对它施加负载。</strong>锁争用需要有人来争。在迁移应用期间哪怕只回放一小片读流量，也足以让队列问题浮出来；这就是「花了 40 毫秒」与「阻塞了 900 条查询 40 毫秒」之间的差别。</li>
+      <li><strong>在人之前 lint，不是在人之后。</strong>一个跑在 SQL 上的规则引擎——<code class="inline">squawk</code>、Atlas 的破坏性变更分析、Bytebase 的评审规则，或者你自己写的——正是那种要紧意义上的可靠检查器：它每次都便宜且一致地拒掉「危险语句」的一个超集。把它放进必需检查里，让智能体在有人介入之前先对着它迭代（<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/code-review-agents">代码评审智能体</a>）。</li>
+      <li><strong>把阈值公布出来。</strong>「锁时间低于 100 毫秒、没有语句重写整张表、且变更是只增的，即可自动合并」——这是一条政策。落在它之外的一律带着数字转给 DBA。评审者的工作于是从「想象一份计划」变成「给一份实测过的计划定级」——正是让<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/infrastructure-as-code-agents">基础设施即代码智能体</a>可行的那一步。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>回填是智能体写出来的作业，不是它跑的迁移。</h3>
+
+    <p>迁移智能体引发真事故最常见的方式根本不是 DDL，而是这个：在四亿行上跑 <code class="inline">UPDATE orders SET fulfilled_at = created_at</code>，还是在迁移事务里，持着行锁、堆出一段复制积压，把只读副本干下线一小时。这条语句是对的，它只是错的那件产物。</p>
+
+    <p>要求智能体把数据变更作为一个独立的、可操作的作业产出，具备五条性质；并且给它一个模板，好让它不用去发明这些：</p>
+
+    <ul>
+      <li><strong>按键区间分批，</strong>批大小有上界、批与批之间有休眠，让写入速率成为一个旋钮而不是一个意外。</li>
+      <li><strong>带检查点，</strong>把进度写到某个持久的地方，好让一次被打断的回填是接着跑，而不是从头再来。</li>
+      <li><strong>幂等，</strong>因为它一定会被重跑——与<a class="xref" href="/zh/operations/agentops/idempotency-and-retries">幂等与重试</a>是同一套纪律，也是这条 update 应该带条件而不是无条件的原因。</li>
+      <li><strong>按一个真实信号限流，</strong>通常就是复制延迟：超过阈值，作业自己暂停。</li>
+      <li><strong>可观测、可叫停</strong>——已处理行数、剩余行数、当前位置——因为「快跑完了吗」一定会被问到，也因为得有人能在不发版的情况下把它停下来。</li>
+    </ul>
+
+    <div class="callout">
+      <p>向量与搜索索引是同一个问题换了身衣服，而且在一点上更糟：新索引并不明显是错的，只是排序不一样，所以什么都不会失败。如果你的迁移智能体会碰这些，先读<a class="xref" href="/zh/operations/agentops/reindexing-and-embedding-migrations">重建索引与向量迁移</a>，再让它去排一次。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>智能体负责撰写，由受控的执行器负责应用。以及，量对那个失败。</h3>
+
+    <p>把撰写与执行分开，剩下的风险大半就消失了。智能体应当拥有对 schema 和查询统计的读权限，而在生产附近不该有任何 DDL 权限；迁移由应用人类撰写的迁移的同一条流水线来应用，走同样的审批、同样的审计记录、同样的执行身份（<a class="xref" href="/zh/operations/safety-and-security/scoped-credentials-for-agents">面向智能体的最小权限凭据</a>）。一个既能写又能执行 schema 变更的智能体，是一个「它最糟的一天就是你最糟的一天」的单一组件。</p>
+
+    <p>然后去量那个真会疼的东西，而不是吞吐：</p>
+
+    <ul>
+      <li><strong>可归因于迁移的事故数，</strong>并且对每一起都记下：哪一项检查本可以抓住它。那张清单就是你的待办——每一条都是 linter 或影子应用的一条候选规则。</li>
+      <li><strong>迁移窗口内的 p99 延迟，</strong>与一周前的同一窗口对比。锁争用会先在这里现形，然后才出现在事故频道里。</li>
+      <li><strong>收缩债：</strong>已经上线、还等着删除的扩展步骤有多少。在「只增不减」这条规则下它会悄悄增长，而这正是这条规则诚实的代价——一个没人删掉的旧列很便宜；四十个就是一个没人再理得清的 schema。</li>
+      <li><strong>被回滚或热修的迁移比例，</strong>这是「错的是顺序而不是语句」这件事最接近的可得代理指标。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>先把影子应用上线，再把智能体上线。一个拥有「在生产形态数据上测量锁时间」的流水线的团队，可以放心让模型来写迁移；而没有这条流水线的团队，是在指望评审去抓一条在 diff 里根本看不见的性质——评审抓不住它，这也正是几乎每个人都至少经历过一次这类故障的原因。在这个项目里，智能体是便宜的那一部分。</p>
+    </div>
+
+    <p>延伸：<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/large-scale-migration-agents">大规模迁移智能体</a>是代码侧的对应物，<a class="xref" href="/zh/operations/agentops/repairing-agent-side-effects">修复智能体的副作用</a>讲回填写错了值之后怎么收拾，<a class="xref" href="/zh/operations/agentops/staging-environments-for-agents">面向智能体的预发布环境</a>讲怎么把这一切所依赖的那份克隆建起来。</p>
+  </div>
+</section>

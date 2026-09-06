@@ -1,0 +1,121 @@
+<section class="phase">
+  <div class="phase-num">U22</div>
+  <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
+  <h2>Database-migration agents: the deliverable is a schema the running code still fits.</h2>
+  <p class="goal">A model writes correct DDL on the first attempt almost every time, which is exactly why this is the coding-agent task most likely to take production down: the statement is fine and the <em>sequence</em> is wrong, and your test suite runs it against an empty table with nobody else connected. Build this agent to emit an ordered, reversible sequence — expand now, backfill as a job, contract in a later release — and grade it on lock time against a production-shaped clone rather than on whether the migration applied.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Know which half the agent is good at, because the verifier only covers that half.</h3>
+
+    <p>Coding agents work when a cheap check catches their mistakes (<a class="xref" href="/concepts/generator-verifier-gap">the generator–verifier gap</a>). Migrations are a case where the available check is strong on syntax and blind on consequence:</p>
+
+    <ul>
+      <li><strong>What CI does verify:</strong> the migration parses, applies to a fresh database, the ORM models match afterwards, the down-migration reverses it, the test suite passes on the new schema. An agent clears all of this reliably.</li>
+      <li><strong>What CI does not verify:</strong> how long the statement holds a lock on a table with 400 million rows; whether the currently-deployed application code can still read the schema between the migration landing and the next deploy finishing; whether the backfill saturates replication; whether the rewrite needs disk you do not have. None of these are visible on a test database with 200 rows and one connection.</li>
+    </ul>
+
+    <p>So the design principle for the whole playbook: stop trying to make the agent smarter about the second list, and instead <em>move items from the second list into the first</em> — a shadow apply that reports lock duration, a linter that rejects a class of statement outright, a rule that a migration must be compatible with the previous release. Every one of those turns a judgement call into a check.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Teach it expand–contract as three changes, and refuse the one-shot version.</h3>
+
+    <p>The single most valuable thing you can put in the agent's instructions is that a schema change is not a change, it is a sequence in which the old and new application code are both correct at every intermediate point. Renaming a column is the canonical example: <code class="inline">ALTER TABLE ... RENAME COLUMN</code> is one statement and one outage, because the code deployed thirty seconds ago is still selecting the old name.</p>
+
+    <ul>
+      <li><strong>Expand.</strong> Add the new column, nullable, no default that rewrites the table. Add the new index concurrently. Add the constraint as <code class="inline">NOT VALID</code>. Nothing existing breaks because nothing existing changed.</li>
+      <li><strong>Migrate the code.</strong> Write to both, read from the old, then flip reads behind a flag (<a class="xref" href="/operations/agentops/feature-flags-for-agents">feature flags</a>, <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout and versioning</a>). This is the step that spans releases, and it is the step agents skip.</li>
+      <li><strong>Contract.</strong> Drop the old column — in a separate change, in a later release, after the retention window you chose in advance.</li>
+    </ul>
+
+    <p>Have the agent emit all three artefacts in one pull request as separate, individually deployable migrations with explicit ordering and a stated minimum release gap, and make "which application versions run correctly against the intermediate schema" a required field in the PR body. If the tooling supports it, prefer a system that enforces the pattern rather than documenting it — <code class="inline">pgroll</code> keeps both schema versions live behind versioned views for exactly this reason; on MySQL, <code class="inline">gh-ost</code> and <code class="inline">pt-online-schema-change</code> exist because the equivalent <code class="inline">ALTER</code> is not survivable at size.</p>
+
+    <div class="callout">
+      <p>Make the agent's default output <em>additive only</em>. Anything that removes or narrows — drop column, drop table, rename, tightening a type, adding <code class="inline">NOT NULL</code> to existing data — is a different class of work with a human owner and its own release. This one rule removes most of the ways an autonomous migration becomes unrecoverable, and it costs you nothing except the discipline of a follow-up ticket.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The lock queue is the outage, not the statement.</h3>
+
+    <p>The failure that surprises teams is not a slow <code class="inline">ALTER</code>. It is this: your DDL asks for an <code class="inline">ACCESS EXCLUSIVE</code> lock, a long-running <code class="inline">SELECT</code> is holding a conflicting lock, and because Postgres grants locks in a FIFO queue, every subsequent query on that table now queues behind your migration — which is itself waiting. A statement that would have taken two milliseconds takes the site down for the duration of somebody's analytics query.</p>
+
+    <p>The mitigation is mechanical, which means the agent can be made to emit it every time:</p>
+
+    <pre class="standalone">-- Fail fast instead of queueing the whole table behind us.
+SET lock_timeout = '3s';
+SET statement_timeout = '30s';
+
+ALTER TABLE orders ADD COLUMN fulfilled_at timestamptz;   -- metadata only
+
+-- Long-running work never holds a table lock:
+CREATE INDEX CONCURRENTLY idx_orders_fulfilled_at ON orders (fulfilled_at);
+
+-- Two-phase constraint: cheap lock now, full scan without blocking writes.
+ALTER TABLE orders ADD CONSTRAINT orders_fulfilled_ck
+  CHECK (fulfilled_at IS NULL OR fulfilled_at &gt;= created_at) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_fulfilled_ck;</pre>
+
+    <p>Three rules follow, and they belong in the agent's system prompt and in the linter, not in a wiki page nobody re-reads. Set a short <code class="inline">lock_timeout</code> on every migration session so a contended lock fails the migration instead of the application — and pair it with a retry, because failing fast is only safe if something tries again. Never run <code class="inline">CREATE INDEX</code> without <code class="inline">CONCURRENTLY</code> on a live table, and know that it cannot run inside the transaction most migration frameworks wrap around your file. And treat any statement that rewrites the table — most type changes, a volatile default on older engines — as a migration that needs an online-change tool rather than a bigger maintenance window.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Give it a real oracle: a shadow apply on production-shaped data.</h3>
+
+    <p>This is the step that converts the playbook from advice into engineering. Before a human reads the diff, the migration runs automatically against a clone with production-scale row counts and a synthetic workload, and the pipeline reports four numbers back onto the pull request: <strong>maximum lock duration per statement</strong>, <strong>total runtime</strong>, <strong>queries blocked</strong>, and <strong>bytes written</strong>. Those are the facts the reviewer cannot get from the diff and the agent cannot get from reasoning.</p>
+
+    <ul>
+      <li><strong>Restore, do not generate.</strong> A clone from a recent backup or a branch of production has the row counts, the index bloat and the data distribution that make a migration slow. Seeded fixtures do not, and a green run against fixtures is the false accept you were trying to avoid.</li>
+      <li><strong>Run a workload against it.</strong> Lock contention needs contention. Replaying even a thin slice of read traffic while the migration applies is what surfaces the queue problem, and it is the difference between "took 40 ms" and "blocked 900 queries for 40 ms".</li>
+      <li><strong>Lint before the human, not after.</strong> A rules engine over the SQL — <code class="inline">squawk</code>, Atlas's destructive-change analysis, Bytebase's review rules, or your own — is a sound checker in the sense that matters: it rejects a superset of the dangerous statements, cheaply and identically every time. Put it in the required checks and let the agent iterate against it before a person is involved (<a class="xref" href="/playbooks/coding-and-computer-use-agents/code-review-agents">code-review agents</a>).</li>
+      <li><strong>Publish the thresholds.</strong> "Auto-mergeable if lock time is under 100 ms, no statement rewrites the table, and the change is additive" is a policy. Anything outside it routes to a DBA with the numbers attached. The reviewer's job becomes classifying a measured plan rather than imagining one — the same move that makes <a class="xref" href="/playbooks/coding-and-computer-use-agents/infrastructure-as-code-agents">infrastructure-as-code agents</a> workable.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Backfills are jobs the agent writes, not migrations it runs.</h3>
+
+    <p>The most common way a migration agent causes a real incident is not DDL at all. It is <code class="inline">UPDATE orders SET fulfilled_at = created_at</code> across 400 million rows, inside the migration transaction, holding row locks and generating a replication backlog that takes the read replicas out for an hour. The statement is correct. It is also the wrong artefact.</p>
+
+    <p>Require the agent to emit data changes as a separate, operable job with five properties, and give it a template so it does not have to invent them:</p>
+
+    <ul>
+      <li><strong>Batched by key range,</strong> with a bounded batch size and a sleep between batches, so the write rate is a dial rather than a surprise.</li>
+      <li><strong>Checkpointed,</strong> writing its progress somewhere durable, so an interrupted backfill resumes instead of restarting.</li>
+      <li><strong>Idempotent,</strong> because it will be re-run — the same discipline as <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a>, and the reason the update should be conditional rather than unconditional.</li>
+      <li><strong>Throttled on a real signal,</strong> replication lag being the usual one: above a threshold, the job pauses itself.</li>
+      <li><strong>Observable and stoppable</strong> — rows processed, rows remaining, current position — because "is it nearly done" will be asked, and because someone needs to be able to halt it without a deploy.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Embeddings and search indexes are the same problem wearing different clothes, and they are worse in one respect: the new index is not obviously wrong, just differently ranked, so nothing fails. If your migration agent touches those, read <a class="xref" href="/operations/agentops/reindexing-and-embedding-migrations">reindexing and embedding migrations</a> before you let it schedule one.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The agent authors; a controlled runner applies. And measure the right failure.</h3>
+
+    <p>Separate authorship from execution and most of the residual risk goes away. The agent should have read access to the schema and to query statistics, and no DDL privilege anywhere near production; the migration is applied by the same pipeline that applies human-authored ones, with the same approvals, the same audit record and the same runner identity (<a class="xref" href="/operations/safety-and-security/scoped-credentials-for-agents">scoped credentials for agents</a>). An agent that can both write and execute a schema change is a single component whose worst day is your worst day.</p>
+
+    <p>Then measure the thing that actually hurts, not throughput:</p>
+
+    <ul>
+      <li><strong>Incidents attributable to a migration,</strong> and for each one, which check would have caught it. That list is your backlog — every entry is a candidate rule for the linter or the shadow apply.</li>
+      <li><strong>p99 latency during migration windows,</strong> compared with the same window a week earlier. Lock contention shows up here before it shows up in an incident channel.</li>
+      <li><strong>Contract debt:</strong> how many expand steps are shipped and awaiting their drop. This grows silently under an additive-only rule and is the honest cost of it — an old column nobody removed is cheap; forty of them is a schema nobody can reason about.</li>
+      <li><strong>Rate of migrations reverted or hot-fixed,</strong> which is the closest available proxy for how often the sequence, not the statement, was wrong.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Ship the shadow apply before you ship the agent. A team with a pipeline that measures lock time on production-shaped data can safely let a model write migrations; a team without one is relying on review to catch a property that is not visible in the diff, and reviewers do not catch it — that is why the outage has happened to almost everyone at least once. The agent is the cheap part of this project.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/playbooks/coding-and-computer-use-agents/large-scale-migration-agents">large-scale migration agents</a> for the code-side counterpart, <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a> for the cleanup when a backfill wrote the wrong values, and <a class="xref" href="/operations/agentops/staging-environments-for-agents">staging environments for agents</a> for building the clone this all depends on.</p>
+  </div>
+</section>

@@ -152,6 +152,7 @@ export const entries: Entry[] = [
 
   // --- 2026-09-05: the card certifies a configuration, not a capability ---
   { page: 'system-cards', slug: 'system-cards', title: L('System Cards','系统卡'), summary: L('A system card is a safety-testing record about one checkpoint, written by the vendor — it certifies a configuration you may not be served, so read the elicitation methodology and the refusal boundary and keep your own pinned acceptance eval for everything else.','系统卡是一份关于某一个检查点的安全测试记录，由厂商自己撰写——它为一个你未必被服务到的配置背书，所以只读能力激发方法与拒答边界，其余一切都交给你自己那套钉死版本的验收评测。'), group: L('AI Ecosystem','AI 生态') },
+  { page: 'generator-verifier-gap', slug: 'generator-verifier-gap', title: L('The Generator–Verifier Gap','生成-核验落差'), summary: L('Every agent loop bets that checking costs less than doing, and where the bet fails no model upgrade rescues it — but the sharper consequence is that an agent allowed to retry until it passes inherits the verifier’s false-accept rate, not the model’s, so build the checker first and set autonomy from it.','每个智能体循环都在赌「检查比做更便宜」，赌不成时换模型也救不回来——而更锋利的推论是：一个被允许重试到通过为止的智能体，继承的是核验器的误接受率而不是模型的，所以先把检查器造出来，并用它来定自主等级。'), group: L('Building Blocks','基础构件') },
 ];
 
 /** Flat, ordered list of all entries (mirrors field-guide CHAPTERS). */
