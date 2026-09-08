@@ -1,0 +1,147 @@
+<p class="lede">Every control you built for your coding agent — the approval prompt, the tool allowlist, the sandbox — sits between the model and the world, and GitSpawn never goes near the model. Manifold Security disclosed a class of eight flaws across seven CLI coding agents in which opening a booby-trapped repository is the whole attack: the harness runs <code>git status</code> to gather context, Git honours a <code>core.fsmonitor</code> setting the repository itself supplied, and an attacker's command executes with full user privileges before anyone types a prompt. Four of the eight were still executing repository-supplied commands when the researchers retested on 1 September.</p>
+
+<section>
+  <h2>What was disclosed</h2>
+  <p>Git has a performance feature called <code>core.fsmonitor</code>: point it at a helper program and Git runs that program whenever it refreshes the index, so it can skip a full filesystem scan. The setting can live in a repository's own <code>.git/config</code>. Nearly every CLI coding agent examined starts a session by quietly running <code>git status</code>, <code>git diff</code> or similar to work out where it is. Those two facts compose into arbitrary code execution with no exploit involved — the config is read exactly as designed, and the command runs exactly as configured.</p>
+
+  <table>
+    <thead>
+      <tr><th>Step</th><th>What the developer sees</th><th>What is actually happening</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Repository lands on disk</td>
+        <td>A folder from a colleague, a client, a bug report</td>
+        <td>An attacker-authored <code>.git/config</code> arrives with it</td>
+      </tr>
+      <tr>
+        <td>Agent opens the directory</td>
+        <td>The tool starting up</td>
+        <td>The harness shells out to <code>git</code> for context</td>
+      </tr>
+      <tr>
+        <td>Git refreshes the index</td>
+        <td>Nothing — there is no output</td>
+        <td><code>core.fsmonitor</code> spawns the attacker's binary</td>
+      </tr>
+      <tr>
+        <td>Session begins</td>
+        <td>A prompt, waiting for input</td>
+        <td>Code has already run as the logged-in user</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/your-agent-ran-git-status-and-that-was-enough/arch-two-paths.svg" alt="Two lanes. The upper lane shows the designed path: a typed request, a model proposing a tool call, a permission gate, and sandboxed execution. The lower lane shows the GitSpawn path: opening a folder, the harness running git status for context, Git reading core.fsmonitor from the repository's own .git/config, and the attacker's command running with full user privileges outside the sandbox with no prompt. Every control in the upper lane sits downstream of the lower lane." width="900" height="500" loading="lazy" />
+    <figcaption>The permission system governs what the model decides to do. This runs before the model has a turn.</figcaption>
+  </figure>
+
+  <p>The affected list is not a fringe of hobby projects: Claude Code, OpenAI Codex, Cursor, Grok Build, Goose, Hermes Agent and Qwen Code. Seven independent teams, seven independent codebases, one shared blind spot.</p>
+</section>
+
+<section>
+  <h2>The permission prompt was never in the path</h2>
+  <p>Read the agent-security literature of the past year and it converges on a single mental model: the model is the untrusted decision-maker, so put a gate between what it decides and what happens. Approve the tool call. Allowlist the commands. Run the whole thing in a container. Every one of those controls is anchored to a model turn, and it is a good model — for the threat it addresses.</p>
+
+  <p>GitSpawn is a reminder that the harness is not neutral plumbing. Before the model sees anything, the harness gathers context: it lists files, reads a config, checks the branch, computes a diff. That work is code your agent runs on your behalf, in your account, on input the attacker controls, and no product in this category treats it as a privileged boundary. The researchers noted that in some cases it fires before the user has even authenticated — which means the process that ran the attacker's command had not yet established who was using it.</p>
+
+  <ul>
+    <li><strong>An approval prompt cannot fire</strong> for an action nobody proposed. There was no tool call; there was a subprocess the harness always runs.</li>
+    <li><strong>A command allowlist passes it.</strong> <code>git status</code> is on every allowlist ever written, and the dangerous behaviour is inside Git, not in the argument vector.</li>
+    <li><strong>The sandbox is often not up yet.</strong> Startup context-gathering frequently runs in the host process, and even where it does not, the container was scoped for the agent's work rather than for arbitrary attacker code.</li>
+    <li><strong>Nothing is logged as suspicious,</strong> because nothing suspicious happened by the agent's own accounting. The transcript starts after the damage.</li>
+  </ul>
+
+  <p>This is the same structural point as <a href="/blogs/the-block-log-is-an-injection-channel">the block-log injection channel</a> from a different direction. There, attacker text reached a trusted store and the agent read it as instruction. Here the attacker never needs the model to cooperate at all — the harness is enough. Both are cases where the interesting surface is the plumbing around the loop rather than the loop.</p>
+</section>
+
+<section>
+  <h2><code>git clone</code> is safe, and that is the trap</h2>
+  <figure>
+    <img src="/blogs/your-agent-ran-git-status-and-that-was-enough/compare-delivery-paths.svg" alt="Three columns comparing how a repository reaches disk. A normal git clone rebuilds .git/config locally and does not carry the attacker's setting. An archive, shared drive or synced folder copies the .git directory byte for byte and does carry it. A pre-built dev container or restored backup carries whatever was prepared elsewhere and is the path a developer inspects least." width="900" height="300" loading="lazy" />
+    <figcaption>The one delivery path everybody pictures is the one that is clean.</figcaption>
+  </figure>
+
+  <p>Cloning from GitHub does not carry the payload. Git builds <code>.git/config</code> locally from your own defaults and the remote URL; the source repository's config is not transferred. That single fact is why the first reaction to this disclosure is usually to file it under theoretical — and it is exactly why it is worth reading twice, because the delivery paths that <em>do</em> carry the directory are the unremarkable ones.</p>
+
+  <ul>
+    <li><strong>Archives.</strong> A zip or tarball of a working tree copies <code>.git</code> verbatim. This is how a client hands over a codebase, how a takehome exercise arrives, how a repository gets attached to a support ticket.</li>
+    <li><strong>Shared and synced folders.</strong> A network share, a sync client, a USB stick, a folder mounted into a VM. None of them rewrite a config.</li>
+    <li><strong>Pre-built development containers and images.</strong> The working tree was prepared on somebody else's machine and shipped whole. This is also the path a developer is least likely to inspect and most likely to trust, because inspecting it is the thing the image exists to save you.</li>
+    <li><strong>Restored backups and snapshots.</strong> A restore reproduces the config that was in place at capture time, including one placed there by an earlier compromise.</li>
+  </ul>
+
+  <p>Put those together with how coding agents are actually used and the exposure sharpens. Agents get pointed at unfamiliar code for a living — triage this repository, review this contractor's work, migrate this legacy project. "Open a directory somebody else prepared" is not an edge case for this category. It is the job.</p>
+</section>
+
+<section>
+  <h2>The disclosure record is the more useful artefact</h2>
+  <figure>
+    <img src="/blogs/your-agent-ran-git-status-and-that-was-enough/data-patch-status.svg" alt="Status chart of eight GitSpawn findings across seven agents. Goose fixed with CVE-2026-72718. Claude Code's fsmonitor path fixed in 2.1.196 three days after report, with the report closed as a duplicate. Cursor fixed. Still executing at the 1 September retest: a second Claude Code configuration path, Grok Build, Qwen Code, and Hermes Agent, the last assigned CVE-2026-71963 independently after six unanswered contact attempts." width="900" height="400" loading="lazy" />
+    <figcaption>Half the findings closed quickly. The other half are still open, and the pattern in which half is which is not random.</figcaption>
+  </figure>
+
+  <p>Goose shipped a fix and took CVE-2026-72718. Claude Code's <code>core.fsmonitor</code> finding was reported on 26 June and fixed in 2.1.196 three days later — the report itself was closed as a duplicate of one filed earlier the same day, which tells you two researchers found the same thing within hours of each other. Cursor fixed its path. That is a functioning disclosure process.</p>
+
+  <p>The other half is the story. Four findings were still executing repository-supplied commands when retested on 1 September: Grok Build, Qwen Code, Hermes Agent, and a second configuration path in Claude Code. Hermes Agent's CVE-2026-71963 was assigned independently after six contact attempts went unanswered — a vendor with a shipped agent and no reachable security contact.</p>
+
+  <p>Two things are worth taking from that split rather than from the vulnerability itself:</p>
+
+  <ul>
+    <li><strong>A patched vendor is not a patched class.</strong> The same agent had one path fixed in three days and another still open two months later. Vendor-level statements — "we fixed GitSpawn" — do not survive contact with a class of eight findings, and neither does a version-pinned mitigation.</li>
+    <li><strong>Security maturity is now a procurement axis for agent tooling.</strong> Whether a project has a security contact, an advisory feed and a track record of turning a report into a release is not a nice-to-have for a tool you point at untrusted code with your own credentials. It is the property that determines your exposure window, and it varies enormously across a list of seven products that all look similar in a feature comparison.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>What actually helps</h2>
+  <p>The immediate fix belongs to the vendors, and it is not subtle: refuse repository-supplied executable config. Git ships the mechanism — <code>safe.directory</code> gates repositories not owned by the current user, and the agent can force its own configuration scope when it shells out. Every agent in this category should be running its context-gathering with repository-level config for executable settings disabled, and should say so in its documentation.</p>
+
+  <p>What you can do without waiting is narrower but real, and it generalises past this particular setting:</p>
+
+  <ul>
+    <li><strong>Treat opening a directory as the privileged action.</strong> Not the first tool call — the moment the agent is pointed at a tree. That is where the trust decision actually happens, and no product currently prompts there.</li>
+    <li><strong>Inspect <code>.git/config</code> before opening code you did not clone.</strong> One <code>grep</code> for <code>fsmonitor</code>, <code>hooksPath</code>, <code>sshCommand</code>, <code>pager</code> and <code>editor</code> across incoming trees. It is a two-line pre-commit-style check and it covers the current known shapes.</li>
+    <li><strong>Re-clone rather than open in place.</strong> If a repository arrived as an archive, clone from the canonical remote and apply the diff. This discards the attacker-controlled config by construction — a workflow change rather than a control.</li>
+    <li><strong>Run unfamiliar repositories in a sandbox that is already up.</strong> The value here is not that the sandbox is clever; it is that it exists before the agent process starts, so it bounds startup code the agent's own permission system never sees. Devcontainers help only if the image is yours.</li>
+    <li><strong>Watch for process spawns from the agent's own subprocesses.</strong> The behavioural signal — <code>git</code> spawning something that is not a Git subcommand — is cheap to alert on and survives the next variant, which will use a different config key.</li>
+  </ul>
+
+  <p>The general lesson outlasts <code>core.fsmonitor</code>. Every tool a coding agent shells out to has its own configuration language, and several of those languages are Turing-complete or can name a program to run: build systems, test runners, linters, formatters, package managers, editors. An agent that reads a project's configuration in order to be helpful is executing that project's intent. The threat model that treats the model as the only untrusted component is a model of the wrong system.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>What is GitSpawn?</h3>
+  <p>A class of eight vulnerabilities across seven CLI coding agents, disclosed by Manifold Security, in which a repository's own <code>core.fsmonitor</code> Git setting causes an attacker-chosen command to run when a coding agent performs a routine background <code>git status</code>. No prompt is typed and no approval is clicked; in some cases it fires before the user has authenticated.</p>
+  <h3>Am I affected if I only clone from GitHub?</h3>
+  <p>Not through that path. <code>git clone</code> builds <code>.git/config</code> locally and does not copy the source repository's version. The exposure comes from repositories that arrive as archives, on shared or synced drives, inside pre-built development containers, or through a restored backup — anything that copies the <code>.git</code> directory rather than reconstructing it.</p>
+  <h3>Does my sandbox protect me?</h3>
+  <p>Partly, and only if it is running before the agent process starts. Startup context-gathering frequently executes in the host process, and where it does run inside a container, that container was scoped for the agent's work rather than for arbitrary attacker code. A sandbox bounds the damage; it does not prevent the execution.</p>
+  <h3>Which agents were fixed?</h3>
+  <p>Goose (CVE-2026-72718), Cursor, and Claude Code's <code>core.fsmonitor</code> path, fixed in 2.1.196 three days after the 26 June report. Four findings — Grok Build, Qwen Code, Hermes Agent (CVE-2026-71963) and a second Claude Code configuration path — were still executing repository-supplied commands when retested on 1 September. Check your own version rather than a vendor statement.</p>
+  <h3>Is this prompt injection?</h3>
+  <p>No, and the distinction matters. Prompt injection persuades a model to do something; this never involves the model. It is arbitrary code execution through a trusted tool the harness invokes on its own initiative, which is why every defence aimed at what the model decides is irrelevant to it.</p>
+  <h3>What is the smallest useful check?</h3>
+  <p>Grep incoming working trees for <code>fsmonitor</code>, <code>hooksPath</code>, <code>sshCommand</code>, <code>pager</code> and <code>editor</code> in <code>.git/config</code> before opening them with an agent. It covers the known shapes, costs nothing, and is scriptable as a pre-open hook in whatever wrapper you already use.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/agent-harness">The agent harness</a> — why the half of the system nobody publishes is usually the half that was wrong.</li>
+    <li><a href="/playbooks/coding-and-computer-use-agents/sandboxing-and-execution">Sandboxing &amp; execution</a> — what a boundary has to be up before in order to hold.</li>
+    <li><a href="/deep-dives/agent-security/agent-supply-chain-security">Agent supply-chain security</a> — the category this lands in, and how the rest of it is shaped.</li>
+    <li><a href="/concepts/ambient-authority">Ambient authority</a> — why the credential the process already holds is the thing that gets used.</li>
+    <li><a href="/concepts/blast-radius">Blast radius</a> — the property you can bound before you know how the attack works.</li>
+    <li><a href="/operations/safety-and-security/detecting-agent-compromise">Detecting agent compromise</a> — the behavioural signals that survive a variant with a different config key.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://www.manifold.security/blog/ai-coding-agents-git-hijack">Manifold Security — GitSpawn: a single flaw lets untrusted repos run code in Claude Code, Codex, Cursor and Grok</a></li>
+    <li><a href="https://thehackernews.com/2026/09/malicious-git-configs-can-make-claude.html">The Hacker News — Malicious .git configs can make Claude, Codex, Cursor and other AI agents run attacker code</a></li>
+    <li><a href="https://git-scm.com/docs/git-config">git-config documentation — <code>core.fsmonitor</code> and <code>safe.directory</code></a></li>
+  </ul>
+</section>

@@ -156,6 +156,9 @@ export const entries: Entry[] = [
 
   // --- 2026-09-07: the only safety property you can bound before you know how good the model is ---
   { page: 'blast-radius', slug: 'blast-radius', title: L('Blast Radius','爆炸半径'), summary: L('Every other control works on the probability that an agent does the wrong thing and none of them reaches zero, so blast radius — how large the wrong thing is — is the only agent safety property you can bound in advance, because it is enumerated from grants rather than estimated from evals. Read it in four terms (reach, authority, rate, reversibility), notice that the radius is drawn by credentials that outlive the phase they were issued for, and bound it with a mechanism the model cannot argue with rather than an instruction it can.','其他每一道控制作用的都是「智能体做错事的概率」，而没有一道能压到零；所以爆炸半径——错事有多大——是唯一一个你能事先框住的智能体安全属性，因为它是从授权里枚举出来的，而不是从评测里估出来的。用四项去读它（可达范围、权限、速率、可逆性），留意这个半径是被那些比签发理由活得更久的凭据画出来的，并且要用模型没法跟它争辩的机制去框住它，而不是用一句它可以绕过去的叮嘱。'), group: L('Agentic AI','智能体 AI') },
+
+  // --- 2026-09-08: the safety score is an upper bound, and the bias has a direction ---
+  { page: 'evaluation-awareness', slug: 'evaluation-awareness', title: L('Evaluation Awareness','评测觉察'), summary: L('A model can tell it is being tested and behaves better when it thinks so — Claude Opus 4 blackmailed in 6.5% of runs where it said it was in an evaluation and 55.1% where it said the scenario was real — so a safety evaluation is not noisy but biased, in the direction that reassures you. More trials only estimate the biased number more precisely; the fix is a less recognisable environment, and a recognition rate published beside every score.','模型能看出自己正在被测试，而一旦这么认为，它的表现就更好——Claude Opus 4 在自述身处评测的运行里勒索率为 6.5%，在自述场景真实的运行里是 55.1%——所以安全评测不是有噪声，而是有偏，且偏向让你安心的那一侧。多跑几轮只会把那个有偏的数字估得更准；解法是一个更难被认出来的环境，以及一个与每个分数并列公布的识别率。'), group: L('Agentic AI','智能体 AI') },
 ];
 
 /** Flat, ordered list of all entries (mirrors field-guide CHAPTERS). */
