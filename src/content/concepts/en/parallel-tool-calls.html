@@ -1,0 +1,86 @@
+<section class="phase">
+  <div class="phase-num">B27</div>
+  <div class="week">Concepts · Core Building Blocks</div>
+  <h2>Parallel Tool Calls.</h2>
+  <p class="goal">The batch your model just emitted was decided before any of it ran — four calls chosen in one breath, with no result from the first available to shape the second. That single property turns parallel tool calling from a latency optimisation into a correctness decision: the only calls safe to issue together are the ones that commute and can be retried independently, and the model is not the component that knows which of yours those are. You are, and the place to say so is the executor, not the prompt.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>One turn, several calls, no lookahead.</h3>
+
+    <p>In an ordinary <a class="xref" href="/concepts/tool-calling-explained">tool-calling</a> turn the model emits one call, your harness runs it, and the result goes back as the next message. A parallel batch is the same protocol with the count raised: a single assistant turn carries several tool-use blocks, the harness executes them — usually concurrently — and returns every result together before the model speaks again.</p>
+
+    <p>The interesting part is not the concurrency. It is that all <em>N</em> calls were selected from the same information. In a sequential loop, call two is written after result one exists and can be narrowed by it. In a batch, call two is a guess made in parallel with call one, and the model does not learn it guessed until the whole batch comes back.</p>
+
+    <ul>
+      <li><strong>It is on by default.</strong> Both major APIs emit multiple calls per turn unless told otherwise: OpenAI takes a top-level <code class="inline">parallel_tool_calls: false</code>, Anthropic takes <code class="inline">tool_choice: {"type": "auto", "disable_parallel_tool_use": true}</code>, which caps the turn at one tool. If you have never set either, you already ship batches.</li>
+      <li><strong>The flag is per request, not per deployment.</strong> That is the useful shape: a research phase can fan out while the phase that writes anything runs one call at a time, inside the same run.</li>
+      <li><strong>Concurrency is your harness's choice.</strong> The API hands you a list. Nothing obliges you to execute it concurrently, and for a mixed batch you should not.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Say the batch out loud and the risk becomes obvious: <em>"run these four things in an order I have not specified, and tell me what happened afterwards."</em> No transaction, no ordering guarantee, no chance to abort after the first result. That is a fine instruction for four lookups and a bad one for anything that writes.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Two properties decide whether a batch is safe.</h3>
+
+    <p>A call belongs in a batch when it satisfies both of these against every other call in the same batch. One is not enough.</p>
+
+    <ul>
+      <li><strong>Commutativity.</strong> Running A then B leaves the world in the same state as B then A. Four reads against a store nobody is writing to commute. <code class="inline">apply_discount</code> and <code class="inline">charge_card</code> against the same order do not, and neither does a read of a record paired with a write to it — the read may or may not see the write, and which it sees is a scheduling accident.</li>
+      <li><strong>Independent retryability.</strong> If one call fails, re-running only that one is correct. This is where batches usually break, because partial failure is the ordinary outcome: three succeed, one returns a 503, and the model — which sees a mixed result set and no repair protocol — commonly re-emits something close to the original batch. Any non-idempotent call in it now runs twice.</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># A batch the model will happily emit, and should not</span>
+
+assistant turn:
+  <span class="c-fn">create_ticket</span>(title=<span class="c-st">"refund request"</span>)      <span class="c-out">→ ok, id=T-4192</span>
+  <span class="c-fn">post_comment</span>(ticket=<span class="c-st">"?"</span>, body=…)           <span class="c-err">→ error: needs T-4192</span>
+  <span class="c-fn">notify_customer</span>(ticket=<span class="c-st">"?"</span>)                <span class="c-err">→ error: needs T-4192</span>
+
+<span class="c-cm"># The model retries the batch. create_ticket is not idempotent.</span>
+<span class="c-cm"># You now have T-4192 and T-4193, and a customer notified about one of them.</span></pre>
+
+    <p>The failure is not that the model was careless. It is that the batch shape gave it no way to be careful: the dependency it needed to respect was only expressible by waiting, and waiting is the thing a batch does not do.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What you actually buy, and what it quietly costs.</h3>
+
+    <p>The speedup is real. It is also narrower, and more expensive elsewhere, than the pitch suggests.</p>
+
+    <ul>
+      <li><strong>Latency becomes max, not sum</strong> — which pays when the calls are slow and roughly equal, and pays almost nothing when one call dominates. Three 80 ms lookups behind a 4 s search save you 240 ms on a turn that still takes four seconds.</li>
+      <li><strong>Tokens go the other way.</strong> Every result lands in <a class="xref" href="/concepts/context-windows">context</a> at once, in full. A sequential loop can stop after result one made results two through five unnecessary; a batch has already paid for all five, and paid again on every subsequent turn that carries them. Fan-out is the fastest way to fill a context window with material the run never needed, which is why it shows up as a <a class="xref" href="/concepts/agent-cost-control">cost</a> problem before it shows up as a latency win.</li>
+      <li><strong>It does more work, not the same work faster.</strong> A model that can see result one often issues a narrower second call, or none. Batching removes that option by construction, so the comparison is not "same four calls, less wall clock" — it is "four calls instead of the two a sequential loop would have made".</li>
+      <li><strong>Spend gets lumpy.</strong> Concurrency multiplies against rate limits and per-call cost in the same instant, so a run that was comfortably inside a quota sequentially can trip it in a batch, and the retry storm that follows is charged to you.</li>
+    </ul>
+
+    <p>The honest rule of thumb: batch when the calls are independent reads that are individually slow — search, retrieval, a fan-out over several sources — and serialise everything else. That is a narrower licence than the default setting gives you.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Put the constraint in the executor, not the prompt.</h3>
+
+    <p>"Do not call these two tools together" is an instruction with a failure rate. The same rule in the code that dispatches the batch has a return value. Four changes, all in your harness, none requiring the model's cooperation:</p>
+
+    <ul>
+      <li><strong>Classify every tool as reading or mutating in the registry</strong>, next to its schema. This is one boolean per <a class="xref" href="/concepts/tool-design-for-agents">tool definition</a> and it is the field the rest of this list depends on.</li>
+      <li><strong>Refuse the unsafe shape at dispatch.</strong> A batch containing more than one mutating call gets serialised — or rejected with a message telling the model to issue them one at a time, which is a repair it handles well. A batch mixing a write with a read of the same resource gets the same treatment.</li>
+      <li><strong>Derive idempotency keys from arguments, not from a fresh UUID.</strong> A key generated per attempt is not an idempotency key. Hash the call's semantic arguments plus a run identifier so a re-emitted <code class="inline">create_ticket</code> resolves to the ticket that already exists. The operational depth is in <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a>.</li>
+      <li><strong>Return per-call results with stable identifiers and per-call errors</strong> — never one merged blob, and never a single failure that discards three successes. The model can only retry precisely if the transcript says precisely what happened; see <a class="xref" href="/deep-dives/tool-capability-design/shaping-tool-results">shaping tool results</a>.</li>
+      <li><strong>Cap the width.</strong> An upper bound on calls per turn — eight is generous for most agents — bounds the worst turn's context growth, its concurrency against your dependencies, and the size of the mess a bad batch can make. It is the cheapest <a class="xref" href="/concepts/blast-radius">blast radius</a> control in the tool layer.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Go and read one week of production transcripts for the widest batch your agent has ever emitted, and check it against the two properties in Step 2. Most teams find at least one batch containing two writes, and they find it in the logs rather than in an incident because nothing has yet retried at the wrong moment. Then add the reading/mutating boolean to your tool registry and make the dispatcher enforce it — an afternoon's work that turns a class of race conditions into a return value, and leaves the fan-out you actually wanted untouched.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/deep-dives/tool-capability-design/advanced-tool-orchestration-patterns">advanced tool orchestration patterns</a> for the batch's more structured cousins, <a class="xref" href="/deep-dives/tool-capability-design/streaming-tool-calls-in-practice">streaming tool calls</a> for what the wire actually looks like while a batch is being emitted, and <a class="xref" href="/deep-dives/tool-capability-design/code-as-action">code as action</a> for the approach that replaces the batch with a program the model can express dependencies in.</p>
+  </div>
+</section>

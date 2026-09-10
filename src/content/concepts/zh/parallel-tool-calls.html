@@ -1,0 +1,86 @@
+<section class="phase">
+  <div class="phase-num">B27</div>
+  <div class="week">概念 · 核心构件</div>
+  <h2>并行工具调用。</h2>
+  <p class="goal">你的模型刚刚吐出的那一批调用，是在任何一个跑起来之前就定下的——四次调用在同一口气里选出，第一次的结果还不存在，自然也无从塑造第二次。就这一条性质，把并行工具调用从一项延迟优化变成了一个正确性决定：唯一可以放在一起发出的调用，是那些彼此可交换、且能各自独立重试的调用；而知道你这边哪些属于此列的，并不是模型。是你。而说出这件事的地方，是执行器，不是提示词。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>一轮，多次调用，没有前瞻。</h3>
+
+    <p>在一次寻常的<a class="xref" href="/zh/concepts/tool-calling-explained">工具调用</a>轮次里，模型发出一次调用，你的外壳把它跑掉，结果作为下一条消息回去。并行批次是同一套协议，只是把数量抬了上来：单个 assistant 轮次里带着好几个工具调用块，外壳把它们执行掉——通常是并发的——并在模型再次开口之前，把每一个结果一起送回。</p>
+
+    <p>有意思的地方不在并发。而在于这 <em>N</em> 次调用是从同一份信息里选出来的。在顺序循环里，第二次调用是在第一个结果已经存在之后才写下的，可以被它收窄。在批次里，第二次调用是一次与第一次并排作出的猜测，而模型直到整批回来之前，都不知道自己猜过。</p>
+
+    <ul>
+      <li><strong>它默认是开着的。</strong>两家主要 API 若不另行交代，每轮都会发出多次调用：OpenAI 收一个顶层的 <code class="inline">parallel_tool_calls: false</code>，Anthropic 收 <code class="inline">tool_choice: {"type": "auto", "disable_parallel_tool_use": true}</code>，把该轮封顶为一次工具。如果你从没设过其中任何一个，你早就在发批次了。</li>
+      <li><strong>这个开关是按请求的，不是按部署的。</strong>这才是有用的形状：在同一次运行里，检索阶段可以扇出，而那个会写任何东西的阶段一次只跑一个调用。</li>
+      <li><strong>并发是你外壳的选择。</strong>API 交给你的是一个列表。没有任何东西强迫你并发执行它，而对一个混合批次，你不该这么做。</li>
+    </ul>
+
+    <div class="callout">
+      <p>把这批调用念出声来，风险就明摆着了：<em>"按一个我没有指定的顺序去跑这四件事，跑完再告诉我发生了什么。"</em> 没有事务，没有顺序保证，也没有在第一个结果之后中止的机会。对四次查询而言这是条好指令；对任何会写的东西而言，这是条坏指令。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>两条性质决定一个批次安不安全。</h3>
+
+    <p>一次调用可以进批次，前提是它相对同批中的每一个其他调用都同时满足下面两条。只满足一条不够。</p>
+
+    <ul>
+      <li><strong>可交换性。</strong>先跑 A 再跑 B，留下的世界状态与先 B 后 A 相同。四次针对无人写入的存储的读取是可交换的。针对同一张订单的 <code class="inline">apply_discount</code> 与 <code class="inline">charge_card</code> 不是；读一条记录再配上对它的一次写，同样不是——那次读可能看得见那次写，也可能看不见，而看见与否是调度上的偶然。</li>
+      <li><strong>可独立重试性。</strong>若其中一个调用失败了，只重跑它一个是正确的。批次通常就折在这里，因为部分失败才是常态：三个成功，一个返回 503，而模型——它看到的是一组混合结果，手上没有修复协议——常见的反应是把接近原样的那一批重新发一遍。批里任何非幂等的调用，现在跑了两次。</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># A batch the model will happily emit, and should not</span>
+
+assistant turn:
+  <span class="c-fn">create_ticket</span>(title=<span class="c-st">"refund request"</span>)      <span class="c-out">→ ok, id=T-4192</span>
+  <span class="c-fn">post_comment</span>(ticket=<span class="c-st">"?"</span>, body=…)           <span class="c-err">→ error: needs T-4192</span>
+  <span class="c-fn">notify_customer</span>(ticket=<span class="c-st">"?"</span>)                <span class="c-err">→ error: needs T-4192</span>
+
+<span class="c-cm"># The model retries the batch. create_ticket is not idempotent.</span>
+<span class="c-cm"># You now have T-4192 and T-4193, and a customer notified about one of them.</span></pre>
+
+    <p>这次失败不是因为模型不小心。而是因为批次这个形状根本没给它小心的余地：它需要尊重的那份依赖关系，唯一的表达方式就是"等一等"，而"等"恰恰是批次不做的事。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>你实际买到了什么，以及它在别处悄悄收了多少。</h3>
+
+    <p>提速是真的。它同时也比宣传里更窄，并且在别的地方更贵。</p>
+
+    <ul>
+      <li><strong>延迟从"求和"变成"取最大"</strong>——这在各次调用都慢、且彼此量级相当时划算，在某一次调用独大时几乎白给。三次 80 毫秒的查询躲在一次 4 秒的搜索背后，给你省下 240 毫秒，而这一轮仍然要花四秒。</li>
+      <li><strong>token 则走向相反的方向。</strong>每一个结果都在同一时刻、完整地落进<a class="xref" href="/zh/concepts/context-windows">上下文</a>。顺序循环可以在"结果一使得结果二到五变得多余"之后就停手；批次已经把五个都付过钱了，而且在此后每一个仍带着它们的轮次里再付一遍。扇出是把一个上下文窗口填满"本次运行根本用不上的材料"的最快办法，这也是为什么它先以<a class="xref" href="/zh/concepts/agent-cost-control">成本</a>问题的面目出现，而不是先以延迟收益的面目出现。</li>
+      <li><strong>它做的是更多的工作，而不是把同样的工作做得更快。</strong>一个能看见结果一的模型，往往会发出一次更窄的第二调用，或者干脆不发。批处理从构造上取消了这个选项，所以对比的并不是"同样四次调用、更少的墙钟时间"——而是"四次调用，对上顺序循环本来只会发的两次"。</li>
+      <li><strong>开销变得一阵一阵的。</strong>并发在同一瞬间同时乘上速率限制与单次调用成本，于是一次顺序跑时舒舒服服待在配额内的运行，换成批次就能把配额顶穿；而随之而来的重试风暴，账记在你头上。</li>
+    </ul>
+
+    <p>诚实的经验法则：当各次调用是彼此独立、且单个本身就慢的读取时才批处理——搜索、检索、跨几个来源的一次扇出——其余一律串行。这是一份比默认设置给你的窄得多的许可。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>把约束放进执行器，而不是提示词。</h3>
+
+    <p>"不要把这两个工具一起调"是一条带失败率的指令。同一条规则写在派发这批调用的代码里，则带一个返回值。四项改动，全在你的外壳里，没有一项需要模型的配合：</p>
+
+    <ul>
+      <li><strong>在注册表里把每个工具标注为"读"还是"写"</strong>，就挨着它的 schema。这是每份<a class="xref" href="/zh/concepts/tool-design-for-agents">工具定义</a>上的一个布尔值，也是这份清单其余各项赖以成立的那个字段。</li>
+      <li><strong>在派发处直接拒掉不安全的形状。</strong>含有一个以上写入调用的批次一律串行化——或者驳回，并附一句让模型逐个发出的说明，这种修复它处理得很好。把写与"对同一资源的读"混在一起的批次，同样处理。</li>
+      <li><strong>幂等键从参数导出，而不是现生成一个 UUID。</strong>每次尝试都新生成的键不是幂等键。把该调用的语义参数加上一个运行标识一起做哈希，好让一次重发的 <code class="inline">create_ticket</code> 解析到那张已经存在的工单上。运维层面的纵深在<a class="xref" href="/zh/operations/agentops/idempotency-and-retries">幂等与重试</a>。</li>
+      <li><strong>逐调用返回结果，带稳定标识与逐调用的错误</strong>——绝不合并成一坨，也绝不让一次失败吞掉三次成功。模型只有在记录说清楚发生了什么时，才能精确地重试；见<a class="xref" href="/zh/deep-dives/tool-capability-design/shaping-tool-results">工具结果的塑形</a>。</li>
+      <li><strong>给宽度封顶。</strong>每轮调用数的上限——对多数智能体来说八个已经很宽裕——同时框住了最坏那一轮的上下文膨胀、它对你各个依赖的并发压力，以及一个坏批次能捅出的篓子有多大。这是工具层里最便宜的<a class="xref" href="/zh/concepts/blast-radius">爆炸半径</a>控制。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>去把一周的生产记录翻出来，找到你的智能体发过的最宽的那一批，拿第 2 步的两条性质对着它验一遍。多数团队会找到至少一批含有两次写入的调用；而他们是在日志里、而不是在事故里找到它的，只因为还没有哪一次重试恰好赶在错误的时刻。然后把"读/写"这个布尔值加进工具注册表，让派发器强制执行它——一个下午的活，把一类竞态条件变成一个返回值，而你真正想要的那份扇出丝毫未动。</p>
+    </div>
+
+    <p>延伸：<a class="xref" href="/zh/deep-dives/tool-capability-design/advanced-tool-orchestration-patterns">进阶工具编排模式</a>讲批次那些结构更完整的表亲，<a class="xref" href="/zh/deep-dives/tool-capability-design/streaming-tool-calls-in-practice">流式工具调用</a>讲一批调用正被吐出来时线路上到底长什么样，<a class="xref" href="/zh/deep-dives/tool-capability-design/code-as-action">代码即动作</a>讲那条用"一段模型可以在其中表达依赖关系的程序"来取代批次的路子。</p>
+  </div>
+</section>
