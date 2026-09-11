@@ -1,0 +1,156 @@
+<p class="lede">这四个里有两个其实是同一个路由器换了张账单：OpenRouter 的 Auto Router 底下跑的就是 Not Diamond，所以一个想"两家都上以分散风险"的团队，实际上只上了一家。这还是较小的那个意外。更大的那个是：路由器是你放进请求路径里的一个分类器，而它的错误是无声的——一次误路由会带着 200 状态码返回一个有效、只是略差一点的答案——所以采用它，就等于欠下了一次你多半还没有的质量评估。而在智能体循环内部，逐步路由会和提示词缓存迎面相撞，后者省下的通常更多。</p>
+
+<section>
+  <h2>先看全貌</h2>
+  <p>四个产品，三个不同的路由决定，两种截然不同的落脚处。</p>
+
+  <table>
+    <thead>
+      <tr><th>项目</th><th>出身</th><th>它决定什么</th><th>它跑在哪</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>RouteLLM</td>
+        <td>LMSYS / 伯克利，开源，ICLR 2025</td>
+        <td>强模型还是弱模型，阈值可调</td>
+        <td>你进程里的一个库</td>
+      </tr>
+      <tr>
+        <td>Not Diamond</td>
+        <td>商业公司，已获种子轮，SaaS</td>
+        <td>选哪个模型，来自逐查询学习到的偏好</td>
+        <td>你调厂商之前的一次托管调用</td>
+      </tr>
+      <tr>
+        <td>OpenRouter Auto Router</td>
+        <td>OpenRouter，beta，免费使用</td>
+        <td>同一个决定——它跑的就是 Not Diamond</td>
+        <td>你本来就在调的那个网关里</td>
+      </tr>
+      <tr>
+        <td>vLLM Semantic Router</td>
+        <td>vLLM 生态，Apache 2.0</td>
+        <td>意图与复杂度——以及要不要开推理</td>
+        <td>你自己推理栈里的一个 Envoy 过滤器</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/routellm-vs-not-diamond-vs-vllm-semantic-router-vs-openrouter-auto/data-feature-matrix.svg" alt="四行特性矩阵——RouteLLM、Not Diamond、OpenRouter Auto 与 vLLM Semantic Router——按五列打分：可自托管、自带评估工具、跨外部厂商的覆盖面、对推理投入的控制，以及是否在模型调用前增加一次网络往返。RouteLLM 在自托管与评估上强，在厂商覆盖面上弱。Not Diamond 与 Auto Router 在覆盖面上强，在自托管上弱。vLLM Semantic Router 在自托管与推理控制上强，在外部厂商上弱。" width="900" height="400" loading="lazy" />
+    <figcaption>先读最后一列：四个里有三个会在模型调用之前多加一道决策环节。</figcaption>
+  </figure>
+
+  <p>类别比格子更要紧。RouteLLM 和 vLLM Semantic Router 是你自己跑的东西；Not Diamond 和 Auto Router 是你去调的东西。仅这一项差别，就决定了你的延迟下限、你的故障模式，以及这个路由决定事后还能不能审。</p>
+</section>
+
+<section>
+  <h2>各自站在哪里</h2>
+  <figure>
+    <img src="/blogs/routellm-vs-not-diamond-vs-vllm-semantic-router-vs-openrouter-auto/arch-where-the-router-sits.svg" alt="一条请求路径上三种可能的路由器摆放位置示意图。进程内：RouteLLM 分类器在应用内部运行，在任何网络调用之前挑好模型。代理层：你自己推理栈里的 Envoy 外部处理器对意图与复杂度做分类，可选地关掉推理模式，再转发到本地后端。托管：应用调用一个路由服务，或调用一个 auto 端点本身就在调该服务的网关，在发出厂商调用之前拿回模型选择。一处注记显示 OpenRouter Auto 与 Not Diamond 汇聚到同一个决策引擎。" width="900" height="500" loading="lazy" />
+    <figcaption>三种摆放位置，而其中一个方框被四个产品里的两个共用。</figcaption>
+  </figure>
+
+  <h3>RouteLLM——诚实的起点</h3>
+  <p>RouteLLM 出自 LMSYS，也就是 Chatbot Arena 那个团队，论文发表于 ICLR 2025。它把路由框定成一个二元问题：这条查询发给强模型还是弱模型，阈值由你调到自己选定的成本—质量点上。它带了好几种路由器实现——相似度加权排序、矩阵分解模型、一个 BERT 分类器——更要紧的是，它还带了当初用来度量这些实现的评估工具。论文里那个招牌结果，大致是"在某个基准的多数题目上达到 GPT-4 水平的质量，成本约为四分之一"。</p>
+  <p>把那个数字当成方法演示，而不是对你的预测。RouteLLM 真正给你的，是这一类产品里唯一诚实的那件东西：在你相信任何人报出的百分比之前，先在你自己的查询上把它量出来的办法。代价是它是一份研究代码库——模型对、阈值、重训练和周边管道，都归你。</p>
+
+  <h3>Not Diamond，以及其实就是 Not Diamond 的 Auto Router</h3>
+  <p>Not Diamond 是一层托管路由：你把查询发给它，它告诉你该由哪个模型来处理，厂商调用还是你自己发。它明确不是网关——它坐在 OpenRouter、Hugging Face，或你手上任何厂商栈之上。公司拿过一轮不大的种子轮，天使名单的履历相当扎实；它的路由是逐查询学出来的，而不是在一条强/弱轴上卡阈值。</p>
+  <p>OpenRouter 的 Auto Router 是同一个决定的另一种交付方式。<code>openrouter/auto</code> 端点处于 beta，除底层模型的令牌之外不额外收费，从一个横跨数十家厂商、数百个模型的目录里挑选——而引擎跑的是 Not Diamond。对多数团队来说，这种打包方式严格更好：不多一跳、不多一家供应商、不多一把密钥。但这层血缘关系仍然值得知道，因为"我们评估了两个路由器"并不是它听起来的那种分散风险，也因为一个你没有选过的依赖，依然是依赖。</p>
+
+  <h3>vLLM Semantic Router——那个其实不算模型路由器的</h3>
+  <p>这是四个里的异类，而对智能体负载来说，往往也是最相关的一个。它作为 Envoy 外部处理器跑在你自己的 vLLM 后端之前：Envoy 截住请求，经 gRPC 交给分类器，由分类器决定去向。内核是基于 Hugging Face Candle 的 Rust，用 Go 包一层以对接 ext_proc 接口；分类器是一个 ModernBERT 模型，给意图和复杂度打分。它是 Apache 2.0，并且在路由之外还带了语义缓存、PII 检测和一个 prompt guard。</p>
+  <p>有意思的是它做的那个决定。它不只是在模型之间挑，而是决定<em>这条查询值不值得开推理</em>——推理模式自动调节。项目公布的、以 Qwen3 30B 在 MMLU-Pro 上的数据是：准确率提升 10.2%，同时延迟下降 47.1%、令牌用量下降 48.5%。令牌降下去而准确率还<em>升</em>上来，这才是关键破绽：在简单查询上，推理不只是贵，有时还确实更差。这和<a href="/zh/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">自适应思考与投入预算</a>是同一个论点，只不过实现在了代理层。</p>
+</section>
+
+<section>
+  <h2>路由器究竟在决定什么</h2>
+  <figure>
+    <img src="/blogs/routellm-vs-not-diamond-vs-vllm-semantic-router-vs-openrouter-auto/compare-what-it-decides.svg" alt="三列对比每个路由器优化的那根轴。强还是弱：一个可调的二元阈值，好推理，但模型对得你自己挑。逐查询的模型偏好：在众多模型上学到的选择，覆盖面广，但决定不透明。投入与意图：决定一条查询值得多少计算、要不要开推理，而这正是主导智能体成本的那根轴。" width="900" height="300" loading="lazy" />
+    <figcaption>三个不同的问题。只有第三个问在了智能体开支真正变动的那根轴上。</figcaption>
+  </figure>
+
+  <p>把这三个决定放到同一根轴上比，分野不在准确率，而在于问的是什么问题。强/弱阈值问的是"这难吗"，给你一个能向财务解释清楚的旋钮。逐查询的学习偏好问的是"这类查询上哪个模型通常表现最好"，用一个你事后重建不出来的决定，换来了覆盖面。投入分类器问的是"这值得多少计算"——而在推理模型的流量上，钱就在这儿，因为"一个短答案"和"一长串思维链"之间的差距，远大于两家厂商每令牌单价之间的差距。</p>
+
+  <p>那些公布的节省区间——常见的说法是 30% 到 85%——都是真的，也都是在别人的流量上量出来的。路由器的回报是你查询分布的性质：当你的请求有很大一个"确实简单"的头部、和一小条"确实难"的尾巴时，它才划算。聊天助手长这样；抽取类流水线不长这样，因为每条请求难度相同，正确做法是挑一个小模型然后收工，而不是花钱请一个分类器反复重新发现这件事。在相信任何百分比之前先量你自己的分布；口径见<a href="/zh/operations/economics-roi/unit-economics">单位经济性</a>，而要看的数字是每个成功完成任务的成本。</p>
+</section>
+
+<section>
+  <h2>你因此欠下的那次评估</h2>
+  <p>这是最常被跳过的一部分，也是路由器项目往往在第六个月悄悄停摆的原因。你栈里其他每一个组件失败时都很吵。路由器不是：当它把一条难查询发给小模型时，你得到的是 200、一段流畅的回答，和一个略差的结果。没有可以告警的错误率，没有延迟尖峰，没有哪一行日志写着<em>这个选择错了</em>。</p>
+
+  <ul>
+    <li><strong>路由质量在运维指标里是隐形的，</strong>只有对着一份有已知正确答案的留出集才看得见。如果你没有这份集合，路由器就是不可证伪的，而它省下的钱会是你唯一看得见的数字——这恰恰就是让它感觉像成功的那种失败形态。</li>
+    <li><strong>每一次模型发布都会移动决策边界。</strong>一个在上个季度那对模型上训出来的学习型路由器，正在对已经变了的能力做"校准过"的判断。路由器会过期，而网关不会；告诉你东西已经放坏了的，是<a href="/zh/operations/evaluation-and-observability/quality-regression-detection">质量回退检测</a>。</li>
+    <li><strong>记录决定，而不只是记录结果。</strong>每一条请求都存下：选了哪个模型、由哪个版本的路由器选的、分数是多少。没有这个字段，你就回答不了"质量下降是因为路由器还是因为模型"，而这会是所有人问的第一个问题。</li>
+    <li><strong>先影子跑，再切换。</strong>在一部分流量上并行跑路由器，但照样把请求都发给强模型，然后把"路由器本来会选什么"和"强模型实际产出了什么"做对比。这个实验的成本只是节省额的一个零头，而它是事先估出回退幅度的唯一办法。</li>
+    <li><strong>把那一跳算进预算。</strong>托管路由器会在模型调用前加一次网络往返——通常是几十毫秒，偶尔糟得多——外加一个会宕的依赖。现在就定好路由器挂掉时怎么办：默认回落到强模型是对的，默认回落到便宜的那个是一起无声的质量事故，而这个选择该放在<a href="/zh/operations/agentops/graceful-degradation-and-fallback">优雅降级与回退</a>里。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>在智能体循环里做路由会打碎缓存</h2>
+  <p>以上都适用于聊天流量。智能体会改变这笔账，而且改得对路由器不利。</p>
+
+  <p>智能体的每一步都会把整份对话记录重发一遍：系统提示词、工具定义、此前每一份工具结果。这个前缀既稳定又庞大，而这正是提示词缓存存在的意义；缓存命中的输入读取，相对新鲜输入通常有大约九折的折扣——也就是只付一成。而缓存是按模型分的。把第 4 步路由到与第 3 步不同的模型，前缀就又变凉了：你为了在一步的令牌上省下一小部分，付出了整份累积对话记录的全价。在多数智能体循环里，缓存折扣才是更大的那个数字——这意味着逐步路由可能在让你多花钱的同时，让每一块看板都显示它在省钱。算式见<a href="/zh/concepts/prompt-caching">提示词缓存</a>与<a href="/zh/deep-dives/architectures-and-patterns/context-caching-economics">上下文缓存的经济性</a>。</p>
+
+  <p>还有一个正确性方面的论据，而且它更有分量。不同模型在怎么发出工具调用、多积极地去调、怎么格式化结构化输出、工具报错时怎么反应上都不一样。在轨迹中途换模型，意味着这次运行的行为会因为与任务无关的原因在半途改变，而复现一次失败需要知道哪一步是哪个模型处理的。这是一笔真实的调试税，换来的那点节省通常已经被缓存吃掉了。</p>
+
+  <p>真正行得通的摆放位置是<em>任务</em>边界而不是步骤边界：对进来的任务分类一次，为整次运行挑定一个模型，并在这期间让前缀保持热。这样既保住了缓存、又让轨迹保持连贯，而且依然吃到了大部分差价——因为决定你到底需不需要前沿模型的，是任务难度，不是步骤难度。这也正是<a href="/zh/deep-dives/architectures-and-patterns/router-pattern">路由器模式</a>所描述的位置，也是为什么"投入分类器"这种形态在这里比"模型选择器"泛化得更好。</p>
+</section>
+
+<section>
+  <h2>什么情况下挑哪个</h2>
+  <table>
+    <thead>
+      <tr><th>如果你的处境是……</th><th>RouteLLM</th><th>Not Diamond / Auto Router</th><th>vLLM Semantic Router</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>想先量一量再投入</td><td>可以——它自带评估工具</td><td>难；决定不透明</td><td>可以，在你自己的栈上</td></tr>
+      <tr><td>已经在用网关，想要那份轻松收益</td><td>否</td><td>选它，且不多一家供应商</td><td>否</td></tr>
+      <tr><td>自托管开放权重模型</td><td>只是个库</td><td>形态不对</td><td>就是这个场景</td></tr>
+      <tr><td>推理模型主导账单</td><td>间接</td><td>间接</td><td>直接——投入控制</td></tr>
+      <tr><td>对话记录很长的智能体循环</td><td>只在任务边界</td><td>只在任务边界</td><td>只在任务边界</td></tr>
+      <tr><td>难度均一的流水线</td><td>别用</td><td>别用</td><td>别用</td></tr>
+    </tbody>
+  </table>
+  <p>最后一行是多数团队真正所属、又最不愿听到的那一行。如果一个负载里每条请求都是同一个形状，正确的"路由器"是你在代码里做一次、并且不花钱的那个决定。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>OpenRouter 的 Auto Router 真的就是 Not Diamond 吗？</h3>
+  <p>Auto Router 端点用 Not Diamond 作为它的路由引擎，所以决定来自同一处。不同的是打包方式：Auto Router 出现在你本来就在调的网关里，不多一跳、不多一份合同、不多一把密钥。如果你是为了冗余在二者之间挑，那你其实是在"一个引擎"和"同一个引擎"之间挑。</p>
+
+  <h3>这些路由器真能省下 30%–85% 吗？</h3>
+  <p>那些数字是真实测量，但测在"简单查询头部很肥、困难查询尾巴很细"的流量上。你能省多少，是你自己难度分布的性质，不是路由器的性质。在按别人负载上的数字做规划之前，先在你自己请求的一个留出切片上量一遍。</p>
+
+  <h3>我能把路由器放进智能体循环里吗？</h3>
+  <p>放在任务边界上可以。放在步骤边界上，它会和提示词缓存打架——换模型会让已累积的对话记录变成缓存未命中，而缓存读取的折扣通常大于一步上省下的钱——而且会让工具调用行为在轨迹中途改变，那是一笔你要一直付下去的调试成本。</p>
+
+  <h3>vLLM Semantic Router 特别在哪？</h3>
+  <p>它作为 Envoy 外部处理器跑在你自己的推理栈里，而不是一次托管调用；而且它的主要决定是"这条查询值得多少计算"——包括要不要开推理——而不是"用哪家厂商的模型"。在推理密集的流量上，这根轴挪动的钱远多于模型选择。</p>
+
+  <h3>路由器出问题时，最先坏掉的是什么？</h3>
+  <p>表面上什么都没坏，而这正是问题。一次误路由返回的是状态码正常、内容略差的有效响应。没有留出评估集、也没有在每条请求上记录所选模型这个字段，路由器的回退与普通的模型波动就无从区分。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站：</h3>
+  <ul>
+    <li><a href="/zh/concepts/model-routing">模型路由</a>——撇开产品，只讲概念。</li>
+    <li><a href="/zh/deep-dives/architectures-and-patterns/router-pattern">路由器模式</a>——在智能体里，这个决定该放在哪。</li>
+    <li><a href="/zh/concepts/prompt-caching">提示词缓存</a>——逐步路由丢掉的那份折扣。</li>
+    <li><a href="/zh/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">自适应思考与投入预算</a>——语义路由器真正优化的那根轴。</li>
+    <li><a href="/zh/concepts/ai-gateways">AI 网关</a>——这些东西要么坐在它里面，要么坐在它前面。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://github.com/lm-sys/RouteLLM">lm-sys/RouteLLM on GitHub</a></li>
+    <li><a href="https://www.notdiamond.ai/">Not Diamond</a></li>
+    <li><a href="https://openrouter.ai/openrouter/auto">OpenRouter Auto Router</a></li>
+    <li><a href="https://vllm-sr.ai/docs/intro/">vLLM Semantic Router 文档</a></li>
+  </ul>
+</section>
