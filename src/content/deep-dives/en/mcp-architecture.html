@@ -2,16 +2,16 @@
   <div class="phase-num">P3</div>
   <div class="week">Deep Dive · Protocols &amp; Interop</div>
   <h2>The Model Context Protocol: hosts, clients, servers, and three primitives.</h2>
-  <p class="goal">MCP (introduced by Anthropic in November 2024, governed by an open specification) standardises the edge between an agent and the tools, data, and prompts it uses. This essay covers its participant model, its three server primitives — resources, tools, prompts — its JSON-RPC message layer, and its transports, with small on-the-wire examples.</p>
+  <p class="goal">MCP's participant model survived the 2026-07-28 revision intact; its lifecycle did not. There is no <code class="inline">initialize</code> handshake any more — every request restates its own protocol version and capabilities in <code class="inline">params._meta</code>, and an open connection is no longer a session. What is left is the part worth learning once: three roles (host, client, server), three intent-typed primitives (resources, tools, prompts), and a JSON-RPC layer where anything that has to persist between calls now needs a name you chose.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
     <h3>The participant model: host, client, server.</h3>
 
-    <p>MCP defines three roles. Getting them straight is the whole mental model:</p>
+    <p>MCP — introduced by Anthropic in November 2024 and governed by an open specification — defines three roles. Getting them straight is the whole mental model:</p>
     <ul>
       <li><strong>Host.</strong> The application the user interacts with and that embeds the model — an IDE assistant, a desktop chat app, an agent runtime. The host manages the model, enforces user consent, and coordinates one or more clients.</li>
-      <li><strong>Client.</strong> A connector <em>inside</em> the host, with a strict one-to-one relationship to a single server. If a host connects to three servers, it runs three clients. The client speaks the protocol and isolates that server's session.</li>
+      <li><strong>Client.</strong> A connector <em>inside</em> the host, with a strict one-to-one relationship to a single server. If a host connects to three servers, it runs three clients. The client speaks the protocol and isolates that server's connection.</li>
       <li><strong>Server.</strong> A separate program that exposes capabilities — tools, resources, prompts — over the protocol. A server <a href="/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">wraps one system</a> (a filesystem, a database, a SaaS API) and is reusable by any MCP-capable host.</li>
     </ul>
 
@@ -23,7 +23,7 @@
 └─────────────────────────────────────────────┘
    one client  ⇄  one server  (1:1, isolated)</span></pre>
 
-    <p>The 1:1 client-to-server isolation is deliberate: it bounds trust per connection. A malicious or buggy server cannot see another server's session, and the host decides which servers a model context is exposed to. This is the protocol expression of the M+N argument from the interop-problem essay — wrap each system once as a server, teach the host the client once.</p>
+    <p>The 1:1 client-to-server isolation is deliberate: it bounds trust per connection. A malicious or buggy server cannot see another server's traffic, and the host decides which servers a model context is exposed to. This is the protocol expression of the M+N argument from the interop-problem essay — wrap each system once as a server, teach the host the client once. One caveat that STEP 3 develops: a connection bounds trust, but since 2026-07-28 it holds no state, so "one client per server" is an isolation property and not a session.</p>
   </div>
 
   <div class="step">
@@ -45,37 +45,48 @@
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>The wire: JSON-RPC 2.0, with a lifecycle.</h3>
+    <h3>The wire: JSON-RPC 2.0, and the lifecycle that went away.</h3>
 
-    <p>MCP messages are <strong>JSON-RPC 2.0</strong>: requests with an <code class="inline">id</code> expecting a response, results, errors, and one-way notifications. Every session begins with an <code class="inline">initialize</code> handshake in which both sides exchange protocol version and a capabilities object — this is the version negotiation that lets the M+N graph evolve without a flag day.</p>
+    <p>MCP messages are <strong>JSON-RPC 2.0</strong>: requests with an <code class="inline">id</code> expecting a response, results, errors, and one-way notifications. Through the 2025-11-25 revision every session began with an <code class="inline">initialize</code> handshake in which both sides exchanged a protocol version and a capabilities object. The 2026-07-28 revision deleted <code class="inline">initialize</code> and <code class="inline">notifications/initialized</code> and moved that negotiation onto every individual request: <code class="inline">params._meta</code> carries <code class="inline">io.modelcontextprotocol/protocolVersion</code> and <code class="inline">io.modelcontextprotocol/clientCapabilities</code> (both REQUIRED), <code class="inline">io.modelcontextprotocol/clientInfo</code> (SHOULD), and an optional <code class="inline">io.modelcontextprotocol/logLevel</code>. A request missing a required field gets <code class="inline">-32602</code> and, over HTTP, status <code class="inline">400</code>; a request that relies on a capability it did not declare gets <code class="inline">MissingRequiredClientCapabilityError</code> (<code class="inline">-32021</code>), again <code class="inline">400</code>. The <a href="/deep-dives/mcp/mcp-revision-2026-07-28" class="xref">2026-07-28 revision essay</a> walks the full migration; what matters architecturally is the consequence — a request is now self-describing, and a connection carries no negotiated context.</p>
 
-<pre class="standalone"><span class="c-cm"># 1. Client opens the session and declares itself</span>
-{<span class="c-st">"jsonrpc"</span>:<span class="c-st">"2.0"</span>,<span class="c-st">"id"</span>:<span class="c-st">1</span>,<span class="c-st">"method"</span>:<span class="c-st">"initialize"</span>,
- <span class="c-st">"params"</span>:{<span class="c-st">"protocolVersion"</span>:<span class="c-st">"2025-06-18"</span>,
-   <span class="c-st">"capabilities"</span>:{<span class="c-st">"roots"</span>:{},<span class="c-st">"sampling"</span>:{}},
-   <span class="c-st">"clientInfo"</span>:{<span class="c-st">"name"</span>:<span class="c-st">"my-host"</span>,<span class="c-st">"version"</span>:<span class="c-st">"1.0"</span>}}}
+    <p>The closest thing to a replacement is <code class="inline">server/discover</code>, and the asymmetry in its requirement level is the part to remember. Servers MUST implement it; clients are free never to call it, firing any RPC inline instead and handling <code class="inline">UnsupportedProtocolVersionError</code> (<code class="inline">-32022</code>) if the guess was wrong. When it is called, the response carries <code class="inline">supportedVersions</code>, <code class="inline">capabilities</code>, an optional <code class="inline">instructions</code> string, and <code class="inline">ttlMs</code> plus <code class="inline">cacheScope</code> so a client knows how long it may cache the answer and how widely. One detail has cost real deployments: <code class="inline">serverInfo</code> is <em>not</em> a top-level field of that result — it lives in <code class="inline">_meta</code> under <code class="inline">io.modelcontextprotocol/serverInfo</code>. The TypeScript SDK shipped the top-level shape and produced hard connect failures rather than graceful degradation, which is a durable reminder that "the SDK does it this way" is not the same claim as "the spec says so".</p>
 
-<span class="c-cm"># 2. Server responds with its own capabilities</span>
-{<span class="c-st">"jsonrpc"</span>:<span class="c-st">"2.0"</span>,<span class="c-st">"id"</span>:<span class="c-st">1</span>,<span class="c-st">"result"</span>:{
-   <span class="c-st">"protocolVersion"</span>:<span class="c-st">"2025-06-18"</span>,
-   <span class="c-st">"capabilities"</span>:{<span class="c-st">"tools"</span>:{<span class="c-st">"listChanged"</span>:<span class="c-kw">true</span>},
-                    <span class="c-st">"resources"</span>:{},<span class="c-st">"prompts"</span>:{}},
-   <span class="c-st">"serverInfo"</span>:{<span class="c-st">"name"</span>:<span class="c-st">"github"</span>,<span class="c-st">"version"</span>:<span class="c-st">"2.1"</span>}}}
+<pre class="standalone"><span class="c-cm"># 1. Optional for clients, mandatory for servers: what is this server?</span>
+{<span class="c-kw">"jsonrpc"</span>:<span class="c-st">"2.0"</span>,<span class="c-kw">"id"</span>:1,<span class="c-kw">"method"</span>:<span class="c-st">"server/discover"</span>,
+ <span class="c-kw">"params"</span>:{<span class="c-kw">"_meta"</span>:{
+   <span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>:<span class="c-st">"2026-07-28"</span>,
+   <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>:{}}}}
 
-<span class="c-cm"># 3. Client confirms it is ready (a notification: no id)</span>
-{<span class="c-st">"jsonrpc"</span>:<span class="c-st">"2.0"</span>,<span class="c-st">"method"</span>:<span class="c-st">"notifications/initialized"</span>}</pre>
+<span class="c-cm"># 2. Versions, capabilities, cache hint -- and serverInfo inside _meta.</span>
+{<span class="c-kw">"jsonrpc"</span>:<span class="c-st">"2.0"</span>,<span class="c-kw">"id"</span>:1,<span class="c-kw">"result"</span>:{
+   <span class="c-kw">"supportedVersions"</span>:[<span class="c-st">"2026-07-28"</span>,<span class="c-st">"2025-11-25"</span>],
+   <span class="c-kw">"capabilities"</span>:{<span class="c-kw">"tools"</span>:{<span class="c-kw">"listChanged"</span>:<span class="c-kw">true</span>},
+                    <span class="c-kw">"resources"</span>:{},<span class="c-kw">"prompts"</span>:{}},
+   <span class="c-kw">"instructions"</span>:<span class="c-st">"Search issues before opening a PR."</span>,
+   <span class="c-kw">"resultType"</span>:<span class="c-st">"complete"</span>,<span class="c-kw">"ttlMs"</span>:3600000,<span class="c-kw">"cacheScope"</span>:<span class="c-st">"public"</span>,
+   <span class="c-kw">"_meta"</span>:{<span class="c-kw">"io.modelcontextprotocol/serverInfo"</span>:{<span class="c-kw">"name"</span>:<span class="c-st">"github"</span>,<span class="c-kw">"version"</span>:<span class="c-st">"2.1"</span>}}}}
 
-    <p>After the handshake the client uses listing methods to discover what the server offers, then invocation methods to use it:</p>
+<span class="c-cm"># 3. Or skip it: every request restates the handshake for itself.</span>
+{<span class="c-kw">"jsonrpc"</span>:<span class="c-st">"2.0"</span>,<span class="c-kw">"id"</span>:2,<span class="c-kw">"method"</span>:<span class="c-st">"tools/list"</span>,
+ <span class="c-kw">"params"</span>:{<span class="c-kw">"_meta"</span>:{
+   <span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>:<span class="c-st">"2026-07-28"</span>,
+   <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>:{},
+   <span class="c-kw">"io.modelcontextprotocol/clientInfo"</span>:{<span class="c-kw">"name"</span>:<span class="c-st">"my-host"</span>,<span class="c-kw">"version"</span>:<span class="c-st">"1.0"</span>}}}}</pre>
 
-<pre class="trace"><span class="c-out">tools/list        -> [{name, description, inputSchema}, …]
+    <p>Two rules make that self-description survivable in a mixed fleet. Every result object now carries <code class="inline">resultType</code> — <code class="inline">"complete"</code>, <code class="inline">"input_required"</code>, or an extension value such as the Tasks extension's <code class="inline">"task"</code> — and a client MUST treat an <em>absent</em> <code class="inline">resultType</code> as <code class="inline">"complete"</code>. That second rule is the entire backwards-compatibility story in one line: a server that has never heard of the field still returns results a current client reads correctly. And the state the handshake used to imply is gone with it, with no replacement. The spec requires that state spanning requests "MUST be referenced by an explicit identifier the client passes on each request", and forecloses the obvious workaround in one sentence: "an open connection, such as a STDIO process, is not a conversation or session." A stdio subprocess is a pipe; a held-open HTTP stream is a pipe. Anything that must persist between calls needs a handle you designed, returned in a result and threaded back as an argument.</p>
+
+    <p>The client discovers what a server offers with listing methods, then uses it with invocation methods:</p>
+
+<pre class="trace"><span class="c-out">server/discover   -> supportedVersions, capabilities, instructions, ttlMs
+tools/list        -> [{name, description, inputSchema}, …]
 tools/call        -> run a tool by name with arguments
 resources/list    -> [{uri, name, mimeType}, …]
 resources/read    -> fetch a resource's contents by uri
 prompts/list      -> [{name, arguments}, …]
 prompts/get       -> expand a prompt template with args
-notifications/*   -> listChanged, progress, cancelled, …</span></pre>
+notifications/*   -> list_changed, progress, message, cancelled, …</span></pre>
 
-    <p>Capability discovery is therefore <em>runtime</em>, not build-time: a host learns a server's tools by calling <code class="inline">tools/list</code>, and a <code class="inline">listChanged</code> notification lets the server tell the host the set has changed. Capability discovery has its own dedicated essay; the point here is that MCP bakes it into the lifecycle.</p>
+    <p>Capability discovery is therefore <em>runtime</em>, not build-time: a host learns a server's tools by calling <code class="inline">tools/list</code>, or by calling <code class="inline">server/discover</code> once and caching the answer for <code class="inline">ttlMs</code>, and a <code class="inline">list_changed</code> notification tells it the set has moved. Those notifications are no longer pushed at a host unbidden — over HTTP a client asks for them by opening a <code class="inline">subscriptions/listen</code> stream and naming the ones it wants. Capability discovery has its own dedicated essay; the point here is that MCP puts it in the request path rather than in a lifecycle.</p>
   </div>
 
   <div class="step">
@@ -84,16 +95,38 @@ notifications/*   -> listChanged, progress, cancelled, …</span></pre>
 
     <p>MCP separates the message format (JSON-RPC) from the transport that carries it. Two transports are defined by the specification:</p>
     <ul>
-      <li><strong>stdio.</strong> The host launches the server as a subprocess and exchanges JSON-RPC over its standard input/output. Ideal for local tools (a filesystem or Git server on your machine): no network surface, lifecycle tied to the process.</li>
-      <li><strong><a href="/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a>.</strong> The server is a remote HTTP endpoint; the client POSTs requests and the server may stream responses and server-initiated messages (using server-sent events as the streaming mechanism). This is the path for hosted, multi-client servers and is where authentication — the spec aligns remote auth with <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2-style authorization</a> — and transport security live.</li>
+      <li><strong>stdio.</strong> The host launches the server as a subprocess and exchanges JSON-RPC over its standard input/output. Ideal for local tools (a filesystem or Git server on your machine): no network surface, lifecycle tied to the process — though the open pipe is a transport and not a session, so it confers no permission to keep state on the side.</li>
+      <li><strong><a href="/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a>.</strong> The server is a remote HTTP endpoint; the client POSTs requests and the server answers with plain JSON or streams the response as server-sent events. Unsolicited server-to-client messages arrive on a <code class="inline">subscriptions/listen</code> stream the client opened deliberately — <code class="inline">GET</code> on the MCP endpoint, and the standalone stream it carried, were removed in 2026-07-28. This is the path for hosted, multi-client servers and is where authentication — the spec aligns remote auth with <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2-style authorization</a> — and transport security live.</li>
     </ul>
 
-    <p>One more capability is worth naming because it inverts the usual direction: <strong>sampling</strong>. A server can ask the host to run a model completion on its behalf (declared in the <code class="inline">initialize</code> capabilities). This lets a server be "agentic" without shipping its own model, but it is also a control-flow inversion the host must mediate with user consent.</p>
+    <p>One direction of travel was removed outright, and it is worth naming because older documentation is full of it. Through 2025-11-25 a server could call back into the host mid-execution: <code class="inline">sampling/createMessage</code> asked the host to run a model completion on the server's behalf, <code class="inline">elicitation/create</code> asked it to collect input from the user, <code class="inline">roots/list</code> asked which directories were in scope. 2026-07-28 removed all three as server-initiated requests. The capability survives as <strong>MRTR</strong> — Multi Round-Trip Requests — which keeps the feature and inverts who holds the call: instead of calling back, the server returns <code class="inline">resultType: "input_required"</code> with an <code class="inline">inputRequests</code> map and an opaque <code class="inline">requestState</code>, and stops. The client resolves those requests however it likes — asking the user, consulting a policy, filling a default — and re-sends the original method with <code class="inline">inputResponses</code> attached, under a <em>different</em> JSON-RPC id.</p>
+
+<pre class="standalone"><span class="c-cm"># The server needs a decision. It does not call back -- it returns.</span>
+{<span class="c-kw">"jsonrpc"</span>:<span class="c-st">"2.0"</span>,<span class="c-kw">"id"</span>:7,<span class="c-kw">"result"</span>:{
+   <span class="c-kw">"resultType"</span>:<span class="c-st">"input_required"</span>,
+   <span class="c-kw">"inputRequests"</span>:{
+     <span class="c-kw">"confirm"</span>:{<span class="c-kw">"method"</span>:<span class="c-st">"elicitation/create"</span>,
+                <span class="c-kw">"params"</span>:{<span class="c-kw">"message"</span>:<span class="c-st">"Merge PR 42 into main?"</span>,
+                          <span class="c-kw">"requestedSchema"</span>:{<span class="c-kw">"type"</span>:<span class="c-st">"object"</span>,
+                            <span class="c-kw">"properties"</span>:{<span class="c-kw">"ok"</span>:{<span class="c-kw">"type"</span>:<span class="c-st">"boolean"</span>}},
+                            <span class="c-kw">"required"</span>:[<span class="c-st">"ok"</span>]}}}},
+   <span class="c-kw">"requestState"</span>:<span class="c-st">"v1.opaque.9f2c81ae"</span>}}
+
+<span class="c-cm"># The client answers, then re-sends the same call under a DIFFERENT id.</span>
+{<span class="c-kw">"jsonrpc"</span>:<span class="c-st">"2.0"</span>,<span class="c-kw">"id"</span>:8,<span class="c-kw">"method"</span>:<span class="c-st">"tools/call"</span>,
+ <span class="c-kw">"params"</span>:{<span class="c-kw">"name"</span>:<span class="c-st">"merge_pr"</span>,<span class="c-kw">"arguments"</span>:{<span class="c-kw">"number"</span>:42},
+           <span class="c-kw">"inputResponses"</span>:{<span class="c-kw">"confirm"</span>:{<span class="c-kw">"action"</span>:<span class="c-st">"accept"</span>,
+                                        <span class="c-kw">"content"</span>:{<span class="c-kw">"ok"</span>:<span class="c-kw">true</span>}}},
+           <span class="c-kw">"requestState"</span>:<span class="c-st">"v1.opaque.9f2c81ae"</span>,
+           <span class="c-kw">"_meta"</span>:{<span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>:<span class="c-st">"2026-07-28"</span>,
+                     <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>:{<span class="c-kw">"elicitation"</span>:{}}}}}</pre>
+
+    <p>The architectural payoff is that the control-flow inversion is gone. A server no longer needs a stream held open in order to reach the host mid-call, which is precisely why the session could be deleted at all — and the consent point moved somewhere better, because the host is now answering a question inside its own control flow rather than servicing an interrupt from a server it does not trust. Any documentation that describes a server "calling back into the host" is describing the superseded revision; the shape to look for now is a result that says it is not finished.</p>
 
     <div class="callout warn">
-      <p>MCP standardises the <em>channel</em>, not trust. A connected server can return content that the model will read — a prompt-injection surface — and a tool call can have real side effects. The protocol's job is to make consent points explicit (the host gates tool execution and sampling); deciding what to grant is yours. The <a href="/deep-dives/mcp/mcp-security-anti-patterns" class="xref">threat model</a>, capability scoping, and provenance defenses are covered in the Safety &amp; Agentic Security deep-dives. Treat "the server speaks MCP" as describing shape, never authorization.</p>
+      <p>MCP standardises the <em>channel</em>, not trust. A connected server can return content that the model will read — a prompt-injection surface — and a tool call can have real side effects. The protocol's job is to make consent points explicit (the host gates tool execution and every input a server asks for mid-call); deciding what to grant is yours. Note too that <code class="inline">clientInfo</code> and <code class="inline">serverInfo</code> are self-reported and never verified by the protocol. The <a href="/deep-dives/mcp/mcp-security-anti-patterns" class="xref">threat model</a>, capability scoping, and provenance defenses are covered in the Safety &amp; Agentic Security deep-dives. Treat "the server speaks MCP" as describing shape, never authorization.</p>
     </div>
 
-    <p>The throughline: MCP is a participant model (host/client/server) plus three intent-typed primitives (resources/tools/prompts) plus a negotiated JSON-RPC lifecycle over a pluggable transport (stdio or streamable HTTP). That is the entire architecture; the rest of this track examines how its pieces — structured I/O, discovery, <a href="/field-guide/the-two-layer-consensus" class="xref">agent-to-agent extension</a> — generalise.</p>
+    <p>The throughline: MCP is a participant model (host/client/server) plus three intent-typed primitives (resources/tools/prompts) plus a JSON-RPC layer whose negotiation rides on every request rather than on a lifecycle, over a pluggable transport (stdio or Streamable HTTP). That is the entire architecture; the rest of this track examines how its pieces — structured I/O, discovery, <a href="/field-guide/the-two-layer-consensus" class="xref">agent-to-agent extension</a> — generalise.</p>
   </div>
 </section>

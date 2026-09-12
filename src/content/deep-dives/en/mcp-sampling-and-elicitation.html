@@ -1,95 +1,135 @@
 <section class="phase">
   <div class="phase-num">C7</div>
   <div class="week">Deep Dive · MCP</div>
-  <h2>Sampling and elicitation invert the MCP request flow — the server asks the client's model or user for something — and both features are under-covered in tutorials despite being the correct answer to two common design problems.</h2>
-  <p class="goal">Two features from the 2025-11-25 spec don't show up in tutorials because they invert the normal request flow: sampling lets a server ask the client's model to generate text (potentially with the server's tools available in the nested loop), and elicitation lets a server ask the user for input during a tool call. Both look exotic; both are the answer to concrete design problems — "how does my server call an LLM without holding an API key" and "how do I capture a third-party credential without falling into the token-passthrough trap the spec forbids". Cover them once and they stop looking exotic.</p>
+  <h2>A server still has to ask the host for a model completion, a user's answer, or a filesystem root — but since the 2026-07-28 revision it can no longer call back to get them: it returns the questions as a result, and the client retries the original call carrying the answers.</h2>
+  <p class="goal">Every sampling and elicitation tutorial written before mid-2026 describes a mechanism the protocol no longer has. The 2026-07-28 revision deleted server-initiated requests outright — the spec's words are "This is a breaking change" — and replaced them with MRTR, Multi Round-Trip Requests: the server answers with <code class="inline">resultType: "input_required"</code> and its questions attached, then the client re-sends the same method with the answers. The reasons a server needs to ask the host things survive untouched. The mechanism is inverted.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>Sampling: the server asks the client's model.</h3>
+    <h3>What a server still needs from the host — and what stopped working.</h3>
 
-    <p>The default MCP request flow moves from client to server: the client asks, the server answers. Sampling reverses that arrow. During a tool call — or unprompted between calls, if the client permits it — the server issues a <code class="inline">sampling/createMessage</code> request back through the same session, containing a set of messages, model preferences (hints like "prefer a fast model" or "prefer a large one"), and an optional system prompt. The client's host, which is the participant holding an API key or a local model runtime, runs the completion and returns it. The server never sees the model provider; the client's host never exposes credentials. The <a href="/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP participant model</a> makes this shape make sense — sampling is a server calling <em>up</em> the stack, using the host's existing model relationship rather than establishing its own.</p>
+    <p>Three things a server cannot produce on its own still have to come from the other end of the connection, and none of the reasons changed. A server that wants an LLM but does not want to become an LLM operator needs a completion run on the host's account: summarize a resource before returning it, classify a user-supplied blob against a taxonomy the tool understands, rewrite a diff into a commit message the calling agent will then decide whether to apply. Solve any of those server-side and the author buys a model provider account, an API key, a bill, and a compliance conversation. A server that is missing one structured fact — which repository, which of three ambiguous matches, confirm-before-destroying — needs to reach the user without routing the question through the model and losing the answer in a game of telephone. And a server that operates on files needs to know which directories the user has actually put on the table. The <a href="/deep-dives/protocols-and-interop/mcp-architecture" class="xref">MCP participant model</a> explains why all three point the same direction: the API key, the user's attention, and the consented filesystem are the host's assets, not the server's.</p>
 
-    <p>The use cases are the ones a server author reaches for the moment they need an LLM but don't want to become an LLM operator. Summarize a resource before returning it. Generate a follow-up query from a search result. Classify a user-supplied blob against a taxonomy the tool understands. Rewrite a diff into a commit message the calling agent will then decide whether to apply. None of these are hard problems; all of them cost the server author a model provider account, an API key, a bill, and a compliance conversation if they're solved server-side. Sampling collapses the whole apparatus into one JSON-RPC round trip whose credentials belong to the host that already has them. The tradeoff is control: the server does not choose the model, cannot guarantee latency, and depends on the client to honor the model-preference hints in good faith. In practice hints are honored; in practice the client MUST prompt the user for consent before running the sampling call at all, so the server also cannot rely on sampling being available.</p>
-
-<pre class="standalone">// server -> client (over the same session)
-{
-  "jsonrpc": "2.0",
-  "id": 42,
-  "method": "sampling/createMessage",
-  "params": {
-    "messages": [
-      { "role": "user", "content": { "type": "text", "text": "Summarize: <resource>" } }
-    ],
-    "modelPreferences": { "hints": [{ "name": "fast" }], "intelligencePriority": 0.3 },
-    "systemPrompt": "You are a concise summarizer. Answer in one sentence.",
-    "maxTokens": 200
-  }
-}
-// client -> server
-{ "jsonrpc": "2.0", "id": 42, "result": { "role": "assistant", "content": { "type": "text", "text": "..." }, "model": "claude-...-haiku", "stopReason": "endTurn" } }</pre>
+    <p>What stopped working is the delivery. Until 2026-07-28 the server issued <code class="inline">sampling/createMessage</code>, <code class="inline">elicitation/create</code> or <code class="inline">roots/list</code> as a request of its own, back down the session it was already serving. That required a bidirectional stream held open across the whole operation, which in turn forced sticky routing and shared state: two round-trips of one logical call had to land on the same server instance, with that instance's memory of the call still warm. The spec now says the opposite. "Servers MUST send server-to-client requests (such as <code class="inline">roots/list</code>, <code class="inline">sampling/createMessage</code>, or <code class="inline">elicitation/create</code>) using the MRTR pattern. The previous pattern of server-initiated requests is no longer supported. This is a breaking change." MRTR exists because the sticky-instance requirement had to go; it shipped alongside statelessness for exactly that reason. The <a href="/deep-dives/mcp/mcp-revision-2026-07-28" class="xref">2026-07-28 revision</a> essay is the fuller account of what else moved at the same time, and <a href="/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a> covers the transport-level bill this was paying down.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>Sampling with tools: nested loops without a server-side model key.</h3>
+    <h3>MRTR: the server returns its questions, the client retries the call.</h3>
 
-    <p>The feature the 2025-11-25 spec added on top of plain sampling is the one that turns "borrow the model" into "borrow the whole agent loop". A sampling request may declare that the server's own tools are available inside the nested completion. The client's host runs the model, the model decides to call one of the tools, the host proxies the tool call back to the same server, the server executes the tool, the tool result flows back into the nested conversation, the model keeps going. The server is running a full agent loop — plan, act, observe, repeat — without holding an API key and without spinning up an inference stack, because every model turn is a message the client's host runs on its own account. The <a href="/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">building MCP servers</a> essay treats the server as a passive respondent to the model; sampling-with-tools is the primitive that lets a server be a first-class agent orchestrator when the workflow calls for it.</p>
+    <p>MRTR is permitted on exactly three client requests — <code class="inline">prompts/get</code>, <code class="inline">resources/read</code>, and <code class="inline">tools/call</code> — and servers MUST NOT send an <code class="inline">InputRequiredResult</code> in response to any other client request. In place of the normal result, the server returns <code class="inline">resultType: "input_required"</code>, an <code class="inline">inputRequests</code> map whose keys it assigns itself, and an opaque <code class="inline">requestState</code> string. Values in <code class="inline">inputRequests</code> MUST be one of <code class="inline">ElicitRequest</code>, <code class="inline">CreateMessageRequest</code>, or <code class="inline">ListRootsRequest</code> — the same three payloads the old callbacks carried, now travelling as cargo inside a response instead of as requests in their own right. A server MUST include at least one of <code class="inline">inputRequests</code> or <code class="inline">requestState</code>; state with no questions is the load-shedding case, the server saying "come back with this and I will carry on" without needing anything from the user at all. And a server MUST NOT put an entry in <code class="inline">inputRequests</code> for a capability the client never declared, which makes the client's capability declaration a hard gate rather than a hint.</p>
 
-    <p>The pattern is exactly right for jobs where the server has the domain knowledge and the tools but not the reasoning budget. A refactor server that walks a repository, calls its own <code class="inline">read_file</code> and <code class="inline">apply_patch</code> tools, and asks the host's model to decide the next step is a canonical example. A research server that iterates on <code class="inline">search</code> and <code class="inline">fetch</code> until a specific structured answer is reached is another. What breaks: cost accounting (the host's user pays for tokens the server orchestrates, so consent UX has to be explicit about it), termination guarantees (the server chooses when to stop; a runaway nested loop bills the host), and observability (the sampling messages happen inside the client, not the server's process, so the server's tracing shows tool calls and gaps between them rather than a complete transcript). Design for a hard token budget, a hard step budget, and a "stop reason: budget exhausted" signal that the outer agent surface can act on.</p>
+<pre class="standalone">// client -> server : an ordinary call
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+  "params": { "name": "open_pr", "arguments": { "title": "Fix retry backoff" } } }
+
+// server -> client : not an answer — a set of questions, plus its own continuation
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "input_required",
+    "inputRequests": {
+      "github_login": {
+        "method": "elicitation/create",
+        "params": {
+          "mode": "form",
+          "message": "Please provide your GitHub username",
+          "requestedSchema": {
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": ["name"]
+          }
+        }
+      },
+      "capital_of_france": {
+        "method": "sampling/createMessage",
+        "params": {
+          "messages": [
+            { "role": "user", "content": { "type": "text", "text": "What is the capital of France?" } }
+          ],
+          "maxTokens": 100
+        }
+      }
+    },
+    "requestState": "eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0"
+  }
+}</pre>
+
+    <p>The client fulfils each entry locally — renders the form, runs the completion, enumerates its roots — and then re-sends the <em>original</em> method with an <code class="inline">inputResponses</code> map keyed identically to <code class="inline">inputRequests</code>, plus the state it was given. Two rules on that retry are where implementations break. First, the JSON-RPC <code class="inline">id</code> MUST differ between the initial request and the retry: these are two independent requests that happen to be about the same operation, not one request resumed, and the instinct to reuse <code class="inline">id: 1</code> because it "feels like a continuation" is the single most common mistake in MRTR client code. Second, the client MUST echo <code class="inline">requestState</code> byte-exact and MUST NOT inspect, parse or modify it — and if the server did not send one, the client MUST NOT invent one. The correlation that used to live in a held-open connection now lives entirely in those two maps and that one opaque string.</p>
+
+<pre class="standalone">// client -> server : same method, NEW id, answers keyed to the server's own keys
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "open_pr",
+    "arguments": { "title": "Fix retry backoff" },
+    "inputResponses": {
+      "github_login": { "action": "accept", "content": { "name": "octocat" } },
+      "capital_of_france": {
+        "role": "assistant",
+        "content": { "type": "text", "text": "The capital of France is Paris." },
+        "model": "claude-3-sonnet-20240307",
+        "stopReason": "endTurn"
+      }
+    },
+    "requestState": "eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0"
+  }
+}</pre>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>Elicitation form mode: structured user input mid-call.</h3>
+    <h3>Elicitation, form and URL, with the callback removed.</h3>
 
-    <p>Elicitation is the second server-initiated primitive and answers a different question: what does the server do when it needs one more piece of information from the user, and asking through the model would be indirection with lossy consent? The tool call is in progress; the server issues <code class="inline">elicitation/create</code> with a JSON Schema describing the fields it wants, a human-readable message explaining why, and a request id. The client's host renders a form — a small dialog, a slash-command-shaped inline card, whatever the host's UX vocabulary is — the user fills it, the response returns as structured JSON matching the schema. Only then does the tool call resume. The primitive replaces two long-standing workarounds: the "return an error message that instructs the model to ask the user" pattern, which loses the user's answer through a game of telephone, and the "prompt the user before the tool call" pattern, which asks for information that turns out not to be needed 60% of the time.</p>
+    <p>Elicitation is the one of the three that is not deprecated, so it is the one worth building on. The form-mode payload itself is unchanged: a JSON Schema describing the fields the server wants, a human-readable message explaining why, and a host free to render checkboxes for booleans, dropdowns for enums, and text inputs for strings. The two design rules that survived contact with practice survive this revision too. Keep the schema flat and small — no nested objects, three or four fields at most — because a dialog with fifteen inputs stops a workflow harder than an extra round-trip would. And give every optional field a default, so the user can accept and move on without typing. What changed is that the form arrives as a value inside <code class="inline">inputRequests</code> rather than as a request the server sent, so the server is not sitting on a half-finished call while the user decides; it has already returned, and it will hear back only if the client retries.</p>
 
-    <p>Form mode is the right choice whenever the missing information is structured: a project id to open, a confirmation before a destructive action, a choice between three ambiguous matches. The schema is a plain JSON Schema draft with the fields the server needs; the host is free to render checkboxes for booleans, dropdowns for enums, and text inputs for strings. The message field is the prompt the user sees ("Which repository do you want to search?"), not a system instruction. Two design rules survive contact with practice. First: keep the schema flat and small — no nested objects, no more than three or four fields — because a dialog with fifteen inputs stops the workflow harder than an extra tool call would. Second: give every optional field a sensible default in the schema, so the user can accept and move on without having to type.</p>
+    <p>Two pieces of 2025-11-25 machinery went away with the callback. <code class="inline">notifications/elicitation/complete</code> and the <code class="inline">elicitationId</code> that went with it are gone, because there is no longer an out-of-band completion signal to correlate — the retry <em>is</em> the correlation. <code class="inline">notifications/roots/list_changed</code> is gone as well. If your server or client still sends either, it is speaking a revision that no longer exists.</p>
 
-<pre class="standalone">// server -> client, mid tool call
-{
-  "jsonrpc": "2.0",
-  "id": 7,
-  "method": "elicitation/create",
-  "params": {
-    "message": "Which repository do you want to open?",
-    "requestedSchema": {
-      "type": "object",
-      "properties": {
-        "repo": { "type": "string", "enum": ["web", "api", "infra"], "description": "Repository key" },
-        "branch": { "type": "string", "default": "main" }
-      },
-      "required": ["repo"]
-    }
-  }
-}
-// client -> server
-{ "jsonrpc": "2.0", "id": 7, "result": { "action": "accept", "content": { "repo": "api", "branch": "main" } } }</pre>
+    <p>URL-mode elicitation is the variant the <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 profile</a> essay points at every time it explains what to do <em>instead</em> of token passthrough, and MRTR makes its shape more honest rather than less. The tool call needs to act on a third-party service the server holds no credentials for. The server returns an <code class="inline">ElicitRequest</code> in <code class="inline">url</code> mode alongside its <code class="inline">requestState</code> and then stops — no open connection, no parked thread, nothing to keep warm. The client's host opens the URL in the user's browser, the user completes the flow, and the third-party token lands on a callback the <em>client</em> controls. Only when the client retries does the server learn anything, and what it learns is an accept action and whatever handle it needs to identify the linked account — never the third-party token. Token passthrough is forbidden because the naive version, where the server holds the caller's token and forwards it downstream, collapses the RFC 8707 audience guarantee and forces the downstream service to trust the wrong principal. The non-negotiable is unchanged: the third-party token never touches the server.</p>
+
+<pre class="trace">t=0.00  client  | tools/call id=1                 | name=connect_github
+t=0.01  server  | result resultType=input_required | inputRequests.link = elicitation/create mode=url
+t=0.01  server  | requestState=AEAD(...)           | request COMPLETE — no connection held, no state parked
+t=0.02  client  | opens url in user's browser      | user completes OAuth
+t=8.31  client  | callback lands on client         | code -> exchange -> access_token STORED IN CLIENT
+t=8.33  client  | tools/call id=2                  | inputResponses.link={action:accept}  requestState echoed byte-exact
+t=8.34  server  | verify requestState, then parse  | resumes via linked account | server never sees gh access_token</pre>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>Elicitation URL mode: OAuth without token passthrough.</h3>
+    <h3>requestState is your continuation, handed to an untrusted party.</h3>
 
-    <p>URL-mode elicitation is the newer variant and the one the <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 profile</a> essay points at every time it explains what to do <em>instead</em> of token passthrough. The tool call needs to act on a third-party service — a GitHub repository, a Notion workspace, a Stripe dashboard — and the server does not hold that service's credentials. The server issues an elicitation request whose payload is a URL rather than a schema; the client's host opens that URL in the user's browser; the user completes whatever flow lives at the URL (an OAuth authorization code exchange, a device flow, an app install page); the third-party service returns its token directly to a callback the <em>client</em> controls; the server receives a resume signal but never sees the third-party token. The token-passthrough anti-pattern the spec forbids by name is forbidden precisely because doing it the naive way — the server holds the caller's token, the server forwards it to the downstream service — collapses the RFC 8707 audience guarantee and forces the downstream service to trust the wrong principal. URL-mode elicitation is the shape that keeps every credential in the hands of the party that owns the relationship.</p>
+    <p>This is the part of MRTR that has no analogue in the old design, and it is the part to get right. When the connection held the state, the state was in the server's own memory. Now the server serializes its continuation, hands it to the client, and asks for it back — and the spec is blunt about what that means: servers MUST treat <code class="inline">requestState</code> as attacker-controlled. If it influences authorization or business logic in any way, the server MUST integrity-protect it with an HMAC or an AEAD, and MUST reject state that fails verification. It SHOULD embed the principal, a TTL, and an identifier for the originating request. A server that stuffs <code class="inline">{"tenant": "acme", "approved": true}</code> into <code class="inline">requestState</code> unsigned has not built a resumption token; it has built an authorization decision that the caller can edit, and the caller is exactly the party the decision was meant to constrain. The <a href="/deep-dives/mcp/mcp-security-anti-patterns" class="xref">MCP security anti-patterns</a> essay catalogues what happens when a server trusts the wrong end of a message; this is the newest way to arrive there.</p>
 
-    <p>The trace signature to look for is short. The server logs a "waiting for elicitation" state; there is no outbound HTTP call from the server's process to the third-party service during the wait; the resume message from the client carries whatever handle the server needs to identify that the flow succeeded (a scoped internal token bound to the server's own audience, a claim about which downstream account is now linked, an opaque cursor the server can use to resume the tool call). If any log line during that window shows the server making a request to the third-party service using a bearer token that came from the caller, that is passthrough dressed up as elicitation, and the correct action is to remove the outbound call and rebuild the flow around the client. The spec's non-negotiable is that the third-party token never touches the server; the tool becomes safer, not slower, when that rule is enforced end to end.</p>
+<pre class="standalone">// what belongs inside requestState, before you seal it
+{
+  "sub":  "user_9x",                     // principal the ORIGINAL request ran as
+  "orig": "tools/call:open_pr:01JB7Q",   // originating-request identifier
+  "exp":  1793664000,                    // TTL — minutes, not days
+  "step": "awaiting_github_login"        // the server's own continuation
+}
 
-<pre class="trace">t=0.00  server  | tool_call=connect_github     | need external creds
-t=0.01  server  | elicitation/create           | mode=url  url=https://github.com/login/oauth/authorize?...&state=abc123
-t=0.02  client  | open in user's browser       | user completes OAuth
-t=8.31  client  | callback lands on client     | code -> exchange -> access_token STORED IN CLIENT
-t=8.33  client  | elicitation resume           | { action=accept, linked_account_id=gh_u_9x }
-t=8.34  server  | tool_call resumes            | operates via linked_account_id  | server never sees gh access_token</pre>
+// on the wire : AEAD(key, canonical_json(state))  ->  opaque base64
+// on return   : VERIFY first, then parse. Verification failure is a hard reject,
+//               not a warning. Then check exp, then check that sub still matches
+//               the principal on the retry — a valid blob from another session
+//               is still the wrong blob.</pre>
+
+    <p>The operational tells are short. Bind the state to the principal on the retry, not just to the principal that created it, or you have built a replay primitive that works across sessions. Keep the TTL measured in minutes, because the only legitimate gap between the two round-trips is however long a human takes to fill in a form or finish an OAuth flow. And cap retries per logical operation on the client side: a server that answers every retry with another <code class="inline">input_required</code> is either malfunctioning or walking the client around a loop, and the client is the only participant positioned to stop it.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>Human-in-the-loop design: consent UX for both.</h3>
+    <h3>The mechanism is mandatory; two of the three payloads are on a clock.</h3>
 
-    <p>Sampling and elicitation share a design property that the tutorials treating them as neat protocol features tend to elide: they let the server drive an experience the user did not ask for at the moment it happens, and that shifts consent from a per-connection question to a per-interaction one. The <a href="/operations/safety-and-security/human-in-the-loop" class="xref">human-in-the-loop</a> operations essay treats consent as an ops discipline; the sampling and elicitation cases are where an MCP host actually lives out that discipline. For sampling, the consent surface must show four things every time: which server is asking, why (a short reason string the server supplies), what the model will be shown (the messages payload, or a summary of it if the payload is long), and what tools the server has made available in the nested loop. For elicitation, the surface must show which server is asking, what fields (form mode) or what URL (URL mode) — and for URL mode, the origin of the URL and any warnings about opening it in the user's browser.</p>
+    <p>The most useful sentence on this page for anyone choosing what to build on: MRTR is how you must carry these requests today, and two of the three requests it can carry are themselves deprecated. Sampling, Roots and Logging are all marked Deprecated in 2026-07-28. Elicitation is not. Sampling-with-tools — the pattern where the server declares its own tools inside the nested completion and borrows the host's whole agent loop rather than just a model call — is part of Sampling and carries the same marker; so does <code class="inline">includeContext: "thisServer"</code> and <code class="inline">"allServers"</code>, deprecated back in 2025-11-25 and now following the feature that hosts it. Read that as a planning constraint, not a countdown: put the user-input path on elicitation, and treat sampling as a convenience your server should degrade gracefully without.</p>
 
-    <p>Two operational patterns keep the consent UX honest. First, rate-limit server-initiated calls per session — a server that fires ten elicitation requests in a minute is either malfunctioning or hostile, and the client should refuse further requests with an explicit error the server can log against its own bug tracker. Second, distinguish "grant once for this call" from "grant for the session" from "grant for this server forever"; a user who says yes to a sampling call to summarize one resource should not be considered as having said yes to nested-tool sampling loops for the rest of the session. The two primitives that let a server borrow the host's model and the host's user are the same two primitives that make consent UX the load-bearing surface of the client. Both work exactly as well as the client that renders them; both fall over as hard as any web permission dialog when the client renders them lazily.</p>
+    <p>Be precise about what the deprecation policy actually promises, because the internet is already getting it wrong. The earliest a deprecated feature may be removed is "the first revision released on or after 2027-07-28". That date marks when a feature becomes <em>eligible</em> for removal, not when it is removed — the actual removal is a Core Maintainer decision taken at release preparation, and it may happen later or not in that cycle at all. Nothing has been removed under this policy yet. "Sampling is removed in July 2027" is a claim nobody can currently make, and a roadmap built on it will be wrong in whichever direction the maintainers go.</p>
+
+    <p>The consent story survives the inversion and gets slightly better. Sampling and elicitation still let a server drive an experience the user did not ask for at that moment, which still makes consent a per-interaction question rather than a per-connection one — the discipline the <a href="/operations/safety-and-security/human-in-the-loop" class="xref">human-in-the-loop</a> essay treats as an ops problem. What MRTR adds is batching: because the server returns all its questions in one <code class="inline">inputRequests</code> map, the client can render one consent surface for the whole set instead of interrupting the user once per callback. That surface still has to show which server is asking, why, what the model would be shown for a sampling entry, and — for a URL-mode elicitation — the origin of the URL about to open in the user's browser. Keep the three grants distinct: once for this call, for this session, forever for this server. A user who approved one summarization has not approved the next hundred. Both primitives work exactly as well as the client that renders them, and both fall over as hard as any web permission dialog when the client renders them lazily.</p>
   </div>
 </section>
