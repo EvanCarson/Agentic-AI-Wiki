@@ -13,6 +13,8 @@
     <p>行得通的形状是短、动词化、指令化。以动词开头。用读者的语言而非 API 的语言说清用途。写明"何时用、何时不用"，好让模型有一条明确规则可套。以一个模型可以照猫画虎的用法例子收尾。<a href="/zh/deep-dives/tool-capability-design/tool-design-principles" class="xref">通用工具设计原则</a>那篇深入解析讲了"把工具元数据视为提示词界面"背后的根据；MCP 这边的具体做法归结为：为将要读这段文字的 agent 而写，且要显式点出多数作者留白的负向情形——<a href="/zh/deep-dives/tool-capability-design/tool-discovery-and-docs" class="xref">面向 agent 的工具文档</a>那篇总体地展开了这门纪律，而在 MCP 里，<code class="inline">tools/list</code> 的表面让它成了承重件。</p>
 
     <p>改写这件事，感受比争论要容易得多。"Retrieves user information from the database" 变成 "Get a user by id when you need their email, role, or account status. Do NOT use for listing users (use <code class="inline">list_users</code>). Example: <code class="inline">get_user(id='u_123')</code>." 后者在生产里胜出，因为它同时给了模型正向触发和负向排除。凡是两条描述可能被搞混的地方，就在原地做区分：描述里的相互引用是这套协议允许的最便宜的提示词工程，能把互为近邻、彼此竞争的工具变成协调的工作流。</p>
+
+    <p><code class="inline">2026-07-28</code> 修订版里有一处细节，改变了一条糟糕描述会让你付出多久的代价。现在每份 <code class="inline">tools/list</code> 结果都在工具旁边带着 <code class="inline">ttlMs</code> 与 <code class="inline">cacheScope</code>，而 <code class="inline">ttlMs</code> 缺失意味着客户端按 <code class="inline">0</code> 处理。你填进去的那个数字，就是你把措辞改好之后、旧措辞还能继续赢下选择的时长：你写的这段提示词是有缓存寿命的，而定下这个寿命的人是你。</p>
   </div>
 
   <div class="step">
@@ -35,6 +37,8 @@
     <p>把同一操作拆成两个工具——<code class="inline">search(query) → [{id, summary}]</code> 与 <code class="inline">fetch(id) → full_content</code>——模型就能自己挑哪几篇文档值得完整读。多一次往返成本不高；上下文节省却很惊人；而且轨迹变得可读，因为这种两步分解正好契合人类如何解释"发生了什么"。这个模式在微软 Learn MCP 服务器的复盘里被点名，如今在内容型服务器上几乎通用，但其底层原则可以推广：任何<em>可能</em>返回大 payload 的工具，都应该拆成"摘要+id 形式"和"完整 payload 形式"两个独立工具，而不是一个带 <code class="inline">verbose</code> 开关的多态工具。</p>
 
     <p>两个相邻模式随之而来。分页读取：一个可能返回未知数量结果的工具应当接受 cursor、返回一页加下一 cursor，让模型自己控制每次让多少结果进入上下文。结构化过滤工具与 fetch 工具保持分离：一个返回 id + 一行摘要的 <code class="inline">list_incidents(status, since)</code> 应当与返回一切的 <code class="inline">get_incident(id)</code> 分开。把二者合并成一个带"详细度"参数的 <code class="inline">query_incidents</code>，就把当初拆开时想赶走的多态性又请了回来。</p>
+
+    <p>那个 cursor 如今是模型的事，因而也就成了你的事。<code class="inline">2026-07-28</code> 修订版删掉了逐连接状态，并且没有拿任何东西补上：跨请求的状态"MUST 由客户端在每次请求上传回的一个显式标识符来引用"，规范还明说"一条打开的连接——比如一个 STDIO 进程——不是一次对话，也不是一个会话"。于是你的续读句柄——一页的 cursor、一次检索的 id、一份草稿的 token——就是一个普普通通的工具结果，由<em>模型</em>当作工具参数交还给你。它对模型可见、由模型选择，而且在交回来之前，它已经和 agent 一路读到的各种不受信文本一起待在同一个上下文窗口里。请把它当成可被攻击者影响的输入来设计：要不可猜测而不是顺序递增，要绑定到当初产生它的那次授权，并且每次使用都重新校验。"同一条连接"不再意味着"同一个调用方"，因此一个只编码了"返回什么"、却没编码"谁有资格拿到"的句柄，就是一个等着提示词注入来发现的访问控制漏洞。<a href="/zh/deep-dives/mcp/mcp-revision-2026-07-28" class="xref">2026-07-28 修订版</a>那篇把这次移除与其余迁移讲全了。</p>
   </div>
 
   <div class="step">
@@ -50,6 +54,10 @@
   "hint": "No matches for 'quarterly-report-q4'. Try: (a) broaden the query,\n  or (b) call list_categories() to see valid filter values,\n  or (c) confirm with the user that the report exists.",
   "done": false
 }</span></pre>
+
+    <p>面包屑是一种约定。对于"服务器确实非得从宿主那里拿到点什么才收得了尾"的情形，如今有了协议层面的同一个想法，而这两件事值得在脑子里分清楚。MRTR——多轮往返请求（Multi Round-Trip Requests）——让服务器返回 <code class="inline">resultType: "input_required"</code>，附上一个 <code class="inline">inputRequests</code> 映射和一份不透明的 <code class="inline">requestState</code>；客户端随后用键名完全对应的 <code class="inline">inputResponses</code> 重试原来那次调用，并且换一个 JSON-RPC id。它只允许出现在 <code class="inline">tools/call</code>、<code class="inline">resources/read</code> 与 <code class="inline">prompts/get</code> 上。设计上的界线很干净：<code class="inline">input_required</code> 的意思是"在有人替我取来某样东西之前，我答不了"；一个 <code class="inline">hint</code> 字段的意思是"我答完了，这是接下来可以试的方向"。用一次往返去推模型一把，是搞错了类别；而在服务器其实需要一份凭证时只丢个 hint，则会让 agent 去猜一个从没被问出口的问题。</p>
+
+    <p>由于 <code class="inline">requestState</code> 会离开你的服务器、再经客户端回来，它 MUST 被当作攻击者可控的数据——和上面那些续读句柄是同一条规矩，只是赌注更大。如果它会影响授权，就用 HMAC 或 AEAD 做完整性保护；校验不过的 state 要直接拒绝，而不是回落到某个默认值；并把主体、TTL 与发起那次请求的标识嵌进去，好让一份被重放的 blob 没法被指向另一次调用。还有一件事该在动手之前知道：MRTR 承载的那几样东西——采样（Sampling）、Roots 与日志（Logging）——在 <code class="inline">2026-07-28</code> 里本身已被标记为 Deprecated。政策把最早的移除时点定在"2027-07-28 当天或之后发布的第一个修订版"，那是移除变得<em>有资格</em>发生的日子，而不是某样东西会消失的日子；到目前为止，还没有任何东西依据该政策被真正移除。"已弃用但仍在"是保留一条回退路径的理由，不是绕开这项特性去做设计的理由。</p>
   </div>
 
   <div class="step">

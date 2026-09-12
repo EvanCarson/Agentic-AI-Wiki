@@ -1,35 +1,59 @@
 <section class="phase">
   <div class="phase-num">C10</div>
   <div class="week">Deep Dive · MCP</div>
-  <h2>Shipping an MCP server is a distribution problem — the Registry gives you one discovery surface, but the packaging choice (npm vs PyPI vs OCI) determines who can actually install it.</h2>
-  <p class="goal">Building the server is one problem; getting it in front of users is another. The MCP Registry — currently the closest thing to a package index for MCP — lets you list a server; the package type (npm, PyPI, or an OCI image) determines who can install it and how; and the 2026 roadmap adds <code class="inline">.well-known</code> capability discovery so hosts don't need a registry lookup to find compatible servers at runtime. This is a short essay because the topic is small; skipping it means users can't find your server.</p>
+  <h2>Shipping an MCP server is a distribution problem — the Registry gives you one discovery surface, but the packaging choice (one of six registry types) determines who can actually install it.</h2>
+  <p class="goal">Building the server is one problem; getting it in front of users is another. The MCP Registry — the closest thing MCP has to a package index, and still explicitly <em>in preview</em> — lets you list a server; the package type determines who can install it and how; and <code class="inline">server/discover</code>, mandatory since <code class="inline">2026-07-28</code>, means a host that already has your URL never needs the registry at all. This is a short essay because the topic is small; skipping it means users can't find your server.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
     <h3>The MCP Registry: what it is now.</h3>
 
-    <p>The MCP Registry is a central index of published servers — name, description, transports supported, package type, license, capability tags, and a pointer at the underlying package. A host that wants to let a user "add an MCP server" queries the Registry, filters by capability, and hands the resulting <code class="inline">command + args</code> or HTTP endpoint to its transport layer. Publishing is a JSON manifest submitted through the Registry's CLI; the review bar today is closer to npm than to the App Store. The failure mode is the same as npm's, too — an unlisted server is invisible to any host that only looks in the Registry, and a listed server with a stale metadata block gets picked up for the wrong reasons.</p>
+    <p>The MCP Registry is a central index of published servers — name, description, repository, version, the package or packages it ships as, the remote endpoints it answers on, and the environment variables it expects. A host that wants to let a user "add an MCP server" queries the Registry, filters, and hands the resulting launch command or HTTP endpoint to its transport layer. Read the status line before you build against it: the Registry's own about page carries the banner <em>"The MCP Registry is currently in preview. Breaking changes or data resets may occur before general availability. If you encounter any issues, please report them on GitHub."</em> There is no announced GA date. The deployed service reports version <code class="inline">1.8.1</code>, built 2026-08-06, from <code class="inline">GET /v0/version</code>. Two API prefixes are live — <code class="inline">/v0/</code> and <code class="inline">/v0.1/</code> — and the docs now steer integrators to the latter: "Production applications should consider using <code class="inline">/v0.1/</code> for stability." There is no <code class="inline">/v1/</code>. The failure mode is the same as npm's — an unlisted server is invisible to any host that only looks in the Registry, and a listed server with a stale metadata block gets picked up for the wrong reasons.</p>
 
     <p>The Registry is not a runtime — it does not proxy tool calls, front the transport, or sign responses. Its only jobs are discovery and metadata. Everything <a href="/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">building an MCP server</a> teaches — tool granularity, resource vs prompt split, annotations — is invisible to the Registry beyond what you write into the description field. That field is where selection actually happens, and treating it as a marketing slug instead of a capability sentence is the fastest way to publish a server nobody installs.</p>
 
 <pre class="standalone">{
-  "name": "acme-search",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "dev.acme/search",
   "description": "Search Acme's docs, then fetch full articles by id.",
   "version": "1.4.2",
-  "protocolVersions": [">=2025-11-25"],
-  "transports": ["stdio", "streamable-http"],
-  "package": { "type": "npm", "name": "@acme/mcp-search" },
-  "capabilities": ["tools", "resources"],
-  "license": "MIT",
-  "homepage": "https://acme.dev/mcp"
+  "repository": { "url": "https://github.com/acme/mcp-search", "source": "github" },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@acme/mcp-search",
+      "version": "1.4.2",
+      "runtimeHint": "npx",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        { "name": "ACME_API_KEY", "description": "Acme API key", "isRequired": true, "isSecret": true }
+      ]
+    }
+  ],
+  "remotes": [
+    { "type": "streamable-http", "url": "https://mcp.acme.dev/mcp" }
+  ]
 }</pre>
+
+    <p>That file is <code class="inline">server.json</code>, and the tool that pushes it is <code class="inline">mcp-publisher</code>. The working loop is <code class="inline">init</code> → <code class="inline">login</code> → <code class="inline">publish</code>, with <code class="inline">validate</code> to check a manifest against the <code class="inline">2025-12-11</code> schema before you send it, <code class="inline">status</code> to move a published version between <code class="inline">active</code>, <code class="inline">deprecated</code> and <code class="inline">deleted</code>, and <code class="inline">logout</code> to drop the stored token. <code class="inline">login</code> takes a method, and the method decides which namespace you are allowed to publish into: GitHub OAuth device flow and GitHub Actions OIDC for <code class="inline">io.github.*</code>, generic OIDC for other CI, DNS TXT or an HTTP <code class="inline">/.well-known/mcp-registry-auth</code> document for a domain namespace such as <code class="inline">dev.acme/*</code>, and <code class="inline">none</code> for a local registry you are testing against. Both domain methods can keep the signing key in Google KMS or Azure Key Vault instead of on disk, which is the difference between a domain namespace one engineer can publish under and one a team can.</p>
+
+<pre class="shell">mcp-publisher init                  # scaffold server.json, autodetecting the package manager
+mcp-publisher validate              # exhaustive check against the 2025-12-11 schema
+mcp-publisher login github          # or: github-oidc | oidc | dns | http | none
+mcp-publisher publish               # server verifies package ownership + namespace auth
+mcp-publisher status --status deprecated dev.acme/search 1.4.1</pre>
+
+    <p>Two 2026 changes break publishers that worked before, and both fail in ways that read like an auth bug. Publishing under an organisation namespace now requires the GitHub <strong>Owner</strong> role — being a member of the org is no longer enough, so a release job that has worked for a year starts failing the moment the account behind it is anything less than an owner. And version 1.8.1 rejects <code class="inline">github.io</code> domains in DNS and HTTP token exchange, which retires the cheapest way people were claiming a domain namespace. If a publish suddenly stops working, check the role and the domain before you debug the manifest.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>Package types: npm, PyPI, OCI.</h3>
+    <h3>Package types: npm, PyPI, OCI — and three more.</h3>
 
-    <p>The three package types cover the three realistic delivery stories. An npm package (JS/TS servers) installs with <code class="inline">npx</code> for one-shot execution or <code class="inline">npm i -g</code> for persistence; the host launches it as a subprocess, which puts it on the stdio path by default. A PyPI package (Python servers) installs with <code class="inline">pip</code>, <code class="inline">pipx</code>, or <code class="inline">uv</code>; <code class="inline">uvx</code> has become the FastMCP-idiomatic one-shot launcher, playing the role <code class="inline">npx</code> does for Node. An OCI image is heavier but runtime-independent — the host pulls it, runs it, and talks to it over <a href="/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a> rather than stdio, because binding a container's stdio to a host's tool loop is more friction than a network endpoint. The trade-off is not subtle: npm and PyPI depend on the host having a working Node or Python runtime; OCI ships a self-contained thing that runs identically everywhere. Pick per audience — hobbyists and small teams take the npm/PyPI hit, enterprise deploys take the OCI hit.</p>
+    <p>Three package types cover the three realistic delivery stories, and three more exist for the ecosystems that need them. An npm package (JS/TS servers) installs with <code class="inline">npx</code> for one-shot execution or <code class="inline">npm i -g</code> for persistence; the host launches it as a subprocess, which puts it on the stdio path by default. A PyPI package (Python servers) installs with <code class="inline">pip</code>, <code class="inline">pipx</code>, or <code class="inline">uv</code>; <code class="inline">uvx</code> has become the FastMCP-idiomatic one-shot launcher, playing the role <code class="inline">npx</code> does for Node. An OCI image is heavier but runtime-independent — the host pulls it, runs it, and talks to it over <a href="/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP</a> rather than stdio, because binding a container's stdio to a host's tool loop is more friction than a network endpoint. The trade-off is not subtle: npm and PyPI depend on the host having a working Node or Python runtime; OCI ships a self-contained thing that runs identically everywhere. Pick per audience — hobbyists and small teams take the npm/PyPI hit, enterprise deploys take the OCI hit.</p>
+
+    <p>The full set of <code class="inline">registryType</code> values the Registry accepts today is <code class="inline">npm</code>, <code class="inline">pypi</code>, <code class="inline">nuget</code>, <code class="inline">cargo</code>, <code class="inline">oci</code>, and <code class="inline">mcpb</code> — .NET and Rust servers are first-class, and <code class="inline">mcpb</code> covers MCP's own bundle format. One wrinkle worth knowing before you waste an afternoon: the published <code class="inline">2025-12-11</code> schema's <code class="inline">registryType</code> examples still omit <code class="inline">cargo</code> even though the validator accepts it. Trust the validator, not the examples. Each type is also pinned to one trusted base URL — npm to <code class="inline">registry.npmjs.org</code>, PyPI to <code class="inline">pypi.org</code>, Cargo to <code class="inline">crates.io</code>, and OCI to a short allowlist including Docker Hub, <code class="inline">ghcr.io</code> and Quay — so a private mirror is not a publishable source.</p>
 
 <pre class="trace"># npm — one-shot, Node runtime
 npx -y @acme/mcp-search --stdio
@@ -38,20 +62,27 @@ npx -y @acme/mcp-search --stdio
 uvx acme-mcp-search --stdio
 
 # OCI — self-contained image, Streamable HTTP
-docker run -p 3333:3333 ghcr.io/acme/mcp-search:1.4.2</pre>
+docker run -p 3333:3333 ghcr.io/acme/mcp-search:1.4.2
+
+# registryType values the validator accepts today
+npm   pypi   nuget   cargo   oci   mcpb</pre>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
     <h3>Versioning: SemVer with spec-version pinning.</h3>
 
-    <p>Two version numbers travel together, and confusing them is where compatibility bugs come from. The server's own version is SemVer — <code class="inline">1.4.2</code> — with the usual contract: patch for bugfixes, minor for additive tool changes, major for breaking schema changes. The other number is the MCP <code class="inline">protocolVersion</code>, exchanged in the <code class="inline">initialize</code> handshake, identifying the spec revision (currently <code class="inline">2025-11-25</code>). The server advertises the spec versions it supports as a range; the host picks the highest one it also supports; both sides must handle the "host newer than server" and "server newer than host" cases without crashing. A server that pins to exactly one spec version turns every spec bump into a forced upgrade for its clients — the transition from HTTP+SSE to Streamable HTTP took months precisely because servers pinned narrowly. The Registry manifest lists both numbers so a host can filter by spec compatibility before installing.</p>
+    <p>Two version numbers travel together, and confusing them is where compatibility bugs come from. The server's own version is SemVer — <code class="inline">1.4.2</code> — with the usual contract: patch for bugfixes, minor for additive tool changes, major for breaking schema changes. That is the number the Registry indexes, and the one <code class="inline">mcp-publisher publish</code> refuses to reuse. The other number is the MCP protocol version, a dated spec revision — currently <code class="inline">2026-07-28</code>, which succeeded <code class="inline">2025-11-25</code>. As of that revision it is no longer settled once in an <code class="inline">initialize</code> handshake, because there is no handshake any more: the version travels on every request, and a client that wants to know what a server speaks before committing calls <code class="inline">server/discover</code>, which every server must implement and which answers with the list of supported versions. Both sides must handle the "host newer than server" and "server newer than host" cases without crashing. A server that pins to exactly one spec version turns every spec bump into a forced upgrade for its clients — the transition from HTTP+SSE to Streamable HTTP took months precisely because servers pinned narrowly.</p>
+
+    <p>What does <em>not</em> connect the two numbers is the Registry. <code class="inline">server.json</code> has no protocol-version field at all: the manifest describes the package, the transports and the environment, and says nothing about which spec revisions the server speaks. A host therefore cannot filter the Registry by spec compatibility before installing — it finds out at the first request, or by calling <code class="inline">server/discover</code> once it is connected. Document your supported revisions in the description or the repository README, because right now that is the only place a prospective user can read them.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>The 2026 roadmap: .well-known capability discovery.</h3>
+    <h3>Runtime discovery now exists, and the roadmap is going somewhere else.</h3>
 
-    <p>The 2026 MCP roadmap adds a runtime discovery path that sits alongside the Registry rather than replacing it. A host that already knows a server's URL — because it's enterprise-hosted, local, or bookmarked — fetches <code class="inline">/.well-known/mcp</code> and gets a capability descriptor without ever talking to a central index. This is the same shape as the OAuth Protected Resource Metadata document already in the auth flow, and it solves the same class of problem: discovery that works for servers the public Registry doesn't and can't list — enterprise servers behind a VPN, local servers on a developer's laptop, one-off internal tools. The general pattern is covered in the <a href="/deep-dives/protocols-and-interop/capability-discovery" class="xref">capability discovery</a> essay; the MCP-specific addition is that the descriptor mirrors the Registry's manifest fields — capabilities, transports, spec versions — so a host can consume both sources with one code path. The roadmap places this in the 2026 stable window; it is not yet in the current spec, so treat it as "worth designing your metadata to be reusable when it lands" rather than "ship against it today".</p>
+    <p>A host that already knows a server's URL — because it is enterprise-hosted, local, or bookmarked — no longer needs the Registry to learn what the server does. The <code class="inline">2026-07-28</code> revision made <code class="inline">server/discover</code> mandatory, and it answers with <code class="inline">supportedVersions</code>, <code class="inline">capabilities</code>, optional <code class="inline">instructions</code>, and the caching hints <code class="inline">ttlMs</code> and <code class="inline">cacheScope</code>. That is the runtime discovery path, and it arrived inside the protocol rather than beside it at a well-known URL. The general pattern is covered in the <a href="/deep-dives/protocols-and-interop/capability-discovery" class="xref">capability discovery</a> essay.</p>
+
+    <p>What the roadmap actually prioritises next is a different problem: not "how does a host find out what a server offers" but "how does a host avoid ingesting a catalogue it cannot afford". The Core Primitives working group is chartered on <strong>progressive discovery</strong> — clients learning a server's tools and resources as they need them instead of taking the full list up front — explicitly tied to the caching work that added <code class="inline">ttlMs</code> and <code class="inline">cacheScope</code>, and extending it toward ETags. Capability scoping for tool lists is named as follow-on work from the stateless revision. Design your server metadata so a host can take it in pieces, and so a list result is worth caching; that is the axis the protocol is moving along.</p>
   </div>
 </section>

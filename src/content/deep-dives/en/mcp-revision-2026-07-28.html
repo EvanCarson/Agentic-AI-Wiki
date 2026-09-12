@@ -1,0 +1,125 @@
+<section class="phase">
+  <div class="phase-num">C11</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>Everyone summarises the 2026-07-28 revision as "MCP went stateless" — but deleting the handshake did not delete the agreement, it billed the agreement to every single request.</h2>
+  <p class="goal">A server that talks to a 2026-07-28 client the way it did under 2025-11-25 is not deprecated, it is <em>malformed</em>: no <code class="inline">initialize</code>, no <code class="inline">Mcp-Session-Id</code>, no server-initiated requests, and every result that omits <code class="inline">resultType</code> or a cache hint is now out of contract. The revision removed the one place where negotiation, identity and server-to-client questions used to live, and every one of them had to reappear somewhere — per request, in <code class="inline">params._meta</code>, in new mandatory headers, and in a retry pattern that replaces server-initiated calls entirely. The migration is not "delete your session code"; it is that a per-connection agreement became a per-request obligation.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The handshake was not overhead — it was the only place the agreement could live.</h3>
+
+    <p>The deletion list for 2026-07-28 is long and every item on it is breaking. Gone: the <code class="inline">initialize</code> request and the <code class="inline">notifications/initialized</code> that acknowledged it; the <code class="inline">Mcp-Session-Id</code> header, which the server minted and the client could terminate with a <code class="inline">DELETE</code>; HTTP <code class="inline">GET</code> on the MCP endpoint, and with it the standalone SSE stream; <code class="inline">resources/subscribe</code> and <code class="inline">resources/unsubscribe</code>; <code class="inline">ping</code>; <code class="inline">logging/setLevel</code>; <code class="inline">notifications/roots/list_changed</code>; <code class="inline">Last-Event-ID</code> and SSE event IDs, and therefore resumability; and the three server-initiated requests — <code class="inline">roots/list</code>, <code class="inline">sampling/createMessage</code>, <code class="inline">elicitation/create</code> — along with <code class="inline">notifications/elicitation/complete</code> and <code class="inline">elicitationId</code>. Tasks left core entirely and now live in the extension <code class="inline">io.modelcontextprotocol/tasks</code>.</p>
+
+    <p>Read that list as a changelog and it looks like housekeeping. Read it as an architecture change and it says one thing: the connection stopped being a place where facts could be stored. Under 2025-11-25 the handshake was the event that established what protocol version both sides spoke, what capabilities each side had, who the client was, and what log level it wanted — and the session id was the handle to everything that agreement implied. That was one round trip per connection, amortised over thousands of calls, which is exactly why it was cheap and exactly why removing it is not.</p>
+
+    <p>What the revision bought is real: any instance can serve any request, load balancers stop needing sticky routing, and a replica dying mid-conversation stops being an incident. The <a href="/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP transport essay</a> describes the operational bill that 2025-11-25 sessions incurred — sticky hashing on <code class="inline">Mcp-Session-Id</code>, shared session stores, replay retention windows — and 2026-07-28 deletes most of that bill. It just sends a different one, itemised per request, to the people writing servers.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3><code class="inline">params._meta</code> carries the handshake now, and a request without it is malformed.</h3>
+
+    <p>Capability negotiation did not disappear; it became per-request metadata. Every request carries a <code class="inline">_meta</code> object inside <code class="inline">params</code> with reverse-DNS-namespaced keys. Two are REQUIRED: <code class="inline">io.modelcontextprotocol/protocolVersion</code>, a string, and <code class="inline">io.modelcontextprotocol/clientCapabilities</code>. Two are optional: <code class="inline">io.modelcontextprotocol/clientInfo</code>, which clients SHOULD send anyway, and <code class="inline">io.modelcontextprotocol/logLevel</code>, which is what survives of <code class="inline">logging/setLevel</code> — the level that used to be set once for a session is now stated on each call.</p>
+
+<pre class="standalone">POST /mcp HTTP/1.1
+Host: mcp.example.com
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: search_issues
+
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 7, <span class="c-kw">"method"</span>: <span class="c-st">"tools/call"</span>,
+ <span class="c-kw">"params"</span>: {
+   <span class="c-kw">"name"</span>: <span class="c-st">"search_issues"</span>,
+   <span class="c-kw">"arguments"</span>: {<span class="c-kw">"query"</span>: <span class="c-st">"flaky login test"</span>},
+   <span class="c-cm">// Not optional decoration: this IS the handshake, restated.</span>
+   <span class="c-kw">"_meta"</span>: {
+     <span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>: <span class="c-st">"2026-07-28"</span>,
+     <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>: {<span class="c-kw">"elicitation"</span>: {}},
+     <span class="c-kw">"io.modelcontextprotocol/clientInfo"</span>: {<span class="c-kw">"name"</span>: <span class="c-st">"acme-client"</span>,
+                                                <span class="c-kw">"version"</span>: <span class="c-st">"2.0.0"</span>},
+     <span class="c-kw">"io.modelcontextprotocol/logLevel"</span>: <span class="c-st">"info"</span>}}}</pre>
+
+    <p>The enforcement is what makes this an obligation rather than a convention. A request missing a required <code class="inline">_meta</code> field is malformed: the server MUST reject it with <code class="inline">-32602</code> (Invalid params) and, over HTTP, status <code class="inline">400</code>. A server MUST NOT rely on a capability the client has not declared on that request — if it needs one that is absent, the answer is <code class="inline">MissingRequiredClientCapabilityError</code>, code <code class="inline">-32021</code>, carrying <code class="inline">data.requiredCapabilities</code>, again with HTTP <code class="inline">400</code>. And on Streamable HTTP the protocol version is duplicated into the <code class="inline">MCP-Protocol-Version</code> header, where it MUST match the <code class="inline">_meta</code> value; a mismatch is <code class="inline">400</code> plus <code class="inline">HeaderMismatch</code> (<code class="inline">-32020</code>). Two copies of the same string, on every request, and disagreeing about them is a protocol error.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Per-connection state has no replacement — your session handle is now a tool argument the model picks.</h3>
+
+    <p>This is the part that surprises teams mid-migration, because there is no migration path to find: per-connection state simply has no successor. The spec's rule is that state spanning multiple requests "MUST be referenced by an explicit identifier the client passes on each request", and it forecloses the obvious workaround in one sentence — "an open connection, such as a STDIO process, is not a conversation or session." A long-lived stdio subprocess is not a licence to keep state on the side; the wire contract is the same whether your transport happens to be persistent or not.</p>
+
+    <p>In practice the shape that falls out is this: the server mints a handle for whatever it used to keep per session — a cursor, a transaction, a workspace, an auth-scoped context — and returns it as an ordinary tool result. The model reads that result, and the next call threads the handle back as a tool argument. Which means your state handle now lives in the context window, is visible to the model, and is <em>chosen</em> by the model. It can be dropped, truncated out of context, hallucinated, or swapped for one seen earlier in the same conversation. Every handle a 2026-07-28 server issues therefore needs server-side validation that it belongs to this principal and is still live — the checks a session id got for free from the transport now belong to your tool implementations. It also changes what you test: the interesting cases are no longer "does the session survive a reconnect" but "what does the server do when the model passes back a stale, foreign, or invented handle", which is exactly the kind of contract test the <a href="/deep-dives/mcp/mcp-testing" class="xref">MCP testing essay</a> argues for over vibe-checking through an agent loop.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>MRTR: the server returns its questions instead of asking them.</h3>
+
+    <p>Deleting server-initiated requests would have deleted elicitation, sampling and roots with them, so the revision replaces the mechanism rather than the feature. Multi Round-Trip Requests (MRTR) inverts the direction: the server puts its questions in the <em>result</em>, the client answers them and retries the original call. Because the answers travel in a fresh request, no two round trips need to reach the same instance — which is the whole point. The spec is blunt about the status of the old way: "Servers MUST send server-to-client requests (such as <code class="inline">roots/list</code>, <code class="inline">sampling/createMessage</code>, or <code class="inline">elicitation/create</code>) using the MRTR pattern. The previous pattern of server-initiated requests is no longer supported. This is a breaking change."</p>
+
+<pre class="standalone"><span class="c-cm">// 1. The call. The server needs a decision it is not allowed to make.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 7, <span class="c-kw">"method"</span>: <span class="c-st">"tools/call"</span>,
+ <span class="c-kw">"params"</span>: {<span class="c-kw">"name"</span>: <span class="c-st">"delete_branch"</span>,
+            <span class="c-kw">"arguments"</span>: {<span class="c-kw">"branch"</span>: <span class="c-st">"release/4.2"</span>},
+            <span class="c-kw">"_meta"</span>: {<span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>: <span class="c-st">"2026-07-28"</span>,
+                      <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>: {<span class="c-kw">"elicitation"</span>: {}}}}}
+
+<span class="c-cm">// 2. Not an answer. resultType says: ask the user, then come back.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 7, <span class="c-kw">"result"</span>: {
+  <span class="c-kw">"resultType"</span>: <span class="c-st">"input_required"</span>,
+  <span class="c-kw">"inputRequests"</span>: {
+    <span class="c-kw">"confirm"</span>: {<span class="c-kw">"method"</span>: <span class="c-st">"elicitation/create"</span>,
+                <span class="c-kw">"params"</span>: {<span class="c-kw">"message"</span>: <span class="c-st">"Delete release/4.2? It is not merged."</span>,
+                           <span class="c-kw">"requestedSchema"</span>: {<span class="c-kw">"type"</span>: <span class="c-st">"object"</span>,
+                             <span class="c-kw">"properties"</span>: {<span class="c-kw">"ok"</span>: {<span class="c-kw">"type"</span>: <span class="c-st">"boolean"</span>}},
+                             <span class="c-kw">"required"</span>: [<span class="c-st">"ok"</span>]}}}},
+  <span class="c-cm">// Opaque to the client. Attacker-controlled input to the server.</span>
+  <span class="c-kw">"requestState"</span>: <span class="c-st">"v1.eyJzdWIiOiJ1c2VyLTkxIiwiZXhwIjoxNzk5fQ.9f2c81ae"</span>}}
+
+<span class="c-cm">// 3. The retry: same method, answers attached -- and a DIFFERENT id.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 8, <span class="c-kw">"method"</span>: <span class="c-st">"tools/call"</span>,
+ <span class="c-kw">"params"</span>: {<span class="c-kw">"name"</span>: <span class="c-st">"delete_branch"</span>,
+            <span class="c-kw">"arguments"</span>: {<span class="c-kw">"branch"</span>: <span class="c-st">"release/4.2"</span>},
+            <span class="c-kw">"inputResponses"</span>: {
+              <span class="c-kw">"confirm"</span>: {<span class="c-kw">"action"</span>: <span class="c-st">"accept"</span>, <span class="c-kw">"content"</span>: {<span class="c-kw">"ok"</span>: <span class="c-kw">true</span>}}},
+            <span class="c-kw">"requestState"</span>: <span class="c-st">"v1.eyJzdWIiOiJ1c2VyLTkxIiwiZXhwIjoxNzk5fQ.9f2c81ae"</span>,
+            <span class="c-kw">"_meta"</span>: {<span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>: <span class="c-st">"2026-07-28"</span>,
+                      <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>: {<span class="c-kw">"elicitation"</span>: {}}}}}</pre>
+
+    <p>Four constraints make this work and each one bites someone. MRTR is allowed only on <code class="inline">prompts/get</code>, <code class="inline">resources/read</code> and <code class="inline">tools/call</code> — nowhere else. The values in <code class="inline">inputRequests</code> MUST be an <code class="inline">ElicitRequest</code>, a <code class="inline">CreateMessageRequest</code> or a <code class="inline">ListRootsRequest</code>, and the client's <code class="inline">inputResponses</code> must be keyed identically. The JSON-RPC <code class="inline">id</code> MUST differ between the original request and the retry: these are two independent requests that happen to be about the same work, and a client that reuses the id has sent a duplicate, not a continuation. And <code class="inline">requestState</code> must be echoed byte-exact — clients MUST NOT inspect, parse or modify it. The <a href="/deep-dives/mcp/mcp-sampling-and-elicitation" class="xref">sampling and elicitation essay</a> covers what these three requests are for; MRTR changes only how they arrive.</p>
+
+    <div class="callout warn">
+      <p><code class="inline">requestState</code> is round-tripped through a party you do not control, so the spec requires servers to treat it as attacker-controlled. If it influences authorization or business logic, servers MUST integrity-protect it (HMAC or AEAD) and MUST reject state that fails verification, and SHOULD embed the principal, a TTL and an identifier for the originating request. The failure mode if you skip this is not subtle: a blob that says "this user already approved the delete" is a forgeable approval, and you handed the forger the template.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>What every server now owes on every response: <code class="inline">server/discover</code>, two headers, <code class="inline">resultType</code>, cache hints.</h3>
+
+    <p>With no handshake to answer "what is this server", the revision adds <code class="inline">server/discover</code> and does not make it optional — "Servers MUST implement it." Two request headers become mandatory for the same reason a reverse proxy needs to see the method without parsing a body: <code class="inline">Mcp-Method</code> on all requests, carrying the value of <code class="inline">method</code>, and <code class="inline">Mcp-Name</code> on <code class="inline">tools/call</code>, <code class="inline">resources/read</code> and <code class="inline">prompts/get</code>, carrying <code class="inline">params.name</code> or <code class="inline">params.uri</code>. Non-ASCII values MUST use the Base64 sentinel format rather than being stuffed into a header raw. Routing, rate-limiting and audit logging can now happen at the edge; the cost is that a request missing them is not a well-formed request.</p>
+
+    <p>On the response side, every result object carries <code class="inline">resultType</code> — on the result, note, not on the JSON-RPC envelope, so it is <code class="inline">result.resultType</code>. The values are <code class="inline">"complete"</code>, <code class="inline">"input_required"</code>, and whatever extensions add (Tasks contributes <code class="inline">"task"</code>). Clients MUST treat an unrecognised value as invalid — and MUST treat an <em>absent</em> one as <code class="inline">"complete"</code>. That second rule is the whole backwards-compatibility story in one line: a 2025-11-25 server that has never heard of <code class="inline">resultType</code> emits results a 2026-07-28 client still reads correctly, because absence means the old behaviour.</p>
+
+    <p>Then the caching hints, which are easy to skip and quietly expensive to skip. Results with <code class="inline">resultType: "complete"</code> from <code class="inline">tools/list</code>, <code class="inline">prompts/list</code>, <code class="inline">resources/list</code>, <code class="inline">resources/read</code> and <code class="inline">resources/templates/list</code> must carry <code class="inline">ttlMs</code> and <code class="inline">cacheScope</code>. <code class="inline">ttlMs</code> is an integer count of milliseconds and MUST be <code class="inline">&gt;= 0</code>; <code class="inline">cacheScope</code> is <code class="inline">"public"</code> or <code class="inline">"private"</code>. The default is the trap: an absent <code class="inline">ttlMs</code> means the client assumes <code class="inline">0</code>, i.e. immediately stale. A server that forgets the hint has not opted out of caching — it has told every client to re-fetch its tool list on every turn, which is the one thing statelessness was supposed to make cheap. Wiring these into the server helpers described in <a href="/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">building MCP servers in practice</a> is a one-time change; noticing you forgot takes a traffic bill.</p>
+
+    <div class="callout warn">
+      <p>In the <code class="inline">server/discover</code> response, <code class="inline">serverInfo</code> lives inside <code class="inline">_meta</code> under <code class="inline">io.modelcontextprotocol/serverInfo</code> — it is <em>not</em> a top-level field of <code class="inline">DiscoverResult</code>. It moved there shortly before release, the TypeScript SDK shipped the old shape, and the result was hard connect failures rather than a graceful degradation. Do not trust SEP-2575's text for the final shape; read the released spec. And note that both <code class="inline">clientInfo</code> and <code class="inline">serverInfo</code> are self-reported, never verified by the protocol, and SHOULD NOT be relied on for security decisions.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The migration bill: three new error codes, one renumbering, and what "Deprecated" actually promises.</h3>
+
+    <p>Three error codes are new in this revision, allocated for situations that could not previously arise: <code class="inline">-32020</code> <code class="inline">HeaderMismatch</code>, <code class="inline">-32021</code> <code class="inline">MissingRequiredClientCapability</code>, <code class="inline">-32022</code> <code class="inline">UnsupportedProtocolVersion</code>. None is a renumbering of anything that ever shipped, so no client can have a handler waiting for them. Exactly one genuine renumbering exists: resource-not-found moved from <code class="inline">-32002</code> to <code class="inline">-32602</code>. An implementation of 2026-07-28 MUST NOT emit <code class="inline">-32002</code>, but clients SHOULD keep accepting it from older servers — the asymmetry is deliberate, and a client that hard-fails on the legacy code breaks servers that are still perfectly compliant with their own revision. <code class="inline">-32042</code> (URL elicitation required, a 2025-11-25-only code) is reserved and removed. The allocation policy that governs all of this: <code class="inline">-32000</code>–<code class="inline">-32019</code> is legacy and new codes MUST NOT be allocated there, <code class="inline">-32020</code>–<code class="inline">-32099</code> is reserved to the spec, and application codes SHOULD sit outside <code class="inline">-32768</code>–<code class="inline">-32000</code> entirely.</p>
+
+    <p>A modern-only server still meets legacy traffic, and the spec says what to do with it rather than leaving it to taste. A <code class="inline">GET</code> or <code class="inline">DELETE</code> on the MCP endpoint gets <code class="inline">405 Method Not Allowed</code> — the standalone SSE stream and the session-termination verb are both gone. An incoming <code class="inline">Mcp-Session-Id</code> header is ignored, and the server neither mints nor echoes session IDs. A <code class="inline">Last-Event-ID</code> header is ignored too, because streams are no longer resumable: if an SSE stream breaks, the client MUST re-issue the work as a new request with a new request ID. That last rule is worth pausing on, because it turns a transport-level retry into an application-level one — anything non-idempotent that used to be protected by replay now needs an idempotency story of its own.</p>
+
+    <p>Finally, the deprecations, which are widely misreported. Roots, Sampling, Logging and OAuth Dynamic Client Registration (RFC 7591) are all marked Deprecated in 2026-07-28, with an earliest removal of "the first revision released on or after 2027-07-28". That is an eligibility date, not a removal date: the policy says the feature becomes eligible then, and actual removal is a Core Maintainer decision taken at release preparation, which may happen later. Nothing has been removed under this policy yet. Write "eligible for removal no earlier than 2027-07-28" in your migration ticket, not "removed in July 2027" — the second sentence will make you rip out a working DCR flow ahead of a deadline that does not exist, and the <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 profile essay</a> already gives you the better reasons to move off DCR on your own schedule.</p>
+
+    <p>Put the six steps together and the shape of the revision is clear. 2026-07-28 did not make MCP simpler; it made MCP's servers cheap to operate by making each request more expensive to construct and more demanding to answer. The agreement that used to be established once and referenced implicitly is now restated, validated and re-authorized on every call — which is a genuinely better default for infrastructure, and a genuinely larger migration than "we deleted the session code" implies.</p>
+  </div>
+</section>

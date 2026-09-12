@@ -1,0 +1,125 @@
+<section class="phase">
+  <div class="phase-num">C11</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>人人都把 2026-07-28 修订版总结成"MCP 变无状态了"——但删掉握手并没有删掉那份约定，只是把这份约定的账单摊到了每一次请求头上。</h2>
+  <p class="goal">一台面对 2026-07-28 客户端时还按 2025-11-25 那套说话的服务器，不是"被弃用"，而是<em>格式错误</em>：没有 <code class="inline">initialize</code>、没有 <code class="inline">Mcp-Session-Id</code>、没有服务器发起的请求，而任何漏掉 <code class="inline">resultType</code> 或缓存提示的结果，如今都在契约之外。这一版删掉了协商、身份与服务器向客户端提问原本唯一的落脚点，而这三样全都得在别处重新出现——逐请求地出现在 <code class="inline">params._meta</code> 里、出现在新的强制 header 里、以及出现在一套彻底取代"服务器发起调用"的重试模式里。迁移不是"把会话代码删掉"；而是一份按连接达成的约定，变成了一项按请求履行的义务。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>握手不是开销——它是那份约定唯一能落脚的地方。</h3>
+
+    <p>2026-07-28 的删除清单很长，且每一条都是破坏性变更。被删掉的有：<code class="inline">initialize</code> 请求，以及确认它的 <code class="inline">notifications/initialized</code>；由服务器签发、客户端可用 <code class="inline">DELETE</code> 终止的 <code class="inline">Mcp-Session-Id</code> header；MCP 端点上的 HTTP <code class="inline">GET</code>，连带那条独立的 SSE 流；<code class="inline">resources/subscribe</code> 与 <code class="inline">resources/unsubscribe</code>；<code class="inline">ping</code>；<code class="inline">logging/setLevel</code>；<code class="inline">notifications/roots/list_changed</code>；<code class="inline">Last-Event-ID</code> 与 SSE 事件 ID，因而可恢复性也一并没了；还有三个服务器发起的请求——<code class="inline">roots/list</code>、<code class="inline">sampling/createMessage</code>、<code class="inline">elicitation/create</code>——以及 <code class="inline">notifications/elicitation/complete</code> 与 <code class="inline">elicitationId</code>。Tasks 整个挪出了核心，现在住在扩展 <code class="inline">io.modelcontextprotocol/tasks</code> 里。</p>
+
+    <p>把这份清单当变更日志读，它像是在做家务；当架构变更读，它只说了一件事：连接不再是一个可以存放事实的地方。在 2025-11-25 下，握手是那次确立"双方讲哪一版协议、各自有哪些能力、客户端是谁、它想要什么日志级别"的事件——而会话 id 就是通往这份约定所隐含的一切的把手。那是每条连接一次往返，摊到成千上万次调用上，这正是它当年便宜的原因，也正是删掉它并不便宜的原因。</p>
+
+    <p>这一版换来的好处是真的：任何实例都能响应任何请求，负载均衡不再需要粘性路由，一份副本在对话中途挂掉也不再是事故。<a href="/zh/deep-dives/mcp/mcp-streamable-http-deep-dive" class="xref">Streamable HTTP 传输</a>那一篇讲的就是 2025-11-25 的会话所欠下的运维账单——按 <code class="inline">Mcp-Session-Id</code> 做粘性哈希、共享会话存储、回放保留窗口——而 2026-07-28 把这份账单里的大部分一笔勾销。它只是另开了一张，逐请求列项，寄给写服务器的人。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>握手现在由 <code class="inline">params._meta</code> 承载，缺了它的请求就是格式错误。</h3>
+
+    <p>能力协商并没有消失，它变成了逐请求的元数据。每一次请求都在 <code class="inline">params</code> 里带一个 <code class="inline">_meta</code> 对象，键名用反向域名做命名空间。其中两个是 REQUIRED：<code class="inline">io.modelcontextprotocol/protocolVersion</code>（字符串）与 <code class="inline">io.modelcontextprotocol/clientCapabilities</code>。另外两个可选：<code class="inline">io.modelcontextprotocol/clientInfo</code>，客户端 SHOULD 照样发；以及 <code class="inline">io.modelcontextprotocol/logLevel</code>，它是 <code class="inline">logging/setLevel</code> 留下来的那部分——过去一个会话设一次的级别，如今每次调用都要重述。</p>
+
+<pre class="standalone">POST /mcp HTTP/1.1
+Host: mcp.example.com
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: search_issues
+
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 7, <span class="c-kw">"method"</span>: <span class="c-st">"tools/call"</span>,
+ <span class="c-kw">"params"</span>: {
+   <span class="c-kw">"name"</span>: <span class="c-st">"search_issues"</span>,
+   <span class="c-kw">"arguments"</span>: {<span class="c-kw">"query"</span>: <span class="c-st">"flaky login test"</span>},
+   <span class="c-cm">// Not optional decoration: this IS the handshake, restated.</span>
+   <span class="c-kw">"_meta"</span>: {
+     <span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>: <span class="c-st">"2026-07-28"</span>,
+     <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>: {<span class="c-kw">"elicitation"</span>: {}},
+     <span class="c-kw">"io.modelcontextprotocol/clientInfo"</span>: {<span class="c-kw">"name"</span>: <span class="c-st">"acme-client"</span>,
+                                                <span class="c-kw">"version"</span>: <span class="c-st">"2.0.0"</span>},
+     <span class="c-kw">"io.modelcontextprotocol/logLevel"</span>: <span class="c-st">"info"</span>}}}</pre>
+
+    <p>真正把它从"惯例"变成"义务"的是强制手段。缺少必填 <code class="inline">_meta</code> 字段的请求即为格式错误：服务器 MUST 用 <code class="inline">-32602</code>（Invalid params）拒绝，在 HTTP 上还要配 <code class="inline">400</code> 状态码。服务器 MUST NOT 依赖客户端在这次请求里没有声明的能力——如果它需要一个没出现的能力，答案是 <code class="inline">MissingRequiredClientCapabilityError</code>，错误码 <code class="inline">-32021</code>，带上 <code class="inline">data.requiredCapabilities</code>，同样配 HTTP <code class="inline">400</code>。而在 Streamable HTTP 上，协议版本还要再抄一份到 <code class="inline">MCP-Protocol-Version</code> header 里，且 MUST 与 <code class="inline">_meta</code> 里的值一致；不一致就是 <code class="inline">400</code> 加 <code class="inline">HeaderMismatch</code>（<code class="inline">-32020</code>）。同一个字符串的两份拷贝，每次请求都要带，而两份对不上就是协议错误。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>按连接保存的状态没有替代品——你的会话把手如今是一个由模型挑选的工具参数。</h3>
+
+    <p>这一节是团队迁到一半最容易被扎到的地方，因为压根找不到迁移路径：按连接保存的状态就是没有继任者。规范的规则是，跨多次请求的状态"MUST 由客户端在每次请求上传入的一个显式标识来引用"，并且用一句话堵死了那个最显然的绕法——"一条打开的连接，比如一个 STDIO 进程，并不是一次对话或一个会话。"长驻的 stdio 子进程不是你在旁边攒状态的许可证；无论你的传输碰巧是不是长连接，线上契约都一样。</p>
+
+    <p>实际落下来的形状是这样：服务器为它过去按会话保存的东西——游标、事务、工作区、带鉴权范围的上下文——铸一个把手，作为普通的工具结果返回。模型读到这个结果，下一次调用再把这个把手当工具参数穿回来。这意味着你的状态把手如今住在上下文窗口里，对模型可见，并且由模型<em>挑选</em>。它可能被丢掉、被截断出上下文、被凭空编造，或者被换成同一场对话里更早见过的另一个。因此，2026-07-28 服务器签发的每一个把手，都需要服务端校验它确实属于当前主体、且仍然有效——过去会话 id 从传输层白拿的那些检查，现在归你的工具实现管。它也改变了测什么：有意思的用例不再是"会话能不能扛过一次重连"，而是"当模型传回一个过期的、别人的、或者编出来的把手时，服务器怎么办"——而这正是<a href="/zh/deep-dives/mcp/mcp-testing" class="xref">测试 MCP 服务器</a>那篇主张用契约测试、而不是在 agent 循环里凭感觉验的那类用例。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>MRTR：服务器不再发问，而是把问题写进结果里返回。</h3>
+
+    <p>删掉服务器发起的请求，本会连带删掉征询、采样与 roots，所以这一版换掉的是机制而不是功能。多轮往返请求（Multi Round-Trip Requests，MRTR）把方向反了过来：服务器把问题放进<em>结果</em>里，客户端答完之后重试原来那次调用。因为答案是搭着一次全新的请求回去的，两次往返不需要落到同一个实例上——这正是全部要点所在。规范对老做法的定性毫不客气："服务器 MUST 使用 MRTR 模式来发送服务器到客户端的请求（例如 <code class="inline">roots/list</code>、<code class="inline">sampling/createMessage</code> 或 <code class="inline">elicitation/create</code>）。此前那种服务器发起请求的模式不再被支持。这是一个破坏性变更。"</p>
+
+<pre class="standalone"><span class="c-cm">// 1. The call. The server needs a decision it is not allowed to make.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 7, <span class="c-kw">"method"</span>: <span class="c-st">"tools/call"</span>,
+ <span class="c-kw">"params"</span>: {<span class="c-kw">"name"</span>: <span class="c-st">"delete_branch"</span>,
+            <span class="c-kw">"arguments"</span>: {<span class="c-kw">"branch"</span>: <span class="c-st">"release/4.2"</span>},
+            <span class="c-kw">"_meta"</span>: {<span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>: <span class="c-st">"2026-07-28"</span>,
+                      <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>: {<span class="c-kw">"elicitation"</span>: {}}}}}
+
+<span class="c-cm">// 2. Not an answer. resultType says: ask the user, then come back.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 7, <span class="c-kw">"result"</span>: {
+  <span class="c-kw">"resultType"</span>: <span class="c-st">"input_required"</span>,
+  <span class="c-kw">"inputRequests"</span>: {
+    <span class="c-kw">"confirm"</span>: {<span class="c-kw">"method"</span>: <span class="c-st">"elicitation/create"</span>,
+                <span class="c-kw">"params"</span>: {<span class="c-kw">"message"</span>: <span class="c-st">"Delete release/4.2? It is not merged."</span>,
+                           <span class="c-kw">"requestedSchema"</span>: {<span class="c-kw">"type"</span>: <span class="c-st">"object"</span>,
+                             <span class="c-kw">"properties"</span>: {<span class="c-kw">"ok"</span>: {<span class="c-kw">"type"</span>: <span class="c-st">"boolean"</span>}},
+                             <span class="c-kw">"required"</span>: [<span class="c-st">"ok"</span>]}}}},
+  <span class="c-cm">// Opaque to the client. Attacker-controlled input to the server.</span>
+  <span class="c-kw">"requestState"</span>: <span class="c-st">"v1.eyJzdWIiOiJ1c2VyLTkxIiwiZXhwIjoxNzk5fQ.9f2c81ae"</span>}}
+
+<span class="c-cm">// 3. The retry: same method, answers attached -- and a DIFFERENT id.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 8, <span class="c-kw">"method"</span>: <span class="c-st">"tools/call"</span>,
+ <span class="c-kw">"params"</span>: {<span class="c-kw">"name"</span>: <span class="c-st">"delete_branch"</span>,
+            <span class="c-kw">"arguments"</span>: {<span class="c-kw">"branch"</span>: <span class="c-st">"release/4.2"</span>},
+            <span class="c-kw">"inputResponses"</span>: {
+              <span class="c-kw">"confirm"</span>: {<span class="c-kw">"action"</span>: <span class="c-st">"accept"</span>, <span class="c-kw">"content"</span>: {<span class="c-kw">"ok"</span>: <span class="c-kw">true</span>}}},
+            <span class="c-kw">"requestState"</span>: <span class="c-st">"v1.eyJzdWIiOiJ1c2VyLTkxIiwiZXhwIjoxNzk5fQ.9f2c81ae"</span>,
+            <span class="c-kw">"_meta"</span>: {<span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>: <span class="c-st">"2026-07-28"</span>,
+                      <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>: {<span class="c-kw">"elicitation"</span>: {}}}}}</pre>
+
+    <p>让这套机制成立的有四条约束，每一条都会绊倒一批人。MRTR 只允许用在 <code class="inline">prompts/get</code>、<code class="inline">resources/read</code> 与 <code class="inline">tools/call</code> 上，别处一概不行。<code class="inline">inputRequests</code> 里的值 MUST 是 <code class="inline">ElicitRequest</code>、<code class="inline">CreateMessageRequest</code> 或 <code class="inline">ListRootsRequest</code> 之一，而客户端的 <code class="inline">inputResponses</code> 必须用完全相同的键。原始请求与重试之间的 JSON-RPC <code class="inline">id</code> MUST 不同：这是两次碰巧在处理同一件事的独立请求，复用 id 的客户端发出的是一次重复请求，而不是一次续接。还有，<code class="inline">requestState</code> 必须逐字节原样回传——客户端 MUST NOT 检视、解析或修改它。<a href="/zh/deep-dives/mcp/mcp-sampling-and-elicitation" class="xref">采样与征询</a>那一篇讲的是这三种请求各自的用途；MRTR 改变的只是它们抵达的方式。</p>
+
+    <div class="callout warn">
+      <p><code class="inline">requestState</code> 要经由一个你控制不了的一方兜一圈再回来，所以规范要求服务器把它当作攻击者可控的输入。如果它会影响授权或业务逻辑，服务器 MUST 对其做完整性保护（HMAC 或 AEAD）、并 MUST 拒绝验证不通过的状态，还 SHOULD 在里面嵌入主体、TTL 与一个标识原始请求的 id。省掉这一步的失败模式一点也不隐晦：一个写着"该用户已经批准了这次删除"的 blob 就是一张可伪造的批准单，而模板还是你亲手递给伪造者的。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>每台服务器如今欠下的：<code class="inline">server/discover</code>、两个 header、<code class="inline">resultType</code>、缓存提示。</h3>
+
+    <p>没有握手来回答"这台服务器是什么"，这一版就补上了 <code class="inline">server/discover</code>，而且并不把它设成可选——"服务器 MUST 实现它。"两个请求 header 成为强制，理由跟反向代理需要不解析 body 就看到方法名是同一个：所有请求都要带 <code class="inline">Mcp-Method</code>，值取自 <code class="inline">method</code>；<code class="inline">tools/call</code>、<code class="inline">resources/read</code> 与 <code class="inline">prompts/get</code> 还要带 <code class="inline">Mcp-Name</code>，值取自 <code class="inline">params.name</code> 或 <code class="inline">params.uri</code>。非 ASCII 的值 MUST 采用 Base64 哨兵格式，而不是硬塞进 header。于是路由、限流与审计日志都能在边缘完成；代价是漏了这两个 header 的请求就不是一个格式正确的请求。</p>
+
+    <p>在响应这一侧，每个结果对象都要带 <code class="inline">resultType</code>——注意是在结果上，不是在 JSON-RPC 信封上，所以路径是 <code class="inline">result.resultType</code>。取值为 <code class="inline">"complete"</code>、<code class="inline">"input_required"</code>，再加上扩展补充的值（Tasks 贡献了 <code class="inline">"task"</code>）。客户端 MUST 把无法识别的值当作非法——并且 MUST 把<em>缺失</em>的值当作 <code class="inline">"complete"</code>。后面这条规则，一行就是全部的向后兼容故事：一台从没听说过 <code class="inline">resultType</code> 的 2025-11-25 服务器发回的结果，2026-07-28 客户端照样读得对，因为"缺失"就意味着老行为。</p>
+
+    <p>再就是缓存提示，很容易跳过，而跳过的代价是悄悄花钱。来自 <code class="inline">tools/list</code>、<code class="inline">prompts/list</code>、<code class="inline">resources/list</code>、<code class="inline">resources/read</code> 与 <code class="inline">resources/templates/list</code> 且 <code class="inline">resultType: "complete"</code> 的结果，必须带上 <code class="inline">ttlMs</code> 与 <code class="inline">cacheScope</code>。<code class="inline">ttlMs</code> 是以毫秒计的整数，MUST <code class="inline">&gt;= 0</code>；<code class="inline">cacheScope</code> 取 <code class="inline">"public"</code> 或 <code class="inline">"private"</code>。默认值才是陷阱：<code class="inline">ttlMs</code> 缺失时客户端按 <code class="inline">0</code> 处理，也就是立刻过期。忘了写提示的服务器并不是"选择不缓存"——它是在告诉每一个客户端，每一轮都要重新拉一遍它的工具列表，而这恰恰是无状态本该让它变便宜的那件事。把这些接进<a href="/zh/deep-dives/mcp/mcp-building-servers-in-practice" class="xref">实操构建 MCP 服务器</a>里讲的那套服务器辅助层，是一次性的改动；而发现自己忘了写，代价是一张流量账单。</p>
+
+    <div class="callout warn">
+      <p>在 <code class="inline">server/discover</code> 的响应里，<code class="inline">serverInfo</code> 住在 <code class="inline">_meta</code> 内部的 <code class="inline">io.modelcontextprotocol/serverInfo</code> 下——它<em>不是</em> <code class="inline">DiscoverResult</code> 的顶层字段。它是在发布前不久才挪过去的，而 TypeScript SDK 按老形状发了版，结果不是优雅降级，而是直接连不上。不要拿 SEP-2575 的文字当最终形状的依据；去读已发布的规范。另外注意，<code class="inline">clientInfo</code> 与 <code class="inline">serverInfo</code> 都是自我申报的，协议从不验证，也 SHOULD NOT 被拿来做安全决策的依据。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>迁移账单：三个新错误码、一次改号，以及"Deprecated"到底承诺了什么。</h3>
+
+    <p>这一版新增了三个错误码，对应的都是过去压根不可能出现的情形：<code class="inline">-32020</code> <code class="inline">HeaderMismatch</code>、<code class="inline">-32021</code> <code class="inline">MissingRequiredClientCapability</code>、<code class="inline">-32022</code> <code class="inline">UnsupportedProtocolVersion</code>。它们都不是任何已发布过的东西改的号，所以不可能有哪个客户端已经备好了处理分支。真正的改号只有一处：资源未找到从 <code class="inline">-32002</code> 换到了 <code class="inline">-32602</code>。2026-07-28 的实现 MUST NOT 再发出 <code class="inline">-32002</code>，但客户端 SHOULD 继续接受来自更老服务器的这个码——这种不对称是故意的，而一个碰到旧码就硬失败的客户端，会把那些对自己那一版完全合规的服务器打死。<code class="inline">-32042</code>（要求 URL 征询，仅 2025-11-25 有）被保留并移除。管着这一切的分配政策是：<code class="inline">-32000</code>–<code class="inline">-32019</code> 属于遗留区间，新码 MUST NOT 分配在那里；<code class="inline">-32020</code>–<code class="inline">-32099</code> 保留给规范；应用自定义的码 SHOULD 完全落在 <code class="inline">-32768</code>–<code class="inline">-32000</code> 之外。</p>
+
+    <p>一台只支持新版的服务器仍然会撞上旧流量，而规范把该怎么办说清楚了，没有留给个人口味。MCP 端点上的 <code class="inline">GET</code> 或 <code class="inline">DELETE</code> 一律回 <code class="inline">405 Method Not Allowed</code>——独立 SSE 流与那个终止会话的动词都没了。收到 <code class="inline">Mcp-Session-Id</code> header 就忽略它，服务器既不签发也不回带会话 ID。收到 <code class="inline">Last-Event-ID</code> 同样忽略，因为流不再可恢复：SSE 流断了，客户端 MUST 用一个新的请求 ID 把这件事作为一次新请求重发。最后这条值得停下来想想，因为它把一次传输层的重试变成了应用层的重试——任何过去靠回放兜住的非幂等操作，现在都需要自己的幂等方案。</p>
+
+    <p>最后是那些被广泛误报的弃用。Roots、Sampling、Logging 与 OAuth 动态客户端注册（RFC 7591）在 2026-07-28 里都被标为 Deprecated，最早移除时点是"2027-07-28 当天或之后发布的第一个修订版"。那是一个"获得资格"的日期，不是移除日期：政策说的是该特性到那时才变得<em>有资格</em>被移除，而实际移除是核心维护者在准备发版时做的决定，可能更晚。到目前为止，还没有任何东西是按这条政策被移除的。在你的迁移工单里请写"不早于 2027-07-28 才有资格被移除"，而不是"2027 年 7 月移除"——后一句会让你为了一个并不存在的截止日期去拆掉一套跑得好好的 DCR 流程，而<a href="/zh/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 配置</a>那一篇早就给了你按自己节奏离开 DCR 的更好理由。</p>
+
+    <p>六节连起来看，这一版的形状就清楚了。2026-07-28 没有让 MCP 变简单；它是通过让每次请求更难构造、更难应答，换来了 MCP 服务器的运维便宜。那份过去建立一次、此后隐式引用的约定，如今在每一次调用上重述、校验并重新授权一遍——这对基础设施来说确实是更好的默认值，也确实是一次比"我们把会话代码删了"所暗示的大得多的迁移。</p>
+  </div>
+</section>
