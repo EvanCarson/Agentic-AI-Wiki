@@ -1,0 +1,114 @@
+<section class="phase">
+  <div class="phase-num">O24</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Long-lived sessions &amp; zero-downtime deploys.</h2>
+  <p class="goal">Every deploy strategy you inherited — rolling updates, connection draining, a thirty-second grace period — was designed for requests that finish in under a second. An agent session is a phone call: it can run for forty minutes, it holds state in memory, and it cannot be retried. The consequence is not that deploys get slower; it is that your release cadence is now bounded by the tail of your session-length distribution, and the thing that breaks during a drain is almost never the socket — it is session state the new version cannot read.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>A session is not a request, and your platform assumes it is.</h3>
+
+    <p>The defaults give this away. Kubernetes ships a 30-second termination grace period; load balancers deregister a target and wait a default drain interval measured in seconds to low minutes; blue-green cutovers assume in-flight work completes in the time it takes to flip DNS. All of that is correct for HTTP. None of it is correct for a WebRTC call, a WebSocket agent session, or a two-hour autonomous run.</p>
+
+    <ul>
+      <li><strong>The connection is stateful and irreplaceable.</strong> A dropped request gets retried by a client. A dropped call is a customer hanging up, and a dropped autonomous run may have already written half its side effects.</li>
+      <li><strong>The session holds memory the new process does not have.</strong> Dialogue state, a partially-assembled order, an accumulating transcript, a tool result waiting on a callback. Restarting the process does not restart the conversation.</li>
+      <li><strong>The user is present.</strong> This is the part that makes it an operations problem rather than an engineering inconvenience: there is a human on the other end during your deploy, and their experience of a rolling update is silence.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>The specific failure to look for in your own cluster: a pod receives SIGTERM, the grace period expires while a call is still connected, and the container is killed. Your dashboards record a normal rollout and a slight uptick in session-ended events. Nothing alerts, because from the platform's perspective nothing went wrong.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Compute the drain curve before you choose a strategy.</h3>
+
+    <p>Draining means: stop accepting new sessions on this instance, wait for existing ones to end naturally, then terminate. The wait is governed entirely by the distribution of your session lengths, and specifically by its tail — which almost nobody has measured, because median session length is the number that gets reported.</p>
+
+    <p>Get the real numbers first, and treat them as a deploy input rather than a product statistic:</p>
+
+<pre class="standalone"><span class="c-cm"># p50 / p95 / p99 / max session duration, by session type</span>
+SELECT session_type,
+       percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_s) AS p50,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_s) AS p95,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_s) AS p99,
+       max(duration_s)                                          AS worst
+FROM sessions
+WHERE started_at &gt; now() - interval <span class="c-st">'30 days'</span>
+GROUP BY session_type;</pre>
+
+    <ul>
+      <li><strong>Full drain time is p99-ish, not p50.</strong> If p50 is four minutes and p99 is fifty, a full drain costs fifty minutes per wave, and you are paying for two fleets during it.</li>
+      <li><strong>Multiply by wave count.</strong> A rolling update in ten waves with a fifty-minute drain is a workday. That is the real constraint on how often you ship, and it deserves to be stated in those terms to whoever is asking why releases slowed down.</li>
+      <li><strong>The tail is usually not a long conversation.</strong> It is a stuck one — a session nobody ended because a client disconnected without closing, or an agent waiting forever on a tool. Before optimising the deploy, look at the top of the tail; a meaningful share of it is often a bug that also costs you money in <a class="xref" href="/operations/agentops/concurrency-and-scaling">held capacity</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Pin the session to a version instead of migrating it.</h3>
+
+    <p>The instinct is to move live sessions onto the new build. Resist it. Mid-session migration means serialising in-memory state, transporting it, and rehydrating it into code that may interpret it differently — during a call, with a human waiting. The cheaper design is to accept that <strong>the version is a property of the session</strong>, fixed at creation and never changed.</p>
+
+    <ul>
+      <li><strong>Route by session ID, not by round-robin.</strong> Once a session exists, every subsequent frame, event and reconnection for it must reach the instance and build that created it. This is sticky routing, and it is load-bearing infrastructure here rather than an optimisation.</li>
+      <li><strong>Run N versions concurrently and on purpose.</strong> During a drain there are two builds live, which means two prompt versions, two tool schemas and possibly two model pins. That is fine if it is designed; it is an incident if it is discovered. The same dual-window discipline as <a class="xref" href="/operations/agentops/protocol-revisions-and-deprecation-windows">running two protocol revisions</a> applies.</li>
+      <li><strong>Stamp the build into the trace.</strong> Every span for a session carries its build identifier, so a quality dip during a rollout can be attributed to a version rather than to the weather. Without this, a bad release inside a long drain looks like noise across both fleets — see <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a>.</li>
+      <li><strong>Feature flags are evaluated once, at session start.</strong> A flag that flips mid-session changes the agent's behaviour halfway through a conversation the user experiences as continuous. Snapshot the <a class="xref" href="/operations/agentops/feature-flags-for-agents">flag set</a> into the session and read it from there.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>What actually breaks is state the new version cannot read.</h3>
+
+    <p>Teams solve the connection problem, deploy confidently, and then break anyway — because sessions do not live only in a process. They live in Redis, in a database row, in a durable workflow. The moment the new build writes a field the old build does not understand, or reads a field the old build never wrote, you have two incompatible interpretations of the same session running against the same store.</p>
+
+    <p>The discipline is ordinary schema evolution, applied somewhere people forget it applies:</p>
+
+    <ul>
+      <li><strong>Expand, migrate, contract — never in one release.</strong> Release one adds the new field and writes both. Release two reads the new field. Release three stops writing the old. Any compression of that sequence means a session created before the deploy cannot be served after it.</li>
+      <li><strong>Never change state shape and behaviour in the same deploy.</strong> When something goes wrong you need to know which half caused it, and a rollback must not strand sessions in a format the previous build cannot parse.</li>
+      <li><strong>Test the mixed state explicitly.</strong> Your <a class="xref" href="/operations/agentops/staging-environments-for-agents">staging environment</a> should run old and new builds side by side against one store, with sessions created on each and served by the other. This is a ten-minute test that catches the most expensive class of rollout bug.</li>
+      <li><strong>Treat a rollback as a forward migration.</strong> Rolling back code is easy; rolling back a state format that sessions have already been written in is not. If the previous build cannot read what the current one wrote, you do not have a rollback — you have an outage with extra steps.</li>
+    </ul>
+
+    <div class="callout">
+      <p>If session state lives in a durable execution engine, some of this is handled for you — versioned workflow definitions exist precisely so an in-flight run continues on the code it started with. That is a good reason to consider <a class="xref" href="/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal">durable execution</a> for long-horizon agents, and not a reason to assume the problem is solved: a versioned workflow still needs the state it reads to be compatible.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Bound the tail on purpose: maximum session age as an SLO.</h3>
+
+    <p>An unbounded session length means an unbounded drain, which means you eventually ship by killing calls. The fix is to decide the bound yourself rather than discovering it during an incident: every session gets a maximum age, published as an operational limit, enforced in code, and chosen so that the drain it implies is a duration your release process can absorb.</p>
+
+    <ul>
+      <li><strong>Pick the cap from the drain budget, backwards.</strong> "We are willing to spend twenty minutes draining" is a business statement; a twenty-minute maximum session age is its implementation. Write it down next to your other <a class="xref" href="/operations/agentops/slos-and-error-budgets">SLOs</a>, because it is one.</li>
+      <li><strong>End gracefully well before the cap.</strong> An agent approaching the limit should wrap up, checkpoint, or offer a handoff — not be cut off at the boundary. For a voice agent that is "let me pass you to a colleague"; for an autonomous run it is a checkpoint and a resumable handle, which is exactly what <a class="xref" href="/operations/agentops/durable-state-and-resumability">durable state and resumability</a> is for.</li>
+      <li><strong>Cap concurrent sessions per instance too.</strong> Instances holding a hundred sessions each are expensive to drain and painful to lose. Smaller blast radius per instance makes every rollout cheaper — the same reasoning as everywhere else in <a class="xref" href="/operations/agentops/concurrency-and-scaling">capacity design</a>.</li>
+      <li><strong>Re-measure after every product change.</strong> A new feature that makes conversations longer has just extended your deploy window, and nobody will connect those two facts unless the session-length distribution is on a dashboard somebody watches.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When you must cut a session, have a resumption contract.</h3>
+
+    <p>Emergencies exist: a security patch, a bad release, a node failure. Plan for the cut rather than treating it as the case that will not happen, and write the contract down before you need it.</p>
+
+    <ul>
+      <li><strong>Side effects must be idempotent and reconcilable.</strong> A session terminated mid-tool-call may have submitted an order the caller never heard confirmed. Idempotency keys plus a reconciliation pass are the only honest answer; <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a> covers the mechanics, and <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a> covers the cleanup when they were not.</li>
+      <li><strong>Checkpoint on commit points, not on a timer.</strong> Checkpoint when something irreversible happens or when structured state changes materially. A checkpoint every N seconds is both too expensive and too late.</li>
+      <li><strong>Tell the human.</strong> A session that dies silently is worse than one that says "I have lost my place, let me reconnect" — and far worse than one that reconnects into the same state. Whether resumption is visible or invisible is a product decision; whether it is honest is not.</li>
+      <li><strong>Degrade the fleet, not the session.</strong> Under pressure it is better to stop accepting new sessions and let existing ones finish than to shorten everyone's. Shedding at admission is the <a class="xref" href="/operations/agentops/graceful-degradation-and-fallback">degradation path</a> that costs least.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you do one thing: put your session-duration distribution — p50, p95, p99, max, split by session type — on the same dashboard as your deploy pipeline, and set a maximum session age derived from how long you are willing to drain. Everything else on this page follows from those two numbers, and teams that skip them end up choosing between shipping slowly and hanging up on customers, usually without realising that is the choice they are making. Related: <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout and versioning</a> for the version tuple this pins, <a class="xref" href="/operations/agentops/load-testing-agents">load testing agents</a> for generating the long-session traffic your drain plan assumes, and <a class="xref" href="/concepts/full-duplex-speech">full-duplex speech</a> for the workload that makes all of this urgent.</p>
+    </div>
+  </div>
+</section>
