@@ -169,6 +169,9 @@ export const entries: Entry[] = [
 
   // --- 2026-09-13: the turn was an artefact of the pipeline, not of speech ---
   { page: 'full-duplex-speech', slug: 'full-duplex-speech', title: L('Full-Duplex Speech','全双工语音'), summary: L('A model that listens while it speaks stops emitting the one event your stack was built around — end-of-turn — so tool dispatch, trace spans, guardrails and handoff lose the signal they were silently subscribed to. The deeper trade is that an endpointing threshold you could tune, diff and revert becomes an interruption policy distributed across weights, and the meter changes shape with it: per-minute voice pricing bills the caller’s thinking pause at the same rate as speech, so shortening the conversation beats speeding up the model.','一个边说边听的模型，不再发出你整套技术栈赖以建立的那个事件——轮次结束——于是工具派发、追踪 span、护栏与转接，统统失去了它们默默订阅着的那个信号。更深一层的交易是：一个你能调、能比对、能回滚的端点检测阈值，变成了一条分布在权重里的打断策略，而计费表也随之换了形状：按分钟计价的语音层，把来电者思考时的停顿按与说话相同的费率计费，于是"把对话变短"胜过"把模型变快"。'), group: L('Agentic AI','智能体 AI') },
+
+  // --- 2026-09-14: confidence is the wrong trigger for asking ---
+  { page: 'clarifying-questions', slug: 'clarifying-questions', title: L('Clarifying Questions','澄清式提问'), summary: L('An agent that asks whenever it is unsure is the one people stop delegating to, because a question spends a human\'s attention to buy certainty the agent could usually have bought with a tool call — and in a background run the same question costs hours instead of seconds. Gate on consequence rather than confidence: ask only when the ambiguity would change the work and the wrong branch is expensive to undo, and for the large reversible middle proceed on an assumption stated where the result is read.','一拿不准就发问的智能体，正是人们逐渐不再托付的那个：一次提问要花掉人的注意力，去买一份它通常一次工具调用就能买到的确定性——而在后台运行里，同一个问题的代价从几秒变成几小时。用后果而不是置信度来设闸门：只有当歧义会改变要做的事、且走错那条岔路难以撤回时才问；至于「可撤回」这个很大的中间地带，就带着一个写在结果旁边的假设往下做。'), group: L('Agentic AI','智能体 AI') },
 ];
 
 /** Flat, ordered list of all entries (mirrors field-guide CHAPTERS). */
