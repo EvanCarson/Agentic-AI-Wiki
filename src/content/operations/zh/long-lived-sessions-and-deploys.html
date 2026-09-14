@@ -1,0 +1,114 @@
+<section class="phase">
+  <div class="phase-num">O24</div>
+  <div class="week">运维 · 智能体运维：部署与运营</div>
+  <h2>长会话与零停机发布。</h2>
+  <p class="goal">你继承来的每一套发布策略——滚动更新、连接排空、三十秒宽限期——都是为"一秒内就结束的请求"设计的。而一次智能体会话是一通电话：它可能跑四十分钟，它在内存里攥着状态，而且它不可重试。后果并不是发布变慢了，而是：你的发版节奏如今被会话时长分布的尾部框死；而排空期间真正坏掉的东西，几乎从来不是那个套接字——是新版本读不懂的会话状态。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>会话不是请求，而你的平台假定它是。</h3>
+
+    <p>默认值把这一点暴露无遗。Kubernetes 给出的是 30 秒的终止宽限期；负载均衡器把一个目标摘除后，等待的默认排空时长以秒到几分钟计；蓝绿切换假定在途工作会在翻转 DNS 的时间里完成。这一切对 HTTP 都是对的。对一通 WebRTC 通话、一次 WebSocket 智能体会话，或一次两小时的自主运行，则一条都不对。</p>
+
+    <ul>
+      <li><strong>连接是有状态且不可替代的。</strong>一个被丢掉的请求，客户端会重试。一通被掐断的电话，是一位挂机的顾客；而一次被掐断的自主运行，可能已经写出了一半的副作用。</li>
+      <li><strong>会话攥着新进程没有的内存。</strong>对话状态、一份拼到一半的订单、一段不断增长的记录、一个等着回调的工具结果。重启进程并不会重启这场对话。</li>
+      <li><strong>人就在场。</strong>正是这一点把它从工程上的不便变成了运维问题：你发布的时候，另一端坐着一个真人，而他对一次滚动更新的体验是——沉默。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>该去自家集群里找的那个具体故障：一个 pod 收到 SIGTERM，通话仍在连接中而宽限期已到，容器被杀。你的看板记录的是一次正常的滚动发布，外加"会话结束"事件的轻微上扬。什么都不会告警，因为从平台的视角看，什么都没出错。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>在选策略之前，先把排空曲线算出来。</h3>
+
+    <p>排空的意思是：这个实例不再接受新会话，等现存会话自然结束，然后终止。这个"等"完全由你的会话时长分布决定，尤其是由它的尾部决定——而那几乎没人量过，因为被拿出来汇报的数字是会话时长中位数。</p>
+
+    <p>先把真实数字拿到手，并且把它当作发布的输入，而不是产品统计：</p>
+
+<pre class="standalone"><span class="c-cm"># p50 / p95 / p99 / max session duration, by session type</span>
+SELECT session_type,
+       percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_s) AS p50,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_s) AS p95,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_s) AS p99,
+       max(duration_s)                                          AS worst
+FROM sessions
+WHERE started_at &gt; now() - interval <span class="c-st">'30 days'</span>
+GROUP BY session_type;</pre>
+
+    <ul>
+      <li><strong>完整排空时间取的是 p99 那一档，不是 p50。</strong>如果 p50 是四分钟而 p99 是五十分钟，那么每一波排空就要五十分钟，而在这期间你同时在为两套机群付钱。</li>
+      <li><strong>再乘以波次数。</strong>分十波的滚动更新、每波排空五十分钟，就是一个工作日。这才是"你多久能发一次版"的真实约束，而且值得用这样的措辞，讲给那个正在问"发版怎么变慢了"的人听。</li>
+      <li><strong>尾部通常不是一场长对话。</strong>它是一场卡住的对话——某个客户端没有正常关闭就断开，于是没人去结束那个会话；或者一个智能体在永远地等一个工具。在优化发布之前，先去看尾部的最上端；其中相当一部分往往是个 bug，而它同时还在<a class="xref" href="/zh/operations/agentops/concurrency-and-scaling">占着容量</a>花你的钱。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>把会话钉在一个版本上，而不是去迁移它。</h3>
+
+    <p>本能反应是把活跃会话挪到新构建上。忍住。会话中途迁移意味着把内存中的状态序列化、搬运过去、再在一份可能会作出不同解读的代码里复原——而这一切发生在通话进行中、有人在等着。更便宜的设计是接受一件事：<strong>版本是会话的一项属性</strong>，在创建时固定，此后永不更改。</p>
+
+    <ul>
+      <li><strong>按会话 ID 路由，不要轮询。</strong>一个会话一旦存在，属于它的每一帧、每个事件、每次重连，都必须抵达当初创建它的那个实例与那份构建。这就是粘性路由，而在这里它是承重的基础设施，不是一项优化。</li>
+      <li><strong>有意地并行跑 N 个版本。</strong>排空期间有两份构建在线，这意味着两个提示词版本、两套工具 schema，可能还有两个模型钉版。这件事如果是设计出来的，没问题；如果是被发现的，那就是事故。这与<a class="xref" href="/zh/operations/agentops/protocol-revisions-and-deprecation-windows">同时跑两个协议版本</a>是同一套双窗口纪律。</li>
+      <li><strong>把构建号盖进追踪里。</strong>一个会话的每一个 span 都带上它的构建标识，这样滚动发布期间的质量下滑才能归因到某个版本，而不是归因到天气。没有它，一次长排空里的坏版本，看起来就是两套机群上的一片噪声——参见<a class="xref" href="/zh/operations/evaluation-and-observability/tracing-and-observability">追踪与可观测性</a>。</li>
+      <li><strong>特性开关只在会话开始时求值一次。</strong>一个在会话中途翻转的开关，会在用户体验为连续的那场对话进行到一半时改变智能体的行为。把<a class="xref" href="/zh/operations/agentops/feature-flags-for-agents">开关集合</a>快照进会话，并从那里读取。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>真正坏掉的，是新版本读不懂的状态。</h3>
+
+    <p>团队把连接问题解决掉、信心满满地发布，然后照样出事——因为会话并不只活在进程里。它活在 Redis 里、活在一行数据库记录里、活在一个持久化工作流里。当新构建写下一个旧构建不认识的字段、或读取一个旧构建从不写入的字段的那一刻，你就有了对同一份会话的两种互不兼容的解读，在同一个存储上同时运行。</p>
+
+    <p>该用的纪律就是普通的 schema 演进，只不过用在了一个人们忘了它同样适用的地方：</p>
+
+    <ul>
+      <li><strong>扩展、迁移、收缩——绝不放在一个版本里。</strong>第一版加上新字段并双写。第二版读新字段。第三版停止写旧字段。任何对这个序列的压缩，都意味着发布前创建的会话在发布后没法被服务。</li>
+      <li><strong>绝不在同一次发布里同时改状态形状与行为。</strong>出问题时你得知道是哪一半造成的，而一次回滚绝不能把会话搁浅在一个上一版构建解析不了的格式里。</li>
+      <li><strong>把混合状态显式地测一遍。</strong>你的<a class="xref" href="/zh/operations/agentops/staging-environments-for-agents">预发环境</a>应当让新旧两份构建并排跑在同一个存储上，会话在其中一边创建、由另一边来服务。这是一个十分钟的测试，能抓住滚动发布里代价最高的那一类 bug。</li>
+      <li><strong>把回滚当成一次向前迁移来对待。</strong>回滚代码很容易；回滚一个已经有会话按它写过的状态格式则不然。如果上一版构建读不懂当前版写下的东西，那你手上的就不是回滚——那是一次多了几道工序的故障。</li>
+    </ul>
+
+    <div class="callout">
+      <p>如果会话状态活在一个持久化执行引擎里，其中一部分已经替你办好了——带版本的工作流定义之所以存在，正是为了让一次在途运行继续跑在它启动时的那份代码上。这是考虑为长周期智能体引入<a class="xref" href="/zh/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal">持久化执行</a>的一条好理由，但不是"问题已经解决"的理由：一个带版本的工作流，仍然需要它读到的状态是兼容的。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>有意地框住尾部：把会话最长时长当作一条 SLO。</h3>
+
+    <p>会话时长无上界，就意味着排空无上界，也就意味着你迟早要靠掐断通话来发版。解法是自己来定这个上界，而不是在一次事故里才发现它：每个会话都有一个最长存活时长，作为一项运营限制对外公布、在代码里强制执行，并且取值要让它所隐含的排空时长，是你的发布流程吞得下的。</p>
+
+    <ul>
+      <li><strong>从排空预算倒推这个上限。</strong>「我们愿意花二十分钟排空」是一句业务陈述；二十分钟的最长会话时长就是它的实现。把它写在你其余的 <a class="xref" href="/zh/operations/agentops/slos-and-error-budgets">SLO</a> 旁边，因为它本来就是一条。</li>
+      <li><strong>要在离上限还有余量时就优雅收尾。</strong>一个逼近上限的智能体应当去收尾、去落检查点，或者提出转接——而不是在边界上被切断。对语音智能体来说那句话是「我把您转给一位同事」；对一次自主运行来说，那是一个检查点加一个可恢复的句柄，而这正是<a class="xref" href="/zh/operations/agentops/durable-state-and-resumability">持久状态与可恢复性</a>的用途。</li>
+      <li><strong>每个实例的并发会话数也要设上限。</strong>各攥着一百个会话的实例，排空起来昂贵，丢掉时也痛。每实例更小的爆炸半径会让每一次滚动发布都更便宜——与<a class="xref" href="/zh/operations/agentops/concurrency-and-scaling">容量设计</a>里其他地方是同一个道理。</li>
+      <li><strong>每次产品变更之后都重新量一遍。</strong>一个让对话变长的新功能，刚刚延长了你的发布窗口，而除非会话时长分布出现在一张有人盯着的看板上，否则没人会把这两件事联系起来。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>当你不得不切断一个会话时，要有一份恢复契约。</h3>
+
+    <p>紧急情况是存在的：一个安全补丁、一次糟糕的发布、一台节点故障。为"切断"做好计划，而不是把它当成不会发生的那种情况；并在你需要它之前，就把这份契约写下来。</p>
+
+    <ul>
+      <li><strong>副作用必须幂等且可对账。</strong>一个在工具调用中途被终止的会话，可能已经提交了一笔来电者从未听到确认的订单。幂等键加一趟对账是唯一诚实的答案；<a class="xref" href="/zh/operations/agentops/idempotency-and-retries">幂等与重试</a>讲机制，而<a class="xref" href="/zh/operations/agentops/repairing-agent-side-effects">修复智能体的副作用</a>讲当它们并不幂等时该如何善后。</li>
+      <li><strong>在提交点落检查点，不要按定时器落。</strong>在发生了不可逆的事、或结构化状态发生实质变化时落检查点。每 N 秒落一次，既太贵又太晚。</li>
+      <li><strong>告诉那个人。</strong>一个悄无声息死掉的会话，比一个说出「我刚才断了，让我重新接上」的会话更糟——而后者又远不如一个重连回同一状态的会话。恢复是可见还是不可见，是一个产品决定；它是否诚实，则不是。</li>
+      <li><strong>降级的是机群，不是会话。</strong>压力之下，停止接受新会话、让现存会话跑完，胜过把所有人的会话都截短。在入口处卸载流量，是代价最小的那条<a class="xref" href="/zh/operations/agentops/graceful-degradation-and-fallback">降级通路</a>。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>如果只做一件事：把你的会话时长分布——p50、p95、p99、最大值，按会话类型拆分——放到与发布流水线同一张看板上，并依据"你愿意排空多久"定出一个最长会话时长。本页其余的一切都从这两个数字推导而来；跳过它们的团队，最终只能在"慢慢发版"与"挂客户电话"之间二选一，而且通常意识不到自己正在做这个选择。延伸：<a class="xref" href="/zh/operations/agentops/rollout-and-versioning">灰度与版本化</a>讲这里被钉住的那个版本元组，<a class="xref" href="/zh/operations/agentops/load-testing-agents">智能体压测</a>讲如何造出你的排空计划所假定的长会话流量，而<a class="xref" href="/zh/concepts/full-duplex-speech">全双工语音</a>讲的是让这一切变得紧迫的那种负载。</p>
+    </div>
+  </div>
+</section>

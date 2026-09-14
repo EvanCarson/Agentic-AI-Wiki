@@ -1,0 +1,182 @@
+<p class="lede">The voice model OpenAI put in the API on 10 September keeps listening while it is still talking, and the interesting consequence is not that conversations feel better. It is that end-of-turn — the event your stack used to decide when to call a tool, when to write a trace, when to run a guardrail and when to stop the meter — no longer happens. Every one of those decisions was hanging off a signal that a full-duplex model does not emit.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>GPT-Live-1 is deliberately not a brain. It is the mouth and ears, sold separately from the thinking.</p>
+  <table>
+    <thead>
+      <tr><th>Property</th><th>GPT-Live-1</th><th>What it replaces</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Conversation model</td>
+        <td>Full duplex — listens and speaks simultaneously.</td>
+        <td>Half duplex: detect end of speech, then respond.</td>
+      </tr>
+      <tr>
+        <td>Reasoning and tools</td>
+        <td>Delegated to a backend text model you choose.</td>
+        <td>Handled inside the realtime model.</td>
+      </tr>
+      <tr>
+        <td>Price</td>
+        <td>$0.05/minute, billed by the second — voice layer only.</td>
+        <td>Audio metered as tokens.</td>
+      </tr>
+      <tr>
+        <td>Transports</td>
+        <td>WebRTC, WebSocket and SIP, via <code>v1/live/sessions</code>.</td>
+        <td>Same three, different session object.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/full-duplex-deletes-the-turn/arch-where-the-turn-went.svg" alt="Diagram contrasting two voice agent architectures. On the left, a half-duplex loop: caller audio enters voice activity detection, then endpointing, which emits a single end-of-turn event drawn as a solid accent box; four labelled arrows leave that event, going to tool dispatch, trace write, guardrail check and billing tick. On the right, a full-duplex loop: caller audio and agent audio flow continuously through one model with no endpointing stage and no end-of-turn event; the same four consumers are drawn detached, each with a question mark, waiting for a signal that is never emitted." width="900" height="500" loading="lazy" />
+    <figcaption>Four subsystems were subscribed to one event. Removing the event does not remove the subscribers.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>What actually shipped</h2>
+  <p>On 10 September 2026 OpenAI made <code>gpt-live-1</code> generally available in the API at five cents a minute, billed per second. The model handles incoming and outgoing audio together: it can react to an interruption, a backchannel "mm-hm", a mid-sentence change of direction or background speech while its own audio is still playing.</p>
+
+  <p>The architectural choice underneath is the one worth reading twice. GPT-Live-1 does not do the thinking. You pair it with a backend text model — OpenAI names GPT-6 Astra, Luna and Terra, and third-party models are allowed — and that model does the reasoning and the tool calls while the voice layer keeps the conversation moving. The reported numbers come from that pairing rather than from the voice model alone: on Full Duplex Bench it scores 80.1% on interactivity against 45.4% for GPT-Realtime-2.1, with turn-taking latency down to 0.8 s from 1.4 s; on Full Duplex Bench v3, run with a Terra backend at low reasoning effort, tool-calling Pass@1 is 87.0% against 60.0% and 58.0% for the comparison configurations. Paired with GPT-6 Astra at medium reasoning effort, OpenAI reports a first-place result on Tau3, an end-to-end benchmark of spoken customer-service tasks.</p>
+
+  <p>Operationally it is still a beta-shaped product. Concurrent sessions cap at 25 on tier 1 and 500 on tier 5, and the free tier is not supported — which means the first capacity plan you write is a tier-upgrade request, not a load test.</p>
+
+  <div class="callout">
+    <p>Note what the benchmark configuration implies: every headline number is a tuple of voice model, backend model and reasoning effort. "GPT-Live-1 scores 87%" is not a statement about a model. Record all three when you quote it, and all three when you measure your own.</p>
+  </div>
+</section>
+
+<section>
+  <h2>The turn was load-bearing, and almost nobody wrote that down</h2>
+  <figure>
+    <img src="/blogs/full-duplex-deletes-the-turn/compare-commit-points.svg" alt="Three columns comparing where the commit point sits. Column one, cascaded half duplex: endpointing in your code emits end-of-turn, and you decide everything from it. Column two, speech-to-speech half duplex: endpointing moves inside the model, but a turn boundary is still exposed as an event you can subscribe to. Column three, full duplex: there is no turn boundary at all, and the commit point has to be declared by you as an explicit policy." width="900" height="300" loading="lazy" />
+    <figcaption>Two architecture changes moved the turn boundary. The third removes it.</figcaption>
+  </figure>
+
+  <p>In a cascaded stack, <a href="/playbooks/voice-realtime-agents/turn-taking-and-barge-in">endpointing</a> is a decision your code makes: voice activity detection says whether there is speech in this frame, and an endpointer decides whether the caller is <em>done</em>. That second decision is the most consequential line in a voice agent, and teams tune it for months. What gets noticed less is how much else was quietly bolted to it.</p>
+
+  <ul>
+    <li><strong>Tool dispatch.</strong> "Call the tool when the caller finishes" is the default design, because a tool call mid-utterance risks acting on half a sentence. End-of-turn was the guard.</li>
+    <li><strong>Trace boundaries.</strong> A span per turn is how voice traces are shaped. Without turns, a thirty-minute call is one span with no internal structure, and <a href="/operations/evaluation-and-observability/tracing-and-observability">the trace stops being readable</a> at exactly the length where you need it.</li>
+    <li><strong>Guardrails.</strong> An output check that runs on the completed utterance cannot run on an utterance that is still being emitted while the caller talks over it.</li>
+    <li><strong>Evaluation.</strong> Turn-level scoring — was this response correct, given this user turn — is how nearly every voice eval suite is built. <a href="/blogs/coval-vs-hamming-vs-cekura-vs-bluejay">The voice-eval vendors</a> segment by turn because that is the unit that existed.</li>
+    <li><strong>Human handoff.</strong> "Escalate at the end of the current turn" is the polite version of a transfer. There is no end of the current turn.</li>
+  </ul>
+
+  <p>None of these are hard problems once you see them. They are dangerous because they are invisible: nothing in your code says <code>on_end_of_turn</code> for all five. The dependency is distributed across a state machine, a tracing decorator, a guardrail middleware and a test harness, and the first three will keep running without error. They will simply run at the wrong moments, or never.</p>
+
+  <div class="callout warn">
+    <p>The failure this produces is not a crash. It is a tool called against a sentence the caller was still amending, a guardrail that passes because it evaluated an empty buffer, and a trace that says one thing happened. Every one of those looks like a model regression in your dashboard.</p>
+  </div>
+</section>
+
+<section>
+  <h2>What replaces the turn: commit points you declare</h2>
+  <p>The honest answer is that the turn was always a proxy for something else — the moment at which the agent's understanding is stable enough to act on. Half duplex let you conflate the two, because the caller stopping talking was a decent approximation of the caller being finished. Full duplex forces the distinction into the open, which is uncomfortable and also correct.</p>
+
+  <p>So name the commit points instead of inheriting them:</p>
+
+  <ul>
+    <li><strong>Commit on a completed slot, not on silence.</strong> A booking agent does not need the caller to stop; it needs a date, a party size and a name. Fire the tool when the slot is filled and stable for a short window, and let the caller keep talking. This is what <a href="/playbooks/voice-realtime-agents/voice-tooling-and-state">explicit dialogue state</a> was for, and full duplex makes it mandatory rather than tidy.</li>
+    <li><strong>Make retraction a first-class path.</strong> If you act before the caller is done, they will sometimes correct you — "no, Tuesday" — after the tool ran. That is now the ordinary case, not an edge case, so every commit-early tool needs a compensating action. Read-only lookups are free to fire early; anything that mutates needs the same <a href="/operations/agentops/idempotency-and-retries">idempotency key and reconciliation</a> you would put on a retried booking.</li>
+    <li><strong>Span on activity, not on turns.</strong> Emit a span when a tool fires, when the backend model is invoked, when the agent starts and stops speaking. The call becomes a timeline of overlapping intervals, which is what it always was.</li>
+    <li><strong>Move guardrails to the stream.</strong> An output check that needs a finished utterance is the wrong shape now. Check the backend model's tool arguments — those are discrete — and accept that the audio itself is governed by the model's own behaviour.</li>
+  </ul>
+
+  <p>The uncomfortable part: the decision of when to speak has moved inside the model's weights. In a cascade you tuned a number, and a number is reviewable, diffable and revertible. A learned interruption policy is none of those. It is the same trade the industry made when it moved from rule-based dialogue to LLMs, arriving one layer lower, and it deserves the same response — <a href="/operations/agentops/rollout-and-versioning">pin the version, keep a frozen scenario set, and re-baseline on every change</a>.</p>
+</section>
+
+<section>
+  <h2>Two meters, opposite shapes</h2>
+  <figure>
+    <img src="/blogs/full-duplex-deletes-the-turn/data-full-duplex-bench.svg" alt="Horizontal bar chart of reported benchmark results. Full Duplex Bench interactivity: GPT-Live-1 at 80.1 percent versus GPT-Realtime-2.1 at 45.4 percent. Full Duplex Bench version three tool-calling Pass at 1, run with a Terra backend at low reasoning effort: GPT-Live-1 at 87.0 percent versus comparison configurations at 60.0 percent and 58.0 percent." width="900" height="400" loading="lazy" />
+    <figcaption>Every bar is a configuration, not a model: voice layer, backend model and reasoning effort together.</figcaption>
+  </figure>
+
+  <p>Unbundling the voice layer from the thinking splits your bill into two meters that behave nothing alike, and the split is easy to miss because only one of them appears on the launch page.</p>
+
+  <p>The voice layer is five cents a minute of wall clock. It runs while the caller talks, while the agent talks, and — this is the part worth internalising — while nobody talks. A caller hunting for their account number generates no tokens and costs the same as a caller mid-sentence. Token-metered audio priced what was said; a per-minute layer prices how long the line was open. Anything that lengthens a call now costs money at a flat rate, which quietly re-prices the whole design: a slow backend model, a retrieval step, a hold while a tool runs, a caller who rambles.</p>
+
+  <p>The backend model is the opposite: metered in tokens, indifferent to duration, and driven by how much you make it think. Reasoning effort is a dial that moves your cost per call without moving a single minute of audio — and the benchmark table above shows it also moves quality, so the two meters are coupled through a knob that does not appear on either invoice.</p>
+
+  <p>Which makes the number to track obvious and slightly unusual: <strong>cost per resolved call, decomposed into minutes and tokens.</strong> Not cost per minute, not cost per token. A change that cuts backend spend by shifting to a cheaper model but adds eight seconds of thinking time per exchange can easily lose money, and neither meter alone will tell you. This is the same discipline <a href="/operations/economics-roi/unit-economics">agent unit economics</a> asks for, applied to a system where latency has become a direct cost line rather than a UX concern.</p>
+
+  <div class="callout tip">
+    <p>A concrete audit: take a week of call recordings, measure total silence, and multiply by $0.05/minute. That number is what your endpointing patience used to be free and now is not. If it is large, the fix is usually not a faster model — it is a shorter conversation design.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Who should move, and when</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Adopt full duplex now</th><th>Stay half duplex</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Conversational, interruption-heavy, low stakes per utterance</td>
+        <td>Yes — this is what it is for.</td>
+        <td>Only if your barge-in already works well.</td>
+      </tr>
+      <tr>
+        <td>Every action is a mutation (payments, bookings, dispatch)</td>
+        <td>Only with compensating actions built first.</td>
+        <td>Yes — the turn boundary is cheap safety.</td>
+      </tr>
+      <tr>
+        <td>Regulated call flows with scripted disclosures</td>
+        <td>Not yet — a disclosure the caller talked over is a finding.</td>
+        <td>Yes.</td>
+      </tr>
+      <tr>
+        <td>Your eval suite scores per turn</td>
+        <td>Rebuild the eval first, then adopt.</td>
+        <td>Yes, until then.</td>
+      </tr>
+      <tr>
+        <td>Long silences are structural (lookups, hold music, IVR legacy)</td>
+        <td>Model the minute cost before committing.</td>
+        <td>Possibly cheaper.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The broader read is that OpenAI has done to the voice stack what <a href="/blogs/openai-agents-api-sells-the-harness">the Agents API did to the control loop</a>: taken a layer teams were building badly, made it excellent, and moved a decision you used to own inside a version you cannot pin. That is a good trade in both cases, and in both cases the price is your ability to attribute a regression. The defence is identical too — one frozen scenario you re-run daily, and a number you compute yourself.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Does full duplex mean I no longer need voice activity detection?</h3>
+  <p>You no longer need it to decide when the agent should reply — the model does that. You still want it for the things VAD was separately good at: detecting that a call has gone silent, measuring talk-over rates, and segmenting recordings for review.</p>
+  <h3>Why does GPT-Live-1 need a separate backend model?</h3>
+  <p>Because keeping a conversation flowing and reasoning carefully are different jobs with different latency budgets. Splitting them lets the voice layer stay responsive while a slower model thinks, and lets you choose how hard that model thinks per call. It also means every benchmark number is a property of the pair, not of either half.</p>
+  <h3>Is $0.05 per minute cheaper than what I pay today?</h3>
+  <p>It is not comparable on its own, because it buys only the voice layer. Add the backend model's tokens and any tools. The structural change is that the voice portion is now billed on elapsed time rather than on audio tokens, so silence and slow tool calls have a price they did not have before.</p>
+  <h3>What breaks first when I switch an existing agent over?</h3>
+  <p>Usually the tool-dispatch guard and the eval suite, in that order. Anything with the shape "wait for the user to finish, then act" has no trigger, and any scoring harness segmented by turn has no segments.</p>
+  <h3>Can I keep a human-escalation path in a full-duplex call?</h3>
+  <p>Yes, but the handoff point has to be declared rather than inferred. Pick an explicit condition — a confidence threshold, a caller phrase, a failed tool — and have the agent stop speaking on it, instead of waiting for a turn to end. See <a href="/playbooks/voice-realtime-agents/escalation-and-warm-transfer">escalation and warm transfer</a>.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/full-duplex-speech">Full-duplex speech</a> — the concept, and why it is not simply faster half duplex.</li>
+    <li><a href="/concepts/voice-and-realtime-agents">Voice &amp; realtime agents</a> — the cascade-versus-speech-to-speech choice this sits on top of.</li>
+    <li><a href="/playbooks/voice-realtime-agents/turn-taking-and-barge-in">Turn-taking and barge-in</a> — the half-duplex problem in full detail.</li>
+    <li><a href="/playbooks/voice-realtime-agents/latency-budget">The latency budget</a> — where the milliseconds actually go.</li>
+    <li><a href="/playbooks/voice-realtime-agents/voice-tooling-and-state">Voice tooling and state</a> — dialogue state as the thing commit points are built from.</li>
+    <li><a href="/operations/agentops/long-lived-sessions-and-deploys">Long-lived sessions and deploys</a> — what a call-shaped workload does to your release process.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://openai.com/index/introducing-gpt-live-1-in-the-api/">Build more natural voice experiences with GPT-Live-1 in the API</a> — OpenAI, 10 September 2026.</li>
+    <li><a href="https://developers.openai.com/api/docs/models/gpt-live-1">OpenAI API docs — gpt-live-1</a> — model card, transports and session limits.</li>
+    <li><a href="https://developers.openai.com/api/docs/guides/live">Getting started with GPT-Live</a> — session setup, backend models, WebRTC/WebSocket/SIP.</li>
+  </ul>
+</section>
