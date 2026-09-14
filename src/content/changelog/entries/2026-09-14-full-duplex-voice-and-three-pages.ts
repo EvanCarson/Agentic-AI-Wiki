@@ -1,7 +1,7 @@
 import { L, type ChangelogEntry } from '../types.ts';
 
 const entry: ChangelogEntry = {
-  date: '2026-09-13',
+  date: '2026-09-14',
   title: L(
     'Two AI Blog posts — on the week a voice model stopped waiting for you to finish, and on the four open-source frameworks whose most-polished subsystem it just made redundant — plus three pages on full duplex, the drive-thru lane, and deploying while calls are live',
     '两篇 AI 博客——语音模型不再等你说完的这一周；以及那四个开源框架里被它一举变得多余的、打磨得最精的那个子系统——外加三个页面：全双工、点餐车道，以及在通话进行时发布',

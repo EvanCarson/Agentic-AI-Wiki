@@ -1,7 +1,7 @@
 import { L, type BlogPost } from '../types.ts';
 
 const post: BlogPost = {
-  date: '2026-09-13',
+  date: '2026-09-14',
   slug: 'pipecat-vs-livekit-agents-vs-ten-framework-vs-bolna',
   title: L(
     'Pipecat vs LiveKit Agents vs TEN vs Bolna: buy the media path, not the pipeline',

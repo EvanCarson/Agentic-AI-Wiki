@@ -1,7 +1,7 @@
 import { L, type BlogPost } from '../types.ts';
 
 const post: BlogPost = {
-  date: '2026-09-13',
+  date: '2026-09-14',
   slug: 'full-duplex-deletes-the-turn',
   title: L(
     'Full duplex deletes the turn — and the turn was your commit point',
