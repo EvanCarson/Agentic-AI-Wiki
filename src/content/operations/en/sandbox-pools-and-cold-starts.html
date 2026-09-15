@@ -1,0 +1,117 @@
+<section class="phase">
+  <div class="phase-num">O25</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Sandbox pools &amp; cold starts.</h2>
+  <p class="goal">Every sub-100-millisecond sandbox number you have been quoted is a snapshot restore measured one sandbox at a time, and neither half of that sentence survives contact with an agent fleet. Agents arrive in bursts, where the same providers run one to two orders of magnitude slower and the ranking between them inverts; and the restore trick that produces the fast number is the same mechanism Firecracker's own maintainers call insecure to repeat. Warm and clean are one knob, not two, and you are going to have to turn it somewhere.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The headline number is sequential. Your workload is not.</h3>
+
+    <p>Provider marketing quotes a best-case, one-at-a-time start: the API call goes out, one sandbox comes back, the clock stops. That is a real measurement of a case you will almost never be in. An agent that fans out to eight subagents, a queue that drains after an incident, a batch eval run — these all request many sandboxes at once, and concurrency is where the allocator, the image cache and the scheduler start to matter.</p>
+
+    <p>A public benchmark that publishes dated, versioned JSON results makes the gap concrete. Measuring <em>time to interactive</em> — API request to first successful command inside a fresh sandbox — one provider records an 83 ms median when requests arrive one after another, and a 14.8-second median at concurrency 100. That is a spread of roughly 180× on the same product, and it is not an outlier: across the providers measured, the sequential and burst orderings very nearly invert. The fastest thing in the sequential table is the slowest thing in the burst table.</p>
+
+    <ul>
+      <li><strong>Read the tail, not the median.</strong> One provider posts a sequential median under a second with p95 and p99 above twenty seconds. A twenty-second p99 on sandbox acquisition is a user-visible stall that no amount of median-chasing will surface.</li>
+      <li><strong>The honest vendor claim is the wide one.</strong> Where a provider publishes a range — "often in the 1–3 second range, depending on image size" — the measurements land inside it. Every precise sub-second claim measured well outside its own.</li>
+      <li><strong>Benchmarks have authors.</strong> The one above is run by a company selling an abstraction layer over these providers, which is a reason to check the method rather than to discard the data: it is open, dated and reproducible, which is more than any vendor page offers. Your own numbers, at your own concurrency and region, are the only ones that settle it.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>The measurement teams get wrong: acquiring one sandbox in a loop and calling the p50 their cold start. Acquire at your real arrival shape — the burst size your fan-out actually produces — and record p50, p95 and p99 separately. Expect the number to be several times worse than the one that sold you the platform, and to be a different provider's number than you expected.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Warm and clean are the same knob, and upstream says so explicitly.</h3>
+
+    <p>Fast starts come from not booting. A microVM snapshot captures guest memory and emulated hardware state to a file; restoring it memory-maps the file, loads CPU state and resumes — no kernel boot, no init, no package import. That is where the impressive numbers come from, and it is the right technique.</p>
+
+    <p>It also has a documented constraint that rarely reaches the architecture diagram. Firecracker's own snapshotting documentation states that without a strong mechanism guaranteeing that unique things stay unique across restores, resuming execution from the same state more than once is considered <strong>insecure</strong>. The named hazards are what you would expect once you think about it for a second:</p>
+
+    <ul>
+      <li><strong>Randomness repeats.</strong> The guest's entropy pool and PRNG state are part of the snapshot. Two sandboxes restored from one snapshot can generate the same "random" values — session IDs, nonces, temporary filenames, key material.</li>
+      <li><strong>Identifiers repeat.</strong> Anything the guest derived once and cached — a UUID, a machine ID, a registration token — is now shared by every restore.</li>
+      <li><strong>Secrets repeat.</strong> Credentials fetched before the snapshot was taken are baked into every instance that comes from it.</li>
+    </ul>
+
+    <p>The mitigations exist and are the thing to ask a vendor about: a generation-counter device that lets the guest detect it has been resumed and reseed its PRNG, plus userspace de-duplication of anything unique. The operational point is that "warm" is a claim about shared state, so the question for any provider quoting a fast restore is not how fast but <strong>what gets re-randomised on resume</strong>. If nobody on the call can answer, you are pooling identity as well as memory.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Reuse is usually the default, and the default is scoped wrong.</h3>
+
+    <p>Snapshot restore is the subtle version. The blunt version is that many sandbox SDKs address a sandbox by a name you supply, and handing back the same name hands you back the same live sandbox — filesystem, processes and all. That is a feature, and it is a trap in exactly one place: when the name you chose is narrower than your trust boundary.</p>
+
+    <p>One provider documents this with unusual directness. The same ID always returns the same sandbox instance; inside it, all processes see the same files and all sessions can see all processes; and the docs pair a safe and an unsafe example with the warning that users can read each other's files, concluding that complete isolation means a separate sandbox per user. That is the correct advice and it is easy to violate by accident, because the convenient key — the workflow name, the tool name, the agent name — is almost never the user.</p>
+
+    <ul>
+      <li><strong>Key the sandbox by the trust boundary.</strong> Per end user at minimum; per task where tasks within a user must not see each other. A tenant identifier in the sandbox ID is cheap insurance and reviewable in a diff — the same argument as <a class="xref" href="/operations/agentops/multi-tenancy-for-agents">multi-tenancy for agents</a>.</li>
+      <li><strong>Destroy explicitly; do not rely on the timeout.</strong> Providers expose a teardown primitive that terminates the container and deletes its state. An idle timeout eventually reclaims the sandbox, but "eventually" is both a bill and a window.</li>
+      <li><strong>Do not assume sleep is a reset.</strong> Whether disk survives a sleep-and-wake cycle varies by provider and is in at least one case documented inconsistently. Test it rather than reading it: write a file, sleep the sandbox, wake it, look.</li>
+      <li><strong>Treat the filesystem as agent memory.</strong> A coding agent leaves a repository, a virtualenv, a half-applied patch and its own scratch notes. That is exactly why reuse is fast and exactly why reuse leaks — see <a class="xref" href="/deep-dives/agent-security/sandbox-and-isolation-patterns">sandbox and isolation patterns</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Pool size is Little's law with the hold time in minutes.</h3>
+
+    <p>Serverless intuition assumes a request that finishes in milliseconds, so a warm pool of a few instances absorbs a lot of traffic. An agent holds its sandbox for the whole task. That single change — <em>W</em> measured in minutes instead of milliseconds — is what makes the pool a capacity problem rather than a latency trick, and the arithmetic is the same one that sizes a call centre.</p>
+
+<pre class="standalone"><span class="c-cm"># Little's law: concurrent sandboxes in flight = arrival rate x hold time</span>
+<span class="c-cm"># tasks/minute x minutes held = sandboxes you must have</span>
+
+  12 tasks/min  x   6 min held  =  72 concurrent
+  12 tasks/min  x  20 min held  = 240 concurrent   <span class="c-cm"># same traffic, one slow tool</span>
+
+<span class="c-cm"># Then size the warm pool against the BURST, not the mean:</span>
+<span class="c-cm">#   warm = p95 simultaneous acquisitions, not p50 concurrency</span></pre>
+
+    <ul>
+      <li><strong>Hold time is the sensitive term, and nobody publishes it.</strong> There is no first-party distribution of how long real agent tasks hold a sandbox. What is observable is a gap: harness timeouts cluster around one hour, while reported per-task wall times cluster in single-digit minutes. That gap is not slack — it is the idle bill, and it is yours to measure.</li>
+      <li><strong>Measure hold, not runtime.</strong> The sandbox is held from acquisition to release, which includes every second the agent spends waiting on a model response with an idle container attached. For a multi-turn agent this is frequently the majority of the hold.</li>
+      <li><strong>One slow tool resizes the fleet.</strong> A dependency that adds fourteen minutes to the median task triples your concurrent sandbox count at unchanged traffic. This is the same coupling as <a class="xref" href="/operations/agentops/concurrency-and-scaling">concurrency and scaling</a>, with a per-second meter attached.</li>
+      <li><strong>Cap the hold, then honour the cap.</strong> A maximum sandbox age derived from what you are willing to pay for is an operational limit like any other; without one, a stuck agent holds capacity until the provider's default timeout, which may be an hour.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Whether idle is free is a property of the provider, not of the pool.</h3>
+
+    <p>A warm pool is a bet that pre-paid capacity is cheaper than user-visible latency. Whether that bet is any good depends entirely on a billing detail that differs across providers and is rarely front and centre in the pricing table.</p>
+
+    <ul>
+      <li><strong>Provisioned versus active.</strong> At least one major provider bills memory and disk on the resources you provisioned while the instance is awake, and CPU only on active use — so an idle-but-awake sandbox is not free, it is merely cheaper. Charges stop when the instance sleeps, which makes the inactivity timeout a pricing knob rather than a hygiene setting.</li>
+      <li><strong>Paused is not always free.</strong> One provider bills a stopped <em>and</em> a suspended machine for its root filesystem, so there is no free idle state at all; another charges paused sandboxes for storage only, with the pause itself costing wall-clock time proportional to memory size. These are opposite answers to the same question.</li>
+      <li><strong>Suspend may silently become a cold start.</strong> Where suspension is explicitly not durable — host migration, maintenance and capacity pressure can all reclaim a suspended machine — your agent code cannot assume resumed in-memory state exists. Design the resume path to detect a cold start and rebuild, and test that path deliberately.</li>
+      <li><strong>Use the warm-pool knobs where they exist.</strong> Some platforms expose an explicit floor of warm containers, an idle buffer while active, and a scale-down window. Those three settings are the honest interface to this trade-off, and their documentation states it plainly: a bigger pool costs more and makes fewer requests wait.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Put the pool on the same dashboard as the token spend before you tune either. On short tasks a warm pool can rival the model bill, and it is the line item most likely to be attributed to "infrastructure" and never traced back to a hold-time regression in the agent. <a class="xref" href="/operations/economics-roi/unit-economics">Unit economics</a> for the per-task view, <a class="xref" href="/operations/economics-roi/fixed-vs-variable-costs">fixed vs variable costs</a> for what a reserved pool actually converts.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Instrument the four numbers that decide everything above.</h3>
+
+    <p>Almost every decision on this page collapses into four measurements, none of which comes from a provider dashboard, and all of which are a few lines at the acquisition and release sites.</p>
+
+    <ul>
+      <li><strong>Time to interactive, at your real burst.</strong> From the acquire call to the first successful command, recorded with the number of simultaneous acquisitions in flight. Without that second field the distribution is uninterpretable, because it mixes two workloads that differ by two orders of magnitude.</li>
+      <li><strong>Hold time, split into working and waiting.</strong> Acquisition to release, with the share spent blocked on a model response broken out. The second number is where the cheapest win usually is: releasing the sandbox across a long wait, where the task allows it, is a straight reduction in concurrent capacity.</li>
+      <li><strong>Reuse rate and reuse scope.</strong> What fraction of acquisitions return an existing sandbox, and what key they were addressed by. Reuse rate is your latency story; reuse scope is your isolation story, and a rising reuse rate is only good news if the scope is right.</li>
+      <li><strong>Acquisition failures and queue depth.</strong> Provider concurrency limits are real and hit exactly when you are bursting. A failure to acquire must be a first-class, retried, alertable event — not an exception that surfaces as a mysteriously failed agent run. This is the same discipline as <a class="xref" href="/operations/agentops/rate-limits-and-provider-capacity">rate limits and provider capacity</a>.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you do one thing: run your own acquisition benchmark at the burst size your fan-out actually produces, against two providers, in your region, and keep it as a scheduled job rather than a one-off spreadsheet. The published numbers are sequential and the ordering changes under concurrency, so a choice made from a pricing page is a choice made from a different workload than yours. Then set the sandbox ID to your trust boundary and the maximum hold to a duration you would pay for — those two settings close the isolation and cost questions that the fast-start number quietly leaves open. Related: <a class="xref" href="/concepts/sandboxing-and-code-execution">sandboxing and code execution</a> for the primitives, <a class="xref" href="/operations/agentops/load-testing-agents">load testing agents</a> for generating the burst honestly, and <a class="xref" href="/operations/agentops/durable-state-and-resumability">durable state and resumability</a> for releasing a sandbox without losing the run.</p>
+    </div>
+  </div>
+</section>
