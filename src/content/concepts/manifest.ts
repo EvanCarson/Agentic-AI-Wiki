@@ -172,6 +172,9 @@ export const entries: Entry[] = [
 
   // --- 2026-09-14: confidence is the wrong trigger for asking ---
   { page: 'clarifying-questions', slug: 'clarifying-questions', title: L('Clarifying Questions','澄清式提问'), summary: L('An agent that asks whenever it is unsure is the one people stop delegating to, because a question spends a human\'s attention to buy certainty the agent could usually have bought with a tool call — and in a background run the same question costs hours instead of seconds. Gate on consequence rather than confidence: ask only when the ambiguity would change the work and the wrong branch is expensive to undo, and for the large reversible middle proceed on an assumption stated where the result is read.','一拿不准就发问的智能体，正是人们逐渐不再托付的那个：一次提问要花掉人的注意力，去买一份它通常一次工具调用就能买到的确定性——而在后台运行里，同一个问题的代价从几秒变成几小时。用后果而不是置信度来设闸门：只有当歧义会改变要做的事、且走错那条岔路难以撤回时才问；至于「可撤回」这个很大的中间地带，就带着一个写在结果旁边的假设往下做。'), group: L('Agentic AI','智能体 AI') },
+
+  // --- 2026-09-15: a subagent is a context boundary, not a persona ---
+  { page: 'subagents', slug: 'subagents', title: L('Subagents','子智能体'), summary: L('A subagent buys one thing — a second context window that fills up and vanishes — so the persona is free and does nothing while the isolation is the product. The test for whether one pays is a ratio: how much context it consumes versus how much it returns. And because the child\'s evidence is unrecoverable the moment it returns, "I found nothing" and "I failed to look" arrive as the same sentence — which makes the structured return value, with handles the parent can re-open, the entire deliverable.','子智能体只买到一样东西——第二个会被填满、然后消失的上下文窗口——所以人设是免费的、也什么都不顶用，而隔离才是那件商品。判断它划不划算靠一个比值：它吃掉多少上下文，又返回多少。而由于孩子一返回、它的证据就无从追回，「我什么都没找到」与「我根本没找成」抵达时是同一句话——这就使那个结构化的、带着父方可重新打开的句柄的返回值，成为全部交付物。'), group: L('Agentic AI','智能体 AI') },
 ];
 
 /** Flat, ordered list of all entries (mirrors field-guide CHAPTERS). */
