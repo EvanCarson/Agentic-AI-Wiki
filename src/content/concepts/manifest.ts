@@ -175,6 +175,7 @@ export const entries: Entry[] = [
 
   // --- 2026-09-15: a subagent is a context boundary, not a persona ---
   { page: 'subagents', slug: 'subagents', title: L('Subagents','子智能体'), summary: L('A subagent buys one thing — a second context window that fills up and vanishes — so the persona is free and does nothing while the isolation is the product. The test for whether one pays is a ratio: how much context it consumes versus how much it returns. And because the child\'s evidence is unrecoverable the moment it returns, "I found nothing" and "I failed to look" arrive as the same sentence — which makes the structured return value, with handles the parent can re-open, the entire deliverable.','子智能体只买到一样东西——第二个会被填满、然后消失的上下文窗口——所以人设是免费的、也什么都不顶用，而隔离才是那件商品。判断它划不划算靠一个比值：它吃掉多少上下文，又返回多少。而由于孩子一返回、它的证据就无从追回，「我什么都没找到」与「我根本没找成」抵达时是同一句话——这就使那个结构化的、带着父方可重新打开的句柄的返回值，成为全部交付物。'), group: L('Agentic AI','智能体 AI') },
+  { page: 'trajectories', slug: 'trajectories', title: L('Trajectories','轨迹'), summary: L('An agent\'s real output is the whole path it took, not the answer at the end — and the path is the only place a correct answer and a lucky one look different. Most stacks record model calls rather than runs, so the trajectory cannot be reconstructed; mint a run ID at the goal and make it the primary key.','智能体真正的产出是它走过的整条路，而不是末尾那个答案——而那条路是唯一一处能让「答对了」和「蒙对了」看上去不一样的地方。多数技术栈记录的是模型调用而非运行，于是轨迹重建不出来；在目标到达时铸一个 run ID，并让它成为主键。'), group: L('Agentic AI','智能体 AI') },
 ];
 
 /** Flat, ordered list of all entries (mirrors field-guide CHAPTERS). */
