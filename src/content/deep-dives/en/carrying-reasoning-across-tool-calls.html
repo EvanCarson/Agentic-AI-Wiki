@@ -1,0 +1,131 @@
+<section class="phase">
+  <div class="phase-num">N8</div>
+  <div class="week">Deep Dive · Reasoning &amp; Test-Time Compute</div>
+  <h2>Carrying Reasoning Across Tool Calls.</h2>
+  <p class="goal">Your harness almost certainly rebuilds the message list on every turn — injects a reminder, trims an old message, adds the tool the user just enabled — and on current reasoning models that habit now silently deletes the model's own reasoning mid-task, or returns a 400. Reasoning stopped being output you could discard and became a signed, opaque input you are required to hand back unchanged. Three vendors made three incompatible versions of that rule, and the code that breaks is the code you wrote in 2024 and never thought about again.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Reasoning used to be something you read and threw away.</h3>
+
+    <p>The original mental model was simple and it was right at the time: the model emits a chain of thought, you show it in a debug panel, and you send back only the conclusion. The reasoning was output. Nothing downstream depended on it, and stripping it saved tokens.</p>
+
+    <p>That model is now wrong on every major API, and each vendor broke it differently:</p>
+
+    <ul>
+      <li><strong>Anthropic.</strong> Reasoning arrives in <code class="inline">thinking</code> blocks, each carrying a <code class="inline">signature</code> — an encrypted copy of the full reasoning. When you return a tool result, you must pass the thinking blocks from that assistant message back complete and unmodified, alongside the <code class="inline">tool_use</code> block they accompanied.</li>
+      <li><strong>OpenAI.</strong> The Responses API models reasoning as <em>reasoning items</em>. Keep them server-side by chaining on a previous response, or, if you cannot retain data server-side, request encrypted reasoning content and pass the blob back yourself — decrypted in memory for the next call and never written to disk.</li>
+      <li><strong>Google.</strong> Gemini 3 returns <em>thought signatures</em>, encrypted representations of the reasoning, and enforces their return during function calling: omit them and the request fails with a validation error rather than degrading.</li>
+    </ul>
+
+    <p>Three different nouns, one shared property. The reasoning is no longer a transcript you keep for humans. It is a piece of conversational state, the vendor holds the only key to it, and your agent loop is now responsible for its integrity.</p>
+
+    <div class="callout">
+      <p>Note who this hits hardest. A chat product sends one message and gets one answer; the thinking never has to survive anything. An <a class="xref" href="/concepts/agent-harness">agent harness</a> interleaves a tool call every few seconds, which means it crosses the boundary where this matters dozens of times per task. The feature is aimed squarely at agents and so is the failure mode.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Inside one assistant turn, a tool call is a pause — not an ending.</h3>
+
+    <p>The reason the blocks must come back is structural rather than bureaucratic. When a model calls a tool it has not finished its response; it has suspended it to wait for information. The tool result comes back to the API shaped like a user message, but it is not a new turn — the model is continuing the same response it started, and its earlier reasoning is the part of that response you are holding.</p>
+
+    <p>Strip it and you have not saved tokens. You have converted one deliberation into a sequence of independent guesses, each of which re-derives from scratch whatever it can recover from the visible messages. The plan that said "check the invoice first, then the ledger, and if they disagree stop and escalate" is gone by the time the ledger result arrives; what remains is a model looking at a ledger result with no memory of why it wanted one.</p>
+
+    <p>This gets sharper with interleaved reasoning, where the model thinks <em>between</em> tool calls rather than only before the first one — automatic on current adaptive-thinking models, and the whole point of the feature. The reasoning that reacts to tool result #3 and decides on call #4 lives in a block between them. That block is not decoration; it is the joint.</p>
+
+    <pre class="standalone">User:      Reconcile invoice 8841 against the ledger.
+Assistant: [thinking] + [tool_use: get_invoice]
+User:      [tool_result: ...]
+Assistant: [thinking] + [tool_use: get_ledger_entries]   &lt;- reacts to the result
+User:      [tool_result: ...]
+Assistant: [thinking] + [text: they disagree by $40; escalating]
+
+Every [thinking] above goes back on every subsequent request,
+complete and unmodified, or the turn is no longer one turn.</pre>
+
+    <p>The tokens are not wasted, either. On a keep-all model these blocks stay in context and cost input tokens like any other history; on others the API keeps only what the current model needs and bills accordingly. Either way the decision of what to keep belongs to the API, not to your trimming code — which is the next problem.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The prefix rule turns ordinary middleware into a destructive operation.</h3>
+
+    <p>Here is the part that breaks working systems. A signed reasoning block is valid only in the exact conversation that produced it. Anthropic states the condition precisely: a block stays valid while the top-level system prompt, the tool definitions, and every message before it are unchanged. Change any of them and that block — and every thinking block after it — is invalid. The request then either fails with a 400 or has the invalid blocks dropped, depending on which behaviour you configured.</p>
+
+    <p>Now list what a mature harness does on a normal turn. Every one of these is a prefix edit:</p>
+
+    <ul>
+      <li><strong>Appending a reminder to the system prompt.</strong> "You have 4 steps left." "The user is on the enterprise plan." The single most common piece of agent middleware there is.</li>
+      <li><strong>Adding or removing a tool mid-run.</strong> The user connects an integration, a permission is granted, you narrow the tool set to save tokens. The tool list is part of the signed prefix.</li>
+      <li><strong>Trimming or summarising old messages.</strong> Your <a class="xref" href="/deep-dives/memory-and-context/context-compaction">compaction</a> step rewrites history by design. That is the operation the rule forbids.</li>
+      <li><strong>Changing the effort or thinking configuration.</strong> Dialling effort up for a hard subtask reaches the same prefix, and separately restarts your cache.</li>
+      <li><strong>Re-serialising the messages array.</strong> Rebuilding the conversation from your own database rather than echoing back what the API returned. Field ordering, dropped unknown keys, a normalised whitespace — any of it can count.</li>
+    </ul>
+
+    <p>The replacements exist, and they are the actual migration work: send new instructions as a mid-conversation system message rather than by editing the top-level prompt; add and remove tools with the API's own tool-change blocks rather than by rewriting the tool list; change effort per message rather than globally; and use server-side compaction or context editing rather than rewriting history yourself. The shape of the rule is simple — <strong>append only, and echo back exactly what you received</strong> — and most harnesses were not written that way.</p>
+
+    <p>Choose the failure mode deliberately. Erroring on a mismatch is loud and correct while you are migrating; silently dropping invalid blocks keeps the run alive but means a subtle degradation you will never see in a log. Anthropic's preserved-thinking controls let you pick, and also return a list of the blocks the API dropped, which is the closest thing to a metric here — ship it into your traces before you need it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The quiet failures: a toggle, a fallback, a model swap.</h3>
+
+    <p>The loud failure is a 400 and you will fix it in an hour. The expensive ones do not raise anything.</p>
+
+    <p><strong>Toggling thinking mid-turn.</strong> If the configuration changes between sending a tool call and returning its result, the API does not error — it silently disables thinking for that request, and may strip blocks that would create an invalid turn structure. Your agent completes the task with reasoning switched off and nothing anywhere says so. The only test is whether thinking blocks are present in the response, which means it is a check you have to write.</p>
+
+    <p><strong>Falling back to another provider or model.</strong> A reasoning block is readable by the model that produced it or by a newer one, never by an older one. So the direction of a swap decides what survives: switching up to a newer model carries the conversation's reasoning across, switching down drops it — without an error, and without billing you for the blocks that were dropped. Every <a class="xref" href="/operations/agentops/graceful-degradation-and-fallback">overload-fallback</a> path and every cost-saving <a class="xref" href="/concepts/model-routing">router</a> is therefore also a reasoning-continuity decision, usually made by someone who was thinking about latency.</p>
+
+    <p><strong>Resuming a run.</strong> A durable agent that persists state, dies, and resumes must have stored the assistant turns byte-exact, including blocks whose text is empty. If your persistence layer normalises messages — and most do, because they were written for chat history — the resumed run starts with invalid reasoning. This is a real constraint on <a class="xref" href="/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal">durable execution</a> designs, and it is easy to miss because the crash tests pass: the run continues, it just continues stupider.</p>
+
+    <div class="callout">
+      <p>A cheap invariant that catches most of this: assert, on every request you build, that each assistant message you are sending back is byte-identical to the one the API returned. If your code cannot make that assertion, it is editing something, and you now know where to look.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>You are required to keep it, and you are no longer able to read it.</h3>
+
+    <p>The second half of this shift gets less attention and deserves more. On current Anthropic models the default display setting for thinking is <em>omitted</em>: blocks come back with an empty <code class="inline">thinking</code> field, and the signature carries the encrypted reasoning for continuity. You get faster time-to-first-text as a result, and you get no text to look at. OpenAI's encrypted reasoning content and Gemini's thought signatures are opaque by construction too.</p>
+
+    <p>Three consequences follow, and they are worth stating plainly because they land on controls teams believe they have:</p>
+
+    <ul>
+      <li><strong>"We review the model's reasoning" is not a control you have by default.</strong> It is an option you must turn on, per request, and what you get when you do may be a summary rather than the raw trace. This is a good moment to re-read <a class="xref" href="/concepts/chain-of-thought-faithfulness">chain-of-thought faithfulness</a>: the reasoning was never a reliable account of the computation, and now it is not even reliably visible.</li>
+      <li><strong>Your <a class="xref" href="/concepts/trajectories">trajectory</a> store fills with opaque blobs you cannot audit but must retain.</strong> A signature is required for the run to resume, it is meaningless to your reviewers, and it is still data you are holding. Your <a class="xref" href="/operations/evaluation-and-observability/pii-redaction-in-agent-traces">redaction pipeline</a> cannot inspect it, so decide its retention on the basis of what it was derived from — the conversation — rather than on what you can see in it.</li>
+      <li><strong>Reasoning-based evals need an explicit request.</strong> If your process evaluation scores the model's stated reasoning, it must set the display option and accept the latency cost, and it should record which setting produced the trace. Otherwise you are comparing runs where the model reasoned invisibly against runs where it reasoned on the record, and calling the difference a regression.</li>
+    </ul>
+
+    <p>There is a defensible logic to all of this — the reasoning is generated content the vendor does not want re-ingested, edited or spoofed, and encryption is how you get continuity without exposure. It is still a transfer: the model's intermediate work became a durable artefact that you carry, pay for, and cannot inspect.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What it costs, and the six rules that fall out.</h3>
+
+    <p>The economics are not neutral, and they mostly favour doing this correctly.</p>
+
+    <p>During a tool-use loop, thinking blocks are cached along with the rest of the conversation when you send tool results — automatically, without explicit cache markers — which is why preserved blocks improve cache hit rates across a multi-step run rather than degrading them. The flip side: blocks you will never see again still count as input tokens when read from cache. And any change to the thinking or effort configuration is rendered into the prompt itself, so it starts a new cache prefix; treat an effort change as starting the cache over, and see <a class="xref" href="/deep-dives/architectures-and-patterns/context-caching-economics">caching economics</a> for what that is worth on a long agent run.</p>
+
+    <p>The rules:</p>
+
+    <ul>
+      <li><strong>Echo, never rebuild.</strong> Store assistant turns exactly as received and send them back unchanged. Append new content at the end. Treat the messages array as an append-only log, because that is now what it is.</li>
+      <li><strong>Move your middleware onto supported mechanisms.</strong> Mid-conversation system messages for reminders, tool-change blocks for tool sets, per-message effort, server-side compaction for trimming. If a vendor offers no supported path for something you do, that is a design constraint, not a workaround to route around.</li>
+      <li><strong>Error loudly in development, and instrument the drops in production.</strong> Log the count of invalid or dropped reasoning blocks per run as a first-class metric. A rising number is a harness regression that no eval will show you.</li>
+      <li><strong>Make model switches explicit about reasoning.</strong> Know which direction your fallback goes and what it discards. If a run's reasoning cannot survive the swap, prefer restarting the turn cleanly over continuing with a lobotomised one.</li>
+      <li><strong>Assert thinking is on when you think it is.</strong> A presence check on thinking blocks in the response, on runs where reasoning is load-bearing. It is three lines and it catches the silent-disable case.</li>
+      <li><strong>Do not build a portable abstraction over this yet.</strong> The three vendor models differ in who holds the state, what invalidates it, and whether omission errors. A lowest-common-denominator wrapper will paper over exactly the differences that bite. Adapters per provider, with the differences visible in the code, will age better — the same conclusion <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">effort budgets</a> reached about the parameter layer.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Audit this today with one query, not a project: for a sample of production runs, count how many assistant messages you sent back differ in any byte from what the API returned. Zero means you are fine and you can stop reading. Anything above zero is the number of times per run your harness is deleting or invalidating the model's reasoning, and it is almost certainly coming from one line of middleware that has been there since before any of this existed.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">adaptive thinking and effort budgets</a> for the knob that controls how much of this gets produced, <a class="xref" href="/deep-dives/memory-and-context/context-budgeting">context budgeting</a> for what it costs to keep, and <a class="xref" href="/operations/agentops/model-deprecation-and-migration">model migration</a> for the day you have to change models mid-flight anyway.</p>
+  </div>
+</section>
