@@ -1,0 +1,123 @@
+<p class="lede">Nothing broke the hardware boundary. Docker's 15 September advisory describes two ways out of a Docker Sandboxes microVM, and both of them went through a channel the sandbox opens on purpose — the workspace file share and the guest-to-host socket relay. That is the durable lesson for anyone buying isolation for a coding agent: your blast radius is not set by the isolation technology, it is set by the host-side code servicing the holes you deliberately punched through it.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Two advisories, one product, one root-cause pattern.</p>
+  <table>
+    <thead>
+      <tr><th>Identifier</th><th>Severity</th><th>Affected</th><th>Where it lives</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>CVE-2026-77179</td><td>Critical — CVSS v4.0 9.4</td><td>0.28.0 ≤ v &lt; 0.42.0, macOS</td><td>virtio-fs host server (the workspace share)</td></tr>
+      <tr><td>CVE-2026-79994</td><td>High</td><td>0.37.0 ≤ v &lt; 0.42.0</td><td>guest-to-host Unix domain socket relay</td></tr>
+    </tbody>
+  </table>
+
+  <p>Both are symlink-substitution races; the critical one is classed CWE-59, improper link resolution before file access. Both were fixed in Docker Sandboxes 0.42.0, released on 7 September; the advisory followed on 15 September. Docker has reported no known exploitation.</p>
+
+  <figure>
+    <img src="/blogs/the-microvm-held-the-mount-did-not/arch-the-two-holes.svg" alt="Diagram of a Docker Sandboxes deployment. Inside the microVM the coding agent runs as root with its own kernel and its own Docker daemon. The hardware virtualisation boundary is drawn as a solid wall with no crossings. Two labelled channels pass through it into a host-side virtual machine monitor process running as the ordinary desktop user: the virtio-fs workspace share and the Unix domain socket relay. Both channels carry guest-controlled paths, and both are where the two CVEs landed. Behind the monitor process sits the rest of the user's home directory." width="900" height="500" loading="lazy" />
+    <figcaption>The wall is not where the bugs were. The two doorways through it are.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>What actually broke</h2>
+  <p>Docker Sandboxes, generally available since 30 January 2026, gives each coding agent a disposable microVM: its own kernel, its own filesystem, its own Docker daemon, its own network stack, driven by an <code>sbx</code> CLI. Your project directory is shared in read-write, because an agent that cannot edit your repository is not a coding agent. The pitch is that you can run Claude Code or Codex unattended — permission prompts off — and a compromised or runaway agent still cannot reach the host.</p>
+
+  <p>The first bug is in the virtio-fs host server, the component that serves that shared workspace. When it reopened an unlinked file from a path it had stored earlier, it followed symbolic links. A guest that controls the workspace can replace a parent directory with a symlink after the path was recorded, so the later operation resolves somewhere else entirely. The result is arbitrary read and write of host files reachable by the virtual machine monitor process — which, on a developer laptop, runs as the developer.</p>
+
+  <p>The second bug is the same shape in a different channel. The socket relay checked that a requested socket path sat inside the approved workspace, and then connected using the original path string rather than the validated handle. Swap an intermediate directory for a symlink between the check and the use, and the host connects to an AF_UNIX socket of the guest's choosing, outside the workspace.</p>
+
+  <div class="callout">
+    <p>Both are time-of-check-to-time-of-use races against symlinks: the oldest bug class in Unix, arriving in an AI product because that product's entire job is mediating a filesystem between an untrusted party and you. Note what is <em>not</em> here. This is not an <a href="/blogs/agent-cves-are-authorization-bugs">authorization bug</a> — nobody exceeded a permission they had been granted. The permission model was fine; the code implementing it resolved a path twice and got two different answers.</p>
+  </div>
+</section>
+
+<section>
+  <h2>The untrusted party is your own agent</h2>
+  <p>"An attacker controlling the guest" reads, in a normal container advisory, as someone who already got in. In an agent sandbox it reads differently, because the guest is software you launched yourself and then pointed at the internet.</p>
+
+  <p>A coding agent reads issue text, dependency READMEs, CI logs, web pages, and the output of every command it runs. Any of those can carry instructions, and the agent has a shell. The product's own value proposition — unattended execution with permission prompts disabled — is precisely the configuration in which nobody is watching the moment a <a href="/concepts/prompt-injection-101">prompt injection</a> turns "the guest" into "the attacker controlling the guest". You do not need a compromised laptop or a malicious insider for these CVEs to matter. You need one poisoned README in a transitive dependency and an agent doing what it was bought to do.</p>
+
+  <p>That is why the severity assessment for an agent sandbox should not start from "how likely is a hostile guest". Assume the guest is hostile on some percentage of runs, because that is the threat model the sandbox was purchased to handle. The question that remains is what a hostile guest reaches when the channel it must be given fails.</p>
+</section>
+
+<section>
+  <h2>Why both bugs are in the same place</h2>
+  <figure>
+    <img src="/blogs/the-microvm-held-the-mount-did-not/data-channel-inventory.svg" alt="Feature matrix with four rows and four columns. The rows are the channels a coding-agent sandbox typically opens: workspace file share, host socket relay, network egress, and credential or environment passthrough. The columns are whether the channel can be removed, whether the guest controls its input, whether host-side code parses that input, and the blast radius when it fails. The workspace share scores strongest on every column: it cannot be removed, the guest controls it, host code parses it, and failure reaches the host filesystem." width="900" height="400" loading="lazy" />
+    <figcaption>Rank the channels by how much guest-controlled input reaches host code. The ranking predicts where the CVEs land.</figcaption>
+  </figure>
+
+  <p>Isolation technology has a strong record. A microVM gives you a separate kernel and a hardware-enforced boundary, and neither CVE dented it — the same conclusion the wiki's comparison of <a href="/blogs/gvisor-vs-firecracker-vs-kata-vs-wasm">gVisor, Firecracker, Kata and Wasm</a> reaches from the opposite direction. What has a much weaker record is the paravirtualised plumbing bolted across that boundary so the thing inside can be useful: shared filesystems, socket forwarding, clipboard bridges, port proxies, credential helpers. That code is host-side, it parses guest-controlled input, and it is where sandbox escapes have lived for a decade.</p>
+
+  <p>For an agent sandbox this is structural rather than accidental. The share is the product. Nobody buys a microVM that cannot see the repository, so the one channel with the worst properties — guest-controlled paths, host-side parsing, host filesystem on the other side — is also the one channel you can never configure away. The correct reading of an escape through it is not that the vendor was careless. It is that this surface will produce a bug of this class again, and your design should already assume the next one.</p>
+
+  <p>Which reframes the shopping question. "Is it a real VM or just a container?" is the question everyone asks, and it decides only the wall. The questions that decide your loss are: what is mounted, as whom does the monitor process run, and how fast do you patch.</p>
+</section>
+
+<section>
+  <h2>What to change on Monday</h2>
+  <table>
+    <thead>
+      <tr><th>Boundary</th><th>What it promises</th><th>What a failure gets the guest</th><th>What you control</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>MicroVM / kernel</td><td>No host code execution from guest code</td><td>Everything, but it did not fail here</td><td>Vendor choice, patch level</td></tr>
+      <tr><td>Workspace share</td><td>Guest sees only the project directory</td><td>Every file the monitor process can read or write</td><td>What you mount, and as whom you run</td></tr>
+      <tr><td>Socket relay</td><td>Guest reaches only approved sockets</td><td>Any local service that trusts its socket peers</td><td>Whether you enable it at all</td></tr>
+      <tr><td>Network egress</td><td>Guest reaches only allowed hosts</td><td>Exfiltration of whatever it already read</td><td>Allowlist, and whether one exists</td></tr>
+    </tbody>
+  </table>
+
+  <p>Four concrete moves follow from that table, in descending order of return:</p>
+
+  <ul>
+    <li><strong>Upgrade to 0.42.0 or later.</strong> Both fixes shipped on 7 September, eight days before the advisory. If you install through a package manager rather than the desktop updater, check the installed version rather than assuming.</li>
+    <li><strong>Shrink what is behind the door.</strong> The workspace share does not have to be a directory inside your real home. Give the agent a dedicated checkout under a path that holds nothing else — not your SSH keys, not your cloud credentials, not your other clients' repositories. The first CVE's reach was "host files accessible to the VMM user", and you get to decide how much that is.</li>
+    <li><strong>Do not run the sandbox as your daily user if you can avoid it.</strong> On a shared build host this is straightforward and rarely done; on a laptop it is friction, and the honest trade is to accept the risk deliberately rather than by default. <a href="/deep-dives/agent-security/sandbox-and-isolation-patterns">Sandbox and isolation patterns</a> covers the layering.</li>
+    <li><strong>Patch these on the appliance clock, not the tooling clock.</strong> A developer-tool CVE feels like low priority until you notice it is a pre-authentication path from internet-derived content to your home directory. Treat agent sandboxes as internet-facing software, because functionally they are.</li>
+  </ul>
+
+  <div class="callout tip">
+    <p>If you do one thing today, make it the mount. Upgrading fixes these two bugs; changing what the share points at fixes the class. An agent working in a throwaway clone with no credentials beside it turns the next escape of this kind from an incident into a bad afternoon — and unlike patch velocity, it costs you nothing to keep.</p>
+  </div>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Was the microVM isolation itself broken?</h3>
+  <p>No. Neither CVE involves escaping the virtual machine's hardware boundary or the guest kernel. Both abuse host-side services that deliberately cross that boundary — the virtio-fs file share and the socket relay — by winning a race against a symlink.</p>
+
+  <h3>Am I affected if I do not use macOS?</h3>
+  <p>CVE-2026-77179 is scoped to macOS. The socket-relay bug, CVE-2026-79994, is listed for 0.37.0 up to 0.42.0 without that platform qualifier. Upgrade regardless of platform, and read the advisory for the scoping that applies to your install.</p>
+
+  <h3>Does this mean containers would have been just as good?</h3>
+  <p>No, and the inference runs the wrong way. The microVM boundary held; a container's shared-kernel boundary is weaker and would still have been sitting behind the same shared workspace. What the advisory shows is that the channels through the boundary deserve the same scrutiny as the boundary, not that the boundary is pointless.</p>
+
+  <h3>How would I know if this had been exploited against me?</h3>
+  <p>Realistically, you would not, from the sandbox's own logs. The escape looks like ordinary file operations from the monitor process — the same process legitimately writes your repository. Detection lives at the host level: file integrity monitoring on credential paths, and egress logging. This is the argument <a href="/operations/safety-and-security/detecting-agent-compromise">detecting agent compromise</a> makes at length.</p>
+
+  <h3>What is the general rule to take away?</h3>
+  <p>Count the channels you have opened through your isolation boundary, and assume each one will eventually fail. Then size what sits behind each channel so that the failure is survivable. Isolation strength is a property of the whole perimeter, not of its strongest wall.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/deep-dives/agent-security/sandbox-and-isolation-patterns">Sandbox and isolation patterns</a> — what each isolation layer actually promises.</li>
+    <li><a href="/playbooks/coding-and-computer-use-agents/sandboxing-and-execution">Sandboxing and execution for coding agents</a> — building the enclosure an agent works inside.</li>
+    <li><a href="/operations/safety-and-security/detecting-agent-compromise">Detecting agent compromise</a> — the signals that survive when the agent's own logs cannot be trusted.</li>
+    <li><a href="/concepts/blast-radius">Blast radius</a> — sizing the loss before it happens.</li>
+    <li><a href="/blogs/gvisor-vs-firecracker-vs-kata-vs-wasm">gVisor vs Firecracker vs Kata vs Wasm</a> — the isolation technologies themselves, compared.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://docs.docker.com/security/security-announcements/">Docker security announcements</a></li>
+    <li><a href="https://www.cve.org/CVERecord?id=CVE-2026-77179">CVE-2026-77179 record</a></li>
+    <li><a href="https://www.cve.org/CVERecord?id=CVE-2026-79994">CVE-2026-79994 record</a></li>
+    <li><a href="https://www.docker.com/products/docker-sandboxes/">Docker Sandboxes product page</a></li>
+  </ul>
+</section>

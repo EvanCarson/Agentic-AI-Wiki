@@ -1,0 +1,109 @@
+<section class="phase">
+  <div class="phase-num">E21</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>Replay testing with recorded traces.</h2>
+  <p class="goal">Your evals measure the model and your unit tests measure the code, and neither of them notices that a refactor reordered the tool schema so the agent now authenticates on step four instead of step one. Replay is the cheapest gate that catches that class — re-run yesterday's real trajectory against today's build — and it comes with one hard limit nobody tells you before you have built the suite: a recording pins the world, so a replay proves nothing past the first action the agent takes differently. Design around that limit and replay becomes the regression test agent stacks are missing; ignore it and you get a rotting fixture library that fails for reasons unrelated to your change.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What replay is, and what it is not.</h3>
+
+    <p>A replay test takes a recorded run — the goal, the starting state, every tool call with its arguments, every tool response, the model's outputs — and re-executes the agent against the recorded responses instead of live systems. No network, no third-party quota, no cost beyond the model call, and the same inputs every time.</p>
+
+    <p>It is worth being precise about what that buys, because three neighbouring practices get confused with it:</p>
+
+    <ul>
+      <li><strong>An eval</strong> scores outcomes on a task set. It answers "is the agent good?" Replay answers "did the agent's behaviour change?" — a different and much cheaper question, and one you can ask on every pull request.</li>
+      <li><strong>A <a class="xref" href="/operations/evaluation-and-observability/shadow-mode-and-dark-launches">shadow run</a></strong> uses live production traffic against live state. Replay is hermetic and repeatable; shadow is neither, which is exactly why shadow can see distribution and replay cannot.</li>
+      <li><strong>A <a class="xref" href="/operations/agentops/staging-environments-for-agents">staging environment</a></strong> gives the agent a real but fake world with real state transitions. That is the heavyweight option; replay is what you run when staging is too slow to sit in CI.</li>
+    </ul>
+
+    <p>The thing replay is uniquely good at is the harness: prompt assembly, tool registration, schema serialisation, truncation and compaction logic, retry and timeout handling, parsing of tool results, ordering constraints. That code changes weekly, is invisible to your eval suite, and breaks agents in ways that look like model regressions.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The divergence problem, which is the whole design.</h3>
+
+    <p>Replay works by answering tool calls from a recording, usually keyed by tool name plus normalised arguments. The first time the agent calls something the recording does not contain, you have a cache miss, and what you do about it defines what your test actually proves. There are only three options and each is a different instrument:</p>
+
+    <ul>
+      <li><strong>Fail on miss (strict replay).</strong> Any divergence from the recorded trajectory is a test failure. This is a change detector with maximum sensitivity: it catches the schema reorder, and it also fires every time someone improves a prompt. Use it on a small, deliberately chosen set where the trajectory <em>is</em> the contract.</li>
+      <li><strong>Fall through to live.</strong> Unrecorded calls hit the real system. Now the test is neither hermetic nor repeatable, it can mutate real state, and it will pass or fail depending on someone else's uptime. Almost always the wrong answer in CI; occasionally right for a single nightly canary.</li>
+      <li><strong>Answer from a contract fixture.</strong> A fake implementation of the tool serves the miss according to the tool's contract rather than a transcript. The agent may legitimately deviate and still be judged. This is the version that scales, and STEP 3 is about paying for it.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Do not let a framework pick this for you silently. Record-and-replay libraries borrowed from HTTP testing default to one of these three behaviours, and the default is usually "fall through to live" or "synthesise something plausible". A fabricated tool response in a replay harness produces a green test for a run that could never happen, which is worse than no test.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Two tiers, because one suite cannot do both jobs.</h3>
+
+    <p>Trying to make a single replay suite serve as both change detector and behaviour test is how teams end up with three hundred fixtures nobody trusts. Split it.</p>
+
+    <p><strong>Tier one — pinned trajectories.</strong> Twenty to fifty recordings, strict, fast, running on every pull request. The assertion is on the shape of the run, not the prose: which tools were called, with which argument invariants, in an order satisfying the constraints that matter. A useful assertion set looks like this:</p>
+
+    <pre class="standalone">assert trace.tools_called[0].name == "authenticate"
+assert "delete_record" not in trace.tool_names        # never in this scenario
+assert trace.step_count &lt;= 12                          # compaction still working
+assert trace.tokens_in &lt;= budget * 1.15                # prompt didn't silently grow
+assert order_before(trace, "fetch_policy", "issue_refund")
+assert trace.final.schema_valid</pre>
+
+    <p><strong>Tier two — contract fixtures.</strong> A fake tool server with real state: writes are visible to later reads, an idempotency key behaves like one, an error can be injected on demand. Slower to build and the only version that can answer "did the agent still accomplish the task by a different route", which is the question that matters once anyone starts improving prompts. Run it nightly, score it on outcome rather than on trajectory, and keep it as the place where <a class="xref" href="/deep-dives/evaluating-agents/trajectory-and-process-evaluation">process evaluation</a> lives.</p>
+
+    <p>Tier one is a diff. Tier two is a test. Teams that skip tier one lose the plumbing regressions; teams that only have tier one end up disabling it within a quarter because every genuine improvement turns it red.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Fixture rot is the running cost, and it is the failure mode.</h3>
+
+    <p>A recording is a photograph of somebody else's API on a Tuesday. The API moves; your recording does not. Six months in, the dangerous state is a suite that is fully green against responses no live system would return any more — a replay of a world that stopped existing, which is precisely how <a class="xref" href="/operations/agentops/third-party-tool-drift">third-party tool drift</a> reaches production unnoticed.</p>
+
+    <ul>
+      <li><strong>Stamp every recording.</strong> Provider, API version, capture date, the model and harness version it was captured under. A fixture without provenance cannot be judged stale and therefore never will be.</li>
+      <li><strong>Expire on a clock.</strong> Recordings older than a set age fail the build as stale rather than as wrong. This converts an invisible rot into a scheduled chore, and the chore is small if it is frequent.</li>
+      <li><strong>Run one live conformance check per external tool, nightly.</strong> Not the whole suite — a single call per tool, asserting the response still matches the shape your fixtures assume. That one job is what keeps the other four hundred honest.</li>
+      <li><strong>Re-record from production, not by hand.</strong> Hand-edited fixtures encode what the author believed the API does. Harvest replacements from real <a class="xref" href="/concepts/trajectories">trajectories</a>, which is the same corpus <a class="xref" href="/operations/evaluation-and-observability/eval-set-maintenance">eval-set maintenance</a> draws from.</li>
+      <li><strong>Redact at capture time.</strong> Recordings are production data with customer content in the tool responses, and they end up in a git repository that every engineer can read. Redaction belongs in the capture path, not in a cleanup script — see <a class="xref" href="/operations/evaluation-and-observability/pii-redaction-in-agent-traces">redacting PII from agent traces</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Assert on effects, not on text.</h3>
+
+    <p>Replay does not make a model deterministic. Even at temperature zero, output varies with batching, kernel versions, quantisation and provider-side routing, and <a class="xref" href="/concepts/reproducibility-and-determinism">reproducibility</a> explains why chasing bit-identical generation is a losing errand. So any assertion on the model's prose is a flaky test that will be deleted within a month, and correctly so.</p>
+
+    <p>Assert instead on things the system genuinely controls: which tools were called, with which arguments, in what order; how many steps were taken; how many tokens went in; which side effects would have occurred; whether the final output validates against its schema. These are stable under ordinary generation variance and sensitive to exactly the harness changes you built the suite to catch.</p>
+
+    <p>Two consequences worth planning for:</p>
+
+    <ul>
+      <li><strong>A model upgrade invalidates every pinned trajectory at once.</strong> Treat that as the feature it is — a diff of behavioural change across the whole corpus — but budget a person to adjudicate it, because "the recording is stale" and "the agent got worse" arrive looking identical. This is the reviewable moment in <a class="xref" href="/operations/agentops/model-deprecation-and-migration">a model migration</a>, and it is worth more than any aggregate score.</li>
+      <li><strong>Prompt-cache behaviour changes when you replay.</strong> Identical prefixes across replay runs make caching look better than production, so read cost assertions as a ceiling on structure, not as a forecast of spend.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Where it sits in the pipeline.</h3>
+
+    <p>Replay earns its place by being fast enough to block a merge. Put it there and keep everything slow somewhere else:</p>
+
+    <ul>
+      <li><strong>Pre-merge:</strong> tier-one pinned trajectories, twenty to fifty of them, under two minutes, no model judge, no network. Failure means "your change altered behaviour" — a conversation, not necessarily a bug.</li>
+      <li><strong>Nightly:</strong> tier-two contract fixtures with outcome scoring, plus the live conformance check per external tool. This is where <a class="xref" href="/deep-dives/evaluating-agents/eval-driven-development-and-ci">eval-driven CI</a> and replay meet.</li>
+      <li><strong>On incident:</strong> the first artifact of any agent incident should be a recording of the failing run, added to tier one the same week. An incident that does not leave a fixture behind will happen again, and <a class="xref" href="/operations/evaluation-and-observability/quality-regression-detection">regression detection</a> is only as good as the corpus it runs on.</li>
+      <li><strong>Never:</strong> as a quality gate. A green replay suite says today's build behaves like yesterday's on the paths you recorded. It says nothing about whether yesterday's was any good.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do this in one afternoon: take your ten highest-volume production trajectories, redact them, pin them strictly, and assert only on the tool sequence and step count. That alone catches the majority of harness regressions, and it will fail the first time within a fortnight — probably on a change nobody thought was behavioural. Add the contract-fixture tier when someone improves a prompt and the pinned suite goes red for the right reason; that is the signal it is time, not a sign the approach failed.</p>
+    </div>
+  </div>
+</section>
