@@ -1,0 +1,111 @@
+<section class="phase">
+  <div class="phase-num">Y38</div>
+  <div class="week">Playbook · Domain Playbooks</div>
+  <h2>Smart-home agents: the actuation is the demo, the event history is the product and the liability.</h2>
+  <p class="goal">Every smart-home agent demo turns on a light, and every smart-home agent incident will be about something it read. Device event history is a presence log for everyone who lives in the building — attacker-writable at the device-name layer, unbounded in the time dimension, and impossible to un-read once it is in a context window — while the actuation half is the part that is enumerable, reversible and easy to gate. Build the read path with a budget and a window cap before you write a single command, and treat "turn on the lamp" as the easy problem it is.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Sort devices by reversibility, not by category, and grant autonomy per class.</h3>
+
+    <p>The useful axis is not lights-versus-locks. It is what happens when the agent is wrong and nobody is watching. Three classes, and they earn different permissions:</p>
+
+    <ul>
+      <li><strong>Reversible and low-consequence.</strong> Lamps, scenes, media, a speaker's volume. A wrong action is an annoyance, corrected by the opposite command. This is the only class that earns unattended autonomy, and it is most of what people actually want.</li>
+      <li><strong>Reversible but consequential.</strong> Thermostats, blinds, irrigation, EV charging. A wrong action costs money, comfort or a frozen pipe before anyone notices, because the feedback loop is hours long. Autonomy here needs bounds — a temperature range, a duty cycle, a daily budget — not a confirmation prompt.</li>
+      <li><strong>Irreversible or safety-bearing.</strong> Locks, garage doors, gas and water valves, ovens, anything medical, anything that admits a person to the building. No autonomy. Not behind a confirmation, either: a confirmation that fires often enough becomes a reflex, and the one that matters arrives looking like the other forty.</li>
+    </ul>
+
+    <p>Platforms are starting to enforce the third class for you — Google's Home MCP blocks door unlocking outright rather than exposing it behind approval — and that is the right shape to copy. Refusing to expose a capability is a stronger control than gating it, because it cannot be worn down by frequency. Where you must expose one, require a second factor that is not the agent: a physical press, a separate app confirmation, a code the agent does not hold. See <a class="xref" href="/operations/safety-and-security/physical-actuation-safety">physical actuation safety</a> for the general treatment.</p>
+
+    <div class="callout">
+      <p>Write the class onto the device record, not into the prompt. A prompt-level rule is advisory and gets summarised away over a long session; a class attached to the device is checked by your tool wrapper on every call, including the call at step forty that nobody reviewed.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Your action space is discovered at runtime, so policy has to be written over traits.</h3>
+
+    <p>This is the part that breaks a conventional allowlist. Home platforms expose devices through capability <em>traits</em>, and the commands available on a given device come from a schema the platform reports when you connect. Someone pairs a Matter blind on a Tuesday and the agent's action set has grown — with no deploy, no review and no version bump anywhere in your stack.</p>
+
+    <ul>
+      <li><strong>Enumerate at connect and on change, then classify.</strong> Pull the resource list, map every trait to one of the three classes in STEP 1, and persist the mapping with a version. The mapping is your policy artefact; the device list is not.</li>
+      <li><strong>Default-deny unknown traits.</strong> A trait your classifier has never seen is not low-risk by default. It is unclassified, which means unavailable until someone classifies it. This single rule is what keeps a new product category from silently entering the autonomous tier.</li>
+      <li><strong>Diff the surface and alert on growth.</strong> "Three new traits appeared on this account" is an event worth a notification, exactly like a new IAM permission. <a class="xref" href="/operations/agentops/tool-catalog-lifecycle">Tool-catalogue lifecycle</a> is the general discipline; here the catalogue changes because someone went shopping.</li>
+      <li><strong>Never let the model choose the trait mapping.</strong> Asking the model "is this action safe" at runtime puts the classification inside the thing being constrained. Classification is a build-time decision with a human in it.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The physical world has no transactions. Build a read-modify-verify contract.</h3>
+
+    <p>Nothing in a home rolls back, and a command that times out is in an <em>unknown</em> state rather than a failed one. Most agent stacks treat a timeout as a failure and retry, which is how a garage door ends up cycling.</p>
+
+    <ul>
+      <li><strong>Express commands as absolute targets, never as relative deltas.</strong> <code class="inline">set_temperature(20)</code> is idempotent; <code class="inline">turn_up_by(2)</code> applied twice is a different house. This single rule removes most retry damage — the same argument as <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a>, with physical consequences.</li>
+      <li><strong>Verify with an observation, not with the command's return value.</strong> A 200 means the platform accepted the request. Whether the device did it is a separate question answered by reading state back, with a bounded wait.</li>
+      <li><strong>On timeout, read before you retry.</strong> Never re-issue blind. If the state read is also unavailable, surface an explicit unknown to the user and stop — an honest "I could not confirm the garage door closed" is worth more than a confident summary.</li>
+      <li><strong>Sequence, do not fan out, within a scene.</strong> A batch that half-applies leaves the home in a state no one designed. Apply in a defined order, verify each step, and report the partial state plainly if you stop midway.</li>
+    </ul>
+
+    <pre class="standalone">// Absolute target, explicit verification, unknown is a first-class outcome.
+{ "action": "set_temperature", "device": "thermostat.hall", "target_c": 20 }
+→ accepted
+{ "verify": "read_state", "device": "thermostat.hall", "within_ms": 8000 }
+→ { "setpoint_c": 20, "observed_at": "2026-09-19T18:04:11Z" }   // confirmed
+
+// Timeout path — do NOT re-issue the command.
+{ "verify": "read_state", "device": "garage.main", "within_ms": 8000 }
+→ { "status": "unknown", "reason": "device unreachable" }       // tell the user, stop</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Event history is the sensitive asset. Budget it like a cost, not like a lookup.</h3>
+
+    <p>A home platform's history API returns past state changes and event logs over whatever window you ask for. Each row is innocuous — a light on, motion detected, a door opened. The set is a behavioural record: when the house is empty, who comes home when, which nights nobody slept there. No allowlist can refuse that, because the sensitive object is the pattern, and the pattern is an inference the agent draws.</p>
+
+    <ul>
+      <li><strong>Cap the window server-side, in your own wrapper.</strong> Default to hours. Make a wider query a separate, logged, user-visible request. A width limit is the one control that survives every downstream mistake, and it is a few lines.</li>
+      <li><strong>Fetch for a stated purpose and discard.</strong> "Why was the heating on all day Tuesday" needs Tuesday, not the month. Pull the narrow window, answer, and drop it rather than letting it ride in context for the rest of the session.</li>
+      <li><strong>Keep it out of memory and out of summaries.</strong> A persistent-memory write derived from event history outlives the question that justified it, unattributed. Exclude the history tool's output from memory extraction explicitly — this is one of the few cases where a blanket exclusion is right.</li>
+      <li><strong>Know your retention chain.</strong> Once history enters a context window it is in your traces, your provider's logs, and any debugging export. Decide whether those systems should hold it, and redact at the boundary if not — see <a class="xref" href="/operations/evaluation-and-observability/pii-redaction-in-agent-traces">PII redaction in agent traces</a>.</li>
+      <li><strong>Prefer aggregates when the question is a pattern.</strong> If the user wants "am I leaving the heating on too much", compute it and return the number. Do not hand the raw log to the model and ask it to notice.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Treat every string from the home as untrusted input, starting with the device names.</h3>
+
+    <p>The realistic compromise is not a hostile agent. It is a correct agent reading text somebody else wrote, and a home is unusually good at producing that text.</p>
+
+    <ul>
+      <li><strong>Device and room names are attacker-supplied.</strong> Anyone who can add or rename a device on the account controls a string that lands in the agent's context — a guest, a contractor, a previous occupant, a compromised third-party integration. Render names as data, never as instructions: keep them in a delimited field, strip control characters, cap length, and never interpolate one into a system-level instruction.</li>
+      <li><strong>Camera and doorbell event summaries are model output.</strong> A description of what a camera saw is generated text, produced by a model that has no idea its output will be read as fact by something holding actuation tools. That is a two-model supply chain; treat the upstream one as an untrusted source. <a class="xref" href="/operations/safety-and-security/telemetry-as-untrusted-input">Telemetry as untrusted input</a> is the pattern.</li>
+      <li><strong>Assume injection plus reconnaissance arrive together.</strong> The connection that could carry an injected instruction also carries the household's schedule and the command surface. Design so that a successful injection cannot reach the class-three devices at all — which it cannot, if STEP 1's classes are enforced in your wrapper rather than in the prompt.</li>
+      <li><strong>Log the provenance of anything that influenced an action.</strong> When an agent acts on an event, record which event, from which device, at what timestamp. Reconstructing "why did the lights come on at 3am" six weeks later is the ordinary case — see <a class="xref" href="/operations/governance-compliance/audit-trails">audit trails</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>A home is multi-person; an OAuth grant is not. Design for the people who never saw the consent screen.</h3>
+
+    <p>This is the requirement most teams discover late, and it has no purely technical fix. One account holder authorises the integration. Everyone else in the building — partners, children, housemates, guests, carers, a cleaner — is recorded by the sensors and represented in the history, and none of them consented to a third-party agent reading it.</p>
+
+    <ul>
+      <li><strong>Make the grant narrower than the account.</strong> Share the minimum set of devices into whatever identity the agent uses, and keep cameras out of it unless a specific feature needs them. The unit of blast radius is the grant, so make the grant small — <a class="xref" href="/concepts/blast-radius">blast radius</a>, applied to a building.</li>
+      <li><strong>Record what was granted, by whom, when, and how it is revoked.</strong> A single revoke path that actually works, tested, is worth more than a granular permissions UI nobody opens. <a class="xref" href="/operations/governance-compliance/delegated-access-and-consent-records">Delegated access and consent records</a> covers the artefact.</li>
+      <li><strong>Do not let the agent answer questions about people.</strong> "Was my daughter home last night" is technically a history query and substantively surveillance. Decide the policy deliberately, implement it as a refusal on the query shape rather than a hope about the model, and give the refusal a reason.</li>
+      <li><strong>Disclose in the home, not only in the app.</strong> If an agent can act or observe, the people living there should be able to find that out without having the account. A visible state — a light, a card on a display, a monthly summary to the household — is the closest thing to consent the architecture allows.</li>
+      <li><strong>Plan for the household changing.</strong> People move out. An agent with standing access and a memory of the previous occupant's routines is a problem with a name; make account membership changes trigger a memory and history purge.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Build the first version with the actuation tool removed entirely. An agent that can only read — "why is the house cold", "did the back door get left open", "what is costing me money" — is genuinely useful, ships in a week, and forces you to solve the window caps, the untrusted-name handling and the memory exclusions while the stakes are low. Then add class-one devices, and only then argue about the rest. The teams that do it in the other order ship the lamp demo and discover the history problem in a support ticket. Related: <a class="xref" href="/operations/safety-and-security/physical-actuation-safety">physical actuation safety</a> for the write path in depth, <a class="xref" href="/deep-dives/mcp/mcp-security-anti-patterns">MCP security anti-patterns</a> for the integration layer, and <a class="xref" href="/playbooks/agent-ux-and-human-interaction/undo-and-reversibility">undo and reversibility</a> for what to offer when there is no undo.</p>
+    </div>
+  </div>
+</section>
