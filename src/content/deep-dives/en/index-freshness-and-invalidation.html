@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">R10</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Index freshness: the deletion you never propagated is the one that hurts.</h2>
+  <p class="goal">A stale index does not return an error, it returns a confident answer with a citation attached — and the three ways a corpus goes stale are not one problem with one fix. An out-of-date paragraph is embarrassing; a document that was deleted and still answers is an incident, because someone retired it on purpose and your system overruled them. The rule this entry argues for: drive invalidation from the source's change stream, give deletion a privileged path that does not wait for the next crawl, and remember that everything your pipeline derived from a chunk — summaries, memory entries, graph nodes, cached answers — inherits none of it.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three kinds of change, three different failures.</h3>
+
+    <p>Teams talk about "index freshness" as a single latency number, which hides the fact that the three events that make an index wrong have completely different blast radii:</p>
+
+    <ul>
+      <li><strong>An update.</strong> The document still exists; its content moved. The retrieved chunk is a true statement about a previous version, and the citation resolves to a live document that no longer says it. Cost: a wrong answer the user can catch by clicking through. Annoying, self-correcting, and the only one of the three that most teams measure.</li>
+      <li><strong>A deletion.</strong> The document is gone — retracted, superseded, or removed because it should never have existed. Your index still holds the chunk and the retriever still ranks it, so the agent will quote a document that the organisation deliberately withdrew. The citation is now the aggravating factor rather than the mitigation: it lends authority to text nobody stands behind, and it points at a URL that 404s, which is how the user learns your system is lying. Cost: a correctness incident, sometimes a legal one.</li>
+      <li><strong>A permission change.</strong> The document exists, but this reader no longer may see it. This is not a freshness problem wearing a different hat — it is an authorisation problem whose enforcement you happened to cache, and the cache's staleness <em>is</em> your revocation latency. The full treatment is in <a class="xref" href="/operations/safety-and-security/permission-aware-retrieval">permission-aware retrieval</a>; the only thing to carry from here is that it must not share a refresh schedule with content.</li>
+    </ul>
+
+    <p>Rank them by how the failure surfaces and the priority inverts the usual one. Updates are noisy and get fixed. Deletions are silent, plausible, and indistinguishable at retrieval time from a correct hit — nothing in the vector says "this document no longer exists". A retriever that returns something is behaving normally; there is no error path to alert on.</p>
+
+    <div class="callout">
+      <p>The design rule that falls out: <strong>updates can ride a schedule; deletions need an event.</strong> If your only invalidation mechanism is "we re-crawl every night", you have chosen to serve retracted content for up to a day, and you have chosen it implicitly, in a cron expression, without anyone signing off on the window.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The nightly re-crawl is a bill, not a guarantee.</h3>
+
+    <p>The default freshness architecture is a scheduled full crawl, and it has the worst cost profile available: the price scales with the size of the corpus, while the thing it is chasing scales with the rate of change. Those two numbers are usually three orders of magnitude apart.</p>
+
+<pre class="standalone"><span class="c-cm"># A corpus of 1M documents, 0.5% changing per day</span>
+
+  documents re-read per night      = 1,000,000
+  documents that actually changed  =     5,000     <span class="c-cm"># 0.5%</span>
+  wasted work                      =       200x
+
+<span class="c-cm"># And the freshness you bought with it:</span>
+
+  mean staleness   = interval / 2 =  12 hours
+  worst staleness  = interval     =  24 hours
+  deletion window  = interval     =  24 hours      <span class="c-cm"># retracted content still answering</span>
+
+<span class="c-cm"># Halving staleness doubles the bill. The bill is the corpus, not the delta.</span></pre>
+
+    <p>The arithmetic is why "just crawl more often" stops being an option exactly when the corpus gets big enough to matter. Content-hash-keyed incremental ingest — re-embed only when the hash changes — fixes the embedding half of the bill but not the crawl half: you still have to fetch a million documents to discover that 995,000 of them are unchanged. On a local filesystem that discovery is nearly free; over an API with rate limits it is the dominant cost, and it is the reason teams quietly lengthen the interval until the freshness window is a day, then a week.</p>
+
+    <p>Two honest exceptions. A corpus under roughly a hundred thousand documents on storage you control can be reconciled in full often enough that none of this matters — do the simple thing. And a corpus that genuinely changes wholesale, like a nightly analytics export, is a rebuild, not an invalidation problem; see <a class="xref" href="/operations/agentops/reindexing-and-embedding-migrations">re-indexing and embedding migrations</a> for how to cut over without a window where the index is half of each.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Subscribe to the source, and expect it to lie about deletions.</h3>
+
+    <p>The structurally correct answer is to stop polling and let the source tell you: a change feed, a webhook, a change token, a database write-ahead log. Every serious content system has one — document platforms expose change APIs with a cursor, object stores emit create and delete notifications, Git gives you a diff per commit, relational sources give you logical replication. Cost then scales with the delta, which is what you wanted.</p>
+
+    <p>There is a catch that ruins a surprising number of first implementations: <strong>change feeds are good at creations and updates and bad at deletions</strong>. The failure modes are consistent across products and worth naming, because each produces a ghost in your index:</p>
+
+    <ul>
+      <li><strong>Silent disappearance.</strong> The item simply stops appearing in listings. Nothing is emitted, because nothing happened — from the source's point of view, a row went away.</li>
+      <li><strong>Deletion as an access error.</strong> The next fetch returns 403 or 404, which your ingest worker classifies as a transient failure and retries for three days before giving up. It never reaches the code path that would remove the chunk.</li>
+      <li><strong>Moves that look like deletes and deletes that look like moves.</strong> A rename emits a delete plus a create with a new identifier; a move to an archive space emits nothing at all. If your primary key is a path, both corrupt the index.</li>
+      <li><strong>Cursor gaps.</strong> A change token that expires, a webhook endpoint that was down for an hour, a replication slot that fell behind. The events in the gap are gone and nothing tells you which ones they were.</li>
+    </ul>
+
+    <p>So the event stream is necessary and not sufficient. Pair it with a <strong>reconciliation sweep whose only job is finding tombstones</strong>: list identifiers from the source, diff against identifiers in the index, remove what is missing. This is much cheaper than a crawl — you fetch IDs, not content, so a million-document reconcile is a few paginated listings rather than a million bodies — and it can therefore run hourly where a crawl runs nightly. Key both the stream and the sweep on a stable source-assigned identifier, never a path or a URL, or the sweep will delete half the corpus the first time someone reorganises a folder.</p>
+
+    <div class="callout warn">
+      <p>Make the ingest worker distinguish "gone" from "failed", and make that distinction explicit rather than inferred from a status code. A 404 from a source that is healthy means delete; a 404 from a source that is returning 404 for everything means stop and page someone. Pipelines that conflate the two either accumulate ghosts forever or empty the index during an outage, and both failures are discovered by a user, late.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Tombstone first, compact later — and remember what the chunk left behind.</h3>
+
+    <p>When a deletion event arrives, the instinct is to remove the vector. That is the slow path: in most stores a delete is a segment rewrite or a compaction that lands eventually, and "eventually" is exactly the window you were trying to close. Write a tombstone instead — a <code class="inline">deleted_at</code> field on the chunk's metadata — and filter on it at query time. The row disappears from results in milliseconds, the physical removal happens on the store's own schedule, and the two concerns stop being coupled.</p>
+
+    <p>This is also the only mechanism that makes deletion auditable. A row that vanished tells you nothing; a tombstone with a timestamp and a reason lets you answer "when did we stop serving this" months later, which is a question that arrives from legal rather than from engineering.</p>
+
+    <p>Then the part that is genuinely missed. A retrieval pipeline does not store one copy of a document; it stores a family of derived artefacts, and <strong>none of them inherit the deletion</strong>:</p>
+
+    <ul>
+      <li><strong>Summaries and contextual prefixes.</strong> If you prepend a generated document summary to every chunk, that summary contains the deleted content and lives in chunks you did not delete.</li>
+      <li><strong>Knowledge-graph nodes and edges.</strong> An extraction pass turned the document into entities and relations. Deleting the source chunk leaves the assertions standing, and a <a class="xref" href="/deep-dives/retrieval-and-rag/graph-rag">graph retriever</a> will happily traverse them.</li>
+      <li><strong>Agent memory.</strong> The agent read the document last week and wrote a fact into long-term memory. The memory has no pointer back. This is the hardest one and the reason <a class="xref" href="/deep-dives/memory-and-context/memory-write-path-architectures">memory write paths</a> should record provenance on every written fact — without it, deletion is unenforceable by construction.</li>
+      <li><strong>Caches.</strong> A semantic cache holding a question-and-answer pair grounded in the deleted document will keep serving it, faster than the index would, and with no retrieval step to filter. See <a class="xref" href="/concepts/semantic-caching">semantic caching</a>.</li>
+      <li><strong>Eval sets and fine-tuning corpora.</strong> Less urgent, occasionally the one that matters most.</li>
+    </ul>
+
+    <p>The practical version: give every derived artefact a <code class="inline">source_ids</code> array at creation time, and make deletion a fan-out over that index rather than a single row operation. Retrofitting provenance after the first erasure request is significantly more expensive than carrying it from the start, which is the same argument <a class="xref" href="/operations/governance-compliance/erasure-against-agent-memory">erasure against agent memory</a> makes from the governance side.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Make staleness a number, per source, with a name on it.</h3>
+
+    <p>Freshness is unowned in most systems because it is unmeasured, and it is unmeasured because the obvious metric — "when did the crawler last run" — measures the crawler rather than the corpus. The number that means something is <strong>change-to-queryable</strong>: wall-clock from the moment a document changed at the source to the moment the updated version can be retrieved. Instrument it by stamping the source's own modification timestamp onto the chunk at ingest and differencing against ingest time.</p>
+
+    <ul>
+      <li><strong>Report it per source, at p99.</strong> A mean across a wiki, a ticketing system and a document store is a number about none of them. One source with an expired webhook will sit at days while the mean looks fine.</li>
+      <li><strong>Report deletion separately.</strong> Delete-to-unqueryable is a different distribution with a different owner and a different consequence. It is the number to put in front of whoever signs off on retention.</li>
+      <li><strong>Alert on the absence of events, not just on errors.</strong> A change feed that goes quiet looks identical to a corpus that stopped changing. Every source needs an expected-event-rate floor and an alarm beneath it; this is the single highest-yield monitor on the whole pipeline.</li>
+      <li><strong>Put the timestamp in the retrieved chunk.</strong> Return <em>last modified</em> alongside the text so the model can see it and say "as of 3 September" rather than asserting the present tense. Costs a handful of tokens; converts a category of silent wrongness into a hedge the reader can act on.</li>
+      <li><strong>Add expiry cases to the eval set.</strong> A question whose correct answer changed, and a question whose source document was deleted, belong in the small living eval set described in <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">evaluating RAG</a>. Without them, every freshness regression ships green.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Decide the staleness budget per corpus, and let some of it be generous.</h3>
+
+    <p>None of this argues for minimising staleness everywhere. Freshness costs money and complexity, and a lot of corpora do not need much of it. The decision is a per-corpus budget written down once, by someone who owns the content rather than the pipeline:</p>
+
+    <ul>
+      <li><strong>Minutes, event-driven.</strong> Anything a person acts on and a person can change: pricing, policy, on-call rotas, entitlements, incident notes. Here a deletion event must be honoured immediately, and the index should prefer returning nothing to returning something retracted.</li>
+      <li><strong>Hours, event-driven with a nightly sweep.</strong> Product documentation, internal wikis, support macros. The common case, and the one the architecture in Steps 3 and 4 is sized for.</li>
+      <li><strong>Days, scheduled.</strong> Research corpora, archives, published papers, anything append-mostly where an old version is still a true statement about the past.</li>
+      <li><strong>Never index it.</strong> If a corpus changes faster than you can propagate and the answer must be current — an order status, a ticket queue, a balance — retrieval is the wrong tool. Give the agent a live query tool instead. This is the same conclusion <a class="xref" href="/deep-dives/retrieval-and-rag/local-first-retrieval">local-first retrieval</a> reaches about source trees: grep reads the file as it is now, and no invalidation strategy beats not having a copy.</li>
+    </ul>
+
+    <p>That last row is the one worth arguing for hardest, because it is the option nobody proposes in the design meeting. A large fraction of freshness engineering exists to make an index behave like a live query. If the field is small, structured and already exposed by an API, the honest architecture is a tool call — and the index keeps the prose that does not change every hour.</p>
+
+    <div class="callout tip">
+      <p>If you do one thing: pick your most important corpus and measure delete-to-unqueryable today, by deleting a test document at the source and timing how long it keeps coming back. Most teams have never run this and are surprised by the answer, because the number is usually the crawl interval plus the store's compaction lag plus however long the cache lives — three delays nobody adds up. Then give deletion its own event path and its own tombstone, before you spend anything on making updates faster. Related: <a class="xref" href="/operations/safety-and-security/permission-aware-retrieval">permission-aware retrieval</a> for the ACL half, <a class="xref" href="/deep-dives/retrieval-and-rag/agentic-retrieval">agentic retrieval</a> for letting the agent notice staleness and search again, and <a class="xref" href="/concepts/knowledge-cutoffs-and-time">knowledge cutoffs and time</a> for the model's own version of this problem.</p>
+    </div>
+  </div>
+</section>

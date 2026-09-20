@@ -1,0 +1,113 @@
+<section class="phase">
+  <div class="phase-num">O26</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Serving agent traffic: the client that never gives up and never reads.</h2>
+  <p class="goal">Your API's operational design rests on two assumptions that were true for a decade and are not true of an agent: that a frustrated client eventually stops, and that a confused client goes and reads something. An agent's retry is its control loop, so a 429 is a pause rather than a signal, and a badly worded 400 is a prompt rather than a problem — which means your error responses have quietly become the only interface you have for expressing intent to the majority of your traffic. Automated requests passed human ones on the open web in 2026; the operational work is not blocking them, it is serving them deliberately.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>You are already serving it, and your dashboards are averaging two populations.</h3>
+
+    <p>This is not a forecast. Cloudflare Radar, which observes a large slice of the web, recorded automated requests crossing 57.5% of HTML traffic against 42.5% from humans in mid-2026 — a crossover its own published forecast had put a year later. HUMAN Security's benchmark put the growth of <em>agentic</em> traffic specifically, meaning agents taking actions rather than crawlers collecting text, in the thousands of percent year on year. Cloudflare's own breakdown of AI crawler purpose in May 2026 — 51.8% of requests for training against 9.3% for search — is worth holding next to that, because it says most of the automation arriving at a public endpoint is not there to send anyone back.</p>
+
+    <p>Treat those numbers as an order of magnitude, not a constant; the mix differs enormously by industry and by how much of your surface is public. The operational consequence does not depend on the exact figure:</p>
+
+    <ul>
+      <li><strong>Every latency percentile you watch is now a blend.</strong> Agents issue bursts of small reads with no think time; humans issue sparse requests with pauses. A p99 computed over both is a number about neither, and it moves when the mix moves rather than when your service changes.</li>
+      <li><strong>Conversion and engagement metrics inherit the same problem.</strong> A funnel that counts sessions counts agent sessions, and an agent that reads six pages to answer one question looks like an engaged reader with a zero conversion rate.</li>
+      <li><strong>Capacity forecasts built on human seasonality break.</strong> Agent traffic has no evening dip and no weekend, and it arrives in fan-out shaped bursts that look like an attack and are not.</li>
+    </ul>
+
+    <p>The first piece of work, before any policy decision, is a label: classify every request as human, verified agent, or unverified automation, and split every dashboard by it. Almost every later decision on this page needs that label to exist, and teams consistently discover that they cannot answer "how much of this is agents" at all.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>An agent's retry is its control loop, so your 429 is advice it cannot take.</h3>
+
+    <p>A human who hits a rate limit goes away. A browser with exponential backoff gives up after a few attempts. An agent in a loop treats a failed tool call as a step, reasons about it, and calls again — possibly having rewritten the request in a way that defeats whatever deduplication you had. The loop terminates when the model decides it has succeeded or when its harness's step budget runs out, and neither of those is your rate limit.</p>
+
+    <p>This inverts what a rate limiter is for. It was a capacity control with a side effect of shaping behaviour; against agent traffic it is primarily a communication channel, and how you shape the response decides whether the caller backs off or hammers:</p>
+
+    <ul>
+      <li><strong>Always send <code class="inline">Retry-After</code>, and make it truthful.</strong> An agent can honour a number. It cannot infer a schedule from a bare 429, and the model's prior is to try again immediately.</li>
+      <li><strong>Distinguish "too fast" from "out of quota" in the body, not just the status.</strong> They demand opposite behaviours — wait versus stop and escalate to a human — and both arrive as 429. A machine-readable reason code is the difference between a paused agent and a wedged one.</li>
+      <li><strong>Never return a retryable status for a permanent condition.</strong> A 503 emitted because a required field was missing buys you an infinite loop at your own expense. Permanent failures must be 4xx and must say which field.</li>
+      <li><strong>Shape rather than reject where you can.</strong> Queueing a request for two seconds costs you a held connection; rejecting it costs you the request again in a hundred milliseconds, plus the model tokens the caller burned deciding to retry. Against loop-driven clients, the cheap-looking option is often the expensive one.</li>
+    </ul>
+
+    <p>This is the mirror image of the discipline in <a class="xref" href="/operations/agentops/rate-limits-and-provider-capacity">rate limits and provider capacity</a>, which covers your side of the call. Both halves obey the same rule: a limit that cannot be read by the thing hitting it is a limit that gets hit again.</p>
+
+    <div class="callout warn">
+      <p>Watch for the retry-storm shape specific to agents: identical-intent requests with non-identical bytes. The agent rephrases the query, reorders parameters or adds a field between attempts, so request-hash deduplication and idempotency keys derived from the body both miss. Deduplicate on the caller's declared operation and resource identifiers, not on a checksum of what they sent.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Your error messages are prompts now, so write them as instructions.</h3>
+
+    <p>A human who gets <em>"Invalid request"</em> opens your documentation. An agent puts that string into its context and guesses, and its next attempt is drawn from a distribution you influenced by exactly nine characters. The error body is the highest-leverage text on your API surface and is almost always the least-maintained.</p>
+
+    <p>What separates an error an agent recovers from cleanly from one that produces three more failed calls:</p>
+
+    <ul>
+      <li><strong>Name the field and the constraint.</strong> "<code class="inline">start_date</code> must be ISO-8601 and not later than <code class="inline">end_date</code>" is recoverable in one turn. "Invalid date range" is a coin flip.</li>
+      <li><strong>Say whether retrying could ever work.</strong> A boolean <code class="inline">retryable</code> in the body removes an entire class of loop. Humans infer this from tone; models infer it from nothing.</li>
+      <li><strong>Offer the valid set when it is small.</strong> Returning the eight allowed enum values costs a few dozen bytes and removes a search problem. This is the same discipline as writing good <a class="xref" href="/deep-dives/tool-capability-design/tool-error-messages">tool error messages</a> — the audience is identical, because increasingly it <em>is</em> the same audience.</li>
+      <li><strong>Keep codes stable and documented, because they are being memorised.</strong> A model that has seen your API in training or in a tool description has a prior about your error shapes. Renaming a code is a behavioural change to every caller at once, with no deprecation channel.</li>
+    </ul>
+
+    <p>The same logic extends one level out. If you publish an OpenAPI description or an <a class="xref" href="/concepts/what-is-mcp">MCP</a> server, that document is now your real documentation for most non-human callers, and the prose page is a fallback. Under-described parameters in a schema produce exactly the failure modes catalogued in <a class="xref" href="/deep-dives/tool-capability-design/tool-schemas-and-contracts">tool schemas and contracts</a>, except that here you are the one absorbing the retries.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Writes need an idempotency contract you publish, not one you hope for.</h3>
+
+    <p>The read side of agent traffic is a capacity problem. The write side is a correctness problem, and it is the one that produces refunds. An agent that loses a connection mid-write does not know whether the write landed; the model's options are to retry or to ask a human, and every harness ever built biases toward retry. Duplicate orders, duplicate tickets, duplicate messages, duplicate charges.</p>
+
+    <p>You cannot fix this from the caller's side, because you do not control the caller. Publish the contract instead:</p>
+
+    <ul>
+      <li><strong>Accept an idempotency key on every mutating endpoint</strong> and document it in the schema description, where the model will actually see it. Store the key with the response for a stated window and replay the original response on a repeat.</li>
+      <li><strong>Make the replayed response identical, including the status code.</strong> A 200 on the first attempt and a 409 on the replay teaches the agent that something went wrong, and it will try to fix it.</li>
+      <li><strong>Return a stable resource identifier in every write response.</strong> It gives the agent a way to check rather than repeat — and "check first" is a behaviour you can actually get, if checking is cheap and obvious.</li>
+      <li><strong>Provide a cheap read-back path.</strong> Most duplicate writes are a failed read in disguise: the agent could not confirm, so it acted. A fast, rate-limit-exempt "did this happen" endpoint is worth more than any amount of retry tuning.</li>
+    </ul>
+
+    <p>The internal-facing version of this argument is in <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a>; the difference outbound is that you must express the contract in a schema rather than in a runbook, because the client reading it has never met you.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>You cannot price, ration or exempt what you cannot identify.</h3>
+
+    <p>Every policy worth having — a higher limit for a paying customer's agent, a lower one for anonymous automation, an exemption for a read-back endpoint — needs the caller to be identifiable. User-agent strings are self-asserted and were always a courtesy. The regimes that actually carry weight, and their honest limits, are covered in <a class="xref" href="/concepts/bot-verification-and-agent-access">bot verification and agent access</a>; the operational decisions that follow are these:</p>
+
+    <ul>
+      <li><strong>Decide what unverified automation gets, explicitly.</strong> The default today is that it degrades — slower, throttled, occasionally challenged — which is a policy nobody wrote down and nobody can explain to a partner whose agent is failing intermittently. Write the tier down and publish it.</li>
+      <li><strong>Separate identity from intent.</strong> Knowing a request came from a well-known agent platform tells you nothing about whose behalf it is acting on. A customer's assistant and an arbitrary user's research agent can arrive from the same infrastructure with the same signature, and they deserve different limits. Where you need the distinction, require an end-user credential and treat the platform signature as a hint.</li>
+      <li><strong>Price the work, not the session.</strong> Seat-based and session-based pricing assume a human behind each one. Against agent callers the stable unit is the operation — a lookup, a write, a report — which is also the unit your cost actually scales with. The wider argument is in <a class="xref" href="/operations/economics-roi/pricing-models">pricing models</a>.</li>
+      <li><strong>Expect to be a tool in someone else's loop.</strong> If your endpoint is wrapped in an MCP server you do not control, your rate limit is being consumed by a caller who cannot see it, on behalf of a user who does not know you exist. Design the error text for that reader.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Instrument the four numbers that tell you whether the policy is working.</h3>
+
+    <p>Agent traffic fails quietly in both directions — you can be over-serving it at your own cost or under-serving a partner into a support ticket — and neither shows up on a standard dashboard. Four measurements cover it:</p>
+
+    <ul>
+      <li><strong>Traffic share by class, per endpoint.</strong> Human, verified agent, unverified automation. Per endpoint matters: the mix on a pricing page and on a write API are different products with different answers.</li>
+      <li><strong>Retry multiplier after a 4xx or 429.</strong> How many further requests arrive from the same caller within the next minute. This is the direct measurement of whether your error text worked, it is cheap to compute, and it is the fastest feedback loop available for improving it.</li>
+      <li><strong>Duplicate-write rate.</strong> Mutating requests that an idempotency key collapsed, plus near-duplicates that arrived without a key. The second figure is the one that becomes a refund.</li>
+      <li><strong>Cost per class.</strong> Compute, bandwidth and any downstream model or vendor spend attributed to automation rather than to people. Without it, an agent-driven traffic increase reads as growth right up until the margin conversation, and the denial-of-wallet risk in <a class="xref" href="/operations/safety-and-security/denial-of-wallet-and-cost-attacks">denial of wallet and cost attacks</a> is invisible until it is large.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you do one thing: take your five most-called endpoints, read their error bodies as though you were a model with no memory and no browser, and rewrite the ones that do not name a field, a constraint and whether retrying can help. That is a day of work, it needs no new infrastructure, and it reduces load from the traffic class that is now the majority — because every retry you prevent is a request you never serve. Then add an idempotency key to your writes and split one dashboard by caller class. Related: <a class="xref" href="/operations/agentops/concurrency-and-scaling">concurrency and scaling</a> for absorbing the bursts, <a class="xref" href="/deep-dives/tool-capability-design/shaping-tool-results">shaping tool results</a> for what a good response looks like to a model, and <a class="xref" href="/concepts/agent-interoperability">agent interoperability</a> for where this is all heading.</p>
+    </div>
+  </div>
+</section>
