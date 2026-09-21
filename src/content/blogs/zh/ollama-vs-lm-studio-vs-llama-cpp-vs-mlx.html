@@ -1,0 +1,201 @@
+<p class="lede">把四个本地运行时指向同一份权重、同一段提示词、同一个 OpenAI 兼容端点，你会在进去的方向上拿到四份不同的提示词；而在出来的方向上，你拿到的东西介于「一个解析好的 <code>tool_calls</code> 数组」与「一坨躺在 <code>content</code> 里、会被你的智能体框架当成回答的 XML」之间。这句话里没有一个字关乎每秒多少令牌，而每秒多少令牌是所有人唯一拿来比较的那根轴。真正决定你的本地智能体能不能跑得起来的那一层，是进去时的聊天模板和出来时的工具调用解析器——而这四个运行时把两者都从零重新实现了一遍，各实现各的。</p>
+
+<section>
+  <h2>一眼看清</h2>
+  <p>这里有两个是引擎，另两个是裹在引擎外面的体验层——这是惯用的分法，而对一个智能体来说这个分法是错的。真正要紧的那根轴是：谁来构造提示词，谁来解析回复。</p>
+
+  <table>
+    <thead>
+      <tr><th>运行时</th><th>提示词由谁构造</th><th>工具调用由谁解析</th><th>约束输出？</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>llama.cpp</td>
+        <td>自家从头写的 C++ Jinja 引擎</td>
+        <td>一个差分自动解析器，外加 15 个手写解析器</td>
+        <td><strong>有</strong>——由解析器导出的 GBNF</td>
+      </tr>
+      <tr>
+        <td>Ollama</td>
+        <td>手写的 Go 渲染器，或 Go 文本模板，或交给 llama.cpp</td>
+        <td>19 个手写的 Go 解析器，或一次子串扫描</td>
+        <td>没有</td>
+      </tr>
+      <tr>
+        <td>LM Studio</td>
+        <td>闭源；或者它自己注入的系统提示词</td>
+        <td>闭源；兜底是一套自创的文本协议</td>
+        <td>仅在 MLX 上，经由 llguidance</td>
+      </tr>
+      <tr>
+        <td>mlx-lm</td>
+        <td><strong>模型作者自己的模板</strong>，经由 Hugging Face</td>
+        <td>12 个手写解析器，或者压根没有</td>
+        <td>没有</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx/data-parser-counts.svg" alt="横向柱状图，显示各运行时自带的、手写的、针对特定模型的工具调用解析器数量：Ollama 19 个、llama.cpp 15 个、mlx-lm 12 个。LM Studio 的是闭源的，未计入。" width="900" height="400" loading="lazy" />
+    <figcaption>三个项目各自独立地为同一批模型维护着一座「每模型一解析器」的动物园。LM Studio 私下维护着第四座。</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx/data-feature-matrix.svg" alt="特性矩阵，四个运行时为行、四根轴为列：对模型作者模板的提示词忠实度、工具调用解析、语法约束的工具输出，以及 tool_choice 支持。" width="900" height="400" loading="lazy" />
+    <figcaption>没有哪一行在四根轴上都强。进去的方向最忠实的那一个，出来的方向最弱。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>那个没人做基准测试的层</h2>
+
+  <figure>
+    <img src="/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx/arch-where-it-breaks.svg" alt="流水线示意图：从一个 OpenAI 格式的请求，经过聊天模板渲染、令牌生成、工具调用解析，回到一个 tool_calls 数组；渲染与解析两步被标出为各运行时用自己实现替换掉的两处，而中间的权重完全相同。" width="900" height="500" loading="lazy" />
+    <figcaption>四列里的权重是同一份。所有不同都坐在它的两侧。</figcaption>
+  </figure>
+
+  <p>一次 OpenAI 形状的工具调用，是穿过两次翻译的一趟往返。你的 <code>messages</code> 与 <code>tools</code> 数组，会用随模型一起发布的一份 Jinja 模板渲染成一整根扁平字符串；模型按它被训练时的那套标记吐出文本——<code>&lt;tool_call&gt;</code>、<code>[TOOL_CALLS]</code>、<code>&lt;|tool_call&gt;</code>、一个通道头、一个类 Python 的调用表达式；然后运行时把那段文本解析回结构化的 <code>tool_calls</code>。权重只看得见中间那一段。</p>
+
+  <p>这两次翻译都是按模型来的，都不存在任何规范意义上的文档，而且都会悄无声息地失败。渲染错了，模型收到的是一份与它训练时不匹配的提示词，于是产出略差一些的工具调用——没有报错。解析错了，那次工具调用会以散文形式抵达 <code>content</code> 字段，而你那个只盯着 <code>tool_calls</code> 的智能体框架，看到的是一个不肯用工具的模型。正是这个失败模式让本地智能体显得「就是不听指令」，也正因如此，修法几乎从来不是换个更大的模型。这也是为什么<a href="/zh/concepts/constrained-decoding">约束解码</a>在这里远比在面对一个托管 API 时更要紧——在那边，两端的翻译都归厂商管。</p>
+</section>
+
+<section>
+  <h2>llama.cpp——从一座解析器动物园，走到一个会读模板的解析器</h2>
+
+  <p>llama.cpp（MIT，12.9 万星，2026 年 9 月 14 日发布语义化版本 <code>v0.4.1</code>，与滚动构建标签并行）在 2026 年走的方向和其他所有人相反，而数字把这件事说得很生动。3 月 6 日之前，它的 <code>common_chat_format</code> 枚举有 29 个取值——<code>LLAMA_3_X</code>、<code>HERMES_2_PRO</code>、<code>FUNCTIONARY_V3_2</code>、<code>COMMAND_R7B</code>、<code>DEEPSEEK_R1</code>，一个模型家族一个，各自带一个解析器。今天这个枚举有五个。</p>
+
+  <p>顶替掉另外 24 个的东西确实巧妙：一个差分自动解析器，<em>靠读模型自己的聊天模板来推断那套标记</em>。它用哨兵值把模板渲染好几遍——源码里真的写着 <code>FFF_FIRST_FUN_F</code> 和 <code>AA_ARG_FST_AA</code> 这样的探针字符串——再对输出做差分，提取出分隔符、参数编码方式、调用 ID 的位置，以及推理段是不是基于标签的。由此它构造出一个 PEG 解析器，再由那个 PEG 解析器导出一份 GBNF 语法去约束生成，并在模型吐出工具段标记时惰性触发。</p>
+
+  <p>最后这一步是整篇对比里最有价值的东西，也是唯一存在它的地方：<strong>只有 llama.cpp 在采样时就约束住那次工具调用的形状，而不是先寄希望、再去解析。</strong>一次格式错误的工具调用不是一个需要事后补救的解析失败；它是一串采样器压根不会吐出来的令牌。</p>
+
+  <p>这套架构并没有消灭特例，它只是把特例挪了个地方。<code>common/parsers/</code> 里仍住着 15 个手写解析器（9 月才拆分出来），服务于那些标记格式打败了通用机制的模型——其中一个的命名空间令牌，正好与自动解析器自己的分隔符撞上了。对这些情形的识别，是一连串针对模板原文的子串测试；而其中一条会打印一句警告，恰好告诉你那份模板文件有多承重：它检测出一份过期的 Gemma 4 模板，然后套上兼容性变通。</p>
+
+  <div class="callout">
+    <p>在你信任它的忠实度之前，有两条注意事项值得知道。llama.cpp 在一月把它 vendored 的 Jinja 库换成了一个从头写的引擎，而那个引擎自家的 README 写明了两处与参考行为的已知偏离——模板加进去的空白会被当作一个独立令牌来分词；由用户输入动态拼出来的特殊令牌不起作用。另外还有一个 <code>workaround</code> 命名空间，会在渲染之前改写你的消息数组：把 developer 角色映射成 system、回填非空 content、把工具参数从字符串强转成对象。这些都站得住脚；但没有一样能做到与模型作者的本意逐字节相同。而且文档落后代码落后得厉害——server 的 README 至今还在告诉你函数调用需要加 <code>--jinja</code> 标志，而那个标志早在 2025 年 12 月就成了默认。</p>
+  </div>
+</section>
+
+<section>
+  <h2>Ollama——三条聊天路径，和一次子串扫描</h2>
+
+  <p>Ollama（MIT，18.1 万星，2026 年 9 月 17 日发布 <code>v0.34.2</code>）是四者中用得最多的，内部构造也最出人意料。它 vendored 了 llama.cpp——在写作当天，钉在落后上游约 98 个构建的位置——然后，对一批规模可观且还在扩张的模型，<strong>干脆把 llama.cpp 的整套聊天栈关掉</strong>，自己用 Go 把活儿做了。</p>
+
+  <p>一共有三条路径。清单里带有 Ollama 专属渲染器或解析器的模型，两端都走 Go 代码，并且设置 <code>DisableJinja</code>。更老的模型走一个 Go <code>text/template</code> 加一个通用解析器。其余的交给内嵌的 llama-server，也就是上一节描述的那套。一个模型走哪条路径，取决于它清单里的一个字段——而在至少一个家族里，还取决于一条文件名启发式：在模型名里找 <code>e2b</code> 或 <code>12b</code>，据此在小号与大号渲染器变体之间做选择。</p>
+
+  <p>这份重新实现的体量不小：大约 20 个渲染器文件覆盖 26 个模型名，19 个解析器文件覆盖 27 个。它们中的每一个，都是对「模型本来就随包发布了的那份 Jinja 模板」的第二份实现，由另一个团队维护，走另一条代码路径。Ollama 确实对其中约八个做了逐字节的交叉核对，对照的是模型作者的真实模板——那些参考模板被签入了仓库——但那个测试藏在一个环境变量后面需要主动开启，且覆盖不到三分之一的渲染器。</p>
+
+  <p>通用兜底才是让人不舒服的地方。为了找出一个模型的工具调用标记，Ollama 会走一遍 Go 模板的 AST，定位 <code>{{if .ToolCalls}}</code> 节点，取紧随其后的第一段文本，拿它当开始标签——而如果什么也没找到，代码注释说它会返回 <code>"{"</code>，以表示「应当尝试把 JSON 对象当作工具调用来解析」。随后，对某个具体工具的识别，是在模型输出里对该工具自己的名字做一次字节级子串搜索。它奏效的频率比听上去高；而它的失败恰恰是你能预料到的那些：未决的 issue 列表里有「解析失败时工具调用被无声丢弃」「工具调用之后的内容被丢掉」，以及「某个参数恰好叫 <code>name</code> 时整次工具调用凭空消失」。</p>
+
+  <p>Ollama 里哪儿都没有语法约束。对整个仓库搜 grammar 或 GBNF，只返回一条注释。它渲染、自由生成、再解析回来的东西。它还在 OpenAI 兼容与 Anthropic 兼容两个端点上都把 <code>tool_choice</code> 记为不支持——这就把它排除在「任何需要强制调用的智能体」的后端之外了。</p>
+</section>
+
+<section>
+  <h2>LM Studio——两个档位，和一套别人都不说的协议</h2>
+
+  <p>LM Studio 是这里唯一的闭源主角；它的 SDK 与 CLI 是 MIT，但应用本身没有公开。它同时跑 llama.cpp，以及在 Apple 芯片上跑 MLX，把引擎当作可热加载的运行时来切换。</p>
+
+  <p>它的工具使用模型明确分两档，而文档对此坦诚得不寻常。「原生」支持要求两件事同时成立：模型的聊天模板支持工具，<em>并且</em> LM Studio 实现了该模型那套特定格式。两条都满足的模型会在界面上拿到一个锤子徽章。公布出来的原生支持家族清单是三个——Qwen、Llama 3.1/3.2、Mistral——而同一篇文档里的日志片段标着 2024 年的日期，所以这份清单只能当参考，不能当现状。</p>
+
+  <p>其余一切落到「默认」工具使用，而这一部分在另外三家那里没有对应物。LM Studio 注入它自己的系统提示词，指示模型按一套它自创的格式吐出调用：</p>
+
+  <pre class="standalone">[TOOL_REQUEST]{"name": "tool_name", "arguments": {"param1": "value1"}}[END_TOOL_REQUEST]</pre>
+
+  <p>它还会改写对话，好让那些没有 tool 角色的模板也能用——把 <code>tool</code> 角色的消息转成 <code>user</code>，并把之前助手的 <code>tool_calls</code> 改写成同一套自创语法。文档注明这个格式随时可能变动；并且如果它解析不出一次格式正确的调用，它会把文本原样放回 <code>content</code>。</p>
+
+  <p>把这读作一种工程立场，而不是一个缺陷：LM Studio 判断，一套模型从没见过、靠上下文现教的统一格式，胜过一套它还没实现的、按模型来的格式。对一个聊天应用来说这个取舍合理。而对一个智能体来说，这意味着你的工具调用可靠性，取决于一个在完全不同的标记上微调过的模型的上下文内指令遵循能力——这比另外两种方案的保证都弱得多；而它的 bug 跟踪器里，正持续不断地出现恰好是这个症状的报告：工具调用以原始文本抵达，<code>tool_calls</code> 为空。</p>
+
+  <p>有个例外值得一提，因为它是本文里第二好的机制：LM Studio 的 MLX 引擎是开源的，而它用 llguidance、对照硬编码的按模型标记，去约束工具输出。在 Apple 芯片上跑一个 MLX 模型时，LM Studio 做到了 Ollama 与 mlx-lm 都没做的那件事。</p>
+</section>
+
+<section>
+  <h2>mlx-lm——忠实的提示词，以及有时压根没有的解析器</h2>
+
+  <p>苹果的 mlx-lm 是这里最小的项目（7000 星，对比 llama.cpp 的 12.9 万），而它赢下了所有人都输掉的那一半问题。它直接调用 Hugging Face <code>transformers</code> 的 <code>apply_chat_template</code>，这意味着你的模型看到的那份提示词，就是模型作者的模板，由参考 Jinja2 执行，中间没有任何重新实现。这篇对比里没有第二个能这么说。</p>
+
+  <p>回复那一侧正好相反。它有 12 个工具解析器，靠对聊天模板做子串匹配来挑选——<code>"&lt;minimax:tool_call&gt;" in chat_template</code>、<code>"[TOOL_CALLS]" in chat_template</code>，诸如此类——挑不出来时退回去看词表。而给那些标记只是一层普通 <code>&lt;tool_call&gt;</code> 包装的模型用的通用解析器，一共三行：去空白、<code>json.loads</code>、返回。</p>
+
+  <p>而当什么都匹配不上时，mlx-lm 不会拒绝。它记一条「该模型不支持工具调用」的警告，然后继续往下走——照样把你的 <code>tools</code> 数组喂进模板，于是模型被告知了有哪些工具、调用了一个，而这次调用以文本形式回到 <code>content</code> 里，没有 <code>tool_calls</code> 字段，<code>finish_reason</code> 也没变。这是本文论点最干净的一次演示：同一份权重、一份<em>比</em>任何对手都更忠实的提示词，而那次工具调用完完全全丢在了解析层。还有两条实际提醒：服务端自己的文档里根本没提 <code>tools</code> 这个参数，尽管它实现了；而 PyPI 上最后一个发布版落后当前主干约五个月，所以从 PyPI 钉版本的人，跑的解析代码比仓库看起来要旧上一截。</p>
+</section>
+
+<section>
+  <h2>那个证明论点的 bug：两个项目以相反的顺序读同样的文件</h2>
+
+  <figure>
+    <img src="/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx/compare-template-precedence.svg" alt="从一个同时包含 chat_template.jinja 文件与 tokenizer_config.json 内 chat_template 条目的模型仓库出发的两条路径：Hugging Face 这条偏好 .jinja 文件，GGUF 转换这条偏好 tokenizer_config 条目，于是同一个仓库产出两份不同的提示词。" width="900" height="300" loading="lazy" />
+    <figcaption>同一个仓库、同一个模型、两份渲染出来的提示词——由一条被两套工具链定义成相反方向的优先级规则决定。</figcaption>
+  </figure>
+
+  <p>一个模型仓库可以把它的聊天模板放在两个地方：一个独立的 <code>chat_template.jinja</code> 文件，以及 <code>tokenizer_config.json</code> 里的一个 <code>chat_template</code> 字符串。很多仓库两个都带，因为文件是较新的约定，而那个 JSON 条目被留在了原地。</p>
+
+  <p>Hugging Face <code>transformers</code> 明确地裁决了这件事，源码里的注释写着：独立的聊天模板文件优先于 tokenizer 配置里的模板条目。而 llama.cpp 的 GGUF 转换器裁得正好相反：它先读 <code>tokenizer_config.json</code> 的 <code>chat_template</code>，只把 <code>.jinja</code> 文件当兜底。</p>
+
+  <p>于是，对任何一个「<code>.jinja</code> 文件已更新、而 JSON 条目变陈旧」的模型来说，mlx-lm 渲染出的提示词，与烤进每一个 GGUF、并因此由 llama.cpp、Ollama 与 LM Studio 端出来的提示词，来自两份不同的模板。没有报错，没有警告，也没有一个版本号不匹配能让你注意到。你观察到的，会是一个「GGUF 形态下工具调用莫名比基准数字差」的模型，而你会去怪量化。</p>
+
+  <div class="callout">
+    <p>这就是「模板是一份没有版本的字符串契约」在实践中的意思。没人签字，没人做 diff，两套主流工具链对「哪一份才是权威」各执一词，而失败表现为质量回退而非异常。如果你正在调一个工具调用很糟的本地智能体，在改动任何别的东西之前，先把完整渲染出来的提示词打出来——这里每一个运行时都会给你看——那是最快能发现「你一直在测的提示词和你以为的不是同一份」的办法。</p>
+  </div>
+</section>
+
+<section>
+  <h2>什么时候选哪个</h2>
+
+  <table>
+    <thead>
+      <tr><th>如果你是……</th><th>选</th><th>因为</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>在做一个必须可靠调用工具的智能体</td><td>直接用 llama.cpp</td><td>只有它在采样时就约束工具调用，而不是事后再解析；并且它把模板与自己的解析判断都摊开来给你看。</td></tr>
+      <tr><td>在 Apple 芯片上，且两半都想要</td><td>LM Studio 配 MLX 引擎</td><td>参考级的 MLX 提示词渲染，加上 llguidance 约束的输出——唯一两端都拿到的组合，代价是一个闭源应用。</td></tr>
+      <tr><td>在跑评测，或要与公开数字对齐</td><td>mlx-lm</td><td>只有它原样渲染模型作者的模板，而那些公开分数正是用它跑出来的。先确认它有你那个模型的解析器。</td></tr>
+      <tr><td>要快速把很多模型架起来做非智能体的活儿</td><td>Ollama</td><td>它的模型库与「拉下来就跑」的顺手程度确实无人能及；而当你并不解析工具调用时，这些全都无所谓。</td></tr>
+      <tr><td>在按每秒令牌数做决定</td><td>随便哪个</td><td>它们共用引擎。不管你选哪个，会弄坏你智能体的那样东西在这一页上，不在吞吐图表里。</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <p>在选定任何东西之前，拿同一份权重、同一个工具调用请求，在两个运行时上各跑一遍，然后 diff 三个字段：渲染出来的提示词、原始补全文本，以及 <code>tool_calls</code> 回没回来。二十分钟。如果提示词不同，你就找到了那道质量差距；如果补全文本相近而只有一个产出了 <code>tool_calls</code>，你就找到了那道解析差距——而这整个门类里，就只有这两个 bug。</p>
+  </div>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+
+  <h3>同一个模型，这些运行时产出的结果会不一样吗？</h3>
+  <p>会，而且以两种不同的方式。它们从同一个 <code>messages</code> 数组构造出不同的提示词，因为四者中有三个重新实现了聊天模板、而不是去跑模型作者那份。它们解析模型输出的方式也不同，所以一次工具调用，在一个运行时那里以结构化的 <code>tool_calls</code> 数组返回，在另一个那里以纯文本躺在 <code>content</code> 里。</p>
+
+  <h3>哪一个对模型作者的本意最忠实？</h3>
+  <p>提示词那一侧是 mlx-lm，因为它直接调用 Hugging Face 的 <code>apply_chat_template</code>。这里没有任何一个运行时保证逐字节相同的渲染；而 mlx-lm 的解析是四者里最弱的，所以「进去的方向忠实」本身并不能让它成为最好的智能体后端。</p>
+
+  <h3>为什么我的本地模型「不肯用工具」，而托管版本会？</h3>
+  <p>最可能的解释是：它确实用了，而你的运行时没能解析出那次调用，于是它以文本形式留在了 <code>content</code> 里——那是你的框架从不去看的地方。在对模型下任何结论之前，先看原始补全。</p>
+
+  <h3>有谁用语法约束工具调用的输出吗？</h3>
+  <p>llama.cpp 有，它从自己的解析器导出一份 GBNF 语法，并在工具段标记处惰性触发。LM Studio 的 MLX 引擎有，用的是 llguidance。Ollama 根本没有语法相关的代码，mlx-lm 在工具上也没有。</p>
+
+  <h3>Ollama 只是 llama.cpp 的一层壳吗？</h3>
+  <p>比以前少多了。它 vendored 了 llama.cpp 与 MLX，但对一批还在扩张的模型，它会关掉 llama.cpp 的聊天处理，用自己的 Go 代码渲染提示词、解析回复——在写作当时，自家渲染器覆盖约 26 个模型名、自家解析器覆盖约 27 个。</p>
+
+  <h3>每秒令牌数到底有多要紧？</h3>
+  <p>比那些对比文章暗示的要不那么要紧，因为这些项目共用引擎——Ollama 与 LM Studio 都跑 llama.cpp，而在 Apple 芯片上两者也都越来越多地跑 MLX。吞吐上的差别大多是配置问题；工具调用忠实度上的差别是架构问题。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关：</h3>
+  <ul>
+    <li><a href="/zh/concepts/chat-templates">聊天模板</a> —— 这一切底下那份没有版本的字符串契约。</li>
+    <li><a href="/zh/concepts/small-and-local-models">小模型与本地模型</a> —— 什么情况下本地跑才是对的选择。</li>
+    <li><a href="/zh/concepts/constrained-decoding">约束解码</a> —— 为什么语法约束的工具调用胜过事后解析。</li>
+    <li><a href="/zh/deep-dives/architectures-and-patterns/on-device-agent-architecture">端侧智能体架构</a> —— 一个跑在用户机器上的智能体更完整的形状。</li>
+    <li><a href="/zh/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp">vLLM、SGLang、TensorRT-LLM 与 llama.cpp</a> —— 同一批引擎，改按服务吞吐来评判。</li>
+  </ul>
+  <h3>项目信源：</h3>
+  <ul>
+    <li><a href="https://github.com/ggml-org/llama.cpp/blob/master/docs/autoparser.md">llama.cpp — the differential autoparser, documented</a></li>
+    <li><a href="https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/vocab.py">llama.cpp — GGUF chat-template precedence in the converter</a></li>
+    <li><a href="https://github.com/ollama/ollama/blob/main/tools/template.go">Ollama — how the generic tool-call tag is inferred</a></li>
+    <li><a href="https://github.com/lmstudio-ai/docs/blob/main/1_developer/3_openai-compat/tools.mdx">LM Studio — native vs default tool use</a></li>
+    <li><a href="https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tokenizer_utils.py">mlx-lm — tool-parser inference from the chat template</a></li>
+  </ul>
+</section>

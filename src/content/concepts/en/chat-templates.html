@@ -1,0 +1,75 @@
+<section class="phase">
+  <div class="phase-num">B28</div>
+  <div class="week">Concepts · Core Building Blocks</div>
+  <h2>Chat templates.</h2>
+  <p class="goal">The model never sees your messages array. It sees one flat string of tokens, produced by a Jinja template that shipped alongside the weights, and that template — not your prompt, not your framework — decides what "system", "tool" and "assistant" actually mean to this particular model. It is the highest-leverage artefact in the stack and the only one nobody versions, diffs or tests, which is why a model that calls tools perfectly through one runtime quietly stops through another.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What it does, mechanically.</h3>
+
+    <p>A chat model is still a next-token predictor over a single sequence. Roles, turns and tool calls do not exist at that level; they are a convention encoded as literal text and special tokens, and the chat template is the function that performs that encoding.</p>
+
+    <ul>
+      <li><strong>Input:</strong> your <code class="inline">messages</code> array, and — this is the part people miss — your <code class="inline">tools</code> array too. Tool definitions are not a separate API channel; they are rendered into the same string, in whatever shape the template author chose.</li>
+      <li><strong>Output:</strong> one string, containing the model's special turn markers (<code class="inline">&lt;|im_start|&gt;</code>, <code class="inline">[INST]</code>, <code class="inline">&lt;|start_header_id|&gt;</code> — every family invents its own), which the tokeniser then maps to IDs.</li>
+      <li><strong>The generation prompt:</strong> the template also appends the opening marker for the assistant's turn, so the model continues rather than predicting a new user message. Forget this flag and the model politely writes the user's next line for you.</li>
+    </ul>
+
+    <p>Because the markers are literal text, the boundary between instruction and data is a string convention, not a type. That is the mechanical reason the <a class="xref" href="/concepts/instruction-hierarchy">instruction hierarchy</a> is advisory and <a class="xref" href="/concepts/prompt-injection-101">prompt injection</a> is not a bug a vendor can patch: by the time the sequence reaches the weights, your system prompt and a retrieved web page are the same kind of thing, distinguished only by text the template wrote around them.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>It is a contract, and nobody versions it.</h3>
+
+    <p>The template ships with the weights but is not part of them. It is a text file in the model repository, and it has all the properties of a dependency and none of the discipline of one.</p>
+
+    <ul>
+      <li><strong>It lives in two places at once.</strong> Modern repositories carry a standalone <code class="inline">chat_template.jinja</code>; older ones carry a <code class="inline">chat_template</code> string inside <code class="inline">tokenizer_config.json</code>; many carry both because the second was never removed. Which one is authoritative depends on the toolchain reading it, and the two dominant toolchains resolve that precedence in <em>opposite</em> directions — so a repository whose <code class="inline">.jinja</code> was updated while the JSON entry went stale renders two different prompts depending on how you loaded it.</li>
+      <li><strong>There is often more than one template per model.</strong> Many models ship a default template and a separate tool-use variant, selected only when a <code class="inline">tools</code> array is present. Your tool-calling behaviour may be governed by a template you have never looked at.</li>
+      <li><strong>Fine-tunes inherit it, correctly or not.</strong> A fine-tune published without its own template gets whatever the base model's was. If the fine-tuning data used a different conversation format — extremely common — every inference is now slightly off-distribution, and nothing reports it.</li>
+      <li><strong>Serving stacks override it.</strong> Every local runtime and several hosted ones let an operator supply a different template, and some substitute their own reimplementation by default. The model card's template and the one actually rendering your traffic are two separate facts.</li>
+    </ul>
+
+    <p>Nothing in that list produces an error. A template mismatch is a quality regression, which is why it is usually blamed on quantisation, on the model, or on the prompt.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The four ways it goes wrong.</h3>
+
+    <p>Ordered by how often they are misdiagnosed rather than by severity.</p>
+
+    <ul>
+      <li><strong>Right model, wrong template.</strong> The inheritance and precedence cases above. Symptom: the model is subtly worse than its published benchmark scores, across the board, with no single reproducible failure. This is the hardest to spot because there is nothing to spot.</li>
+      <li><strong>Right template, different renderer.</strong> Serving stacks reimplement Jinja, or reimplement the template itself in another language for speed. Any reimplementation is a chance to diverge, and the divergences are invisible — a rewritten template that gets one separator wrong produces a fluent, plausible, slightly degraded model.</li>
+      <li><strong>Whitespace, which is not cosmetic.</strong> A space added by a template is not free: depending on where it lands it can be absorbed into a neighbouring token or become a token of its own, changing the sequence the model was trained to expect. This is the clearest illustration that templates operate below the level of text and belong to <a class="xref" href="/concepts/tokens-and-tokenization">tokenisation</a>, not to prompting.</li>
+      <li><strong>Tools rendered by a template that does not support them.</strong> If the template has no branch for the <code class="inline">tools</code> array, your carefully designed schemas are either dropped entirely or flattened into a system message by the serving layer's fallback. The model then calls tools in whatever format it feels like, the runtime fails to parse it, and the call arrives as prose in the content field — which your framework, watching for a structured <code class="inline">tool_calls</code> array, reads as a refusal. See <a class="xref" href="/concepts/tool-calling-explained">tool calling</a> for the round trip this breaks, and the wiki's comparison of <a class="xref" href="/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx">four local runtimes</a> for how differently four projects handle exactly this.</li>
+    </ul>
+
+    <div class="callout">
+      <p>All four failures share a signature: fluent output, no exception, degraded results. That makes the template the first thing to check when a model underperforms in your stack and the last thing anyone does check — because the mental model is "prompt goes in, answer comes out", and the template is invisible in that picture.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Treat it as a versioned dependency.</h3>
+
+    <p>Four habits, in order of how much they save you.</p>
+
+    <ul>
+      <li><strong>Print the fully rendered prompt.</strong> Every serving stack will show it to you, and it is the single highest-value debugging artefact in local inference. Do it once per model on adoption, and again whenever behaviour changes. More people have found their bug in that string than in any evaluation.</li>
+      <li><strong>Pin the template with the weights, and diff it on upgrade.</strong> It is a file; check it into your repository next to the model reference. A template change is a model change — it invalidates your <a class="xref" href="/concepts/evals-101">evaluation</a> baselines exactly as a new checkpoint would, and it silently invalidates your <a class="xref" href="/concepts/prompt-caching">prompt cache</a>, because the cached prefix no longer matches a single byte of the new one.</li>
+      <li><strong>Prefer constraint over parsing for structured output.</strong> A runtime that constrains generation to a grammar cannot emit a malformed tool call; a runtime that parses afterwards can only discover one. That is the practical argument for <a class="xref" href="/concepts/constrained-decoding">constrained decoding</a> and the reason it matters far more when you self-host than when a provider owns both ends of the translation.</li>
+      <li><strong>Record which template produced a run.</strong> A hash of the rendered prefix, stored with the trace, turns "the model got worse last Tuesday" from an argument into a lookup — and it is the same discipline <a class="xref" href="/concepts/reproducibility-and-determinism">reproducibility</a> asks of every other input.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you do one thing: take the model you are running locally and dump the rendered prompt for a request that includes a tool definition. Look for three things — that your tools appear in it at all, that the turn markers match the ones on the model card, and that there is no stray whitespace before the generation prompt. That check takes five minutes, it is the only way to see the layer you are actually programming against, and it resolves a surprising share of "this model is bad at tool calling".</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/system-vs-user-prompts">system vs user prompts</a> for the roles the template encodes, <a class="xref" href="/concepts/small-and-local-models">small &amp; local models</a> for where this bites hardest, and <a class="xref" href="/operations/agentops/model-deprecation-and-migration">model deprecation &amp; migration</a> for handling the template change that arrives with the next checkpoint.</p>
+  </div>
+</section>
