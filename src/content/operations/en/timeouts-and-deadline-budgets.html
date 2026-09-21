@@ -1,0 +1,135 @@
+<section class="phase">
+  <div class="phase-num">O27</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Timeouts &amp; deadline budgets: the number nobody chose.</h2>
+  <p class="goal">Every timeout in your agent was picked by someone who could not see the others, and the product of those independent choices — not any of them individually — is the worst case you actually ship. A thirty-second tool ceiling inside a twenty-step loop with two automatic client retries is a run that can legitimately last most of an hour, and nobody wrote that number down or agreed to it. Smaller constants will not fix it. The fix is to stop configuring timeouts at call sites and start passing a deadline down the run, because a budget composes and a constant does not.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The arithmetic nobody did.</h3>
+
+    <p>A request/response service has one hop and one timeout, so the timeout <em>is</em> the worst case. An <a class="xref" href="/concepts/the-agent-loop">agent loop</a> has a step count you do not control, and the loop multiplies every number inside it.</p>
+
+    <p>Work a realistic configuration through. Twenty steps, each a model call plus a tool call. The tool client is set to 30 seconds. The model SDK is left at its default — the OpenAI Python library times out after ten minutes and retries certain errors twice on its own, before your code ever sees a failure. The honest ceiling on that run is not "thirty seconds" and not "ten minutes". It is twenty times the sum of both, times the retry multiplier, and it is measured in hours.</p>
+
+    <p>Nobody intends this, because the defaults are inherited from three libraries that disagree about what "too long" means:</p>
+
+    <ul>
+      <li><strong>No timeout at all.</strong> Python's <code class="inline">requests</code> sets none by default; its own quickstart warns that "failure to do so can cause your program to hang indefinitely". An agent whose tool layer is built on it has a step that can never end.</li>
+      <li><strong>Five seconds.</strong> <code class="inline">httpx</code> ships <code class="inline">Timeout(timeout=5.0)</code> as its default configuration — reasonable for an API call, catastrophic for a tool that runs a test suite.</li>
+      <li><strong>Ten minutes, plus two silent retries.</strong> The model SDKs, sized for a long reasoning request rather than for your loop.</li>
+    </ul>
+
+    <p>Your agent inherits whichever of these fires first, which is rarely the one you would have chosen. And the tail is worse than the mean suggests, because the loop gives the slow path many chances to happen: a step that takes the slow branch <strong>one time in a hundred</strong> produces a slow <em>run</em> <strong>roughly one time in six</strong> at twenty steps. You do not get to average that away. The p99 of a run is set by the worst step in it, and you have twenty draws.</p>
+
+    <div class="callout">
+      <p>Write down the number you are actually shipping before you tune anything. Multiply your per-step ceiling by your step cap, add the model-call ceiling times the same cap, multiply by one plus your automatic retry count. If that product is larger than the <a class="xref" href="/operations/agentops/slos-and-error-budgets">SLO</a> you published, you do not have a latency problem yet — you have a specification problem, and every fix below is downstream of fixing that.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>A deadline is a value you pass. A timeout is a constant you configure.</h3>
+
+    <p>Distributed systems settled this argument a decade ago and agent stacks have mostly not read the transcript. gRPC's own guidance puts it plainly: a deadline is "a point in time past which a client is unwilling to wait", a timeout is "the max duration of time that the call can take", and the two are related by adding the timeout to the clock at the moment the call starts. The deadline is the primitive. The timeout is a derived quantity.</p>
+
+    <p>Two mechanics are worth stealing verbatim:</p>
+
+    <ul>
+      <li><strong>Propagation is automatic in the mature implementations.</strong> A server that calls another server honours the original client's deadline — enabled by default in Go and Java, explicitly in C++. gRPC's documentation is blunt about why you want this: doing it by hand is "error-prone".</li>
+      <li><strong>It travels as remaining time, not as a timestamp.</strong> gRPC converts the deadline back into a timeout with the elapsed time already deducted, precisely so that unsynchronised clocks on two machines cannot corrupt it. Your run's budget should move the same way.</li>
+    </ul>
+
+    <p>Ported to an agent, that is four rules:</p>
+
+    <ul>
+      <li><strong>Mint the deadline where you mint the run.</strong> The goal arrives, you allocate a run ID, and you allocate an absolute deadline in the same breath — they belong to the same record, for the same reason, and both need to reach every layer. If you are already carrying the run ID for <a class="xref" href="/concepts/trajectories">trajectory</a> reasons, the budget rides along for free.</li>
+      <li><strong>Derive every call's timeout as <code class="inline">min(remaining, ceiling_for_this_step_type)</code>.</strong> The per-step ceiling stays — it is how you stop one pathological tool from eating the whole run — but it can only ever shorten the call, never extend it past the deadline.</li>
+      <li><strong>Refuse to start what cannot finish.</strong> If the remaining budget is below the p50 for this step type, do not make the call. Starting work you will abandon spends money, produces a side effect you will have to reconcile, and buys nothing. gRPC servers do this by cancelling an already-expired RPC rather than serving it; your harness should do it before dialling.</li>
+      <li><strong>Subagents inherit a slice, never a fresh allocation.</strong> This is the most common way the budget quietly evaporates: a parent with five minutes left spawns three <a class="xref" href="/concepts/subagents">subagents</a> that each construct a default ten-minute budget, and the parent's deadline becomes decorative. A child's budget is a portion of the parent's remaining time, decided by the parent, and the parent must still be alive to receive the answer.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>A timeout abandons work. It does not cancel it.</h3>
+
+    <p>This is the part that turns a latency control into a correctness problem, and it is the one most agent stacks get wrong. gRPC's documentation says the quiet part directly: "the server application is responsible for stopping any activity it has spawned to service the RPC." Your timeout firing is a statement about your patience. It is not a statement about the other system's behaviour.</p>
+
+    <p>So when a tool call times out at thirty seconds and the remote handler commits at thirty-one, you are now holding a question rather than a failure: <em>did it happen?</em> And the agent's instinct — the model sees an error and proposes the call again — is the worst available answer, because the model has no way to know the first attempt landed. Two invoices, two tickets, two emails.</p>
+
+    <p>The controls are unglamorous and they all live below the model:</p>
+
+    <ul>
+      <li><strong>Mint the idempotency key before the first attempt, not on retry.</strong> A key generated at retry time is a new key, which is the same bug wearing a hat. See <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency &amp; retries</a> for the full contract.</li>
+      <li><strong>Make the timeout path a reconcile, not a retry.</strong> On expiry of a write, the next operation is a read by key — "did operation <code class="inline">k</code> land?" — and only its answer decides whether to re-issue. Reconciliation is cheap, bounded and safe; blind retry is none of those.</li>
+      <li><strong>Never let the model own the retry decision for a write.</strong> Reads are fine to re-drive from the loop. Writes are not, because the decision needs state the model does not have. The harness swallows the timeout, reconciles, and hands the model a settled fact. This is the same boundary <a class="xref" href="/deep-dives/architectures-and-patterns/tool-error-recovery">tool error recovery</a> draws between errors the model should see and errors it should never be shown.</li>
+      <li><strong>Record the abandonment.</strong> Every expired write is a potential orphan. Log it as one, with the key, so that <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a> is a query rather than an archaeology project.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Cancellation is a capability, not an assumption. If a tool can take minutes — a build, a migration, a long retrieval — it needs an explicit cancel endpoint and your harness needs to call it on expiry. Absent that, "timeout" means you have stopped watching a process that is still running, still costing, and still capable of changing your data. Durable execution engines exist largely to make this survivable; see <a class="xref" href="/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal">durable execution</a>.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Streaming and thinking destroy your liveness signal.</h3>
+
+    <p>A read timeout asks "have bytes arrived recently?" For a decade that was a fair proxy for "is this making progress?" In an agent stack it is no longer either.</p>
+
+    <ul>
+      <li><strong>Keepalives keep a dead run alive.</strong> An SSE stream that emits a comment frame every fifteen seconds will never trip a read timeout, no matter how thoroughly the thing behind it has stopped doing useful work. You have configured a liveness check on your transport and it is answering on behalf of a corpse.</li>
+      <li><strong>Reasoning tokens make time-to-first-useful-output variable by design.</strong> An adaptive effort budget is exactly a mechanism for spending unpredictable amounts of time before anything observable happens — see <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">adaptive thinking &amp; effort budgets</a>. Any timeout tight enough to catch a hung request will also kill a legitimately hard one.</li>
+      <li><strong>Token arrival is not step progress.</strong> A model emitting a long, confident, wrong plan is producing bytes at full rate while the run goes nowhere.</li>
+    </ul>
+
+    <p>Run two clocks instead of one, and make the first one semantic:</p>
+
+    <ul>
+      <li><strong>An inactivity clock on state change, not on bytes.</strong> Reset it when something happens that a reader of the <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">trace</a> would call an event: a tool call emitted, a tool result returned, a message completed, a checkpoint written. Not on a keepalive, not on a token.</li>
+      <li><strong>A hard wall on the run deadline from STEP 2.</strong> Absolute, unconditional, and independent of how lively things look.</li>
+    </ul>
+
+    <p>And give long-running tools a progress protocol — a heartbeat that carries a monotonically advancing unit of work, not just a pulse. Without one your only choices are killing work that was fine and waiting forever on work that is not, and you will pick wrong in both directions.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Reserve budget for the landing.</h3>
+
+    <p>The most wasteful failure in a deadline-bounded agent is the run that spends 100% of its budget working and 0% of it answering. The deadline arrives mid-tool-call, the harness kills the run, and a nearly complete piece of work is returned as an error — having cost full price.</p>
+
+    <p>Treat the finish as a funded step. Reserve a tail — a flat twenty seconds, or 10% of the budget, whichever is larger — that nothing but termination may spend. Then spend the rest on a ladder rather than a cliff:</p>
+
+    <ul>
+      <li><strong>At roughly 60% consumed, stop widening.</strong> No new <a class="xref" href="/concepts/parallel-tool-calls">parallel exploration</a>, no new subagents, no speculative retrieval. Breadth is what you buy with budget you have; at this point you no longer have it.</li>
+      <li><strong>At roughly 80%, admit only calls that fit.</strong> Every remaining tool call must have a p95 below the remaining budget minus the reserve. This is the refuse-to-start rule from STEP 2, applied with a harder threshold.</li>
+      <li><strong>At the reserve, stop and land.</strong> Summarise what is established, what is not, and what was in flight when the budget ran out.</li>
+    </ul>
+
+    <p>Two details decide whether this is useful or merely tidy. <strong>Tell the model the remaining budget.</strong> If it can adapt its effort, the budget is an input to that decision, not a wrapper around it — a model that knows it has ninety seconds left will pick a different plan than one that discovers it by being killed. And <strong>label the partial result as partial</strong>, with the boundary visible: "budget exhausted after 14 steps; the account reconciliation is complete, the vendor lookup was in progress and is not included." A truncated run presented as a finished answer is strictly worse than a clean failure, because it launders an unknown into a claim — which is precisely what a <a class="xref" href="/playbooks/agent-ux-and-human-interaction/review-queues-for-agent-output">review queue</a> cannot catch. Everything else in this step is ordinary <a class="xref" href="/operations/agentops/graceful-degradation-and-fallback">graceful degradation</a>; the labelling is the part people skip.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Operate it: four numbers, and one of them is not what you think.</h3>
+
+    <p>Timeout policy is invisible on a standard dashboard, because everything it does shows up as errors and latency that look like somebody else's fault.</p>
+
+    <ul>
+      <li><strong>Separate "we gave up" from "they failed".</strong> A client-side deadline exceeded and an upstream 503 are the same red bar and opposite problems: one is your configuration, one is their availability, and averaging them produces a quarter of work aimed at the wrong system. This distinction belongs in your <a class="xref" href="/operations/evaluation-and-observability/failure-taxonomy-and-triage">failure taxonomy</a> before it belongs on a chart.</li>
+      <li><strong>Attribute the exhaustion to the step that spent the budget, not the step that was holding it.</strong> This is the counter-intuitive one, and getting it wrong sends teams optimising innocent code. When a run dies at step 18, step 18 is rarely the culprit — the four-minute retrieval at step 3 is. Attribute by consumption share across the run, which requires per-step budget accounting you have to add deliberately.</li>
+      <li><strong>Watch the distribution of budget utilisation, not the count of timeouts.</strong> If p50 utilisation is 15% and p99 is 100%, your deadline is irrelevant to the median user and is the binding constraint for the tail — which tells you the fix is in the tail's cause, not in the number. Timeout <em>count</em> tells you none of that. Pair this with <a class="xref" href="/operations/evaluation-and-observability/measuring-agent-latency">measuring agent latency</a>, which is where the per-step distributions live.</li>
+      <li><strong>Alert on reconciliations, because that is the true cost of your policy.</strong> Every write you had to read back is a timeout that bought you uncertainty. If that rate rises, your ceilings are too tight, and tightening them further will make correctness worse while making the latency chart look better.</li>
+    </ul>
+
+    <p>Then test it honestly. <a class="xref" href="/operations/agentops/load-testing-agents">Load tests</a> run with deadlines disabled measure a system you do not operate; the interesting behaviour is what the fleet does when budgets start expiring together, which is also when your <a class="xref" href="/operations/agentops/concurrency-and-scaling">concurrency</a> assumptions and your provider's <a class="xref" href="/operations/agentops/rate-limits-and-provider-capacity">rate limits</a> begin interacting badly.</p>
+
+    <div class="callout tip">
+      <p>Do this first, before touching a single constant: emit one field — <strong>budget remaining at every step boundary</strong> — into your existing traces, and leave it for a week. It costs an afternoon and it answers the three questions you are currently guessing at: whether your deadline binds at all, which step actually consumes the run, and how many of your "errors" are your own client giving up on work that finished. Almost every team that does this discovers their real ceiling is set by a library default nobody in the room knew about.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/agentops/kill-switches">kill switches</a> for stopping a run that is inside its budget and still wrong, <a class="xref" href="/operations/agentops/durable-state-and-resumability">durable state &amp; resumability</a> for the runs that should be suspended rather than abandoned, and <a class="xref" href="/concepts/agent-cost-control">agent cost control</a> for the other budget that the same step count multiplies.</p>
+  </div>
+</section>

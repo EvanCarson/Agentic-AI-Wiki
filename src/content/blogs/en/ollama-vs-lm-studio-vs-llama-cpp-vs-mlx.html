@@ -1,0 +1,201 @@
+<p class="lede">Point four local runtimes at the same weights, the same prompt and the same OpenAI-compatible endpoint, and you will get four different prompts on the way in and, on the way out, anywhere between a parsed <code>tool_calls</code> array and a blob of XML sitting in <code>content</code> that your agent framework will treat as an answer. Nothing in that sentence is about tokens per second, and tokens per second is the only axis anyone compares. The layer that decides whether your local agent works at all is the chat template going in and the tool-call parser coming out — and all four runtimes reimplement both, differently, from scratch.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Two of these are engines and two are experience layers wrapped around engines, which is the usual framing and is the wrong one for an agent. The axis that matters is who builds the prompt and who parses the reply.</p>
+
+  <table>
+    <thead>
+      <tr><th>Runtime</th><th>Prompt built by</th><th>Tool call parsed by</th><th>Constrained output?</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>llama.cpp</td>
+        <td>Its own C++ Jinja engine, written in-house</td>
+        <td>A differential autoparser, plus 15 hand-written parsers</td>
+        <td><strong>Yes</strong> — GBNF derived from the parser</td>
+      </tr>
+      <tr>
+        <td>Ollama</td>
+        <td>Hand-written Go renderers, or a Go text template, or llama.cpp</td>
+        <td>19 hand-written Go parsers, or a substring scan</td>
+        <td>No</td>
+      </tr>
+      <tr>
+        <td>LM Studio</td>
+        <td>Closed; or its own injected system prompt</td>
+        <td>Closed; falls back to a bespoke text protocol</td>
+        <td>On MLX only, via llguidance</td>
+      </tr>
+      <tr>
+        <td>mlx-lm</td>
+        <td><strong>The model author's own template</strong>, via Hugging Face</td>
+        <td>12 hand-written parsers, or nothing at all</td>
+        <td>No</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx/data-parser-counts.svg" alt="Horizontal bar chart of hand-written, model-specific tool-call parsers shipped by each runtime: Ollama 19, llama.cpp 15, mlx-lm 12. LM Studio's are closed source and not counted." width="900" height="400" loading="lazy" />
+    <figcaption>Three projects independently maintaining a per-model parser zoo for the same models. LM Studio maintains a fourth, privately.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx/data-feature-matrix.svg" alt="Feature matrix with four runtimes as rows and four axes as columns: prompt fidelity to the model author's template, tool-call parsing, grammar-constrained tool output, and tool_choice support." width="900" height="400" loading="lazy" />
+    <figcaption>No row is strong across all four. The one that is faithful on the way in is the weakest on the way out.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>The layer nobody benchmarks</h2>
+
+  <figure>
+    <img src="/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx/arch-where-it-breaks.svg" alt="Pipeline diagram from an OpenAI-format request through chat-template rendering, token generation and tool-call parsing back to a tool_calls array, marking the render step and the parse step as the two places each runtime substitutes its own implementation while the weights stay identical." width="900" height="500" loading="lazy" />
+    <figcaption>The weights are the same in all four columns. Everything that differs sits on either side of them.</figcaption>
+  </figure>
+
+  <p>An OpenAI-shaped tool call is a round trip through two translations. Your <code>messages</code> and <code>tools</code> arrays are rendered into one flat string using a Jinja template that shipped with the model; the model emits text in whatever markup it was trained on — <code>&lt;tool_call&gt;</code>, <code>[TOOL_CALLS]</code>, <code>&lt;|tool_call&gt;</code>, a channel header, a Python-ish call expression; and the runtime parses that text back into structured <code>tool_calls</code>. The weights only see the middle.</p>
+
+  <p>Both translations are per-model, both are undocumented in any normative sense, and both fail quietly. When the render is wrong the model receives a prompt that does not match its training and produces slightly worse tool calls — no error. When the parse is wrong the tool call arrives as prose in the <code>content</code> field, and your agent framework, which is looking at <code>tool_calls</code>, sees a model that declined to use a tool. That failure mode is why local agents "just don't follow instructions" and why the fix is almost never a bigger model. It is also why <a href="/concepts/constrained-decoding">constrained decoding</a> matters far more here than it does against a hosted API, where the provider owns both ends of the translation.</p>
+</section>
+
+<section>
+  <h2>llama.cpp — from a parser zoo to a parser that reads the template</h2>
+
+  <p>llama.cpp (MIT, 129,000 stars, semver <code>v0.4.1</code> on 14 September 2026 alongside rolling build tags) has spent 2026 going in the opposite direction from everyone else, and the numbers make it vivid. Before 6 March its <code>common_chat_format</code> enum carried 29 values — <code>LLAMA_3_X</code>, <code>HERMES_2_PRO</code>, <code>FUNCTIONARY_V3_2</code>, <code>COMMAND_R7B</code>, <code>DEEPSEEK_R1</code>, one per model family, each with its own parser. Today the enum has five.</p>
+
+  <p>What replaced the other 24 is genuinely clever: a differential autoparser that <em>reads the model's own chat template to work out the markup</em>. It renders the template several times with sentinel values — the source literally contains <code>FFF_FIRST_FUN_F</code> and <code>AA_ARG_FST_AA</code> as probe strings — and diffs the outputs to extract the delimiters, the argument encoding, the call-ID position and whether reasoning is tag-based. From that it builds a PEG parser, and from the PEG parser it derives a GBNF grammar that constrains generation, triggered lazily when the model emits the tool-section marker.</p>
+
+  <p>That last step is the most valuable thing in this entire comparison and the only place it exists: <strong>llama.cpp is alone in constraining the shape of the tool call at sampling time rather than hoping and then parsing.</strong> A malformed tool call is not a parse failure to recover from; it is a token sequence the sampler would not emit.</p>
+
+  <p>The architecture does not eliminate special cases, it relocates them. Fifteen hand-written parsers still live in <code>common/parsers/</code>, split out in September, for the models whose markup defeats the general mechanism — including one whose namespace token collides with the autoparser's own delimiters. Detection of those cases is a chain of substring tests against the raw template text, and one of them prints a warning that tells you exactly how load-bearing the template file is: it detects an outdated Gemma 4 template and applies compatibility workarounds.</p>
+
+  <div class="callout">
+    <p>Two caveats worth knowing before you trust the fidelity. llama.cpp replaced its vendored Jinja library with an engine written from scratch in January, and that engine's own README documents two known departures from reference behaviour — whitespace added by a template is tokenised as a standalone token, and special tokens assembled dynamically from user input do not work. There is also a <code>workaround</code> namespace that rewrites your message array before rendering: remapping the developer role to system, backfilling non-null content, coercing tool arguments from strings to objects. All defensible; none of it byte-identical to what the model author intended. And the documentation lags the code badly — the server README still tells you function calling needs the <code>--jinja</code> flag, which became the default in December 2025.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Ollama — three chat paths and a substring scan</h2>
+
+  <p>Ollama (MIT, 181,000 stars, <code>v0.34.2</code> on 17 September 2026) is the most used of the four and has the most surprising internals. It vendors llama.cpp — pinned, on the day of writing, about 98 builds behind upstream — and then, for a large and growing set of models, <strong>switches llama.cpp's chat stack off entirely</strong> and does the work itself in Go.</p>
+
+  <p>There are three paths. Models with an Ollama-specific renderer or parser in their manifest get Go code on both ends, with <code>DisableJinja</code> set. Older models get a Go <code>text/template</code> plus a generic parser. Everything else is handed to the embedded llama-server, which does what the previous section describes. Which path a model takes is a field in its manifest — and in at least one family, a filename heuristic that looks for <code>e2b</code> or <code>12b</code> in the model name to pick between a small and a large renderer variant.</p>
+
+  <p>The reimplementation is substantial: around 20 renderer files covering 26 model names, and 19 parser files covering 27. Every one of those is a second implementation of something the model already shipped as a Jinja template, maintained by a different team, reached by a different code path. Ollama does cross-check about eight of them byte-for-byte against the model author's real template — the reference templates are checked into the repo — but that test is opt-in behind an environment variable and covers under a third of the renderers.</p>
+
+  <p>The generic fallback is where it gets uncomfortable. To find a model's tool-call marker, Ollama walks the Go template's AST, locates the <code>{{if .ToolCalls}}</code> node, takes the first text that follows it, and uses that as the opening tag — and if it finds nothing, the code comment says it returns <code>"{"</code> to indicate that JSON objects should be attempted as tool calls. Detection of a specific tool is then a byte-level substring search for the tool's own name in the model's output. It works more often than it sounds like it should, and its failures are exactly the ones you would predict: the open issue list includes tool calls silently discarded when parsing fails, content after a tool call being dropped, and a tool call vanishing entirely when a parameter happens to be named <code>name</code>.</p>
+
+  <p>There is no grammar anywhere in Ollama. A repository-wide search for grammar or GBNF returns a single comment. It renders, generates freely, and parses what comes back. It also documents <code>tool_choice</code> as unsupported on both its OpenAI- and Anthropic-compatible endpoints, which rules it out as a backend for any agent that needs to force a call.</p>
+</section>
+
+<section>
+  <h2>LM Studio — two tiers, and a protocol nobody else speaks</h2>
+
+  <p>LM Studio is the only closed-source subject here; its SDKs and CLI are MIT but the application is not published. It runs both llama.cpp and, on Apple silicon, MLX, swapping engines as hot-loadable runtimes.</p>
+
+  <p>Its tool-use model is explicitly two-tier and the documentation is unusually honest about it. "Native" support requires two things at once: the model's chat template supports tools, <em>and</em> LM Studio has implemented that model's specific format. Models meeting both get a hammer badge in the UI. The published list of natively supported families is three — Qwen, Llama 3.1/3.2, and Mistral — and its accompanying log excerpt is dated 2024, so treat the list as indicative rather than current.</p>
+
+  <p>Everything else falls to "Default" tool use, and this is the part with no analogue in the other three. LM Studio injects its own system prompt instructing the model to emit calls in a format it invented:</p>
+
+  <pre class="standalone">[TOOL_REQUEST]{"name": "tool_name", "arguments": {"param1": "value1"}}[END_TOOL_REQUEST]</pre>
+
+  <p>It also rewrites the conversation to fit templates that lack a tool role — converting <code>tool</code>-role messages to <code>user</code>, and rewriting prior assistant <code>tool_calls</code> into the same bespoke syntax. The documentation notes the format is subject to change, and that if it cannot parse a correctly formatted call it returns the text in <code>content</code>.</p>
+
+  <p>Read that as an engineering position rather than a flaw: LM Studio has decided that a uniform format the model has never seen, taught in-context, beats a per-model format it has not implemented. For a chat application that is a reasonable trade. For an agent it means your tool-calling reliability depends on in-context instruction-following by a model that was fine-tuned on completely different markup, which is a much weaker guarantee than either of the alternatives — and the bug tracker carries a steady stream of exactly that symptom, tool calls arriving as raw text with <code>tool_calls</code> empty.</p>
+
+  <p>The exception is worth noting because it is the second-best mechanism in this article: LM Studio's MLX engine is open source, and it constrains tool output with llguidance against hardcoded per-model markers. On Apple silicon with an MLX model, LM Studio does the thing Ollama and mlx-lm do not.</p>
+</section>
+
+<section>
+  <h2>mlx-lm — a faithful prompt and, sometimes, no parser at all</h2>
+
+  <p>Apple's mlx-lm is the smallest project here (7,000 stars against llama.cpp's 129,000) and it wins the half of the problem that everyone else loses. It calls Hugging Face <code>transformers</code>' <code>apply_chat_template</code> directly, which means the prompt your model sees is the model author's template, executed by reference Jinja2, with no reimplementation in between. Nothing else in this comparison can say that.</p>
+
+  <p>The reply side is the inverse. There are 12 tool parsers, selected by substring-matching the chat template — <code>"&lt;minimax:tool_call&gt;" in chat_template</code>, <code>"[TOOL_CALLS]" in chat_template</code>, and so on — with a fallback to inspecting the vocabulary. The generic parser, for models whose markup is a plain <code>&lt;tool_call&gt;</code> wrapper, is three lines: strip, <code>json.loads</code>, return.</p>
+
+  <p>And when nothing matches, mlx-lm does not refuse. It logs a warning that the model does not support tool calling, then proceeds — passing your <code>tools</code> array into the template anyway, so the model is told about the tools, calls one, and the call comes back as text in <code>content</code> with no <code>tool_calls</code> field and <code>finish_reason</code> unchanged. That is the cleanest demonstration available of this article's thesis: identical weights, a <em>more</em> faithful prompt than any competitor produced, and the tool call lost entirely at the parse layer. Two further practicalities: the server's own documentation does not mention the <code>tools</code> parameter at all despite implementing it, and the last PyPI release predates the current main branch by about five months, so anyone pinning from PyPI is running noticeably older parsing than the repository suggests.</p>
+</section>
+
+<section>
+  <h2>The bug that proves the point: two projects read the same files in opposite order</h2>
+
+  <figure>
+    <img src="/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx/compare-template-precedence.svg" alt="Two paths from one model repository containing both a chat_template.jinja file and a chat_template entry inside tokenizer_config.json: the Hugging Face path prefers the .jinja file, the GGUF conversion path prefers the tokenizer_config entry, producing two different prompts from the same repository." width="900" height="300" loading="lazy" />
+    <figcaption>Same repository, same model, two rendered prompts — decided by a precedence rule that the two toolchains define in opposite directions.</figcaption>
+  </figure>
+
+  <p>A model repository can carry its chat template in two places: a standalone <code>chat_template.jinja</code> file, and a <code>chat_template</code> string inside <code>tokenizer_config.json</code>. Many carry both, because the file is the newer convention and the JSON entry was left behind.</p>
+
+  <p>Hugging Face <code>transformers</code> resolves this explicitly, with a comment in the source saying that independent chat-template files take priority over template entries in the tokenizer config. llama.cpp's GGUF converter resolves it the other way: it reads <code>tokenizer_config.json</code>'s <code>chat_template</code> first and uses the <code>.jinja</code> file only as a fallback.</p>
+
+  <p>So for any model whose <code>.jinja</code> file has been updated while the JSON entry went stale, the prompt rendered by mlx-lm and the prompt baked into every GGUF — and therefore served by llama.cpp, Ollama and LM Studio — come from different templates. No error, no warning, no version mismatch to notice. You will observe it as a model that is mysteriously worse at tool calling in GGUF form than the benchmark numbers suggested, and you will blame the quantisation.</p>
+
+  <div class="callout">
+    <p>This is what "the template is an unversioned string contract" means in practice. Nobody signs it, nobody diffs it, two major toolchains disagree about which copy is authoritative, and the failure is a quality regression rather than an exception. If you are debugging a local agent that calls tools badly, dump the fully rendered prompt before you change anything else — every one of these runtimes will show it to you, and it is the fastest way to find out you have been testing a different prompt than you thought.</p>
+  </div>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+
+  <table>
+    <thead>
+      <tr><th>If you are…</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Building an agent that must call tools reliably</td><td>llama.cpp directly</td><td>It is the only one that constrains the tool call at sampling time instead of parsing afterwards, and it exposes the template and its parsing decisions for inspection.</td></tr>
+      <tr><td>On Apple silicon and want both halves</td><td>LM Studio with the MLX engine</td><td>Reference-quality MLX prompting plus llguidance-constrained output — the only combination that gets both ends, at the cost of a closed app.</td></tr>
+      <tr><td>Running evaluations or comparing against published numbers</td><td>mlx-lm</td><td>It is the only one that renders the model author's template unmodified, which is what the published scores were produced with. Check it has a parser for your model first.</td></tr>
+      <tr><td>Standing up many models quickly for non-agentic work</td><td>Ollama</td><td>The model library and pull-and-run ergonomics are genuinely unmatched, and none of this matters when you are not parsing tool calls.</td></tr>
+      <tr><td>Deciding on tokens per second</td><td>Any of them</td><td>They share engines. Whichever one you pick, the thing that will break your agent is on this page and not in a throughput chart.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <p>Before you choose anything, run the same tool-calling request against two runtimes serving the same weights and diff three fields: the rendered prompt, the raw completion text, and whether <code>tool_calls</code> came back populated. Twenty minutes. If the prompts differ you have found your quality gap; if the completions are similar but only one produced <code>tool_calls</code>, you have found a parser gap — and those are the only two bugs in this entire category.</p>
+  </div>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+
+  <h3>Do these runtimes produce different output from the same model?</h3>
+  <p>Yes, and in two distinct ways. They build different prompts from the same <code>messages</code> array, because three of the four reimplement the chat template rather than running the model author's. And they parse the model's output differently, so a tool call that one returns as a structured <code>tool_calls</code> array another returns as plain text in <code>content</code>.</p>
+
+  <h3>Which one is most faithful to the model author's intent?</h3>
+  <p>mlx-lm on the prompt side, because it calls Hugging Face's <code>apply_chat_template</code> directly. No runtime here guarantees byte-identical rendering, and mlx-lm has the weakest parsing of the four, so faithfulness on the way in does not by itself make it the best agent backend.</p>
+
+  <h3>Why does my local model "refuse to use tools" when the hosted version does?</h3>
+  <p>The most likely explanation is that it did use a tool and your runtime failed to parse the call, leaving it as text in <code>content</code> where your framework never looks. Check the raw completion before concluding anything about the model.</p>
+
+  <h3>Does any of them constrain tool-call output with a grammar?</h3>
+  <p>llama.cpp does, deriving a GBNF grammar from its parser and triggering it lazily on the tool-section marker. LM Studio's MLX engine does, using llguidance. Ollama has no grammar code at all, and mlx-lm has none for tools.</p>
+
+  <h3>Is Ollama just a wrapper around llama.cpp?</h3>
+  <p>Less than it used to be. It vendors llama.cpp and MLX, but for a growing list of models it disables llama.cpp's chat handling and renders the prompt and parses the reply in its own Go code — around 26 model names covered by its own renderers and 27 by its own parsers at the time of writing.</p>
+
+  <h3>How much does tokens per second actually matter here?</h3>
+  <p>Less than the comparison articles imply, because these projects share engines — Ollama and LM Studio both run llama.cpp, and both increasingly run MLX on Apple silicon. Throughput differences are mostly configuration. Tool-calling fidelity differences are architectural.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/chat-templates">Chat templates</a> — the unversioned string contract underneath all of this.</li>
+    <li><a href="/concepts/small-and-local-models">Small &amp; local models</a> — when running locally is the right call in the first place.</li>
+    <li><a href="/concepts/constrained-decoding">Constrained decoding</a> — why grammar-constrained tool calls beat parsing afterwards.</li>
+    <li><a href="/deep-dives/architectures-and-patterns/on-device-agent-architecture">On-device agent architecture</a> — the wider shape of an agent that runs on the user's machine.</li>
+    <li><a href="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-llama-cpp">vLLM vs SGLang vs TensorRT-LLM vs llama.cpp</a> — the same engines judged on serving throughput instead.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://github.com/ggml-org/llama.cpp/blob/master/docs/autoparser.md">llama.cpp — the differential autoparser, documented</a></li>
+    <li><a href="https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/vocab.py">llama.cpp — GGUF chat-template precedence in the converter</a></li>
+    <li><a href="https://github.com/ollama/ollama/blob/main/tools/template.go">Ollama — how the generic tool-call tag is inferred</a></li>
+    <li><a href="https://github.com/lmstudio-ai/docs/blob/main/1_developer/3_openai-compat/tools.mdx">LM Studio — native vs default tool use</a></li>
+    <li><a href="https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tokenizer_utils.py">mlx-lm — tool-parser inference from the chat template</a></li>
+  </ul>
+</section>

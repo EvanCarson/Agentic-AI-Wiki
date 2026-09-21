@@ -1,0 +1,75 @@
+<section class="phase">
+  <div class="phase-num">B28</div>
+  <div class="week">概念 · 核心构件</div>
+  <h2>聊天模板。</h2>
+  <p class="goal">模型从来看不见你那个 messages 数组。它看见的是一整根扁平的令牌字符串，由一份随权重一起发布的 Jinja 模板产出；而正是那份模板——不是你的提示词，也不是你的框架——决定了「system」「tool」「assistant」对这个特定模型到底意味着什么。它是整个技术栈里杠杆最大的那件产物，也是唯一一件没人给它打版本、做 diff、写测试的产物；这就是为什么同一个模型在一个运行时下工具调用得完美无缺，换一个就悄悄不灵了。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>它在机制上做了什么。</h3>
+
+    <p>聊天模型仍然是在单一序列上做下一令牌预测。角色、轮次、工具调用在那一层并不存在；它们是被编码成字面文本与特殊令牌的一套约定，而聊天模板就是执行这次编码的那个函数。</p>
+
+    <ul>
+      <li><strong>输入：</strong>你的 <code class="inline">messages</code> 数组，以及——这是被漏掉的那一半——你的 <code class="inline">tools</code> 数组。工具定义不是一条独立的 API 通道；它们被渲染进同一根字符串，形状由模板作者随手选定。</li>
+      <li><strong>输出：</strong>一根字符串，里面带着这个模型的特殊轮次标记（<code class="inline">&lt;|im_start|&gt;</code>、<code class="inline">[INST]</code>、<code class="inline">&lt;|start_header_id|&gt;</code>——每个家族都自己发明一套），随后由分词器映射成 ID。</li>
+      <li><strong>生成提示：</strong>模板还会追加助手那一轮的起始标记，好让模型接着往下写，而不是去预测一条新的用户消息。忘了这个开关，模型就会客客气气地替用户把下一句写出来。</li>
+    </ul>
+
+    <p>由于那些标记是字面文本，指令与数据之间的边界是一种字符串约定，不是一种类型。这就是<a class="xref" href="/zh/concepts/instruction-hierarchy">指令层级</a>只具建议性、而<a class="xref" href="/zh/concepts/prompt-injection-101">提示词注入</a>不是哪家厂商能打补丁的 bug 的机制性原因：等这串序列抵达权重时，你的系统提示词和一份抓回来的网页是同一类东西，区分它们的只有模板写在它们周围的那些文本。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>它是一份契约，而没人给它打版本。</h3>
+
+    <p>模板随权重一起发布，却不属于权重。它是模型仓库里的一个文本文件，拥有依赖项的全部性质，却没有依赖项该有的任何纪律。</p>
+
+    <ul>
+      <li><strong>它同时住在两个地方。</strong>较新的仓库带一个独立的 <code class="inline">chat_template.jinja</code>；较老的把一个 <code class="inline">chat_template</code> 字符串放在 <code class="inline">tokenizer_config.json</code> 里；很多仓库两个都带，因为后者从没被删掉。哪一个才权威，取决于读它的那套工具链；而两套主流工具链把这条优先级裁成了<em>相反</em>的方向——于是一个「<code class="inline">.jinja</code> 更新过、而 JSON 条目变陈旧」的仓库，会因为你加载的方式不同而渲染出两份不同的提示词。</li>
+      <li><strong>一个模型往往不止一份模板。</strong>许多模型会发布一份默认模板，外加一份独立的工具使用变体，仅当请求里带 <code class="inline">tools</code> 数组时才被选中。你的工具调用行为，可能正由一份你从没看过的模板掌管。</li>
+      <li><strong>微调模型会继承它，不管对不对。</strong>一个没有自带模板就发布的微调模型，拿到的是基座模型的那一份。如果微调数据用的是另一种对话格式——这极其常见——那么每一次推理都已经略微偏离分布，而没有任何东西会报告这件事。</li>
+      <li><strong>服务栈会覆盖它。</strong>每一个本地运行时、以及若干托管服务，都允许运维方换一份模板进去；有些还默认用自家的重新实现顶替掉它。模型卡上那份模板，与真正在渲染你流量的那一份，是两件独立的事实。</li>
+    </ul>
+
+    <p>这张清单里没有一条会产生报错。模板不匹配表现为质量回退，所以它通常被怪到量化头上、怪到模型头上，或者怪到提示词头上。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>它出错的四种方式。</h3>
+
+    <p>按「被误诊的频率」而不是按严重程度排序。</p>
+
+    <ul>
+      <li><strong>模型对，模板错。</strong>也就是上面那些继承与优先级的情形。症状：模型全面地、微妙地比它公布的基准分差一点，且没有任何一个可复现的单点失败。这是最难发现的一种，因为根本没有可发现的东西。</li>
+      <li><strong>模板对，渲染器不同。</strong>服务栈会重新实现 Jinja，或者为了速度把模板本身用另一种语言重写一遍。任何重新实现都是一次发散的机会，而这些发散是看不见的——一份重写后只有一个分隔符不对的模板，产出的是一个流畅、像模像样、只是略微退化的模型。</li>
+      <li><strong>空白字符，而它不是装饰。</strong>模板加进去的一个空格并不免费：视它落在哪里，它可能被吸进相邻的令牌，也可能自己成为一个令牌，从而改变模型被训练去期待的那串序列。这最清楚地说明了模板运作在文本这一层之下，属于<a class="xref" href="/zh/concepts/tokens-and-tokenization">分词</a>，而不属于提示工程。</li>
+      <li><strong>由一份不支持工具的模板去渲染工具。</strong>如果模板里没有处理 <code class="inline">tools</code> 数组的分支，你精心设计的那些 schema，要么被整个丢掉，要么被服务层的兜底压平成一条系统消息。模型随后会用它随便想到的格式去调用工具，运行时解析不出来，于是那次调用以散文形式抵达 content 字段——而你那个正盯着结构化 <code class="inline">tool_calls</code> 数组的框架，会把它读成一次拒绝。这个被打断的往返见<a class="xref" href="/zh/concepts/tool-calling-explained">工具调用</a>；而四个项目处理这件事有多不一样，见本站对<a class="xref" href="/zh/blogs/ollama-vs-lm-studio-vs-llama-cpp-vs-mlx">四个本地运行时</a>的对比。</li>
+    </ul>
+
+    <div class="callout">
+      <p>这四种失败共用一个特征：输出流畅、没有异常、结果退化。这让模板成为「模型在你的栈里表现不佳时」第一个该查的东西，同时也是最后一个会有人去查的东西——因为大家的心智模型是「提示词进去、答案出来」，而模板在那幅画里是隐形的。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>把它当成一项有版本的依赖来对待。</h3>
+
+    <p>四个习惯，按能替你省下多少来排序。</p>
+
+    <ul>
+      <li><strong>把完整渲染出来的提示词打出来。</strong>每一个服务栈都会给你看，而它是本地推理里价值最高的那件调试产物。每接入一个模型就做一次，行为一变就再做一次。在那根字符串里找到自己 bug 的人，比在任何评测里找到的都多。</li>
+      <li><strong>把模板和权重一起钉住，升级时做 diff。</strong>它就是个文件；把它签进你的仓库，放在模型引用旁边。模板变更就是模型变更——它让你的<a class="xref" href="/zh/concepts/evals-101">评测</a>基线失效的程度和换一个检查点一模一样；并且它会悄悄让你的<a class="xref" href="/zh/concepts/prompt-caching">提示词缓存</a>失效，因为缓存下来的前缀与新前缀连一个字节都对不上了。</li>
+      <li><strong>结构化输出优先用约束，而不是用解析。</strong>一个把生成约束到语法上的运行时，吐不出格式错误的工具调用；一个事后解析的运行时，只能发现一个。这就是<a class="xref" href="/zh/concepts/constrained-decoding">约束解码</a>的实务论据，也是为什么它在你自托管时远比在厂商同时掌管两端翻译时更要紧。</li>
+      <li><strong>记录是哪一份模板产出了这趟运行。</strong>把渲染出的前缀的哈希与 trace 一起存下来，就把「模型上周二变差了」从一场争论变成一次查表——而这正是<a class="xref" href="/zh/concepts/reproducibility-and-determinism">可复现性</a>对其他每一项输入都提出的同一种纪律。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>如果只做一件事：拿你正在本地跑的那个模型，为一个带工具定义的请求把渲染出来的提示词导出来。看三件事——你的工具到底有没有出现在里面、轮次标记是否与模型卡上的一致、以及生成提示之前有没有多余的空白。这次检查花五分钟，它是你唯一能看见「自己真正在对着编程的那一层」的办法，而且它能解掉相当一部分的「这个模型工具调用很烂」。</p>
+    </div>
+
+    <p>相关：<a class="xref" href="/zh/concepts/system-vs-user-prompts">系统提示词 vs 用户提示词</a>——模板所编码的那些角色；<a class="xref" href="/zh/concepts/small-and-local-models">小模型与本地模型</a>——这件事咬得最狠的地方；以及<a class="xref" href="/zh/operations/agentops/model-deprecation-and-migration">模型弃用与迁移</a>——应对随下一个检查点一起抵达的那次模板变更。</p>
+  </div>
+</section>
