@@ -1,0 +1,122 @@
+<section class="phase">
+  <div class="phase-num">O28</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Fault injection: the outage your dashboard cannot see.</h2>
+  <p class="goal">When a dependency fails inside an ordinary service you get a 500 and an alert; when it fails inside an agent you get a fluent, confident, wrong answer and a green dashboard, because the component handling the error is a language model whose whole training is to keep going. That is the failure mode fault injection exists to find, and it is why the discipline looks different here than it does in a microservice fleet: you inject at the tool boundary rather than the network, and you assert on the trajectory rather than the status code. The question is never "did it survive the fault" — it is "did it tell anyone".</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The model is the thing that hides the fault.</h3>
+
+    <p>A tool result reaches the model as text. A 200 with the right JSON, a 503 body, an empty result array, and a timeout stub the SDK inserted are all just tokens in the context window, and the loop's error-handling logic is a model that has been trained, hard, to produce a helpful next step. It does. That is the bug.</p>
+
+    <ul>
+      <li><strong>Errors get absorbed, not raised.</strong> Search returns nothing, so the agent answers from parametric memory. The pricing tool times out, so the agent quotes a number from an example in its prompt. Neither path throws. Your error rate is unchanged and your answer is now wrong.</li>
+      <li><strong>Retries multiply the invisible cost.</strong> A transient fault the model works around three times is three times the tokens and three times the latency for the same task, with nothing in the metrics but a slightly fatter p99 — see <a class="xref" href="/operations/agentops/timeouts-and-deadline-budgets">timeouts and deadline budgets</a> for how those constants compound.</li>
+      <li><strong>Classic chaos tooling aims at the wrong layer.</strong> Killing a pod or adding 200ms of jitter with <code class="inline">tc</code> exercises your infrastructure's resilience, which is usually fine already. The interesting faults are semantic — a result that is empty, stale, truncated, or wrong-but-well-formed — and no network-level tool produces those.</li>
+      <li><strong>The blast radius is downstream of the answer.</strong> An agent that improvises past a failed read then performs a write based on it has converted a dependency blip into a data-integrity incident. Read <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a> for what that costs to undo.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The one-sentence version: in a normal system, faults are loud and correctness is quiet. In an agent, faults are quiet and only correctness is loud — and you are not measuring correctness on every request. Fault injection is how you find out what the quiet path does.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The fault catalogue that actually matters.</h3>
+
+    <p>Write this list down, because it is short, it is stable, and almost nobody tests past the first two entries. Every one of these happens in production weekly at any real volume.</p>
+
+    <ul>
+      <li><strong>Empty success.</strong> The tool returns 200 and zero results. This is the single highest-yield injection because it is indistinguishable, in text, from "there is nothing to find" — and it is what a permission filter, an index lag, or a typo'd query all look like from inside the loop.</li>
+      <li><strong>Slow but successful.</strong> A call that returns correctly at 25 seconds instead of 400ms. It tests deadline propagation, not error handling, and it is the fault most likely to blow a run budget without tripping anything.</li>
+      <li><strong>Malformed and truncated output.</strong> JSON cut mid-object, a field that arrives as a string where the schema says integer, a 2MB response where you expected 4KB. Each of these takes a different path through your parser and a different path through the model.</li>
+      <li><strong>Stale success.</strong> Correct-looking data from before the last write. Nothing anywhere will flag this, which is why it belongs in a test suite rather than an alert.</li>
+      <li><strong>Error-in-a-200.</strong> The tool returns HTTP 200 with <code class="inline">{"error": "rate limited"}</code> in the body. Your transport layer sees success; your model sees a sentence about rate limiting and decides what to do with it, unsupervised.</li>
+      <li><strong>Provider-side refusal and content filtering.</strong> The model API returns a refusal or a truncated generation mid-run. Agents handle this astonishingly badly — they frequently re-ask, get refused again, and burn the loop budget.</li>
+      <li><strong>Schema drift.</strong> A field renamed, a new required parameter, an enum that gained a value. This is not hypothetical maintenance work; it is the steady-state behaviour described in <a class="xref" href="/operations/agentops/third-party-tool-drift">third-party tool drift</a>.</li>
+      <li><strong>Credential expiry mid-run.</strong> The token was valid at step 2 and is not at step 14. Long runs make this ordinary, and the correct behaviour — stop, surface, do not improvise a workaround — is rarely the observed one.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Inject at the tool boundary, deterministically.</h3>
+
+    <p>The mechanism should be the least clever thing in your stack. A shim between the agent and its tools, controlled by a per-run configuration, that can rewrite or delay any tool result before it becomes text.</p>
+
+    <ul>
+      <li><strong>Put it in the tool-invocation path, not the transport.</strong> A wrapper around your tool dispatcher — or a proxy your MCP client points at — sees the logical call with its arguments, which is what you need to target faults precisely ("fail the third <code class="inline">search_orders</code> call of this run, not a random 5% of HTTP requests").</li>
+      <li><strong>Seed everything.</strong> A fault plan is <code class="inline">(run_id, seed) → list of (call_index, fault)</code>. Given the same seed, the same run produces the same faults. A chaos test you cannot replay is an anecdote, and it will be dismissed as one — this is the same requirement as <a class="xref" href="/operations/evaluation-and-observability/replay-testing-with-recorded-traces">replay testing</a>.</li>
+      <li><strong>Carry it on the run, not on the environment.</strong> A header or run attribute that selects the fault plan means one shared environment serves both normal and injected traffic, and it means you can eventually turn this on for a small, labelled share of production.</li>
+      <li><strong>Inject at the model boundary too.</strong> Refusals, truncations, and 429s from the model provider need the same shim on the other side of the loop. Teams almost always build only the tool half and then are surprised by provider behaviour they never rehearsed.</li>
+      <li><strong>Never inject a write-path fault without idempotency.</strong> If a fault causes a partial write and you cannot reconcile it by key, you have created the incident you were testing for — the prerequisite is <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a>, in place first.</li>
+    </ul>
+
+    <pre class="standalone">fault_plan:
+  run_id: 7f3a…            # replay handle
+  seed: 4291
+  faults:
+    - on: {tool: search_orders, call_index: 3}
+      inject: empty_success        # 200, zero results
+    - on: {tool: get_pricing, call_index: 1}
+      inject: {delay_ms: 25000}    # slow but correct
+    - on: {tool: post_refund, call_index: 1}
+      inject: {status: 200, body: '{"error":"rate limited"}'}
+    - on: {model: completion, step: 9}
+      inject: refusal</pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Assert on the trajectory, and name the three outcomes.</h3>
+
+    <p>This is where agent fault injection diverges hardest from the microservice version. There is no status code to assert on, because the run succeeded — it produced an answer. What you grade is the path, and there are exactly three verdicts worth distinguishing.</p>
+
+    <ul>
+      <li><strong>Correct-degraded.</strong> The agent noticed the fault, did something sensible — retried with backoff, used a fallback source, narrowed the task — and delivered a correct result or a partial one it described accurately. Ship this.</li>
+      <li><strong>Honest stop.</strong> The agent could not complete the task and said so, without inventing a result and without writing anything. This is a pass, and teams under-credit it badly; an agent that stops cleanly under a dependency failure is worth more than one that is clever three times out of four.</li>
+      <li><strong>Silent fabrication.</strong> The agent produced a confident, plausible, unsupported answer — or worse, wrote something. This is the only verdict that is a release blocker, and finding it is the entire point of the exercise.</li>
+    </ul>
+
+    <p>The assertions that separate these are trajectory properties, not output strings: did any tool call retry, and with backoff? Did the final answer cite a source that the injected fault made unavailable? Did a write occur after a failed read in the same run? Did the agent's user-facing text contain an acknowledgement of missing data? Score them with the same machinery you use in <a class="xref" href="/operations/evaluation-and-observability/outcome-vs-trajectory-eval">trajectory evaluation</a>, and file the failures into the buckets in <a class="xref" href="/operations/evaluation-and-observability/failure-taxonomy-and-triage">failure taxonomy and triage</a>.</p>
+
+    <div class="callout">
+      <p>One assertion pays for the whole programme: <strong>a write must never follow a faulted read in the same run</strong>. It is mechanical to check from a trace, it needs no judge, and it catches the class of bug that turns a five-minute dependency blip into a week of reconciliation.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Three venues, in order, with different budgets.</h3>
+
+    <p>Fault injection is not one activity. Running it as one is how it ends up either too slow for CI or too dangerous for production, and then gets dropped.</p>
+
+    <ul>
+      <li><strong>In CI, on a fixed suite.</strong> Ten to thirty scenarios, each pinning one fault to one call, asserted with deterministic trace checks only — no LLM judge, because the gate must be fast and stable. This catches regressions when someone changes a retry policy or a prompt's error-handling instruction. It belongs beside your other gates in <a class="xref" href="/operations/evaluation-and-observability/eval-driven-agent-development">eval-driven development</a>.</li>
+      <li><strong>In staging, as a scheduled game day.</strong> Broader fault plans, multi-fault runs, longer horizons, and a human reading a sample of the trajectories. This is where you find the interesting behaviours — the agent that "solves" a permissions error by trying a different account, the one that treats an empty result as permission to widen its query until it matches everything.</li>
+      <li><strong>In production, narrowly and late.</strong> Only after the first two are boring. A capped share of traffic, internal or consenting tenants first, a live abort condition wired to your <a class="xref" href="/operations/agentops/kill-switches">kill switch</a>, and never on write-capable runs until the idempotency work is done. The reason to do it at all is that staging's tool fixtures are not your vendors, and the faults you have never seen are the ones the fixtures cannot produce.</li>
+    </ul>
+
+    <p>Budget honestly: the CI suite should cost minutes, the game day a half-day of one engineer per month, the production programme a named owner. Compare that to <a class="xref" href="/operations/agentops/load-testing-agents">load testing</a>, which answers a different question — load tells you when the system falls over, injection tells you what it says while it is falling.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The scoreboard, and what improving it looks like.</h3>
+
+    <p>Two numbers, tracked per release, both derived from the same runs:</p>
+
+    <ul>
+      <li><strong>Silent-fabrication rate under injection.</strong> Of the injected runs, the share that ended in a confident unsupported answer or an unjustified write. This is the only number that has to trend to zero, and it is the one to put in front of a release review.</li>
+      <li><strong>Honest-stop share.</strong> Of the runs that could not succeed, the share that stopped and said so. Rising is good, and it is worth watching separately because the cheap way to drive fabrication down — making the agent refuse more — shows up here as an obvious trade you can then price.</li>
+    </ul>
+
+    <p>When fabrication is too high, the fix is almost never a better prompt. It is structural: make the failure legible to the model with an explicit typed error rather than a stringified exception (<a class="xref" href="/deep-dives/tool-capability-design/tool-error-messages">tool error messages</a> is the design work), and make the consequential action unavailable rather than discouraged — a tool the model cannot call under a degraded state beats an instruction telling it not to. <a class="xref" href="/operations/agentops/graceful-degradation-and-fallback">Graceful degradation</a> is the same argument from the availability side.</p>
+
+    <div class="callout tip">
+      <p>Start this week with one scenario and one assertion. Pick your highest-traffic tool, inject <em>empty success</em> on its first call in a copy of your ten most common tasks, and check one thing: does the final answer acknowledge that it found nothing? Most teams running this for the first time find at least one task where the agent answers confidently from memory, and that single result justifies the rest of the programme better than any argument on this page. Then add <em>slow but successful</em> and <em>error-in-a-200</em>, wire the three of them into CI with deterministic checks, and only after that go looking for a game day.</p>
+    </div>
+  </div>
+</section>

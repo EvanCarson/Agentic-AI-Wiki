@@ -1,0 +1,115 @@
+<section class="phase">
+  <div class="phase-num">R11</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Contextual retrieval: the chunk cannot answer its own question.</h2>
+  <p class="goal">"Revenue grew 3% over the previous quarter" is a sentence with no company, no quarter and no year in it, and that is the chunk your splitter handed the embedding model — which is why the single largest source of recall failure in an otherwise competent RAG stack is not the retriever, it is the moment you cut the document up. Prepending a short generated preamble that situates each chunk before you embed it cuts top-20 retrieval failure by 35%, by 49% when the same preamble also feeds a BM25 index, and by 67% with reranking on top — 5.7% down to 1.9%. It costs roughly a dollar per million document tokens. The catch is the one nobody prices: your index is now a function of a second model and a prompt you will want to change.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What chunking destroys, precisely.</h3>
+
+    <p>Chunking is usually discussed as a size trade-off — too small loses context, too large dilutes the embedding — and that framing hides the actual failure. The problem is not that the chunk is short. It is that the chunk's meaning was carried by text that is no longer adjacent to it.</p>
+
+    <ul>
+      <li><strong>Referents go missing.</strong> Pronouns, "the company", "this policy", "the above table", "as described in Section 4". A human reading the chunk in place resolves these from a heading three pages up. The embedding model gets the chunk alone and encodes an underspecified sentence.</li>
+      <li><strong>Distinguishing detail lives in the container.</strong> Ten quarterly filings produce ten chunks that say nearly the same thing. Their embeddings land in nearly the same place, and a query naming a specific company and quarter has no purchase on any of them, because the words it is searching for are not in the text it is searching.</li>
+      <li><strong>The lexical index suffers identically.</strong> This is not a dense-vector quirk. BM25 fails on the same chunk for the same reason: the discriminating token — the company name, the year, the product SKU — is not present. Which is why the fix helps both indexes, and why measuring it on only one understates it.</li>
+      <li><strong>It gets worse as the corpus grows.</strong> With 200 documents, near-duplicates are rare and a decent retriever muddles through. With 200,000, the near-duplicate is the norm, and the retrieval failure rate stops being an annoyance and becomes the thing that caps your answer quality. See <a class="xref" href="/concepts/chunking-and-vector-search">chunking and vector search</a> for the mechanics this builds on.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The diagnostic that settles whether this is your problem: take twenty chunks your system retrieved for real queries, read each one with the document title and surrounding text removed, and ask whether you could tell which document it came from. If you cannot, neither could the embedding model.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The technique, and the two indexes it feeds.</h3>
+
+    <p>Contextual retrieval, as published by Anthropic in September 2024 and since absorbed into most serious pipelines, is mechanically simple. Before embedding a chunk, send the whole document plus that chunk to a cheap model and ask for a sentence or two situating it. Prepend that to the chunk. Index the result.</p>
+
+    <pre class="standalone">&lt;document&gt; {{WHOLE_DOCUMENT}} &lt;/document&gt;
+Here is the chunk we want to situate within the whole document:
+&lt;chunk&gt; {{CHUNK_CONTENT}} &lt;/chunk&gt;
+Please give a short succinct context to situate this chunk within the
+overall document for the purposes of improving search retrieval of the
+chunk. Answer only with the succinct context and nothing else.</pre>
+
+    <p>The output is typically 50–100 tokens: <em>"This chunk is from ACME Corp's Q2 2023 SEC filing; the previous quarter's revenue was $314 million."</em> Prepend, embed, store. Three details decide whether you get the published numbers or a fraction of them:</p>
+
+    <ul>
+      <li><strong>Feed the contextualised text to both indexes.</strong> Contextual embeddings alone give the 35% failure reduction. Running the same contextualised chunks through BM25 as well takes it to 49%. That second index is nearly free and it is where half the remaining gain lives — the generated preamble contains exactly the proper nouns and dates that lexical search is good at, which is the argument already made in <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a>.</li>
+      <li><strong>Store the original chunk for generation.</strong> The preamble is a retrieval aid, not content. Retrieve on the contextualised text; pass the clean chunk (or the chunk plus its real neighbours) to the model. Handing generated context to the generator as if it were source text is how you get citations pointing at sentences no human wrote.</li>
+      <li><strong>Prompt-cache the document.</strong> The document is constant across all its chunks, so the whole-document prefix is cached and only the chunk varies. This is what brings the cost to roughly $1.02 per million document tokens — without caching you are re-reading the document once per chunk and the economics change entirely. See <a class="xref" href="/concepts/prompt-caching">prompt caching</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Read the numbers honestly.</h3>
+
+    <p>35 / 49 / 67 are real and they are also narrower than they look. Four caveats, each of which has sent a team down a wrong path:</p>
+
+    <ul>
+      <li><strong>They are retrieval failure rates at top-20, not answer accuracy.</strong> "Failure" means the right chunk was not in the top 20. If your generator only sees 5 chunks, a fix that moves a chunk from rank 40 to rank 15 improves the measured metric and changes nothing for the user. Either widen the candidate set and rerank down, or measure at the k you actually pass.</li>
+      <li><strong>5.7% → 1.9% is the full stack.</strong> The 67% figure is contextual embeddings <em>plus</em> contextual BM25 <em>plus</em> a reranker. Reranking is doing a large share of that final step, and it is the cheaper change to make first — a cross-encoder over your existing index requires no re-embedding at all.</li>
+      <li><strong>Gains are corpus-dependent and they invert.</strong> The technique helps most where chunks are ambiguous out of context: filings, contracts, manuals, ticket threads, codebases with repeated idioms. It helps least where every chunk is already self-identifying — product pages with the name in every paragraph, FAQ entries, news articles. On a self-identifying corpus you are paying for preambles that restate what the chunk already says, and the extra tokens can dilute the embedding slightly.</li>
+      <li><strong>Small corpora do not need it.</strong> If the whole corpus fits in a long context window, the right answer is to stop retrieving. The relevant comparison is in <a class="xref" href="/deep-dives/memory-and-context/long-context-effective-vs-advertised">effective vs advertised context</a>, and the crossover is higher than most teams assume.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Measure retrieval quality separately from answer quality, on a fixed set of queries with known-good chunk ids. A hundred queries is enough, and building that set is the prerequisite for every decision on this page — without it you are choosing between techniques on vibes and a vendor's benchmark. <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">Evaluating RAG</a> is the full method.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The real cost is the re-index commitment.</h3>
+
+    <p>The dollar figure is the easy part and it is the part everyone quotes. The expensive consequence is architectural: you have added a model and a prompt to the definition of your index.</p>
+
+    <ul>
+      <li><strong>Your index now has four dependencies, not two.</strong> Chunker, embedding model, contextualiser model, contextualiser prompt. Change any one and the stored vectors are no longer comparable to what a fresh ingest would produce. Write the tuple into the index metadata so a future engineer can tell what generated it.</li>
+      <li><strong>"One-time cost at ingest" is per index generation.</strong> A million-document corpus is cheap to contextualise once. The question is how many times you will do it — and the honest answer for a young pipeline is several, because the prompt will improve, the cheap model will be deprecated, and the chunker will change. Budget for three rebuilds, not one.</li>
+      <li><strong>Incremental ingest must pin the version.</strong> New documents arriving after a prompt change get preambles written by a different prompt, and you now have a silently heterogeneous index. Pin the contextualiser version per index generation and route new documents to the generation they match. The migration mechanics are the same ones in <a class="xref" href="/operations/agentops/reindexing-and-embedding-migrations">reindexing and embedding migrations</a>.</li>
+      <li><strong>Latency at ingest, not at query.</strong> This is the technique's best property and worth stating plainly: contextualisation happens offline, so query-time latency is unchanged. Compare the query-time alternatives — a rewriting step or a larger reranker — which buy quality out of the user's latency budget instead.</li>
+      <li><strong>Deletion propagates normally, but derived text does not self-document.</strong> The preamble may quote figures from elsewhere in the document. If that document is retracted, the preamble attached to an unrelated chunk can still be carrying its numbers. The general version of this trap is in <a class="xref" href="/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">index freshness and invalidation</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The cheaper things to try first, in order.</h3>
+
+    <p>Contextual retrieval is not the first move. It is the third or fourth, and teams that reach for it early usually had a cheaper problem. In ascending order of cost:</p>
+
+    <ul>
+      <li><strong>Deterministic prefixes.</strong> Prepend the document title and the heading path — <code class="inline">ACME Corp / 10-Q Q2 2023 / Item 2. MD&amp;A</code> — with no model call at all. Free, instant, fully reproducible, and on well-structured corpora it recovers a meaningful share of the gain because the missing discriminator was usually in a heading. Do this before anything else; if your parser is not giving you the heading path, fix that instead (<a class="xref" href="/deep-dives/retrieval-and-rag/document-parsing-for-rag">document parsing for RAG</a>).</li>
+      <li><strong>A reranker.</strong> The largest single quality lever in most stacks, requires no change to the index, and can be added and removed in an afternoon. If you have not got one, measure it before you measure anything else.</li>
+      <li><strong>Hybrid retrieval.</strong> Adding BM25 alongside dense search catches the exact-match cases — identifiers, error codes, part numbers — that embeddings systematically miss. Also index-side, also cheap.</li>
+      <li><strong>Late chunking.</strong> Embed the full document with a long-context embedding model, then pool the token embeddings into per-chunk vectors. Each chunk's vector has seen the whole document, with no generation step and no prompt to maintain. It is cheaper than contextual retrieval and gives up the explicitness — the context is in the vector, not in text you or BM25 can read, so it does nothing for the lexical index.</li>
+      <li><strong>Contextual retrieval.</strong> Reach for it when the corpus is genuinely ambiguous out of context, the cheaper levers are in place and measured, and you have a retrieval eval set that will tell you whether it worked.</li>
+    </ul>
+
+    <p>These compose rather than compete. The published 67% is deterministic structure, contextual preambles, lexical and dense indexes, and a reranker, all at once — and the reason to sequence them is that each one tells you whether the next is still needed.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to do on Monday.</h3>
+
+    <p>The decision reduces to three questions asked against your own numbers rather than a benchmark.</p>
+
+    <ul>
+      <li><strong>Is retrieval actually your bottleneck?</strong> Split your failures: wrong chunks retrieved, right chunks retrieved and ignored, right chunks retrieved and misread. Only the first is addressed by anything on this page, and it is not always the biggest bucket.</li>
+      <li><strong>Are your chunks self-identifying?</strong> Run the twenty-chunk diagnostic from STEP 1. If most chunks name their own subject, spend the budget on reranking instead.</li>
+      <li><strong>Can you afford to rebuild the index three times?</strong> If a full re-index is an all-hands event, fix that first — the ability to rebuild cheaply is what makes every other retrieval improvement tryable, and it is worth more than any single technique.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Default recipe for a corpus of documents that are long, structured, and full of near-duplicates: deterministic heading-path prefix on every chunk, contextual preamble generated with a small model under prompt caching, both fed into a dense index <em>and</em> BM25, a cross-encoder reranking the top 100 down to the 10 you pass the model, and the original clean chunk — never the preamble — used for generation and citation. Version the index on the tuple of chunker, embedder, contextualiser model and contextualiser prompt, and hold a hundred-query retrieval eval that runs on every rebuild. If you can only do two of those, do the heading prefix and the reranker, and revisit the rest when the eval says retrieval is still the ceiling.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/deep-dives/retrieval-and-rag/advanced-rag-architectures">advanced RAG architectures</a> for where this sits in a full pipeline, <a class="xref" href="/deep-dives/retrieval-and-rag/agentic-retrieval">agentic retrieval</a> for the case where the agent issues its own queries and a single-shot recall number stops describing the system, and <a class="xref" href="/operations/safety-and-security/permission-aware-retrieval">permission-aware retrieval</a> for the constraint that has to hold no matter how you index.</p>
+  </div>
+</section>
