@@ -1,0 +1,123 @@
+<section class="phase">
+  <div class="phase-num">U27</div>
+  <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
+  <h2>Merge queues for agent-authored changes.</h2>
+  <p class="goal">Your coding agents doubled the pull requests and your delivery metrics did not move, so the obvious diagnosis is that review is the bottleneck and the obvious fix is more reviewers or a review bot. Both are wrong in a way that costs a quarter to discover: the constraint is the serialized path between "approved" and "on main", and the standard remedy for volume — batching PRs so one CI run clears several — gets arithmetically worse as agent share rises, because agents raise the per-PR failure rate that batching multiplies. Size your batches to that failure rate, make failure isolation cheap, and spend the rest of your effort lowering the rate before anything enters the queue.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The volume arrived; the system absorbed it by lowering the bar.</h3>
+
+    <p>Start with what the telemetry actually says, because the folklore version — "AI writes more code, review gets slower" — hides the finding that matters.</p>
+
+    <p>Faros AI's 2026 report, drawn from roughly 22,000 developers across more than 4,000 teams over two years, measures each organisation between its lowest and highest AI-adoption periods. Throughput rose. So did everything downstream: bugs per developer up 54%, median review time up around 5×, and the incidents-to-PR ratio more than tripled. LinearB's 2026 benchmarks add the queueing shape — agentic PRs waited about 5.3× longer for a reviewer to pick them up.</p>
+
+    <p>The number to stare at is a different one: <strong>31% more pull requests merged with no review at all.</strong> That is not a bottleneck. A bottleneck holds work back. This is a system that found the volume unabsorbable and responded by routing around its own quality gate — and the tripled incident ratio is the receipt.</p>
+
+    <div class="callout">
+      <p>So the honest framing of the problem is not "we need to review faster." It is: <em>the only gate that still applies uniformly to every change is the automated one between approval and main.</em> If that gate is slow, people will merge around it; if it is fast and strict, it does the work review stopped doing. Everything below is about making it fast enough to stay strict. The complementary half — teaching agents to produce changes that are cheap to verify — is in <a class="xref" href="/playbooks/coding-and-computer-use-agents/patch-generation-and-tests">patch generation and test-driven loops</a>.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Batching is the standard fix, and agent load is exactly what breaks it.</h3>
+
+    <p>A merge queue serializes: it takes the next pull requests, tests them against the current tip of main plus everything ahead of them, and merges the ones that pass. The cost is one CI run per merge, and at agent volume that is the whole problem. Every queue product's answer is batching — group <em>b</em> pull requests, run CI once, merge all <em>b</em> on green.</p>
+
+    <p>Now do the arithmetic, because it is the entire argument on this page. If each pull request independently fails in the queue with probability <em>p</em>, a batch of <em>b</em> passes with probability (1−<em>p</em>)<sup><em>b</em></sup>:</p>
+
+<pre class="standalone"><span class="c-cm"># Probability a batch of b passes, at per-PR queue-failure rate p</span>
+
+   p = 5%   (well-tested human PRs)
+     b = 4    ->  0.95^4  = 81.5%
+     b = 10   ->  0.95^10 = 59.9%
+
+   p = 20%  (typical agent-authored mix, unrebased)
+     b = 4    ->  0.80^4  = 41.0%
+     b = 10   ->  0.80^10 = 10.7%
+
+<span class="c-cm"># Without bisection, one failure discards the whole batch.</span>
+<span class="c-cm"># Expected CI runs per merged PR, b=10:</span>
+<span class="c-cm">#   p=5%   ->  1 / (10 * 0.599)  = 0.17   (batching wins big)</span>
+<span class="c-cm">#   p=20%  ->  1 / (10 * 0.107)  = 0.93   (batching bought you nothing)</span></pre>
+
+    <p>Read the last two lines slowly. At a human failure rate, a batch of ten costs a sixth of a CI run per merged change. At an agent failure rate, the same configuration costs almost a full run per merge — you have paid for the batching machinery, added a queue-reset failure mode, and landed back where you started.</p>
+
+    <p>And <em>p</em> is not a constant you inherited. It is higher for agent-authored changes for three structural reasons: the agent verified against the base commit it started from rather than the tip that exists now, it touches files it has no local context for, and it opens PRs faster than the tree can settle, so conflicts between two agents' changes are ordinary rather than rare. Volume and <em>p</em> rise together, which is why the intuitive response — more volume, bigger batches — is exactly backwards.</p>
+
+    <p><strong>The rule:</strong> batch size is a function of your measured queue-failure rate, not of your queue length. Measure <em>p</em> per repository, weekly, split by author type. If your queue tool supports a dynamic <code class="inline">{min, max}</code> batch size, that is the setting this arithmetic is about — but it tunes on backlog, not on <em>p</em>, so set the ceiling yourself.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Bisection changes the exponent, and it is the one feature worth paying for.</h3>
+
+    <p>The arithmetic above assumes a failed batch is discarded whole. That assumption is what makes high-<em>p</em> batching pointless, and it is also the assumption every serious queue product breaks.</p>
+
+    <p>On failure, split the batch and test the halves; recurse. Isolating one culprit in a batch of <em>b</em> costs roughly 2·log₂(<em>b</em>) extra runs instead of re-running everything, and the healthy pull requests keep moving rather than going back to the end of the line. With test-result caching on top, the halves that already passed as part of a larger group need not be re-run at all.</p>
+
+    <p>This is the axis on which the tools genuinely differ, so shortlist on it rather than on marketing:</p>
+
+    <ul>
+      <li><strong>GitHub's native merge queue</strong> forms merge groups and, when required checks fail, removes the offending pull request from the queue. It has a build-concurrency setting (1–100 dispatched <code class="inline">merge_group</code> events) and an option governing whether failing PRs may be grouped behind a passing one. It is free, it is in the box, and it is the right answer for one repository with fast CI and modest volume. It does not give you batch bisection or monorepo-aware lanes.</li>
+      <li><strong>Trunk Merge Queue</strong> batches compatible pull requests, and on failure moves the batch to a separate queue for bisection, splitting and re-testing with prior passing results reused. It infers parallel lanes from the targets a change actually affects, via build-graph integration (Bazel, Nx).</li>
+      <li><strong>Mergify</strong> exposes the knobs directly: batch size as a fixed integer (1–128) or a dynamic <code class="inline">{min, max}</code>, parallel/speculative checks via temporary draft pull requests that combine changes against the base, a <code class="inline">max_parallel_checks</code> ceiling, priority rules, and scope-aware batching that groups changes touching the same areas.</li>
+      <li><strong>Aviator</strong> builds around affected targets: dynamic queues derived from what a change touches, optimistic validation that waits out a suspected flake by checking whether later batches pass rather than resetting immediately (<code class="inline">use_optimistic_validation</code>, <code class="inline">optimistic_validation_failure_depth</code>), and a self-hosted deployment option.</li>
+    </ul>
+
+    <p>Pick on two questions and you will be right: <em>does it bisect a failed batch</em>, and <em>can it run independent lanes for changes that cannot affect each other</em>. Everything else is configuration.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Lower p before the queue: make the agent verify against the tip it will merge onto.</h3>
+
+    <p>Bisection makes a high failure rate survivable. Reducing the rate makes it cheap, and this is where a coding-agent platform has an advantage no human workflow has: the agent is still running, and it can be told to go again.</p>
+
+    <p>The default agent loop verifies against the commit it checked out. By the time its pull request reaches the front of the queue, main has moved — on a busy repository, by dozens of commits. Most queue failures are not bad patches; they are correct patches tested against stale state.</p>
+
+    <ul>
+      <li><strong>Re-verify at enqueue, against the queue head.</strong> Before a pull request joins the queue, rebase it onto the current speculative tip and run the affected tests. This is one cheap run that converts a queue failure — expensive, serialized, and disruptive to everything behind it — into an ordinary branch failure. It is the single highest-leverage change in this playbook.</li>
+      <li><strong>Hand the failure back to the agent, not to a human.</strong> A queue ejection is a well-specified task with a reproduction attached, which is the ideal input for the loop described in <a class="xref" href="/playbooks/coding-and-computer-use-agents/ci-repair-agents">CI repair agents</a>. Cap the attempts at two and then escalate; an agent that cannot fix its own ejection in two tries is producing a change a human needs to look at.</li>
+      <li><strong>Enforce a change-size ceiling on agent pull requests.</strong> Failure probability scales with files touched, and so does conflict probability against everything else in flight. A 40-file agent PR is not one unit of work, it is a queue hazard. Split it, and see <a class="xref" href="/concepts/blast-radius">blast radius</a> for the same argument applied to runtime.</li>
+      <li><strong>Never let an agent merge outside the queue.</strong> The admin-merge escape hatch exists, agents have tokens, and one direct push to main invalidates every speculative run in flight. Remove the permission rather than writing a policy about it.</li>
+    </ul>
+
+    <p>A caution specific to this loop: an agent whose reward is "make the queue accept it" will find the cheap way — deleting the assertion, marking the test skip, widening the type. That failure mode is not hypothetical and it is covered in <a class="xref" href="/playbooks/coding-and-computer-use-agents/patch-generation-and-tests">patch generation and test-driven loops</a>. The mechanical guard is a diff-level rule: an agent fixing a queue ejection may not modify test files unless the ejection was itself a test failure it is legitimately updating, and any deletion of an assertion is a human review trigger regardless.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Serialize only what actually interacts.</h3>
+
+    <p>A single global queue treats every change as potentially conflicting with every other, which is true of a small repository and badly false of a large one. Two pull requests touching disjoint services cannot break each other, and making them wait in line is pure throughput loss — the loss compounding precisely when volume is highest.</p>
+
+    <p>Affected-target queueing derives each change's targets from the build graph and gives non-overlapping changes their own lane, merging them independently. Overlapping changes get stacked into a shared lane and tested together. The prerequisite is a build system that can answer "what does this diff affect" — Bazel, Nx, Pants, Turborepo — and if you do not have one, the honest approximation is a hand-maintained path-to-lane map. It is worse than a build graph and far better than one global line.</p>
+
+    <p>Two practical notes. First, lane boundaries are a claim about your architecture, and a wrong claim merges two changes that do interact; keep a small set of integration checks that always run in every lane. Second, flaky tests are a different failure with an identical symptom — a red batch — and at agent volume a 1%-flaky test in a required check fires constantly. Quarantine flakes out of the required set through an explicit, tracked process rather than letting the queue's flake heuristics absorb them, and treat the quarantine list as debt with an owner. A queue tuned to tolerate flakes is a queue tuned to tolerate real failures.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Build order, and the metric that tells you it is working.</h3>
+
+    <p>In sequence, each step earning the next:</p>
+
+    <ul>
+      <li><strong>Turn on a queue with no batching at all.</strong> Batch size 1. You now have correctness — nothing merges untested against the real tip — and a measurement: your baseline <em>p</em>, per author type.</li>
+      <li><strong>Add enqueue-time rebase-and-verify.</strong> Watch <em>p</em> fall. This is usually the largest single drop and it costs one pipeline change.</li>
+      <li><strong>Raise batch size to what the measured <em>p</em> supports,</strong> and only if your tool bisects. Recompute monthly; the agent share of your PRs is moving and <em>p</em> moves with it.</li>
+      <li><strong>Split into lanes</strong> once queue wait, not CI duration, is the dominant term in time-to-merge.</li>
+      <li><strong>Route ejections back to the agent</strong> with a two-attempt cap and a test-file guard.</li>
+    </ul>
+
+    <p>Track four numbers weekly and nothing else: queue-failure rate <em>p</em> split by author type, expected CI runs per merged pull request, median time from approval to main, and the share of changes that reached main without passing the queue. The fourth is the one that quietly goes wrong — it is where the 31% lives, and a queue that gets slow will grow it without anyone deciding to.</p>
+
+    <div class="callout tip">
+      <p>Before you buy a queue product, spend an afternoon computing one number from data you already have: for last month's merged pull requests, what fraction would have failed if tested against the tip of main at the moment they merged rather than against their own base? Re-run the affected tests on a sample of fifty at the tip they merged onto. That fraction is your <em>p</em>, and it decides everything on this page — whether batching helps you or is pure overhead, what batch size to configure, and whether bisection is a nice-to-have or the only thing that makes the queue viable. Teams who measure it are usually somewhere between two and four times their guess, and the surprise is almost entirely attributable to agent-authored changes tested against a base that no longer exists.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/playbooks/coding-and-computer-use-agents/background-coding-agents">background coding agents</a> for the source of the volume, <a class="xref" href="/playbooks/coding-and-computer-use-agents/code-review-agents">code review agents</a> for the gate this one is backstopping, and <a class="xref" href="/playbooks/agent-ux-and-human-interaction/review-queues-for-agent-output">review queues for agent output</a> for the human side of the same arithmetic.</p>
+  </div>
+</section>
