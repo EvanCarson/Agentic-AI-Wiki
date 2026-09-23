@@ -1,0 +1,153 @@
+<p class="lede">Every merge queue product sells you batching — group ten pull requests, run CI once, merge all ten — and under agent load that pitch quietly inverts, because the same agents that doubled your pull request volume also raised the per-PR failure rate that batching raises to the tenth power. At a 20% queue-failure rate, a batch of ten passes 10.7% of the time and costs you almost a full CI run per merged change, which is what you were paying before you bought anything. Two capabilities actually change the arithmetic: bisecting a failed batch instead of discarding it, and running independent lanes for changes that cannot affect each other. Shortlist on those two and the rest of the comparison collapses into configuration.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four products, ordered by how much machinery they put between "approved" and "on main". The first is free and in the box; the other three exist because the first one stops at a specific place.</p>
+
+  <table>
+    <thead>
+      <tr><th>Product</th><th>Failed-batch handling</th><th>Lane derivation</th><th>Shape</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>GitHub merge queue</td><td>Remove the failing PR from the queue; no bisection</td><td>None — one queue per protected branch</td><td>Native, free, zero deployment</td></tr>
+      <tr><td>Trunk Merge Queue</td><td>Move the batch to a bisection queue; split, retest, reuse prior passing results</td><td>Dynamic lanes from impacted build-graph targets (Bazel, Nx)</td><td>SaaS, CI-agnostic</td></tr>
+      <tr><td>Mergify</td><td>Parallel/speculative checks on temporary draft PRs; batch size 1–128 or dynamic <code>{min, max}</code></td><td>Scope-aware batching — group changes touching the same declared areas</td><td>SaaS, queue plus merge governance</td></tr>
+      <tr><td>Aviator MergeQueue</td><td>Optimistic validation — wait out a suspected flake by checking later batches rather than resetting</td><td>Dynamic queues from affected targets</td><td>SaaS, with a self-hosted option</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/github-merge-queue-vs-trunk-vs-mergify-vs-aviator/data-feature-matrix.svg" alt="Feature matrix of four merge queue products across batching, failure isolation, lane derivation, flake tolerance and deployment options." width="900" height="400" loading="lazy" />
+    <figcaption>Where each one leans hardest. The second column is the one that changes the asymptotics.</figcaption>
+  </figure>
+
+  <p>A note on sourcing before we go further: much of the public comparison material on this category is written by the vendors about each other, and it is partisan in both directions. Everything stated here as fact comes from each product's own documentation of its own behaviour. Where a claim is about a competitor, we have left it out.</p>
+</section>
+
+<section>
+  <h2>The arithmetic that decides the shortlist</h2>
+  <p>A merge queue serializes: take the next pull requests, test them against the current tip plus everything ahead of them, merge what passes. One CI run per merged change is the baseline cost, and batching is the universal answer to that cost.</p>
+  <p>If each pull request independently fails in the queue with probability <em>p</em>, a batch of <em>b</em> passes with probability (1−<em>p</em>)<sup><em>b</em></sup>. Without bisection, one failure discards the whole batch:</p>
+
+  <table>
+    <thead>
+      <tr><th>Per-PR queue-failure rate</th><th>Batch of 4 passes</th><th>Batch of 10 passes</th><th>CI runs per merge, b=10</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>5% — well-tested human PRs</td><td>81.5%</td><td>59.9%</td><td>0.17</td></tr>
+      <tr><td>10%</td><td>65.6%</td><td>34.9%</td><td>0.29</td></tr>
+      <tr><td>20% — typical agent-authored, unrebased</td><td>41.0%</td><td>10.7%</td><td>0.93</td></tr>
+    </tbody>
+  </table>
+
+  <p>The bottom-right cell is the whole argument. At an agent failure rate, a batch of ten costs nearly a full CI run per merged pull request — you have bought the batching machinery, added a queue-reset failure mode, and landed back at the unbatched baseline.</p>
+  <p>And <em>p</em> is not inherited. Agent-authored changes fail in the queue more often for structural reasons: the agent verified against the base commit it checked out rather than the tip that exists when the PR reaches the front, it edits files it has no local context for, and it opens PRs faster than the tree settles, so cross-agent conflicts are ordinary. Volume and <em>p</em> rise together — which is why the intuitive response to volume, bigger batches, is backwards.</p>
+
+  <figure>
+    <img src="/blogs/github-merge-queue-vs-trunk-vs-mergify-vs-aviator/arch-batch-and-bisect.svg" alt="A batch of eight pull requests failing, resolved two ways: discard and requeue everything, versus split-and-retest until the culprit is isolated." width="900" height="500" loading="lazy" />
+    <figcaption>Same failure, two recoveries. Bisection turns a linear penalty into a logarithmic one and keeps the healthy PRs moving.</figcaption>
+  </figure>
+
+  <p>Bisection is what rescues high-<em>p</em> batching. Split the failed batch, test the halves, recurse: isolating one culprit in a batch of <em>b</em> costs roughly 2·log₂(<em>b</em>) extra runs instead of re-running everything, and the innocent pull requests do not return to the end of the line. With result caching on top, halves that already passed inside a larger group need not run again.</p>
+</section>
+
+<section>
+  <h2>GitHub merge queue — the right answer below a computable threshold</h2>
+  <h3>What it does</h3>
+  <p>It forms merge groups: your pull request is grouped with the tip of the target branch and everything ahead of it in the queue, and required status checks run against that group. A build-concurrency setting caps how many <code>merge_group</code> webhooks dispatch at once, between 1 and 100, which is how you throttle concurrent CI. A separate setting governs whether pull requests with failing required checks may be grouped behind a passing one, or whether every PR in a group must be green.</p>
+  <h3>Where it stops</h3>
+  <p>On failure — a required check red against the merge group, a conflict with the base, a timeout against the configured wait, or a branch-protection failure it cannot resolve — the pull request is removed from the queue. There is no bisection of a failed group and no derivation of independent lanes from a build graph. One protected branch, one line.</p>
+  <h3>When that is fine</h3>
+  <p>When <em>p</em> is low and CI is fast, the machinery the others sell has nothing to do. Compute your own threshold rather than guessing: if your expected CI runs per merged PR at your measured <em>p</em> and your tolerable batch size is already under about 0.5, and your queue wait is dominated by CI duration rather than by depth, the native queue is not the constraint and replacing it buys you a bill. This is the common case for a single repository with a fifteen-minute pipeline, even at meaningful agent volume.</p>
+</section>
+
+<section>
+  <h2>Trunk Merge Queue — bisection as the headline</h2>
+  <h3>Failure isolation</h3>
+  <p>Trunk batches compatible pull requests and, when a batch fails, moves it into a separate queue for bisection: the batch is split in various ways and retested in isolation until the culprits are identified, with prior passing results reused so the isolation pass does not re-run what already went green. The healthy pull requests in the batch keep moving.</p>
+  <h3>Lanes</h3>
+  <p>Trunk infers parallel lanes dynamically from the targets a change actually impacts, through build-system integration with Bazel and Nx. Changes with no overlap test concurrently and merge independently; overlapping ones are grouped and tested together. The prerequisite is a build system that can answer "what does this diff affect" — without one, lane derivation degrades to a hand-maintained path map.</p>
+  <h3>Who it fits</h3>
+  <p>A monorepo where a large fraction of pull requests touch disjoint areas, and where <em>p</em> is high enough that discarding whole batches is the dominant cost. That is the shape agent-heavy repositories converge on.</p>
+</section>
+
+<section>
+  <h2>Mergify — the knobs are the product</h2>
+  <h3>Batching and speculation</h3>
+  <p>Mergify exposes batch size directly: a fixed integer from 1 to 128, or an object <code>{min, max}</code> for dynamic batching that uses <code>min</code> when parallel-check slots are plentiful and grows toward <code>max</code> to drain a backlog. Parallel (speculative) checks work by creating temporary draft pull requests that combine queued changes with the base branch and running CI on each concurrently, with <code>max_parallel_checks</code> capping how much concurrency you ask your CI to absorb.</p>
+  <h3>Ordering and scoping</h3>
+  <p>Each batch is seeded with the pull request next to merge — highest priority, oldest among equals — and batching candidates are ranked by shared scopes, so changes touching the same declared areas group together. Priority rules support interrupting running checks for a higher-priority change. Queue freezing is handled through a Pause API with a flag governing whether checks continue to run while paused.</p>
+  <h3>Who it fits</h3>
+  <p>Teams who want to tune this rather than accept a policy, and teams who want the queue and the merge-governance rules in one configuration file. The dynamic <code>{min, max}</code> batch size is the setting the arithmetic above is about — but note it tunes on backlog depth, not on <em>p</em>, so set the ceiling from your measured failure rate yourself.</p>
+</section>
+
+<section>
+  <h2>Aviator — flakes and monorepo scale</h2>
+  <h3>Affected targets</h3>
+  <p>Aviator builds around what a change touches: dynamic queues derived from affected targets, so non-overlapping pull requests run independently, while overlapping ones are optimistically stacked and tested together as in parallel mode.</p>
+  <h3>Optimistic validation</h3>
+  <p>This is the distinctive piece. When a test fails inside a batch in parallel mode, rather than resetting the queue immediately, Aviator waits to see whether later batches pass — <code>use_optimistic_validation</code>, with <code>optimistic_validation_failure_depth</code> controlling how far it looks. The effect is to stop a flaky required check from repeatedly discarding healthy work.</p>
+  <h3>Deployment</h3>
+  <p>CI-agnostic via status checks, with first-class integration for GitHub Actions, Buildkite, CircleCI, Jenkins, GitLab CI and Argo, and a self-hosted option — the one in this group, and the deciding factor if your source of truth cannot talk to a third-party SaaS.</p>
+  <h3>The caveat that comes with it</h3>
+  <p>Tolerating flakes and tolerating real failures are the same behaviour seen from two angles. Optimistic validation buys throughput against a genuinely flaky check and, configured aggressively, delays your discovery of a genuinely broken one. Treat it as a stopgap attached to a tracked quarantine list with an owner, not as a substitute for fixing the check.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>One repo, CI under ~15 min, measured <em>p</em> under 10%</td><td>GitHub merge queue</td><td>Free, native, and the extra machinery has nothing to do at your failure rate.</td></tr>
+      <tr><td>Monorepo with a real build graph, high agent share</td><td>Trunk or Aviator</td><td>Lane derivation from impacted targets is the only thing that removes false serialization.</td></tr>
+      <tr><td>High <em>p</em>, no build graph, you want to tune</td><td>Mergify</td><td>Explicit batch sizing and speculative checks without requiring Bazel or Nx.</td></tr>
+      <tr><td>A required check you cannot de-flake this quarter</td><td>Aviator</td><td>Optimistic validation is built for exactly this, with an explicit failure-depth setting.</td></tr>
+      <tr><td>Source of truth cannot reach third-party SaaS</td><td>Aviator</td><td>The self-hosted option in this group.</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/github-merge-queue-vs-trunk-vs-mergify-vs-aviator/compare-what-decides.svg" alt="Three columns: per-PR failure rate, CI wall-clock, and conflict domain, each with what it determines and how to measure it." width="900" height="300" loading="lazy" />
+    <figcaption>Three measurements decide this, and you can take all three from data you already have.</figcaption>
+  </figure>
+
+  <p>Whichever you pick, the highest-leverage change is not in the product. It is re-verifying each pull request against the queue head at enqueue time, so a correct patch tested against stale state fails cheaply on a branch rather than expensively in a serialized queue. That is one pipeline change, it usually produces the largest single drop in <em>p</em>, and it makes every product on this list cheaper to run.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Is review really not the bottleneck?</h3>
+  <p>Review is slower — median review time is up roughly 5× in Faros AI's 2026 study of about 22,000 developers, and agentic pull requests wait around 5.3× longer for pickup per LinearB's 2026 benchmarks. But 31% more pull requests now merge with no review at all, and the incidents-to-PR ratio more than tripled. A bottleneck holds work back; this system routed around its own gate. The automated gate is the one still applying uniformly.</p>
+
+  <h3>How do I measure my p without deploying a queue?</h3>
+  <p>Take fifty pull requests merged last month, check each out at the tip of main as it was at their merge moment, and run the affected tests. The failure fraction is your <em>p</em>. Split it by author type — human versus agent — because the two numbers are usually far apart and only the blend matters for batch sizing.</p>
+
+  <h3>Do I need Bazel or Nx to get lanes?</h3>
+  <p>For derived lanes, effectively yes — the products infer targets from a build graph. Without one, a hand-maintained path-to-lane map is a worse approximation and still far better than one global line. Keep a small set of integration checks that run in every lane, because a wrong lane boundary merges two changes that do interact.</p>
+
+  <h3>Can agents merge through the queue themselves?</h3>
+  <p>They should, and they should have no other route. Remove the admin-merge permission from agent tokens rather than writing a policy about it — one direct push to main invalidates every speculative run in flight.</p>
+
+  <h3>What stops an agent from deleting a test to get through?</h3>
+  <p>Nothing in the queue. A diff-level rule: an agent fixing a queue ejection may not modify test files unless the ejection was itself a test failure it is legitimately updating, and any deleted assertion triggers human review regardless.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/playbooks/coding-and-computer-use-agents/merge-queues-for-agent-changes">Merge Queues for Agent-Authored Changes</a> — the build order, the enqueue-time rebase, and the four metrics to track.</li>
+    <li><a href="/playbooks/coding-and-computer-use-agents/ci-repair-agents">CI Repair Agents</a> — where a queue ejection should be routed.</li>
+    <li><a href="/playbooks/coding-and-computer-use-agents/patch-generation-and-tests">Patch Generation &amp; Test-Driven Loops</a> — lowering <em>p</em> at the source.</li>
+    <li><a href="/playbooks/coding-and-computer-use-agents/background-coding-agents">Background Coding Agents</a> — where the volume comes from.</li>
+  </ul>
+  <h3>Product documentation:</h3>
+  <ul>
+    <li><a href="https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue">GitHub — Managing a merge queue</a></li>
+    <li><a href="https://docs.trunk.io/merge-queue/concepts-and-optimizations/batching">Trunk — Batching and bisection</a></li>
+    <li><a href="https://docs.mergify.com/merge-queue/batches/">Mergify — Merge queue batches</a> and <a href="https://docs.mergify.com/merge-queue/parallel-checks/">parallel checks</a></li>
+    <li><a href="https://docs.aviator.co/mergequeue/affected-targets">Aviator — Affected targets</a> and <a href="https://docs.aviator.co/mergequeue/concepts/managing-flaky-tests-in-mergequeue">managing flaky tests</a></li>
+  </ul>
+</section>

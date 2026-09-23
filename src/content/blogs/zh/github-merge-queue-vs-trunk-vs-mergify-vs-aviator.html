@@ -1,0 +1,153 @@
+<p class="lede">每一家合并队列产品卖给你的都是打包——十个 PR 编成一组、跑一次 CI、十个一起合入——而在智能体负载下，这套说辞会悄悄反转，因为把你 PR 数量翻倍的那些智能体，同时也抬高了被打包取十次方的那个单 PR 失败率。队列失败率 20% 时，十个一组只有 10.7% 的概率通过，每合入一次变更要花掉将近一整趟 CI，而那正是你什么都还没买时付的价。真正改变这笔算术的只有两项能力：失败的一组是被二分定位、还是被整组丢弃；以及能不能为彼此不可能互相影响的变更跑独立的道。按这两点来筛，比较里的其余部分就塌缩成配置了。</p>
+
+<section>
+  <h2>速览</h2>
+  <p>四款产品，按它们在「已批准」与「进 main」之间塞进多少机器来排序。第一款免费、开箱即有；另外三款之所以存在，是因为第一款在某个特定的地方停了下来。</p>
+
+  <table>
+    <thead>
+      <tr><th>产品</th><th>失败批次的处理</th><th>分道的推导</th><th>形态</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>GitHub 合并队列</td><td>把失败的 PR 移出队列；不做二分定位</td><td>无——每个受保护分支一条队列</td><td>原生、免费、零部署</td></tr>
+      <tr><td>Trunk Merge Queue</td><td>把这一组挪进二分定位队列；劈开、重测、复用此前通过的结果</td><td>由受影响的构建图目标动态分道（Bazel、Nx）</td><td>SaaS，与 CI 无关</td></tr>
+      <tr><td>Mergify</td><td>在临时草稿 PR 上做并行／推测式检查；批次大小 1–128 或动态 <code>{min, max}</code></td><td>scope 感知打包——把触及同一批声明区域的变更编在一起</td><td>SaaS，队列加合并治理</td></tr>
+      <tr><td>Aviator MergeQueue</td><td>乐观校验——怀疑是 flaky 时先看后续批次，而不是立刻重置</td><td>由受影响目标推导出动态队列</td><td>SaaS，并提供自托管选项</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/github-merge-queue-vs-trunk-vs-mergify-vs-aviator/data-feature-matrix.svg" alt="四款合并队列产品在打包控制、失败隔离、分道推导、flaky 容忍与自托管上的能力矩阵。" width="900" height="400" loading="lazy" />
+    <figcaption>各家最用力的地方。第二列才是改变渐近行为的那一列。</figcaption>
+  </figure>
+
+  <p>继续之前先说一句来源：这个品类的公开对比材料，很多是厂商写彼此的，而且两个方向上都带立场。本文中作为事实陈述的内容，均来自各家产品自己文档中对自身行为的描述；凡是关于竞争对手的说法，我们都略去了。</p>
+</section>
+
+<section>
+  <h2>决定这份候选名单的那笔算术</h2>
+  <p>合并队列做的是串行化：取下一批 PR，把它们放在当前尖端加上排在前面的一切之上测试，通过的就合入。每合入一次变更一趟 CI，这是基线成本；而打包是对这份成本的通用回答。</p>
+  <p>若每个 PR 在队列里独立地以概率 <em>p</em> 失败，那么 <em>b</em> 个一组通过的概率是 (1−<em>p</em>)<sup><em>b</em></sup>。不做二分定位时，一个失败就毁掉整组：</p>
+
+  <table>
+    <thead>
+      <tr><th>单 PR 队列失败率</th><th>4 个一组通过</th><th>10 个一组通过</th><th>每合并一次的 CI 趟数（b=10）</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>5% —— 测试充分的人类 PR</td><td>81.5%</td><td>59.9%</td><td>0.17</td></tr>
+      <tr><td>10%</td><td>65.6%</td><td>34.9%</td><td>0.29</td></tr>
+      <tr><td>20% —— 典型的智能体所写、未变基</td><td>41.0%</td><td>10.7%</td><td>0.93</td></tr>
+    </tbody>
+  </table>
+
+  <p>右下角那一格就是全部论证。在智能体的失败率上，十个一组每合入一个 PR 要花将近一整趟 CI——你买了打包这套机器、多了一种队列重置的失败模式，然后回到了不打包时的基线。</p>
+  <p>而 <em>p</em> 不是继承来的。智能体写的变更在队列里失败得更频繁，原因是结构性的：智能体是对着它检出的那个基线提交做核验的，而不是对着它排到队首时真实存在的尖端；它改的文件里有些它没有本地上下文；而它开 PR 的速度快过这棵树平静下来的速度，于是跨智能体的冲突成了常态。数量与 <em>p</em> 一起涨——所以那个对数量的直觉反应「把批次做更大」，是反的。</p>
+
+  <figure>
+    <img src="/blogs/github-merge-queue-vs-trunk-vs-mergify-vs-aviator/arch-batch-and-bisect.svg" alt="八个 PR 一组失败后的两种恢复方式：整组丢弃重新排队，与劈开重测直到定位出罪魁。" width="900" height="500" loading="lazy" />
+    <figcaption>同一次失败，两种恢复。二分定位把线性代价变成对数代价，并让健康的 PR 继续往前走。</figcaption>
+  </figure>
+
+  <p>拯救高 <em>p</em> 下打包的，正是二分定位。把失败的一组劈开、测两半、递归下去：在 <em>b</em> 个里定位出一个罪魁大约多花 2·log₂(<em>b</em>) 趟，而不是全部重跑，而无辜的那些 PR 不必回到队尾。再叠上结果缓存，那些已经作为更大一组的一部分通过过的半区根本无需重跑。</p>
+</section>
+
+<section>
+  <h2>GitHub 合并队列——在一个可计算的门槛之下，它就是正确答案</h2>
+  <h3>它做什么</h3>
+  <p>它组成 merge group：你的 PR 与目标分支尖端、以及队列里排在它前面的一切编在一起，必需状态检查对着这一组跑。一个构建并发设置限制同时分发多少个 <code>merge_group</code> webhook，范围 1 到 100，你就是用它来节流并发 CI 的。另有一个设置决定：必需检查失败的 PR 能否被编在一个通过的 PR 后面，还是一组里每个 PR 都必须是绿的。</p>
+  <h3>它在哪里停下</h3>
+  <p>失败时——对着 merge group 的某项必需检查变红、与基线冲突、超过配置的等待时限、或是它无法自动解决的分支保护失败——这个 PR 会被移出队列。它不会对失败的一组做二分定位，也不会从构建图推导出彼此独立的道。一个受保护分支，一条线。</p>
+  <h3>什么时候这就够了</h3>
+  <p>当 <em>p</em> 低而 CI 快时，其余几家卖的那些机器无事可做。请计算你自己的门槛，而不是靠猜：如果在你实测的 <em>p</em> 与你能接受的批次大小下，每合入一个 PR 的期望 CI 趟数已经低于约 0.5，而且你的排队等待由 CI 时长、而非队列深度主导，那么原生队列就不是你的约束，换掉它买到的只是一张账单。对一个流水线十五分钟的单仓库来说，这是常见情形，即便智能体的量已经可观。</p>
+</section>
+
+<section>
+  <h2>Trunk Merge Queue——把二分定位当作主打</h2>
+  <h3>失败隔离</h3>
+  <p>Trunk 把兼容的 PR 打成一组，当一组失败时，把它挪进一条单独的队列做二分定位：这一组会以不同方式被劈开、隔离重测，直到罪魁被找出来，而此前通过的结果会被复用，于是这轮隔离不必重跑已经绿过的部分。组里健康的那些 PR 继续往前走。</p>
+  <h3>分道</h3>
+  <p>Trunk 通过与 Bazel、Nx 的构建系统集成，从一次变更实际影响到的目标动态推断出并行的道。没有重叠的变更并发测试、独立合入；有重叠的则编在一起测。前提是有一套能回答「这个 diff 影响到什么」的构建系统——没有的话，分道推导就退化成一张手工维护的路径映射表。</p>
+  <h3>适合谁</h3>
+  <p>一个 monorepo，其中相当大比例的 PR 触及互不相干的区域，而且 <em>p</em> 高到「整组丢弃」成了主要成本。这正是智能体密集的仓库会收敛到的形状。</p>
+</section>
+
+<section>
+  <h2>Mergify——旋钮本身就是产品</h2>
+  <h3>打包与推测</h3>
+  <p>Mergify 把批次大小直接暴露出来：1 到 128 的固定整数，或者一个 <code>{min, max}</code> 对象做动态打包——并行检查槽位充裕时用 <code>min</code>，要清积压时向 <code>max</code> 增长。并行（推测式）检查的做法，是创建把排队中的改动与基线分支合起来的临时草稿 PR，并对每一个并发跑 CI，而 <code>max_parallel_checks</code> 限制你要求 CI 吸收多少并发。</p>
+  <h3>排序与作用域</h3>
+  <p>每一组都以「下一个该合入的 PR」作种子——优先级最高的，同优先级里最老的——而打包候选按共享 scope 排序，于是触及同一批声明区域的变更会被编在一起。优先级规则支持为更高优先级的变更中断正在跑的检查。队列冻结则通过 Pause API 处理，并带一个控制「暂停期间检查是否继续跑」的标志。</p>
+  <h3>适合谁</h3>
+  <p>那些想自己调、而不是接受一套既定策略的团队，以及那些想把队列与合并治理规则放进同一个配置文件的团队。动态的 <code>{min, max}</code> 批次大小正是上面那笔算术所说的那个设置——但请注意它是按积压深度调的，不是按 <em>p</em>，所以上限要由你根据实测失败率自己定。</p>
+</section>
+
+<section>
+  <h2>Aviator——针对 flaky 与 monorepo 规模</h2>
+  <h3>受影响目标</h3>
+  <p>Aviator 围绕「一次变更触及了什么」来搭：由受影响目标推导出动态队列，于是互不重叠的 PR 各自独立跑，而有重叠的会像并行模式那样被乐观地叠在一起测。</p>
+  <h3>乐观校验</h3>
+  <p>这是它最具辨识度的一块。并行模式下当一组里的测试失败时，Aviator 不会立刻重置队列，而是先等着看后面的批次会不会通过——<code>use_optimistic_validation</code>，配合 <code>optimistic_validation_failure_depth</code> 控制它往后看多远。效果是不让一个 flaky 的必需检查反复丢掉健康的工作。</p>
+  <h3>部署</h3>
+  <p>通过状态检查与 CI 无关地对接，并对 GitHub Actions、Buildkite、CircleCI、Jenkins、GitLab CI 与 Argo 提供一等集成，另有自托管选项——这一组里唯一的一家；如果你的代码权威副本不能跟第三方 SaaS 通信，这就是决定性因素。</p>
+  <h3>随之而来的那条告诫</h3>
+  <p>容忍 flaky 与容忍真实失败，是同一种行为的两个侧面。乐观校验在面对一个确实 flaky 的检查时买到了吞吐；而配置得激进时，它会推迟你发现一个确实坏掉的检查。请把它当成挂在一张有主的、可追踪的隔离清单上的权宜之计，而不是修好那个检查的替代品。</p>
+</section>
+
+<section>
+  <h2>何时选哪个</h2>
+  <table>
+    <thead>
+      <tr><th>情形</th><th>选</th><th>因为</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>单仓库，CI 约 15 分钟以内，实测 <em>p</em> 低于 10%</td><td>GitHub 合并队列</td><td>免费、原生，而在你的失败率下，那些额外的机器无事可做。</td></tr>
+      <tr><td>有真正构建图的 monorepo，智能体占比高</td><td>Trunk 或 Aviator</td><td>由受影响目标推导分道，是唯一能消除「假串行化」的东西。</td></tr>
+      <tr><td><em>p</em> 高、没有构建图，而你想自己调</td><td>Mergify</td><td>显式的批次定尺与推测式检查，不要求你先上 Bazel 或 Nx。</td></tr>
+      <tr><td>有一个这个季度修不好的 flaky 必需检查</td><td>Aviator</td><td>乐观校验正是为此而建，还带一个显式的失败深度设置。</td></tr>
+      <tr><td>代码权威副本够不到第三方 SaaS</td><td>Aviator</td><td>这一组里提供自托管的那一家。</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/github-merge-queue-vs-trunk-vs-mergify-vs-aviator/compare-what-decides.svg" alt="三栏：单 PR 失败率、CI 挂钟时长、冲突域，各自决定什么以及怎么测。" width="900" height="300" loading="lazy" />
+    <figcaption>三个测量值决定这件事，而这三个你都能从手上已有的数据里取出来。</figcaption>
+  </figure>
+
+  <p>无论你选哪个，杠杆最高的那处改动都不在产品里。它是在入队时对着队首重新核验每一个 PR，好让一个「对着陈旧状态测过的正确补丁」在分支上便宜地失败，而不是在串行队列里昂贵地失败。这是一处流水线改动，它通常带来 <em>p</em> 的单项最大降幅，并且让这份清单上的每一款产品都更便宜。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>评审真的不是瓶颈吗？</h3>
+  <p>评审确实更慢了——在 Faros AI 对约 22,000 名开发者的 2026 年研究里，评审时间中位数上升约 5 倍；而按 LinearB 的 2026 基准，智能体式 PR 等到接手的时间约为 5.3 倍。但如今完全未经评审就合入的 PR 多了 31%，事故与 PR 的比值也翻了三倍不止。瓶颈会把活拦住；而这套系统是绕开了自己的闸门。仍然一视同仁生效的，是那道自动化闸门。</p>
+
+  <h3>不部署队列，我怎么测自己的 p？</h3>
+  <p>取上个月合入的五十个 PR，把每一个检出到它合入那一刻的 main 尖端上，跑受影响的测试。失败比例就是你的 <em>p</em>。按作者类型拆开——人类对智能体——因为这两个数字通常差得很远，而定批次大小时只有混合值才作数。</p>
+
+  <h3>要拿到分道，非得上 Bazel 或 Nx 吗？</h3>
+  <p>要拿到「推导出来的」分道，基本上是的——这些产品是从构建图推断目标的。没有构建图时，一张手工维护的「路径到道」映射表是更差的近似，但仍然远好过一条全局队列。请保留一小组在每条道里都跑的集成检查，因为一条错误的道边界会放行两个确实会互相影响的变更。</p>
+
+  <h3>智能体能自己走队列合入吗？</h3>
+  <p>应该能，而且不该有别的路。请把管理员直接合并的权限从智能体令牌上撤掉，而不是为它写一条规定——一次直推 main 就会让在途的每一趟推测式运行作废。</p>
+
+  <h3>什么能阻止智能体删掉一个测试来混过去？</h3>
+  <p>队列里没有任何东西能阻止。要靠一条 diff 层面的规则：修复队列弹出的智能体不得修改测试文件，除非这次弹出本身就是它正当更新的那个测试失败；而任何被删掉的断言，无论如何都触发人工评审。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站：</h3>
+  <ul>
+    <li><a href="/zh/playbooks/coding-and-computer-use-agents/merge-queues-for-agent-changes">为智能体写的变更建合并队列</a> —— 建造顺序、入队时的变基，以及该跟的四个指标。</li>
+    <li><a href="/zh/playbooks/coding-and-computer-use-agents/ci-repair-agents">CI 修复智能体</a> —— 一次队列弹出该被路由到哪里。</li>
+    <li><a href="/zh/playbooks/coding-and-computer-use-agents/patch-generation-and-tests">补丁生成与测试驱动循环</a> —— 从源头上把 <em>p</em> 压下去。</li>
+    <li><a href="/zh/playbooks/coding-and-computer-use-agents/background-coding-agents">后台编码智能体</a> —— 这些数量是从哪儿来的。</li>
+  </ul>
+  <h3>产品文档：</h3>
+  <ul>
+    <li><a href="https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue">GitHub — Managing a merge queue</a></li>
+    <li><a href="https://docs.trunk.io/merge-queue/concepts-and-optimizations/batching">Trunk — Batching and bisection</a></li>
+    <li><a href="https://docs.mergify.com/merge-queue/batches/">Mergify — Merge queue batches</a> 与 <a href="https://docs.mergify.com/merge-queue/parallel-checks/">parallel checks</a></li>
+    <li><a href="https://docs.aviator.co/mergequeue/affected-targets">Aviator — Affected targets</a> 与 <a href="https://docs.aviator.co/mergequeue/concepts/managing-flaky-tests-in-mergequeue">managing flaky tests</a></li>
+  </ul>
+</section>

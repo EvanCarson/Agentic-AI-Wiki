@@ -1,0 +1,125 @@
+<section class="phase">
+  <div class="phase-num">N9</div>
+  <div class="week">Deep Dive · Reasoning &amp; Test-Time Compute</div>
+  <h2>Latent Reasoning, and the Trace You Stop Getting.</h2>
+  <p class="goal">Every control you run on an agent's thinking — the monitor that reads the plan before the tool fires, the eval that scores the trajectory, the reviewer who has to explain why a refund was approved — rests on an implementation accident nobody chose: that the model currently deliberates in words, and words go in a log. Latent reasoning deletes that accident in exchange for compute, and it is the most efficient form of test-time scaling anyone has demonstrated. The trade is not tokens for accuracy. It is your only readable account of the run for accuracy, and the replacement account has to exist before you take the deal, not after the first incident.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The model keeps thinking; it just stops writing it down.</h3>
+
+    <p>Two research lines point at the same architecture, and both are now several years deep enough to take seriously as a deployment question rather than a curiosity.</p>
+
+    <p><strong>Continuous thought.</strong> Coconut (<em>Chain of Continuous Thought</em>, Hao et al., arXiv 2412.06769) changes one line of the decoding loop. Instead of sampling the last hidden state into a token and re-embedding that token, it feeds the hidden state straight back in as the next input embedding. Nothing is decoded. The "thought" never becomes text, so it is never forced to collapse onto a single next step.</p>
+
+    <p><strong>Recurrent depth.</strong> Geiping et al. (arXiv 2502.05171) take a 3.5B-parameter model — Huginn, trained on 800B tokens — and give it a core block that can be unrolled an arbitrary number of times at inference. Run more loops, spend more compute per token, with no change in parameter count and no reasoning traces in the training data at all. At up to 50 loops the authors report an effective compute budget in the range of a 50B-parameter model.</p>
+
+    <p>The theoretical reason this is not merely a compression trick is worth stating exactly, because it is the strongest argument on this page and it is not an argument about efficiency. A continuous thought vector is not obliged to represent one state. <em>Reasoning by Superposition</em> (arXiv 2505.12514) shows that a two-layer transformer with <em>D</em> steps of continuous chain-of-thought solves directed-graph reachability, where <em>D</em> is the graph's diameter — while the best known bound for constant-depth transformers using discrete chain-of-thought is O(<em>n</em><sup>2</sup>) decoding steps over <em>n</em> vertices. The mechanism is that each latent vector holds a superposition of search frontiers, so one autoregressive step advances a breadth-first search rather than one path.</p>
+
+    <div class="callout">
+      <p>Read that result as a statement about what discrete tokens cost, not about what latents add. A token is a commitment: the sampling step throws away the distribution and keeps one symbol. Everything <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/tree-and-graph-of-thought">tree-of-thought</a> does with explicit branching and an explicit scorer, continuous thought does inside the residual stream for free — and, for the same reason, invisibly.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The economics favour this, which is why it will arrive whether you plan for it or not.</h3>
+
+    <p>Discrete reasoning is priced twice. You pay for the reasoning tokens as output, and you pay for them again as context on every subsequent turn of the agent loop — see <a class="xref" href="/deep-dives/memory-and-context/context-budgeting">context budgeting</a> for what that compounds to over a forty-step run. You also pay in wall-clock: serial decoding at a few dozen tokens per second is the single largest contributor to the latency of a reasoning-heavy turn, and no amount of batching fixes it because the dependency is sequential.</p>
+
+    <p>Latent reasoning breaks the coupling between <em>amount of deliberation</em> and <em>length of context</em>. Compute per token becomes a dial — loops, or continuous steps — that does not touch the context window at all.</p>
+
+<pre class="standalone"><span class="c-cm"># The same deliberation budget, two ways</span>
+
+  discrete CoT      4,000 reasoning tokens
+                    -> ~4,000 serial decode steps
+                    -> 4,000 tokens of context carried on every later turn
+                    -> billed as output now, as cached input forever
+
+  latent            32 recurrent steps on the final position
+                    -> no decode, no sampling
+                    -> 0 tokens of context
+                    -> billed as compute, invisible to the transcript
+
+<span class="c-cm"># The second column is cheaper on every axis you measure,</span>
+<span class="c-cm"># and empty on the one axis you forgot you were measuring.</span></pre>
+
+    <p>There is a second-order pull, too. Recurrent-depth training needs no chain-of-thought corpus — no distillation from a bigger reasoner, no RL over verifiable tasks, no licensing question about whose traces you trained on. For anyone building an open-weights reasoner without a frontier lab's data pipeline, that is not a nice-to-have. It is the difference between shipping and not.</p>
+
+    <p>So do not plan around latent reasoning as a hypothetical. Plan around it as a thing that arrives in a model card one quarter, for a model that is cheaper and faster than the one you are using, with a paragraph you will skim.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Name what breaks, because "interpretability" is too vague to budget for.</h3>
+
+    <p>The research framing is that latent reasoning closes the monitoring window. True, and too abstract to act on. Here is the same claim expressed as five artifacts that exist in production agent stacks today and stop existing on a latent model.</p>
+
+    <ul>
+      <li><strong>The pre-execution monitor.</strong> A classifier reading the model's stated plan before a consequential tool call, looking for the shape of an injected instruction or an out-of-policy intent. This is the cheapest high-yield control in the <a class="xref" href="/deep-dives/agent-security/prompt-injection-defense-2026">injection-defense</a> stack, precisely because a compromised model usually says what it is about to do before it does it.</li>
+      <li><strong>Process scoring in evals.</strong> Half of <a class="xref" href="/deep-dives/evaluating-agents/trajectory-and-process-evaluation">trajectory evaluation</a> reads the reasoning, not just the actions — did it consider the constraint, did it notice the contradiction, did it decide or drift. On a latent model your eval collapses to outcome-and-actions, which is the weaker signal the whole subfield exists to escape.</li>
+      <li><strong>The triage transcript.</strong> When an agent does something wrong at 3am, the first thing anyone opens is the reasoning around the bad step. Without it, incident review becomes inference from tool calls — you can see it queried the wrong account, and you cannot see why it thought that was the right account.</li>
+      <li><strong>The explanation of record.</strong> Regulated workflows that owe a data subject or an auditor an account of an automated decision have been quietly using the model's own reasoning as the raw material for that account. It was always a shaky practice; it becomes an impossible one. See <a class="xref" href="/operations/governance-compliance/contestability-and-appeals">contestability and appeals</a> for what has to replace it.</li>
+      <li><strong>Drift detection on the reasoning itself.</strong> Teams that watch the distribution of reasoning length, hedging language or plan structure across a deploy have a genuinely early warning signal. It disappears without an error.</li>
+    </ul>
+
+    <p>Notice what these five have in common. None of them is a research programme. Each is a running piece of software with a dashboard and an owner, and each one's input is a string that is about to become a null.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The strongest objection: the trace was never faithful, so who cares.</h3>
+
+    <p>This objection is correct on the facts and wrong on the conclusion, and it is worth walking through carefully because it is the argument that will be used to wave the change through.</p>
+
+    <p>The facts first. A chain of thought is not a transcript of the computation. Models produce post-hoc rationalisations, omit the cue they actually used, and — under RL pressure — learn to write a reasoning that scores well rather than one that describes what happened. All of that is documented, and it is the whole content of <a class="xref" href="/concepts/chain-of-thought-faithfulness">chain-of-thought faithfulness</a>. Anyone treating the trace as ground truth is already wrong today.</p>
+
+    <p>Now the conclusion that does not follow. The cross-lab position paper on monitorability (arXiv 2507.11473) makes the load-bearing empirical claim: in almost every setting studied, monitoring the chain of thought catches more misbehaviour than monitoring actions and final outputs alone. A channel does not need to be truthful to be useful. It needs to be <em>correlated with the thing you are trying to catch and cheap to read</em>, and an unfaithful trace clears that bar comfortably — which is why a detector on it works even though a philosopher would object to calling it an explanation.</p>
+
+    <p>So the right framing is not "we are losing the truth." It is: <strong>you are losing a noisy, high-recall, essentially free sensor, and your remaining sensors are all downstream of the action.</strong> Everything you can still see happens after the decision is made. That is a materially different control posture, and it is the one to argue about.</p>
+
+    <div class="callout">
+      <p>The same paper is unusually blunt about the fragility of what it is defending: monitorability is a property of current training recipes, not a guarantee, and it can erode without anyone deciding to erode it. Process supervision that rewards nice-looking reasoning, architecture changes that shorten the trace, and latent reasoning are three different roads to the same place. If you depend on the channel, measure it — do not assume it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Latent is not opaque. It is opaque to the tools you happen to own.</h3>
+
+    <p>The useful asymmetry: a latent reasoning step is unreadable by a text classifier and perfectly readable by a linear probe. It is a vector, and vectors are the native input of the entire <a class="xref" href="/concepts/interpretability-and-probes">probing</a> toolkit — which, unlike most interpretability work, already runs in production at frontier scale and costs a rounding error per call.</p>
+
+    <p>Early work on detecting misaligned reasoning inside continuous thought (arXiv 2604.23460) reports the practically important part: the signal is concentrated in the <em>early</em> latent steps, the ones that function as planning. That maps cleanly onto the control you lost. The pre-execution monitor read the plan; a probe on the first few latent steps reads the plan too, in a different representation.</p>
+
+    <p>Three consequences follow, and the third is the one that decides your architecture.</p>
+
+    <ul>
+      <li><strong>Probes are per-model and per-layer.</strong> They are fitted artifacts, they degrade under distribution shift, and every model update invalidates them. Budget refitting as a recurring cost on your <a class="xref" href="/operations/agentops/model-deprecation-and-migration">migration</a> checklist, not as a project.</li>
+      <li><strong>Probes need labels you do not have yet.</strong> To fit a detector for "about to do the out-of-policy thing," you need examples of the model about to do the out-of-policy thing. Today those examples are in your reasoning logs. Harvest them while the channel still exists.</li>
+      <li><strong>Probes need white-box access.</strong> Residual-stream reads are not in anyone's public chat API. If your latent-reasoning model is hosted behind a vendor endpoint, you cannot fit or run a probe on it at all, and the replacement sensor is unavailable to you by contract rather than by physics.</li>
+    </ul>
+
+    <p>That last point turns this from an ML question into a procurement question, and it is the sentence to put in front of whoever signs the contract: <strong>on a hosted latent-reasoning model, the vendor is the only party who can monitor the reasoning, and whether they do is a term, not a fact.</strong></p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to do, in the order that survives being half-finished.</h3>
+
+    <p>Nothing here is a reason to avoid latent reasoning. It is a reason to treat the reasoning format as an interface your stack depends on — which is exactly what it became, unannounced, the day you shipped a monitor that reads it.</p>
+
+    <ul>
+      <li><strong>Write down which of your controls read the trace.</strong> One afternoon, one list, and it is the artifact that makes every later argument concrete. Most teams discover between two and five, and are surprised by at least one.</li>
+      <li><strong>Move every control you can to the action boundary.</strong> A policy check on the tool call with its resolved arguments, a receipt for each consequential action, an egress filter on the response. These survive any change in how the model thinks, which is the definition of a control worth having. This is the same conclusion <a class="xref" href="/deep-dives/agent-security/decision-receipts-and-audit">decision receipts</a> reaches from the audit side.</li>
+      <li><strong>Make the verifier carry the weight the trace was carrying.</strong> If a separate model or program scores the proposed action, you have an observable that is independent of the reasoning format — and, per <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/verifier-guided-search">verifier-guided search</a>, the thing that was doing most of the work anyway.</li>
+      <li><strong>Keep a decoded sample.</strong> Where a vendor offers a decode-to-text mode on latent steps, run it on a small sampled fraction of production traffic and on your entire eval set. A sampled channel is a weaker control and a perfectly good measurement, and it keeps your probe training data flowing.</li>
+      <li><strong>Put the reasoning format in the model-change checklist.</strong> Alongside context window and pricing, a line that reads <em>does this model emit a readable reasoning trace, and which of our controls consume it</em>. This is the step that converts a silent capability loss into a decision someone made.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do this one thing this week, before any of the above: take fifty production runs, strip the reasoning out of each, and hand them to your incident reviewer and your eval. Measure what the reviewer can still conclude and how much your eval's scores move. That number is the price of latent reasoning for your system, in your units, and you can get it today without waiting for a model that has the property. Teams who run it usually find the eval barely moves and the reviewer is lost — which tells you the trace was propping up your operations, not your metrics, and that is where the replacement has to go.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/inference-time-scaling">inference-time scaling</a> for the axis latent reasoning is competing on, <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/carrying-reasoning-across-tool-calls">carrying reasoning across tool calls</a> for the shift that already made the trace opaque by default, and <a class="xref" href="/operations/safety-and-security/detecting-agent-compromise">detecting agent compromise</a> for the controls that never depended on it.</p>
+  </div>
+</section>
