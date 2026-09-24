@@ -1,0 +1,174 @@
+<p class="lede">Your agent authenticates with a long-lived key in an environment variable, and one successful exfiltration replays it for a year. All four systems here fix that, properly, and the difference between them is mostly where the trust anchor lives. What none of them fixes is the half of agent identity that 2026's incidents are actually about — an agent that is perfectly authenticated while doing what a web page told it to. Buy workload identity for the machine layer, know that it buys you nothing against the confused deputy, and pick on trust anchor and policy plane rather than on features.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Three of these speak SPIFFE. One of them mostly consumes it.</p>
+  <table>
+    <thead>
+      <tr><th>System</th><th>What it is</th><th>Trust anchor</th><th>What the agent ends up holding</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>SPIRE</td>
+        <td>Reference implementation of SPIFFE; CNCF-graduated since 2022</td>
+        <td>Your own trust domain, run by you</td>
+        <td>An X.509 or JWT SVID, default one-hour lifetime, auto-rotated</td>
+      </tr>
+      <tr>
+        <td>Teleport Machine &amp; Workload Identity</td>
+        <td>SPIFFE-compatible issuance inside a broader access platform</td>
+        <td>Teleport's CA, federatable with SPIRE trust domains</td>
+        <td>The same SVIDs, plus one audit log shared with human access</td>
+      </tr>
+      <tr>
+        <td>AWS IAM Roles Anywhere</td>
+        <td>Exchange for AWS credentials from outside AWS</td>
+        <td>AWS Private CA, or a CA certificate you upload</td>
+        <td>Temporary AWS credentials for a mapped IAM role</td>
+      </tr>
+      <tr>
+        <td>HashiCorp Vault</td>
+        <td>Secrets broker that accepts an identity and issues secrets</td>
+        <td>An external SPIFFE authority, or Vault's own auth methods</td>
+        <td>A dynamic database credential, a short-lived cert, a leased secret</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/spire-vs-teleport-vs-iam-roles-anywhere-vs-vault/data-feature-matrix.svg" alt="Feature matrix of four workload identity systems across attestation depth, SPIFFE compatibility, breadth of downstream targets, one plane for humans and machines, and operating burden." width="900" height="400" loading="lazy" />
+    <figcaption>Where each one leans hardest. Nobody is strong in every column, and the last column is a cost, not a capability.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>What workload identity fixes — and the half it does not touch</h2>
+  <figure>
+    <img src="/blogs/spire-vs-teleport-vs-iam-roles-anywhere-vs-vault/arch-svid-to-call.svg" alt="Flow from node and workload attestation through SVID issuance to a downstream call, with a marked gap showing that the SVID carries which process is calling but not which user the turn is for or what text is in the context." width="900" height="500" loading="lazy" />
+    <figcaption>The SVID answers the first question completely and the other two not at all.</figcaption>
+  </figure>
+
+  <h3>The half that is genuinely solved</h3>
+  <p>SPIFFE's mechanism is attestation rather than a stored secret. SPIRE attests in two stages — first the node, then the workload running on it — and issues a SPIFFE Verifiable Identity Document from that evidence, with no bootstrap secret to provision. The private key is generated locally and never transmitted. The default X.509 SVID lifetime is one hour, and the agent renews around the half-life, so a credential that is somehow captured is worth minutes, not a year. For an agent process this is strictly better than any key-in-a-vault arrangement, and it is worth doing on that basis alone.</p>
+
+  <h3>The half that is not</h3>
+  <p>An SVID attests a process: this binary, on this node, in this namespace. It says nothing about which user's request the agent is currently serving, and nothing at all about the fact that the current turn's instructions arrived inside a retrieved document. Every one of these systems will cheerfully issue a valid identity to an agent in the middle of executing an injected instruction, because from the attestation layer's point of view nothing is wrong — the right process is making the call.</p>
+
+  <p>That is the confused deputy, and it is a different product. Per-user delegation lives in a consent record and a per-task token; per-task scoping lives in your tool layer; the question of what is in the context lives in <a href="/concepts/context-taint-tracking">taint tracking</a>. Workload identity is the floor. Treating it as the ceiling is how teams end up with a beautifully rotated credential to exactly the same god-role they had before.</p>
+</section>
+
+<section>
+  <h2>SPIRE — the highest ceiling, and the one you operate</h2>
+  <h3>What it does</h3>
+  <p>SPIRE is the SPIFFE runtime: a server holding the trust domain and its registration entries, and an agent on each node performing node and workload attestation and serving SVIDs over a local Workload API socket. It issues X.509-SVIDs for mTLS and JWT-SVIDs for things that cannot do mTLS, federates across trust domains, and is the substrate several service meshes already sit on.</p>
+
+  <h3>Where it stops</h3>
+  <p>SPIRE gives you identity and leaves authorisation to you. Its registration entries are a policy store you now own and must keep in sync with reality — and for agent fleets, reality changes when someone edits a deployment. The common failure is not cryptographic; it is that a pilot turns into an operations project bigger than the problem it was started for, with a datastore to run and entries to garbage-collect.</p>
+
+  <h3>Who it fits</h3>
+  <p>Teams with more than one cloud or more than one orchestrator, who need a vendor-neutral trust domain and already have platform engineers who will own it. Also anyone who wants federation with a partner's trust domain, which is the case none of the others handle as cleanly.</p>
+</section>
+
+<section>
+  <h2>Teleport — SPIFFE without the registration database</h2>
+  <h3>What it does</h3>
+  <p>Teleport's Machine &amp; Workload Identity issues the same SPIFFE IDs and SVIDs over the same Workload API with the same trust bundles, so standard SPIFFE SDKs work unmodified, and it can federate with SPIRE-managed trust domains. The difference is the policy surface: a WorkloadIdentity resource maps to Teleport's existing role-based access control, managed through the same CLI and Terraform provider as everything else, with no parallel registration database to maintain.</p>
+
+  <h3>The part that matters for agents</h3>
+  <p>Human access and workload access run through one control plane and land in one audit log. For agent work that is not a convenience — it is the difference between being able to answer "who or what touched this system in March" as a single query, and joining two systems that disagree. It also supports TPM-based node attestation and can act as the CA trust anchor for AWS Roles Anywhere, which removes the AWS Private CA line item below.</p>
+
+  <h3>Who it fits</h3>
+  <p>Organisations that already run Teleport for human access, and teams that want the SPIFFE plane without staffing it. The trade is the obvious one: you are inside one vendor's control plane, and the federation story is what keeps that from being a one-way door.</p>
+</section>
+
+<section>
+  <h2>AWS IAM Roles Anywhere — narrow, cheap, and done by Friday</h2>
+  <h3>What it does</h3>
+  <p>You register a trust anchor — either a reference to AWS Private CA, or a CA certificate you upload from your own PKI — and a profile that binds that anchor to one or more IAM roles and sets the session duration. A workload outside AWS presents its certificate and gets temporary AWS credentials for the mapped role. The service itself carries no per-request charge.</p>
+
+  <h3>Where it stops</h3>
+  <p>It issues AWS credentials, full stop. If your agent also calls a Postgres instance, an internal service and a SaaS API, Roles Anywhere solves one quarter of the problem and you are back to a secret for the rest. It is also not a general identity plane: there is no workload attestation, only possession of a certificate, so the strength of the whole thing is the strength of whatever issues those certificates.</p>
+
+  <h3>The cost note</h3>
+  <p>The service is free; the CA is not. AWS Private CA's general-purpose mode runs around $400 per month plus per-certificate issuance, with a short-lived-certificate mode at roughly an eighth of that — and short-lived is what you want for agents anyway. An external CA, including one fronted by Teleport, removes the line entirely.</p>
+
+  <h3>Who it fits</h3>
+  <p>An agent running on your own hardware or another cloud whose downstream calls are overwhelmingly AWS. This is the smallest possible amount of work that deletes a static access key, and for a lot of teams it is the right first move.</p>
+</section>
+
+<section>
+  <h2>Vault — it consumes an identity better than it mints one</h2>
+  <h3>What it does</h3>
+  <p>Vault's job is the step after identity: turn "I am this workload" into a database credential that expires, a certificate for this connection, or a leased secret with a revocation path. Its SPIFFE auth method accepts and validates SVIDs issued by an external authority such as SPIRE — it does not generate them — while a SPIFFE secrets engine can mint JWT SVIDs, and Vault Enterprise 1.21 added native SPIFFE identity issuance for non-human workloads.</p>
+
+  <h3>Why the distinction matters</h3>
+  <p>Teams reach for Vault and think they have adopted workload identity. What they usually have is a better secret store with the same bootstrapping problem moved one layer down: something still has to prove to Vault who it is. Pair it with a real attestation source and the combination is excellent. Deploy it alone with an AppRole secret ID baked into an image and you have a rotating credential guarding a static one.</p>
+
+  <h3>Who it fits</h3>
+  <p>Almost everyone, as the second component. It is the right answer to "my agent needs a Postgres password that expires" and the wrong answer to "prove which process this is".</p>
+</section>
+
+<section>
+  <h2>What actually decides it</h2>
+  <figure>
+    <img src="/blogs/spire-vs-teleport-vs-iam-roles-anywhere-vs-vault/compare-what-decides.svg" alt="Three columns: where the trust anchor lives, how many downstream systems the agent calls, and whether humans and machines need one policy plane, each with what it determines and how to check it." width="900" height="300" loading="lazy" />
+    <figcaption>Answer three questions and the shortlist collapses to one.</figcaption>
+  </figure>
+
+  <p>Across all four, the axis that never appears in a comparison table is <strong>what the identity unlocks</strong>. Attestation quality is a real difference — SPIRE and Teleport prove which process is asking; Roles Anywhere proves possession of a certificate — but it is second-order if the SVID maps to a role that can do everything. The useful exercise is to list your agent's capabilities and check that each identity unlocks a narrow set of them, which is the <a href="/concepts/blast-radius">blast radius</a> question wearing an IAM hat.</p>
+
+  <p>The second axis is breadth. Roles Anywhere terminates at AWS; Vault terminates at whatever it has a secrets engine for; SPIRE and Teleport terminate at anything that can verify an SVID, which in practice means anything you also control. An agent calling three third-party SaaS APIs is not served by any of them, and that reach stays in OAuth tokens held per user.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Start with</th><th>Add next</th><th>Watch for</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Agents outside AWS, calling mostly AWS</td><td>IAM Roles Anywhere</td><td>Short-lived CA mode, or an external CA</td><td>The Private CA line item, and role scope creep</td></tr>
+      <tr><td>Multi-cloud or multi-orchestrator fleet</td><td>SPIRE</td><td>Vault behind it for downstream secrets</td><td>Registration entries drifting from deployments</td></tr>
+      <tr><td>Teleport already in place for humans</td><td>Teleport Workload Identity</td><td>Federation with a partner SPIRE domain</td><td>One control plane is also one dependency</td></tr>
+      <tr><td>"My agent needs a password that expires"</td><td>Vault</td><td>A real attestation source in front of it</td><td>A static AppRole secret ID under everything</td></tr>
+      <tr><td>Agent acts for individual end users</td><td>None of these alone</td><td>Per-user tokens and consent records</td><td>Assuming the SVID answered the question</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Does a one-hour SVID actually help if the agent is compromised while running?</h3>
+  <p>Not during the run — an attacker with code execution simply uses the live identity. It helps against everything else: a credential lifted from a log, an image, a backup or a leaked env dump is worth minutes rather than indefinitely, and it cannot be replayed from somewhere the attestation does not hold.</p>
+
+  <h3>Can I give each agent task its own identity instead of each agent process?</h3>
+  <p>Not with attestation, because attestation describes the process and a task is not a process. The usual construction is a stable workload identity for the process plus a short, narrow, per-task token minted on top of it — two credentials with different lifetimes, and the second one carries the authority.</p>
+
+  <h3>Is SPIFFE overkill if we only run on Kubernetes?</h3>
+  <p>Often yes at first. Kubernetes service account token projection with OIDC federation to your cloud covers a lot of ground with no new infrastructure. SPIFFE earns its cost when you cross a boundary Kubernetes does not span — another cloud, bare metal, or a partner.</p>
+
+  <h3>Where does MCP fit in this?</h3>
+  <p>An MCP server is another workload and should hold its own identity rather than share the agent's. The authorisation an MCP call needs is generally user-scoped, so it rides on OAuth rather than on the SVID; see <a href="/deep-dives/mcp/mcp-auth-oauth21">MCP auth</a>.</p>
+
+  <h3>What single change gives the most security per hour spent?</h3>
+  <p>Deleting the longest-lived static credential your agents hold and replacing it with any of these. After that, the highest-value hour goes to narrowing what the resulting identity can reach, not to improving the attestation.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/agent-identity-and-permissions">Agent Identity &amp; Permissions</a> — authentication, authorization and attribution as three separate questions.</li>
+    <li><a href="/concepts/ambient-authority">Ambient Authority</a> — the reach that no credential store lists.</li>
+    <li><a href="/deep-dives/agent-security/agent-identity-and-attestation">Agent Identity &amp; Attestation</a> — the mechanism in depth.</li>
+    <li><a href="/operations/safety-and-security/scoped-credentials-for-agents">Scoped Credentials for Agents</a> — narrowing what the identity unlocks.</li>
+    <li><a href="/operations/governance-compliance/access-reviews-for-agent-credentials">Access Reviews for Agent Credentials</a> — what to do with the grants once they exist.</li>
+  </ul>
+  <h3>Product documentation:</h3>
+  <ul>
+    <li><a href="https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/">SPIFFE concepts</a> and the SPIRE documentation.</li>
+    <li><a href="https://goteleport.com/docs/machine-workload-identity/workload-identity/aws-roles-anywhere/">Teleport Workload Identity with AWS Roles Anywhere</a>.</li>
+    <li><a href="https://docs.aws.amazon.com/rolesanywhere/latest/userguide/trust-model.html">The IAM Roles Anywhere trust model</a>.</li>
+    <li><a href="https://developer.hashicorp.com/vault/docs/auth/spiffe">Vault SPIFFE auth method</a>.</li>
+  </ul>
+</section>
