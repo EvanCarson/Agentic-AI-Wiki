@@ -1,0 +1,68 @@
+<section class="phase">
+  <div class="phase-num">A35</div>
+  <div class="week">Concepts · Agentic AI Explained</div>
+  <h2>Context taint tracking.</h2>
+  <p class="goal">By the time your agent decides whether to trust a sentence, the sentence has already lost the one fact that would settle it — where it came from. A context window is a flat string: the system prompt, the user's request and the web page that was fetched thirty seconds ago arrive as the same undifferentiated tokens, and every defense that then tries to read the text and judge whether it is an instruction is guessing at something it could have simply recorded. Taint tracking is the alternative: attach an origin label to data at the moment it enters, carry the label with it, and check the label at the tool call rather than the sentence. It is bookkeeping, not classification — which is why it has a failure mode you can enumerate instead of a false-negative rate you can only estimate.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Every token has an origin. Almost nothing records it.</h3>
+
+    <p>Walk backwards from a bad tool call and you will find a chain: the model emitted <code class="inline">send_email(to=…)</code> because a paragraph in the context said to, and that paragraph arrived in a tool result, and that tool result came from a URL somebody else controls. Each hop is knowable at the moment it happens. None of it is knowable afterwards, because the transcript your model saw was assembled by concatenation, and concatenation throws provenance away.</p>
+
+    <ul>
+      <li><strong>Trusted, roughly.</strong> Your system prompt, your tool definitions, your own code's fixed strings. Content you would be willing to execute.</li>
+      <li><strong>Semi-trusted.</strong> The end user's own message. Authorised to direct the agent within that user's permissions — and nothing beyond them, which is the distinction most stacks collapse.</li>
+      <li><strong>Untrusted.</strong> Every tool result. A fetched page, a retrieved document, a database row that some other user wrote last week, a subagent's return value, the output of the agent's own earlier code. The defining property is not that it is hostile, but that its content is not determined by anyone in this conversation.</li>
+    </ul>
+
+    <p>That third category is larger than teams expect, and it grows every time someone adds an integration. It also includes surfaces that feel internal: an issue tracker, a CRM note field, a log line, a calendar invite title. See <a class="xref" href="/operations/safety-and-security/telemetry-as-untrusted-input">telemetry as untrusted input</a> for how far this reaches.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Taint is bookkeeping. An injection detector is a guess.</h3>
+
+    <p>The two approaches look similar from a distance and fail in opposite ways. A detector — a classifier, a regex set, a second model asked "is this an instruction?" — reads content and produces a probability. It will miss the phrasing it has not seen, and it will flag a legitimate document that happens to contain imperative sentences. Its error rate is a property of the attack distribution, which you do not control.</p>
+
+    <p>Taint tracking does not read the content at all. It records that this string arrived from <code class="inline">http_get</code> and therefore carries the label <code class="inline">untrusted</code>, and it will keep carrying that label through every string operation, summary and variable assignment until something explicitly clears it. There is no phrasing that defeats it, because phrasing is not an input to the decision.</p>
+
+    <div class="callout">
+      <p>Both have a place, and the ordering matters: taint decides what an untrusted value is <em>allowed to do</em>, a detector decides how suspicious it <em>looks</em>. Use taint for the control you must not lose and a detector for triage and alerting. Putting the detector in the load-bearing position is the common mistake, because it is the one that demos well — see <a class="xref" href="/concepts/prompt-injection-101">prompt injection</a> for why the underlying problem is not patchable.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The label has to be checked at the tool call, because the model is not a boundary.</h3>
+
+    <p>Here is the uncomfortable part. Once an untrusted string enters a context window, everything the model generates afterwards is downstream of it. There is no mechanism inside the model that keeps tainted input from influencing a supposedly clean output; the <a class="xref" href="/concepts/instruction-hierarchy">instruction hierarchy</a> is a trained preference, not an access check. So taint, propagated honestly, spreads to the whole context in one hop, and a naive implementation immediately declares everything untrusted and blocks every action.</p>
+
+    <p>Two structures make it usable again:</p>
+
+    <ul>
+      <li><strong>Gate the arguments, not the turn.</strong> The check that pays is per-argument: this <code class="inline">recipient</code> value is tainted, and <code class="inline">send_email</code> requires an untainted recipient. Summarising a hostile page is harmless; letting a value from that page reach the destination field of a write is not. Almost every real agent exfiltration has this shape — untrusted content in, privileged write out.</li>
+      <li><strong>Split the context, so taint has somewhere to stop.</strong> Parse the untrusted document in a second context that holds no credentials and returns a narrow structured value; only that value crosses back. This is what <a class="xref" href="/concepts/subagents">subagents</a> buy you, and it is why the isolation — not the persona — is the product.</li>
+    </ul>
+
+    <p>The research reference point is Google DeepMind's CaMeL (<em>Defeating Prompt Injections by Design</em>, 2025), which runs exactly this split: a privileged model writes a plan as code from the trusted request alone and never sees the data; a quarantined model parses untrusted content with no tool access; a custom interpreter attaches capability metadata to every value and enforces the data-flow rules. On the AgentDojo benchmark it completed 77% of tasks with a provable security guarantee — a real number, and also a real ceiling, since the remaining share is mostly tasks whose control flow depends on the data.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>What it costs, and the version worth building this week.</h3>
+
+    <p>The full construction is expensive: you must write the plan before you see the data, which rules out the open-ended exploration that makes agents attractive in the first place. Most teams should not start there. They should start by making the label exist at all, because today it usually does not.</p>
+
+    <ul>
+      <li><strong>Stamp at the boundary.</strong> Every tool result gets a provenance field — the tool, the source, and a trust level — set by the dispatcher, not by the tool author. Retrofitting this into a message format after a year of production traffic is a migration that never happens.</li>
+      <li><strong>Classify your tools once.</strong> Each tool is a reader, a writer, or both, and each writer declares which of its arguments must be untainted. This table is usually under a hundred rows and it is the whole enforcement surface.</li>
+      <li><strong>Deny the one sequence.</strong> Refuse a privileged write whose arguments derive from untrusted input within the same run, and escalate it to a human instead of guessing. This single rule catches the exfiltration pattern without any classifier.</li>
+      <li><strong>Log the label next to the call.</strong> Taint that is enforced but not recorded gives you no way to answer "which source moved this decision" after an incident — the same gap <a class="xref" href="/concepts/trajectories">trajectories</a> describes.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do this in the order that costs least: add a trust level to your tool-result envelope, mark your five most dangerous tools as privileged writers, and have the dispatcher refuse when a privileged argument traces back to a tool result. That is a day of work, it needs no model change, and it converts the vaguest question in agent security — "could this be an injection?" — into a question your code can answer. Then spend the rest of the effort shrinking what a compromised run could reach at all, which is <a class="xref" href="/concepts/blast-radius">blast radius</a>, and giving the agent credentials narrow enough that persuasion buys little, which is <a class="xref" href="/concepts/ambient-authority">ambient authority</a>.</p>
+    </div>
+  </div>
+</section>
