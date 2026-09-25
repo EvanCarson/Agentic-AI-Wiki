@@ -1,0 +1,125 @@
+<section class="phase">
+  <div class="phase-num">G9</div>
+  <div class="week">Deep Dive · Multi-Agent Systems</div>
+  <h2>What a sub-agent actually inherits.</h2>
+  <p class="goal">Every framework now gives you a switch for how much conversation a sub-agent inherits, and none of them gives you one for how much authority it inherits — so the setting you tune is the one that costs tokens, and the setting you cannot see is the one that decides how bad a compromised run gets. Delegation borrows its intuition from an org chart, where handing work down narrows what the recipient may do. In code it does the opposite: spawning five sub-agents usually produces five concurrent actors holding the parent's entire tool set, its credentials and its ambient reach, with no record of whose instruction started them. Getting this right means writing down five separate inheritance decisions where your framework offers one.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Five things can be inherited. Your config file covers two.</h3>
+
+    <p>When a parent spawns a child, the following cross the boundary — or fail to — and each is an independent decision that most stacks bundle or ignore.</p>
+
+    <ul>
+      <li><strong>Transcript.</strong> The conversation so far: the user's original request, intermediate tool results, the parent's reasoning. Configurable nearly everywhere.</li>
+      <li><strong>Instructions.</strong> The system prompt, policies, style rules, refusal boundaries. Usually bundled with the transcript decision, which is a mistake — the constraint "never email a customer without approval" belongs to the child regardless of whether the transcript does.</li>
+      <li><strong>Authority.</strong> The tool set, the credentials behind those tools, and everything reachable from the process without an explicit credential at all. Almost never configurable; almost always total.</li>
+      <li><strong>Budget and deadline.</strong> Remaining tokens, remaining wall-clock, remaining step count, remaining spend. Typically not inherited, which means not enforced.</li>
+      <li><strong>Provenance.</strong> The trust labels on the material that produced the child's task. Essentially never carried, and its absence is load-bearing in a way we get to in STEP 4.</li>
+    </ul>
+
+    <p>Read that list against the <a class="xref" href="/deep-dives/multi-agent-systems/sub-agent-patterns-comparison">sub-agent patterns</a> your framework offers and the asymmetry is stark: the two cheapest things to get wrong are richly configurable, and the three expensive ones are defaults nobody chose.</p>
+
+    <div class="callout">
+      <p>A useful reframing before going further: a sub-agent is not an employee, it is a thread with a language model attached. Threads inherit the process's file descriptors, environment and network access by default, and nobody finds that surprising. The org-chart metaphor is what makes it surprising here, and it is worth dropping entirely — the only question is which capabilities you deliberately pass down.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Transcript inheritance: the switch that exists, and the real trade behind it.</h3>
+
+    <p>LangChain's deepagents makes the choice explicit and is a good model to reason from. A sub-agent defaults to <code class="inline">mode: "isolated"</code>, where it sees only the task description it was handed and carries no memory of the conversation that led to the delegation. Switch it to <code class="inline">mode: "fork"</code> and it inherits the parent's full conversation history and its exact system prompt. Skills are separate again: custom sub-agents do not inherit them by default, and where they are present, skill state is isolated in both directions — the parent's are invisible to the child and the child's do not propagate back. LangGraph's subgraphs express the same axis structurally: a shared state schema means the child reads the parent's keys, while private state keeps its working memory out of the parent's.</p>
+
+    <p>Both settings fail, in opposite and predictable ways.</p>
+
+    <ul>
+      <li><strong>Fork fails on cost and attention.</strong> You have duplicated a large context window N times, paid for it N times, and handed each child a window in which the relevant instruction is buried among thousands of irrelevant tokens. This is <a class="xref" href="/deep-dives/memory-and-context/context-budgeting">context budgeting</a> at its least forgiving, because the duplication is multiplicative rather than additive.</li>
+      <li><strong>Isolated fails on the constraint stated in turn three.</strong> The user said "keep it under two pages" eight messages ago; the parent's task description did not repeat it; the child cannot know. Every isolated hand-off makes the parent's brief the entire specification, and briefs written by a model under token pressure drop qualifiers.</li>
+    </ul>
+
+    <p>The practical resolution is neither switch: it is a <em>typed hand-off</em>. Give each sub-agent role a small structured schema — the task, the accumulated constraints, the definition of done, the artefacts it may read — and have the parent fill it. That converts "how much history" into a question with a testable answer, because a missing field is visible in a trace and a missing sentence in a paragraph is not. It also makes the <a class="xref" href="/deep-dives/multi-agent-systems/supervisor-worker-pattern">supervisor's</a> decomposition reviewable, which is where most of these failures actually live.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Authority inheritance: the switch that does not exist.</h3>
+
+    <p>Here is the asymmetry that matters. Tool access is bound at the process, not at the conversation. A sub-agent spawned inside the same runtime shares the same MCP client connections, the same environment variables, the same OAuth tokens on disk, the same network namespace, the same database session. Setting <code class="inline">mode: "isolated"</code> isolates the transcript and changes none of it.</p>
+
+    <p>So the sentence to say out loud in a design review: <strong>context isolation is configurable, authority isolation is architectural.</strong> An isolated sub-agent is not a sandboxed one. It is a fresh context window with identical reach, and if it is persuaded by the document it was asked to summarise, it can do everything the parent could — through connections the parent opened, with no approval step and typically with no supervisor inspection of its individual tool calls.</p>
+
+    <p>Fan-out then multiplies the exposure in a direction the topology diagrams do not show:</p>
+
+    <ul>
+      <li><strong>Concurrency at constant authority.</strong> Five parallel workers are five actors that can each write, not five fifths of a writer. Any rate limit, approval queue or human checkpoint tuned for one agent's call pattern is now facing five.</li>
+      <li><strong>The audit trail loses its subject.</strong> If children call tools over the parent's credential, every action in the log is attributed to one identity, and afterwards you cannot say which worker sent the email. That is the attribution half of <a class="xref" href="/concepts/agent-identity-and-permissions">agent identity</a>, and it is lost at spawn time rather than at logging time.</li>
+      <li><strong>Recursion is usually unguarded.</strong> A sub-agent that can spawn sub-agents, with no inherited depth counter, is a fork bomb whose cost is denominated in tokens. Frameworks rarely bound it by default.</li>
+    </ul>
+
+    <p>What actually helps is unglamorous and mostly predates agents: give each sub-agent role its own declared tool allowlist, mint per-child credentials scoped to that allowlist rather than sharing the parent's, and put the write-capable roles in a separate process or sandbox so that "isolated" means something at the operating-system level too. Readers get read tools and no credentials worth stealing; the one role that writes gets a narrow, short-lived grant and a checkpoint. That is <a class="xref" href="/operations/safety-and-security/scoped-credentials-for-agents">scoped credentials</a> applied one level further down than most teams apply it, and it is the only control in this essay that changes the worst case rather than the average one.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Provenance: isolation is a laundering channel.</h3>
+
+    <p>This is the counter-intuitive consequence, and it inverts the safety intuition behind the isolated default.</p>
+
+    <p>Trace a hand-off backwards. The parent fetched a web page. The page contained a line addressed to the agent. The parent, following it, wrote a task description and spawned a child. The child receives that description in its <em>instruction</em> position — a clean, short, authoritative-looking brief with no history attached — and executes it. The untrusted origin was real, knowable at the moment it happened, and destroyed by the delegation. A dispatcher enforcing <a class="xref" href="/concepts/context-taint-tracking">taint rules</a> at the parent would have refused the write; the same dispatcher at the child sees a privileged instruction from its own orchestrator and allows it.</p>
+
+    <p>The split-context construction in the taint literature works precisely because it runs the opposite way: the untrusted content goes <em>into</em> the quarantined child, which holds no credentials, and only a narrow structured value comes back out. The pattern that launders provenance is the mirror image — untrusted content shapes the brief, and the capable child is the one that acts on it. Both are called "using a sub-agent for isolation", and only one of them isolates anything.</p>
+
+    <p>Two rules make the hand-off honest, and neither needs a framework change:</p>
+
+    <ul>
+      <li><strong>Taint flows down.</strong> The hand-off payload carries the maximum trust level of everything that contributed to it. A brief derived from a fetched page is tainted, the child inherits the label, and the child's dispatcher applies the same argument-level checks the parent's would have. Without this, every delegation is a trust-level reset.</li>
+      <li><strong>Returns flow up as untrusted.</strong> A child's return value is a tool result, not a colleague's report. It was produced by a model that read arbitrary content, and the parent must treat it exactly as it treats any other untrusted string — which in particular means a child cannot authorise the parent to do something, however confidently it phrases the recommendation.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Worth stating plainly because it cuts against the marketing: a sub-agent buys isolation of <em>context</em>, which is genuinely valuable for keeping a long document out of the parent's window. It buys isolation of <em>authority</em> only if you built that separately. When a vendor says sub-agents improve security, ask which of the two they mean, and then ask where the credential lives.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Budget and termination are inherited by nobody.</h3>
+
+    <p>The remaining two inheritance channels are cheaper to fix and produce most of the operational pain.</p>
+
+    <ul>
+      <li><strong>A parent step limit does not bound a tree.</strong> "Maximum 30 steps" on the orchestrator means thirty of its own turns, each of which may spawn a child that runs forty. The bound you need is on the whole tree, enforced by a counter passed down and decremented, not by a per-agent constant.</li>
+      <li><strong>Spend has to be a shared, debited budget.</strong> Give the run one token and cost allowance, pass a handle to it, and have each child debit it — so an unexpected fan-out degrades into "children ran out of budget" rather than into an invoice. Per-child limits multiply; a shared ledger does not, which is the distinction <a class="xref" href="/operations/agentops/cost-control-in-the-loop">cost control in the loop</a> turns on.</li>
+      <li><strong>Deadlines must be absolute, not relative.</strong> Pass a wall-clock instant, never a duration, or each level restarts the clock and a three-level tree takes three times as long as the timeout you set. This is the same defect <a class="xref" href="/operations/agentops/timeouts-and-deadline-budgets">deadline budgets</a> describes in RPC chains, and agent trees are deeper than RPC chains.</li>
+      <li><strong>Cancellation has to propagate.</strong> When a user aborts or a kill switch fires, in-flight children must stop. If they hold the credentials, an orphaned child is an unsupervised actor still making writes — the worst possible combination of the previous two steps.</li>
+      <li><strong>Failure semantics need declaring per role.</strong> Does a dead child fail the run, or return a partial result the parent must detect? Silent partial results are how <a class="xref" href="/deep-dives/multi-agent-systems/multi-agent-failure-modes">error propagation</a> gets into a final answer with full confidence attached.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Write the delegation contract down, once, per role.</h3>
+
+    <p>The fix is not a better framework setting; it is a short declaration per sub-agent role, reviewed like an API. Six fields cover it, and the exercise of filling them in is where the design errors surface.</p>
+
+    <pre class="standalone"><span class="c-cm"># one of these per sub-agent ROLE, reviewed like an API</span>
+role: document_reader
+context:     task_schema        <span class="c-cm"># not "fork", not "none" — a typed brief</span>
+instructions: [policy.core]     <span class="c-cm"># inherited explicitly, listed</span>
+tools:       [fetch, extract]   <span class="c-cm"># allowlist; no writer in this role</span>
+credentials: none               <span class="c-cm"># nothing worth stealing</span>
+budget:      shared_ledger      <span class="c-cm"># debits the run's allowance</span>
+trust_out:   untrusted          <span class="c-cm"># parent must treat returns as tool results</span></pre>
+
+    <ul>
+      <li><strong>Put every writer in its own role with its own credential.</strong> Most systems need exactly one, and discovering that is usually the largest single reduction in <a class="xref" href="/concepts/blast-radius">blast radius</a> available.</li>
+      <li><strong>Log the contract with the spawn event.</strong> Role, budget remaining, trust label in, tool allowlist. Without it, <a class="xref" href="/deep-dives/multi-agent-systems/credit-assignment-in-multi-agent-systems">credit assignment</a> has nothing to work with, because you cannot reconstruct what a child was allowed to do after the fact.</li>
+      <li><strong>Test the contract, not just the behaviour.</strong> An assertion that the reader role cannot reach a write tool is a unit test that keeps passing as prompts change; a hope that it will not is not.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Concretely, in this order: declare a tool allowlist per sub-agent role and assert it in a test, so authority stops being inherited by accident; replace prose hand-offs with a typed brief that carries constraints and a trust label; and give the run one shared budget with an absolute deadline that every child debits. Then, and only then, tune context inheritance — <strong>the transcript setting is the one that shows up in your bill, and the authority setting is the one that shows up in your incident report.</strong> The single question to leave a design review with is the crisp version of the whole essay: <em>when this sub-agent is persuaded by the document it is reading, exactly what can it reach?</em> If the answer is "the same things as the parent", you have not delegated anything — you have just added another copy of yourself.</p>
+    </div>
+  </div>
+</section>
