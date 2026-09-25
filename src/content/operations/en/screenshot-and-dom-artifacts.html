@@ -1,0 +1,103 @@
+<section class="phase">
+  <div class="phase-num">E22</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>Screenshots and DOM artefacts in agent traces.</h2>
+  <p class="goal">The first browser agent you put in production turns your trace store into an image archive, and every control you built for it assumes text. A redactor that scores 99% recall on prompts scores zero on a PNG; a retention policy written for JSON spans meets artefacts three orders of magnitude larger; and the frame is simultaneously the model's input, your auditor's only evidence that the run did what you say, and an injection channel nobody is scanning. The way out is to stop treating captures as one artefact class: capture the accessibility tree as the text-of-record, mask in the page before the pixels ever leave it, and keep frames only at the steps where a decision was made.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>A frame is not a span attribute, and the numbers are why.</h3>
+
+    <p>The economics break before the privacy does. A text span for a tool call is a few kilobytes. A full-page screenshot at a realistic viewport is 300 KB to 3 MB, and a browser agent generates one per observation — so a fifty-step session is a couple of hundred megabytes before anyone has looked at it.</p>
+
+    <ul>
+      <li><strong>Your observability bill re-prices itself.</strong> Most tracing backends charge by ingested volume, and image payloads will dominate that number within a week of launch. Teams discover this as a surprise invoice rather than a design decision.</li>
+      <li><strong>Blobs do not belong in the span.</strong> Put frames in object storage with their own lifecycle rules and carry a reference plus a content hash on the span. That split is what later lets you expire images on a thirty-day clock while keeping the trajectory for a year.</li>
+      <li><strong>Per-artefact retention, not per-trace.</strong> One TTL for the whole trace forces you to choose between keeping a page of pixels you will never open and losing the tool sequence you need. Classes with different value and different risk get different clocks — the same argument <a class="xref" href="/operations/evaluation-and-observability/trace-sampling-and-retention">sampling and retention</a> makes, now with a cost term that actually bites.</li>
+      <li><strong>Sampling whole sessions is the wrong axis.</strong> Keeping 5% of sessions loses 95% of your failure evidence. Keeping 100% of sessions and 10% of frames loses almost nothing you use.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Capture the accessibility tree as the text-of-record.</h3>
+
+    <p>The single highest-leverage decision is which representation you treat as authoritative, and it is usually not the pixels. Several of the browser-driving stacks agents use — Playwright's MCP server most explicitly — act on the accessibility tree rather than on screenshots, which means the thing the model reasoned over is already structured text.</p>
+
+    <ul>
+      <li><strong>Text is redactable, diffable and greppable.</strong> An a11y snapshot runs through the same redactor as everything else, diffs cleanly between steps, and lets you search "which sessions saw this button" without a vision model.</li>
+      <li><strong>It is also the honest record of what the agent perceived.</strong> If the agent selected an element by role and name, a screenshot is a re-render for humans; the tree is the input. Storing only the screenshot means your evidence and the agent's actual input are two different things.</li>
+      <li><strong>Store the snapshot, the step diff, and a frame hash.</strong> The hash lets you prove later that a given frame belongs to a given step even after the image itself has expired.</li>
+      <li><strong>Full DOM dumps are the worst of both.</strong> Megabytes of markup, and they carry hidden inputs, inline JSON payloads, data attributes and CSRF tokens the user never saw rendered. If you need markup, capture a bounded subtree around the acted-on element, not <code class="inline">document.documentElement.outerHTML</code>.</li>
+      <li><strong>Vision-driven agents are the exception, and pay for it.</strong> If the agent acts from pixels, the frame <em>is</em> the input and you cannot demote it — so the controls below become mandatory rather than optional.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Mask inside the page, because there is no redactor for pixels.</h3>
+
+    <p>The rule from text tracing holds without modification — the unredacted artefact must never cross a process boundary — but the implementation has to move into the browser, because once a frame is encoded nothing downstream can fix it. OCR-then-redact is a second detector with a second recall problem stacked on the first, and it runs after export.</p>
+
+    <ul>
+      <li><strong>Use the screenshot API's own masking.</strong> Playwright and friends accept a list of selectors to paint over before encoding, so the sensitive region never reaches the buffer. Maintain that selector list per application, in code, reviewed like any other control.</li>
+      <li><strong>Prefer a CSS class the app owns.</strong> Have the product mark sensitive regions (<code class="inline">.pii</code>, <code class="inline">data-sensitive</code>) and mask that class. Then a new field added by a product team inherits the masking instead of silently appearing in captures.</li>
+      <li><strong>Fail closed and loudly.</strong> If a mask selector matches nothing, that is either a fixed layout bug or a redesign — either way, drop the frame and raise, rather than shipping an unmasked capture. Selector rot is the predictable failure mode here.</li>
+      <li><strong>Remember what else is on the screen.</strong> A frame captures everything rendered, including the notification toast, the other record in the list, and the support agent's own name. A text redactor never had to reason about bystanders; a screenshot does.</li>
+      <li><strong>Session isolation is a privacy control, not just a hygiene one.</strong> An agent driving a clean automation profile captures a page with no logged-in identity on it; an agent driving a real profile captures the account. That choice is made when you pick the browser stack, and it determines how bad your captures are before any masking exists.</li>
+      <li><strong>Interaction traces leak differently.</strong> Keystroke-level logs and <code class="inline">fill()</code> arguments contain the password field's contents whether or not the screenshot does. Redact the action log with the same list — see <a class="xref" href="/operations/evaluation-and-observability/pii-redaction-in-agent-traces">redacting PII from agent traces</a> for the pipeline this plugs into.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Test it like a control rather than assuming it: run your real suite against a staging app seeded with marked canary values, then grep the exported artefacts for those values. Any hit is a leak with a stack trace attached. This is the only assurance method that survives a layout change, and it takes an afternoon to wire into CI.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Keep frames where a decision happened, not where a step happened.</h3>
+
+    <p>Uniform capture is both the most expensive policy and the least useful, because the frames that explain failures cluster tightly and the rest are scroll positions.</p>
+
+    <ul>
+      <li><strong>Always keep the frame immediately before a write.</strong> Every irreversible action — submit, purchase, delete, send — gets the pre-action capture retained at the long TTL. This is the evidence that answers "what did the agent believe the page said when it clicked."</li>
+      <li><strong>Always keep the last frame of a failed or aborted run.</strong> Cheap, tiny in volume, and it is the first thing any triage starts from.</li>
+      <li><strong>Keep the first divergence, once you can detect one.</strong> A step whose a11y diff is unexpectedly large, a selector that missed, a navigation nobody asked for. Frames at those steps are worth more than the twenty before them.</li>
+      <li><strong>Down-sample the rest aggressively and asymmetrically.</strong> Thumbnail-resolution frames for the middle of a successful run still let a human confirm the path; full resolution buys nothing once the outcome was right.</li>
+      <li><strong>Promote before you expire.</strong> A capture that becomes part of a regression case moves into the eval dataset and outlives the trace — so it must be re-masked on promotion, because <a class="xref" href="/operations/evaluation-and-observability/eval-set-maintenance">eval sets</a> inherit no retention rule from the store they came from.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The artefact is also an input, which makes the store an attack surface.</h3>
+
+    <p>This is the part that has no analogue in ordinary tracing. A screenshot of a hostile page is a faithful copy of an injection payload, and it lands in a system that was designed for read-only human inspection.</p>
+
+    <ul>
+      <li><strong>Replay re-feeds the payload.</strong> Re-running a recorded session through the model hands the injected instruction back to an agent that now holds current credentials. Replay of browser traces belongs in an environment with no production reach — the same discipline <a class="xref" href="/operations/evaluation-and-observability/replay-testing-with-recorded-traces">replay testing</a> describes, with a sharper reason.</li>
+      <li><strong>Your judges and summarisers read it too.</strong> An LLM-as-judge, an auto-triage summariser or a "describe this failure" helper consumes the captured page as untrusted input and can be steered by it. Treat every artefact-consuming model call as reading <a class="xref" href="/operations/safety-and-security/telemetry-as-untrusted-input">untrusted telemetry</a>.</li>
+      <li><strong>Rendering it in a dashboard is its own risk.</strong> Captured markup displayed in an internal tool is third-party HTML served from your origin. Render captures as images or escaped text, never as live DOM — the point <a class="xref" href="/operations/safety-and-security/rendering-agent-output-safely">rendering agent output safely</a> makes, applied to the trace viewer.</li>
+      <li><strong>Provenance on every artefact.</strong> Record the URL, the frame hash and a trust level alongside the reference, so a downstream consumer can tell a capture of your own app from a capture of an arbitrary site.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to have in place before the first browser agent ships.</h3>
+
+    <ol>
+      <li><strong>Blobs out of spans.</strong> Frames in object storage with their own TTL; spans carry a reference and a hash. Retrofitting this after a quarter of traffic is a migration, not a config change.</li>
+      <li><strong>An a11y snapshot per step as the text-of-record</strong>, through your existing redactor, with the frame as a secondary artefact.</li>
+      <li><strong>An app-owned mask class plus a per-app selector list</strong>, applied at capture time, failing closed, with a canary test in CI.</li>
+      <li><strong>A retention matrix, written down.</strong> Pre-write frames and failure frames long; successful middles short and thumbnailed; DOM subtrees shortest of all.</li>
+      <li><strong>One rule for who may open a frame.</strong> A capture of a customer's screen deserves the break-glass treatment, not a link in a chat channel — the access model <a class="xref" href="/operations/governance-compliance/data-governance">data governance</a> already asks for.</li>
+    </ol>
+
+    <div class="callout tip">
+      <p>If you do one thing this week, make the accessibility snapshot the artefact your triage workflow opens first, and demote the screenshot to supporting evidence. Everything else follows from that inversion: the record becomes text, so your existing redactor, retention and search all apply again; the images become a sampled, masked, short-lived tier you can price; and <strong>the question "can we keep this?" stops being one decision about an opaque blob and becomes four small ones you can actually defend.</strong></p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a> for the span design underneath, <a class="xref" href="/playbooks/coding-and-computer-use-agents/browser-agents">browser agents</a> for the stack that produces these artefacts, and <a class="xref" href="/concepts/computer-use">computer use</a> for why a pixel-driven agent has no cheaper record available.</p>
+  </div>
+</section>
