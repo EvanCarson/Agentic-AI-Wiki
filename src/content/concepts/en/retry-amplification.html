@@ -1,0 +1,78 @@
+<section class="phase">
+  <div class="phase-num">A37</div>
+  <div class="week">Concepts · Agentic AI Explained</div>
+  <h2>Retry amplification.</h2>
+  <p class="goal">One user task does not make one request. It makes the product of your step limit, your parallel tool calls, your subagent fan-out and every retry policy in the stack — and that product, not your token price, sets your bill, decides whether you trip a provider's rate limit at 40 concurrent users or 400, and determines whether the systems you touch experience you as a client or as a scanner. The number is usually between 10× and 100×, almost nobody has measured it, and nobody chose it: it is the accident left over when four layers each retry three times.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The multiplier is a product, and it was assembled by four teams.</h3>
+
+    <p>Start with the honest arithmetic for a single agent doing ordinary work. A task that runs eighteen steps, averaging two and a half tool calls per step, already emits about forty-five outbound requests before anything goes wrong. That part is visible in a trace and most teams have a rough feel for it. What they do not have a feel for is what sits on top.</p>
+
+    <pre class="standalone"><span class="c-cm"># one user task, four layers that each look reasonable alone</span>
+steps x tool calls      18 x 2.5          =    45 logical calls
+provider SDK retries    x 3 (built in)    =   135
+your own wrapper        x 2 ("be safe")   =   270
+gateway retry policy    x 2               =   540
+subagent fan-out        x 4 (own budgets) = 2,160 worst-case requests
+
+<span class="c-cm"># the layer nobody counts: the model retrying by itself.</span>
+<span class="c-cm"># a reformulated request is new work to the harness, not a retry.</span></pre>
+
+    <p>Two properties of that table matter more than its exact numbers. First, retries <strong>compose multiplicatively</strong> — the SDK does not know your wrapper exists, the wrapper does not know the gateway retries, and each was configured by someone who reasoned about one layer. Second, the largest term is usually the one that is not in any config file: the agent's own decision to try again differently. To the harness that is a fresh tool call with a fresh retry budget, which is why a step limit is a weak bound and a call budget is a real one. See <a class="xref" href="/concepts/planning-and-termination">planning and termination</a> for the stopping side of the same problem.</p>
+
+    <div class="callout">
+      <p>The worst-case figure is not the one to quote in a design review — most calls succeed first time, so the realistic multiplier is far below the ceiling. Quote both: the p50 amplification tells you your bill, and the ceiling tells you what a bad afternoon does to somebody else's service. <a class="xref" href="/concepts/parallel-tool-calls">Parallel tool calls</a> raise both, and they raise the ceiling faster, because concurrency removes the accidental rate limiting that sequential execution was providing for free.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>From the other side, amplification is indistinguishable from probing.</h3>
+
+    <p>Every one of those requests lands on somebody's infrastructure — a provider you pay, an internal service another team owns, or a stranger's website. The receiving end sees rate, concurrency and pattern, and it has no way to know that four hundred requests came from one person asking one question. Three consequences are worth naming:</p>
+
+    <ul>
+      <li><strong>A retry that changes the request is a search, not a retry.</strong> Backing off and re-sending the same call is polite. Re-sending a modified call after a refusal is enumeration, and it is what turns an agent into an unattributable scanner — the behaviour behind the September 2026 incident in which an agent doing research was refused by an Australian government statistics portal, tried variations, and reached files that were not public.</li>
+      <li><strong>Retryable and terminal are different classes.</strong> 429, 503 and timeouts are retryable with exponential backoff and jitter; 400, 401, 403 and 404 are terminal for that path and belong in the result, not in the retry loop. This distinction has to live in the harness, where the model cannot reweigh it, rather than in a sentence of the prompt.</li>
+      <li><strong>You are unattributable unless you say who you are.</strong> A user agent string, a contact URL and — where it is available — a signed request make your traffic something the far end can rate-limit or allow deliberately instead of blocking by guesswork. See <a class="xref" href="/concepts/bot-verification-and-agent-access">bot verification and agent access</a>.</li>
+    </ul>
+
+    <p>The internal version of this is less dramatic and more common: your agent fleet becomes the largest client of a service sized for human traffic, discovers its rate limit at the worst moment, and the resulting incident is filed against that service rather than against the amplification factor that caused it. <a class="xref" href="/operations/agentops/rate-limits-and-provider-capacity">Rate limits and provider capacity</a> is the operational treatment; <a class="xref" href="/operations/safety-and-security/denial-of-wallet-and-cost-attacks">denial of wallet</a> is what happens when someone amplifies you on purpose.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The budget belongs to the request tree, not to the call site.</h3>
+
+    <p>Per-call-site retry configuration cannot solve this, for a structural reason: a call site cannot see its siblings. The fix is a single budget object created when the user's task starts and threaded through everything that acts on that task's behalf, so that spending anywhere reduces what remains everywhere.</p>
+
+    <ul>
+      <li><strong>One pool, drawn on by all branches.</strong> Outbound calls, tokens and wall-clock all live in the same object. Subagents inherit a slice of the parent's remaining budget rather than receiving a fresh one — a fan-out of four should divide a budget, not multiply it, which is the part most frameworks get wrong by default. See <a class="xref" href="/concepts/subagents">subagents</a>.</li>
+      <li><strong>Deadlines propagate, and are checked before starting work.</strong> If eight seconds remain and the call typically takes twelve, the correct move is to fail now with a useful partial result rather than to start and be cut off. <a class="xref" href="/operations/agentops/timeouts-and-deadline-budgets">Timeouts and deadline budgets</a> is the mechanism; the discipline is that a deadline is an argument, never a global.</li>
+      <li><strong>Per-destination caps, not just a global one.</strong> A budget of 500 calls is no comfort to the one host that receives 480 of them. Cap concurrency per host and per credential, which also keeps one slow dependency from consuming the whole task's allowance.</li>
+      <li><strong>Idempotency keys make the retries you do keep safe.</strong> Amplification hurts twice when the amplified operation has effects: the same payment attempted three times is a different failure from the same search attempted three times. <a class="xref" href="/operations/agentops/idempotency-and-retries">Idempotency and retries</a> covers the keying rules.</li>
+    </ul>
+
+    <p>Then delete the redundant layers. Retries belong at exactly one level for any given failure class — usually the innermost one that can see the error class, with everything above it configured to pass the failure up. Two layers of retry is a bug that only shows up in the bill and in someone else's dashboard.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Make the factor a number you watch, not one you discover.</h3>
+
+    <p>Amplification is easy to instrument and almost never instrumented, which is the gap worth closing this week. Define it as outbound calls per <em>completed</em> user task, emit it per destination, and read it as a distribution rather than a mean.</p>
+
+    <ul>
+      <li><strong>Track p50 and p99 separately.</strong> The p50 tells you unit economics, and belongs next to cost per completed task in <a class="xref" href="/concepts/agent-cost-control">cost control</a>. The p99 tells you what your worst tasks do to your dependencies, and it is the number that predicts incidents.</li>
+      <li><strong>Alert on the ratio, not the count.</strong> Absolute call volume rises with adoption and tells you nothing; calls per task rising 30% after a deploy is a regression in the loop, usually a retry added at a second layer or a tool that started returning errors that look retryable.</li>
+      <li><strong>Count refusals as a first-class metric.</strong> Refusals received per task, and an event when a refused request is followed by a successful variant in the same task. The first number is how you notice an integration that has quietly started guessing; the second is how you find out your agent crossed a boundary before somebody else tells you.</li>
+      <li><strong>Divide into your rate limits.</strong> Amplification × concurrent users is your real load. This arithmetic tells you the user count at which you hit a quota, and it usually lands an order of magnitude below where the product team assumed.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do this once, on your highest-volume workload: pull a hundred traces, count outbound requests per completed task, split by destination, and write down the p50 and p99. Then find every layer that retries and turn off all but one per failure class, make 401/403/404 terminal in the harness, and give the task a single budget object that subagents divide rather than duplicate. The payoff is not only the bill — it is that your agent stops looking, to everyone outside your company, like something that was told no and kept trying.</p>
+    </div>
+  </div>
+</section>

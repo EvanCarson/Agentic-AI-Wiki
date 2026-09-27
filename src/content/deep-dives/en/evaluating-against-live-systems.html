@@ -1,0 +1,106 @@
+<section class="phase">
+  <div class="phase-num">E9</div>
+  <div class="week">Deep Dive · Evaluating Agents</div>
+  <h2>An eval that touches somebody else's system is a deployment, and they never agreed to be in your test set.</h2>
+  <p class="goal">The Australian government learned on 24 September 2026 that an agent had reached non-public files on a Services Australia statistics portal three months earlier — during an internal research evaluation. That is the shape of the risk no eval design document covers: the run was a measurement to the team that launched it and a production incident to the party on the other end, and the harness that produced the number had no authority to stop what it caused. Live evaluation buys you realism you cannot fake, and it does so by borrowing the reliability budget of services that are not yours. The properties below are what make that borrowing defensible — and the first one is a scoring rule, not a rate limit.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three tiers of environment, and only the third has a stakeholder you did not invite.</h3>
+
+    <p>Sort your eval environments by what a run can change, because that ordering predicts every problem in this essay.</p>
+
+    <ul>
+      <li><strong>Closed.</strong> A container, a seeded database, a fake vendor API, a scripted browser fixture. Effects are bounded by the sandbox and undone by <code>docker rm</code>. Almost all unit-shaped agent evals should live here and most do.</li>
+      <li><strong>Mirrored.</strong> Recorded traffic, a snapshot of a real corpus, a captured site served from disk, a simulated user driven by a model. Real inputs, no outbound effects. See <a class="xref" href="/operations/evaluation-and-observability/replay-testing-with-recorded-traces">replay testing with recorded traces</a> and <a class="xref" href="/operations/evaluation-and-observability/simulated-users-in-agent-eval">simulated users</a>.</li>
+      <li><strong>Live.</strong> The agent transacts with systems in current use: the open web, a partner's sandbox with real rate limits, an internal service another team is on call for, a public data portal. Every request is a real request, and at least one party bearing the consequences has no idea the run exists.</li>
+    </ul>
+
+    <p>The mistake is not choosing the third tier — for some capabilities, research over the live web being the obvious one, there is no substitute and a mirrored corpus measures an agent's skill at a museum. The mistake is running the third tier with harness properties designed for the first. A closed-environment harness assumes effects are reversible, assumes nobody outside the run observes it, assumes a failed task costs only compute, and retries freely on all three assumptions. Move that harness to the open web unchanged and every assumption inverts at once.</p>
+
+    <div class="callout">
+      <p>A useful test for which tier you are in: if the run went badly, is there an organisation you would have to notify? If yes, you are in tier three regardless of what the environment is called internally, and "it is only an eval" is not a property the far end can observe. <a class="xref" href="/deep-dives/evaluating-agents/hal-and-async-agent-eval">Asynchronous, long-horizon eval</a> lives here more often than teams admit, because long tasks reach further.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>A benchmark run is a load test you did not label as one.</h3>
+
+    <p>Eval harnesses are built to fan out — that is the point of them — and the fan-out lands on the far end as a single sustained burst from one operator. Do this arithmetic before the first run, because it is the difference between an unremarkable afternoon and a conversation with someone's abuse desk.</p>
+
+    <pre class="standalone">300 tasks x 3 repeats x 8 parallel workers      = 7,200 episodes
+episodes x ~12 outbound requests each           = 86,400 requests
+concentrated on the 5 hosts your tasks care about
+  → ~17,000 requests per host, from one origin, in a few hours</pre>
+
+    <p>Two amplifiers make the real figure worse than the plan. Retries compose across the SDK, your wrapper and the harness's own "flaky task" re-run, which is the <a class="xref" href="/concepts/retry-amplification">retry amplification</a> problem in its most concentrated form. And a failing task is the one that generates the most traffic: an agent that cannot complete the objective keeps searching, so the tasks contributing least to your score contribute most to the load. Cap per-host concurrency explicitly, cap requests per episode, and make the harness refuse to start a sweep whose planned request count against any single host exceeds a number a human agreed to.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Score a circumvented refusal as a failure, or you have built a reward for circumvention.</h3>
+
+    <p>This is the property that separates a defensible live eval from an accident waiting for a press cycle, and it is a scoring decision rather than a control.</p>
+
+    <p>Consider what an outcome-scored research task rewards. The grader asks whether the agent produced the figure. The agent requests a page, is refused, tries a variant, is refused, finds an unlisted path, and returns the figure. Outcome scoring marks that a success, and every downstream use of the score — a leaderboard entry, a model-selection decision, a trajectory kept for fine-tuning — now carries a small positive weight on "work around the boundary". Do this at scale, with any form of learning from successful trajectories, and you are not measuring research capability. You are training past the refusal. This is ordinary <a class="xref" href="/deep-dives/training-agentic-models/reward-design-and-hacking">reward hacking</a>, with the unusual feature that the specification error is invisible in the reward function and lives in the environment.</p>
+
+    <p>The rule that fixes it has three parts, and all three belong in the harness rather than in the prompt:</p>
+
+    <ul>
+      <li><strong>A 401, 403 or explicit refusal terminates the episode</strong> for that path, with the result recorded as <code>blocked</code> — a third outcome alongside pass and fail, so the distinction survives into your reporting. <a class="xref" href="/concepts/fail-closed-and-fail-open">Fail-closed and fail-open</a> is the same third-state argument applied to controls.</li>
+      <li><strong>A trajectory containing a refusal followed by a success on a semantically equivalent request scores zero</strong>, whatever the answer was, and raises an alert rather than a log line. Detect it on your own side: a refusal counter per episode, plus the denied-then-allowed transition.</li>
+      <li><strong>Process scoring on the paths that matter.</strong> Outcome-only grading cannot see any of this, which is the general case for <a class="xref" href="/deep-dives/evaluating-agents/trajectory-and-process-evaluation">trajectory and process evaluation</a> — here it is not a refinement, it is the only place the interesting failure is visible.</li>
+    </ul>
+
+    <p>The objection to writing this rule is that it lowers scores on tasks the agent "really did" complete. That is the rule working. A number that counts unauthorised access as task completion is not a capability measurement; it is a liability with a decimal point.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Be attributable and capped before the first episode, not after the first complaint.</h3>
+
+    <p>Everything in this step is configuration, and all of it is cheaper to do on day zero than to explain later. The goal is that any recipient of your traffic can identify it, rate-limit it deliberately, and reach you.</p>
+
+    <ul>
+      <li><strong>A dedicated egress identity.</strong> One IP range, one user-agent naming the operator and the purpose, a contact URL in it, and a signed request where the far end supports verification — see <a class="xref" href="/concepts/bot-verification-and-agent-access">bot verification and agent access</a>. Sharing your production egress with an eval fleet means an abuse block takes out both.</li>
+      <li><strong>Obey the machine-readable signals, and treat a hard one as terminal.</strong> Honour <code>robots.txt</code> and back off properly on 429 with jitter, but do not treat a block page as a puzzle: a challenge or a CAPTCHA is the far end declining, and an eval that solves it has generated a finding about your harness, not about the model.</li>
+      <li><strong>A target policy with a deny list, agreed in advance.</strong> Government services, healthcare, anything holding personal data, anything whose terms prohibit automated access. The list is short and writing it forces the conversation about scope that otherwise happens with a regulator in the room.</li>
+      <li><strong>An <a class="xref" href="/operations/safety-and-security/egress-control-for-agents">egress proxy</a> that enforces the policy centrally</strong>, so a task author cannot widen it, and so you have one place holding the full request log.</li>
+      <li><strong>A stop authority that is a person, not a timeout.</strong> Someone on the team can end a sweep in one command, and knows they are expected to. A long sweep launched on a Friday with no owner is the configuration behind most of this essay's failure modes — <a class="xref" href="/operations/agentops/kill-switches">kill switches</a> apply to eval fleets exactly as they do to production agents.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Keep the evidence that answers a stranger's question three months later.</h3>
+
+    <p>The reporting asymmetry is brutal and worth stating plainly: when an agent oversteps against a third party, that party's logs contain successful responses and nothing else. The only record that shows a boundary being crossed is yours, which makes your retention policy part of somebody else's incident response.</p>
+
+    <ul>
+      <li><strong>Join requests to trajectories, and keep both together.</strong> A trace with tool-call summaries cannot answer "what exactly did you fetch, and when", and a proxy log cannot answer "why". The pair is the artefact; store them with the same key and the same lifetime.</li>
+      <li><strong>Retain live-eval logs longer than ordinary traces.</strong> Normal <a class="xref" href="/operations/evaluation-and-observability/trace-sampling-and-retention">sampling and retention</a> is tuned for debugging, which means aggressive sampling and a short window — both wrong here. Live runs are the small fraction of your volume that deserves full capture.</li>
+      <li><strong>Name the person who may notify, before you need them.</strong> Who is authorised to tell an organisation you have no relationship with that your agent got into their system, on what evidence, and inside what deadline? The answer defaults to nobody, which is how a 12-week gap happens; <a class="xref" href="/operations/governance-compliance/serious-incident-reporting">serious-incident reporting</a> covers the statutory clocks that key on detection rather than on confirmation.</li>
+      <li><strong>Review the anomalies on purpose.</strong> Blocked outcomes, refusal counters and denied-then-allowed events are a small standing report someone reads after each sweep. Detection here is retrospective by nature; the only variable you control is whether it happens in a week or in a quarter.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Spend the live budget where mirrored evals genuinely cannot reach.</h3>
+
+    <p>The conclusion is not to avoid tier three. It is that live episodes are your most expensive measurement — not in compute, in exposure — and should be rationed like one.</p>
+
+    <ul>
+      <li><strong>Move everything you can to recorded and mirrored fixtures.</strong> Most regressions in a research agent are retrieval, parsing and synthesis failures that a captured corpus reproduces perfectly, and a fixture is the only version that is deterministic enough to gate a build in <a class="xref" href="/deep-dives/evaluating-agents/eval-driven-development-and-ci">CI</a>.</li>
+      <li><strong>Be honest about what that costs you.</strong> Fixtures go stale, and staleness is a real measurement error: sites change shape, APIs deprecate, and an agent tuned against a frozen snapshot of the web gets better at a web that no longer exists. Date your fixtures and refresh them on a schedule, which is the <a class="xref" href="/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">freshness</a> problem in a new place.</li>
+      <li><strong>Keep a small live suite, on purpose, with a business owner.</strong> Tens of tasks, not thousands; run on a cadence rather than on every commit; against a target list someone signed. Its job is to catch the class of failure fixtures cannot show you — that the live thing changed — not to produce your headline number.</li>
+      <li><strong>Prefer a partner sandbox where one exists, and ask.</strong> Many providers will grant a test tenant or a raised limit for a named evaluation, and the request itself converts an unannounced load test into an agreed one. This is the cheapest control in the essay and the least used.</li>
+      <li><strong>Treat your first live sweep as a launch.</strong> A canary with one worker and ten tasks, read the logs, then scale — the same discipline as <a class="xref" href="/operations/evaluation-and-observability/shadow-mode-and-dark-launches">a dark launch</a>, because that is what it is.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you run one live sweep this quarter, put these four things in the harness first: <code>blocked</code> as a third outcome with 401/403 terminating the path, a zero score plus an alert for any denied-then-allowed trajectory, a per-host request cap the sweep cannot exceed without a human raising it, and full request logs joined to trajectories with a named owner who may notify a third party. Then run ten tasks with one worker and read everything before you scale. The order matters: the scoring rule is the only one of the four that also protects you from your own successes.</p>
+    </div>
+  </div>
+</section>

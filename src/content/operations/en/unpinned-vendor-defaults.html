@@ -1,0 +1,108 @@
+<section class="phase">
+  <div class="phase-num">O29</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Half your configuration is set by somebody else, and it changes without a version number.</h2>
+  <p class="goal">Claude Opus 5.5 shipped on 22 September 2026 with its effort parameter defaulting to <code>medium</code> — every other Claude model that supports effort defaults to <code>high</code> — so a team that migrated by editing a model string moved its agents down a reasoning level, changed how many tool calls each turn makes, and got no diff to review. That is the general problem, not a one-off: your effective configuration is the union of the values you set and the values a vendor, an SDK, a gateway and a harness chose for you, and only the first half lives in your repository. Pinning a dated snapshot does not fix it, because a snapshot pins weights and not the parameters your requests omit.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Four layers decide what your request actually says.</h3>
+
+    <p>Write down a request as your code expresses it, then write down what arrives at the model. The gap is the subject of this page, and it is assembled by parties who never coordinate.</p>
+
+    <ul>
+      <li><strong>The provider's API defaults.</strong> Anything you omit gets a value: reasoning effort, sampling temperature, whether thinking is on, parallel tool calls, safety-filter thresholds, the maximum output ceiling. These are per-model, not per-provider — which is the trap, because the value follows the model rather than the endpoint.</li>
+      <li><strong>The SDK's defaults.</strong> Retry counts, timeouts, connection pooling, streaming behaviour, and sometimes a client-side default for a request field the API would have left alone. A minor-version bump can move any of them, and a lockfile update is the only trace.</li>
+      <li><strong>The gateway or platform defaults.</strong> The same model behind Bedrock, Vertex, Foundry or your own <a class="xref" href="/concepts/ai-gateways">gateway</a> can arrive with different caps, different retry behaviour and different regional routing. Per-platform divergence is itself a default you did not choose.</li>
+      <li><strong>The harness and tool layer.</strong> Which tools are attached, how their descriptions read this week, the step ceiling, the system-prompt fragments a plugin or config file contributes. <a class="xref" href="/operations/agentops/third-party-tool-drift">Third-party tool drift</a> is this layer's version of the problem.</li>
+    </ul>
+
+    <p>The reason this is not covered by existing practice is worth being precise about. <a class="xref" href="/operations/agentops/rollout-and-versioning">Rollout and versioning</a> tells you to pin the (model, prompt, tools) triple to dated snapshots and stamp it on every run, and you should. But a pinned snapshot ID pins the weights; it says nothing about the resolved value of a field your request left empty, and nothing about which of your four layers filled it in.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>A default change ships with no version number you can subscribe to.</h3>
+
+    <p>Three shapes, in increasing order of how long they take to notice:</p>
+
+    <ul>
+      <li><strong>A new model with a different default.</strong> The Opus 5.5 case. You chose the model, so the change is attributable — but the behavioural delta is larger than the version delta suggests, and nothing in your code changed. The vendor's own guidance for this migration is to run a fresh <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">effort sweep</a> rather than carry settings over, which is an admission that the parameter is not portable across models.</li>
+      <li><strong>A removed capability behind the same field.</strong> On the current Claude generation adaptive thinking is always on and a request that explicitly disables thinking returns a 400 at every effort level; the older token-budget shape is no longer accepted at all. Code written against the previous contract fails loudly, which is the good case.</li>
+      <li><strong>The same request, a different platform or SDK.</strong> The quiet case, and the one that produces month-long mysteries: the staging fleet is on one SDK minor version and one region, production is on another, and a behaviour difference gets attributed to load. There is no announcement to subscribe to because from the vendor's side nothing changed.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Note which of these your existing alerting can see. A 400 pages someone. A silently lower reasoning level produces slightly worse outputs at slightly lower cost — the signature of a quality regression with no error, which is exactly what <a class="xref" href="/operations/evaluation-and-observability/quality-regression-detection">quality regression detection</a> exists for and exactly what it struggles with when the change is a step-function in a parameter nobody is recording.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Log the resolved configuration, not the intended one.</h3>
+
+    <p>The whole discipline turns on one habit: record what the request became, next to what it returned. Most teams log the prompt and the completion, which is the pair that cannot answer the question.</p>
+
+    <pre class="standalone"><span class="c-cm"># stamp this on every trace, from the request as sent + the response</span>
+config_fingerprint = sha256(
+    model_id,              <span class="c-cm"># dated snapshot, not an alias</span>
+    effort,                <span class="c-cm"># resolved, including "unset -> provider default"</span>
+    max_tokens, temperature, top_p,
+    thinking_mode,
+    tool_catalog_hash,     <span class="c-cm"># names + descriptions + schemas</span>
+    system_prompt_hash,
+    sdk_version, gateway_version, harness_version,
+    platform,              <span class="c-cm"># api | bedrock | vertex | foundry</span>
+)</pre>
+
+    <p>Two properties make this useful rather than decorative. It must distinguish <em>set explicitly</em> from <em>left to the default</em> — an <code>effort=null</code> field logged as "medium" hides the thing you are trying to catch, so log both the sent value and the effective one where the vendor reports it. And the fingerprint must be a dimension on your metrics, not only a field in a trace, so that "output tokens per turn, by config fingerprint" is a chart you can open. That chart is how a default change looks before anyone knows to look for it: the distribution moves, the fingerprint changed, and the join tells you which layer moved it. <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">Tracing</a> carries this if you put it in the span attributes at the boundary rather than deep in the call.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Assert the values you depend on, in CI, against the live API.</h3>
+
+    <p>A contract test for defaults is a dozen lines and it is the only control here that fails <em>before</em> production. Send one minimal request per model you use, with the fields you care about omitted, and assert the resolved configuration matches a committed snapshot.</p>
+
+    <ul>
+      <li><strong>Commit the expected effective config as a file</strong>, one per (model, platform) pair, and diff it on every run. A failing diff is not an error — it is a notification with a date on it, which is what you wanted from a changelog you cannot subscribe to.</li>
+      <li><strong>Keep it hermetic and cheap.</strong> One short request per pair, no tools, no retries, a tiny output cap. It costs cents a day and replaces a class of incident.</li>
+      <li><strong>Run it on a schedule, not only on commit.</strong> The change you are catching does not arrive with your commits. A daily run is the cadence that matters; a per-commit run tells you about your own edits, which you already know about.</li>
+      <li><strong>Treat the SDK and gateway as part of the assertion.</strong> Pin their versions in the lockfile, and let the test record which versions produced the observed defaults, so a lockfile bump that changes behaviour has a paper trail.</li>
+    </ul>
+
+    <p>This is the same instinct as <a class="xref" href="/concepts/pinning-and-verification">pinning and verification</a> applied one level in: you cannot pin a vendor's default, so you pin an <em>assertion about it</em> and let the build tell you when reality drifted.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>You cannot pin everything, so choose by what the default can do to you.</h3>
+
+    <p>Exhaustive explicitness is its own failure mode — a request that names forty fields is a migration hazard, because every field you set is a field you now maintain against a vendor that improves its defaults. Sort by consequence instead.</p>
+
+    <ul>
+      <li><strong>Always explicit: anything that moves cost per completed task or tool-calling behaviour.</strong> Effort or reasoning level, output ceilings, parallel tool calls, temperature where determinism matters. These are the parameters whose drift shows up as a spend surprise or a behaviour change, and they belong next to your budgets in <a class="xref" href="/concepts/agent-cost-control">cost control</a>.</li>
+      <li><strong>Explicit and tested: anything touching refusals, safety filters or content thresholds.</strong> A moved threshold changes your refusal rate, and a changed refusal rate is a product change. Keep a small standing eval on it.</li>
+      <li><strong>Accept and detect: what you cannot pin at all.</strong> Routing behind an alias, tokenizer revisions, server-side prompt scaffolding, capacity-driven regional placement. The control here is not configuration, it is an eval you run often enough to catch a shift, plus the fingerprint from Step 3 so you can tell a shift from a coincidence.</li>
+      <li><strong>Do not pin by copying the old value.</strong> The most tempting migration is to set explicitly whatever the previous model defaulted to, which preserves a number calibrated for different weights. The vendor's own recommendation on the Opus 5.5 migration is the opposite: sweep the parameter against your evals and pick a level on evidence. Copying forward is how a team ends up paying for <code>high</code> on a model tuned to need <code>medium</code>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Treat a default change as a release, because that is what it is.</h3>
+
+    <p>When the contract test fires, or a vendor announces a new model you intend to adopt, the work that follows is a release process rather than a config edit. The pieces already exist in your <a class="xref" href="/operations/agentops/model-deprecation-and-migration">migration</a> playbook; the point is to trigger them on a default change too.</p>
+
+    <ul>
+      <li><strong>Canary behind a flag, with the old configuration still reachable.</strong> An explicit parameter is what makes rollback instant — you cannot roll back a default. <a class="xref" href="/operations/agentops/feature-flags-for-agents">Feature flags for agents</a> is the mechanism.</li>
+      <li><strong>Run the eval suite at both values, and compare paired.</strong> Not "is the new default good" but "is it different from what we had, on our tasks, by more than noise".</li>
+      <li><strong>Watch the mechanical indicators for a week.</strong> Tokens per turn, tool calls per turn, turns per task, refusal rate, p95 latency. These move before any quality metric does, and they are cheap enough to alert on.</li>
+      <li><strong>Keep a dated defaults diary.</strong> One line per observed change, with the fingerprint and the date. Three weeks later, when someone reports that the agent "got lazier", the suspect list is a file rather than an archaeology project — which is the same argument as <a class="xref" href="/operations/agentops/protocol-revisions-and-deprecation-windows">tracking protocol revisions</a>, applied to parameters instead of wire formats.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Start with the two cheapest pieces, in this order. First, set explicitly every parameter that moves cost or tool-calling behaviour — even where you are setting it to the current default, because the value then lives in your repository and the next vendor change becomes a non-event. Second, add the daily contract test that asserts the resolved configuration for each (model, platform) pair you run, and put its diff in a channel a human reads. Everything else on this page is refinement; those two turn an invisible class of behaviour change into a dated notification.</p>
+    </div>
+  </div>
+</section>
