@@ -1,0 +1,152 @@
+<section class="phase">
+  <div class="phase-num">M12</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>Forgetting is not one operation and it is not a retrieval setting — it is five different mutations, all decided on the write path, which is the one part of the memory stack nobody put a model in.</h2>
+  <p class="goal">A memory system that only ever accumulates does not degrade gracefully; it degrades into a store where the wrong answer outranks the right one, and no amount of recall tuning gets it back. The 2026 measurements are blunt about how bad this is: a small open model reinforcement-trained specifically to answer from the current value of a fact, rather than a superseded one, roughly doubled its accuracy on held-out conversations and landed at 16.7% — meaning five answers in six still cited something the user had already corrected. The fix is not a recency weight. Forgetting decomposes into five structurally different operations, four of them need intent that only exists at the moment of the write, and the architecture that recovers them is a control plane over mutations, not a smarter ranker.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The five things people mean by "forgetting."</h3>
+
+    <p>"The agent should forget that" is a single sentence covering at least five operations with different correctness conditions, different failure modes, and different legal weight. The July 2026 architectural study that introduced the ForgetEval benchmark — 1,385 cases, of which 385 adversarial — names them, and the taxonomy is worth adopting because it stops teams from shipping one mechanism and believing it covers the set.</p>
+
+    <pre class="standalone"><span class="c-cm"># five forgetting primitives, and what "correct" means for each</span>
+
+supersession  a new value replaces an old one
+              correct = the new fact wins recall AND the old
+              one leaves top-k          e.g. moved city
+
+decay         a fact was released and should stop surfacing
+              correct = stays out of top-k without deletion
+                                        e.g. TTL, consumed OTP
+
+amnesia       forget everything about one entity
+              correct = width control — siblings survive
+                                        e.g. "forget my ex"
+
+purge         hard-delete by identifier
+              correct = the row is gone, provably
+                                        e.g. GDPR Art. 17
+
+drift         a chain of supersedes
+              correct = only the latest wins; intermediates
+              unreachable                e.g. price v1→v2→v3</pre>
+
+    <p>Read down the "correct" column and the shape of the problem appears. Supersession has a two-part condition, and almost every production system satisfies only the first half — the new fact is written and does rank, and the old one is still sitting in the store ranking nearly as well. Decay is not deletion and must not be, because an expired fact is often still needed for audit. Amnesia is a width problem rather than a matching problem: the hard part is not finding facts about the entity, it is not taking the neighbours. Purge is the only one where semantic similarity is actively the wrong tool — a deletion obligation is discharged against identifiers, not against embeddings, which is the point developed in <a class="xref" href="/operations/governance-compliance/erasure-against-agent-memory">erasure against agent memory</a>. And drift is the one that quietly breaks evaluation, because a store containing v1, v2 and v3 will happily support three mutually inconsistent answers.</p>
+
+    <div class="callout">
+      <p>The taxonomy also explains why "just add a TTL" is such a persistent non-answer. TTL implements decay and only decay. It cannot express supersession (there is no clock at which "Detroit" became wrong — a sentence did), it cannot express amnesia (it has no notion of entity width), and it cannot discharge a purge (expiry is not deletion). One primitive out of five, and the one with the fewest consequences.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Why the read side cannot fix it, however good the ranker is.</h3>
+
+    <p>The instinct is to solve this at retrieval, because retrieval is where teams already have levers: a recency boost, a decay factor on the similarity score, a filter on <code class="inline">valid_until</code>, a reranker with a freshness feature. Each of these helps a little and none of them is a fix, for a reason worth stating precisely.</p>
+
+    <p>Retrieval is a ranking over candidates. Superseded facts are excellent candidates. "The user lives in Detroit" is semantically near-identical to "where does the user live" — often nearer than the correction, which may have arrived phrased as an aside — so the stale fact sits high in the candidate set on merit. A recency boost turns a strong match into a slightly weaker strong match; with a top-k of eight, both the old and the new fact are almost always retrieved, and the decision moves into the model's context, where it becomes an attention problem rather than a memory one. The model now has two plausible, mutually exclusive facts, one of which happens to be older by a timestamp it has no particular reason to weight.</p>
+
+    <ul>
+      <li><strong>Recency is a weak proxy for currency.</strong> Facts differ enormously in volatility. A home address is stable for years; an on-call rotation changes weekly; a preference stated once in passing outranks nothing. A single global decay curve prices all three the same, and the stable facts are the ones you most want to keep, so tuning the curve to fix staleness costs you the durable rules first.</li>
+      <li><strong>Top-k is the wrong gate.</strong> Supersession requires the old fact to <em>leave</em> the candidate set, not to place second. There is no ranking weight that reliably achieves "absent" for a semantically perfect match.</li>
+      <li><strong>Read-time filters need a field nobody wrote.</strong> Filtering on validity intervals presupposes that the write recorded one. If the write path stored a sentence and an embedding, the filter has nothing to bind to — and this is the common case.</li>
+      <li><strong>Contradiction in context is not neutral.</strong> Two conflicting retrieved facts do not produce a hedge; they produce a confident answer selected by salience, position and phrasing. See <a class="xref" href="/deep-dives/memory-and-context/long-context-effective-vs-advertised">long context: effective vs advertised</a> for why position alone can decide it.</li>
+    </ul>
+
+    <p>The architectural finding that follows is the useful one. Placing model assistance at the <em>mutation-time</em> control plane — the moment a write arrives, when the intent behind it is still available — recovers intent-aware deletion and reaches 91.7–93.2% overall forgetting accuracy across the ForgetEval families, against systems that place the model only at read time. The asymmetry is the whole argument of this essay: at write time you know that this sentence is a correction, which entity it is about, and how wide the change should be. At read time all of that has been compressed into a vector, and the information is simply gone.</p>
+
+    <div class="callout">
+      <p>This is the same lesson as <a class="xref" href="/deep-dives/memory-and-context/memory-write-path-architectures">memory write-path architectures</a>, pushed one step further. That page argues the write path decides what a memory system is; this one adds that the write path is also the only place forgetting can be specified, because forgetting is a statement about the relationship between a new fact and an existing one — and that relationship exists for exactly one instant.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The supersession gap, and the honest reading of the numbers.</h3>
+
+    <p>The measurement worth internalising comes from the June 2026 <em>Supersede</em> work, which isolated fact updates as their own evaluation target and turned the measurement into a reinforcement-learning environment: the agent is rewarded for answering from the current value and penalised for a stale one. Four findings, in descending order of how much they should change your roadmap.</p>
+
+    <ul>
+      <li><strong>The failure is maintenance, not reading.</strong> Agents can read an update perfectly well when it is in front of them. What they cannot do is maintain it under a bounded memory, where the update has to survive compaction, eviction and competition from the original.</li>
+      <li><strong>The gap deepens as the conversation grows.</strong> Which is the opposite of the shape you want, and it means short-session evaluation systematically understates it. If your eval sessions are ten turns long, you are measuring the regime where the problem barely exists.</li>
+      <li><strong>Neither a bigger model nor a bigger memory closes it.</strong> This is the finding that should stop a particular roadmap item. Scaling the store increases the number of stale candidates; scaling the model improves the read that was never the bottleneck.</li>
+      <li><strong>It is trainable.</strong> GRPO fine-tuning of a small open model (Qwen2.5-3B) on the Supersede environment roughly doubled held-out supersession accuracy on real, unseen conversations, from 9.0% to 16.7% — the first evidence the gap can be trained down rather than only measured.</li>
+    </ul>
+
+    <p>Now read that last number the way an operator should. A doubling is a real result and 16.7% is a disaster. It is the strongest published training signal on this task and it still means roughly five out of six answers about an updated fact cite a value the user already corrected. Two conclusions follow, and they are not in tension. Training helps and is worth tracking. And if you are shipping this quarter, you cannot buy your way out of the supersession gap with a model — you have to make the store stop returning the old value, which is a schema and write-path problem, not a weights problem.</p>
+
+    <div class="callout">
+      <p>There is a measurement trap here too. Standard memory benchmarks score recall of planted facts, and a system that never forgets scores well on them by construction. A store that answers "Detroit" is not failing recall — it is succeeding at recall and failing at currency, and those are different metrics that most harnesses do not separate. <a class="xref" href="/deep-dives/memory-and-context/evaluating-memory">Evaluating memory</a> covers the general case; the specific ask here is a currency metric computed only over facts that have been updated at least once.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>You cannot supersede what you cannot name.</h3>
+
+    <p>Every primitive except decay requires identifying a prior fact, which makes entity and attribute resolution the load-bearing dependency of the whole design. The adversarial half of ForgetEval exists because this is where systems break in ways that look like success, and two named failures are worth building tests for.</p>
+
+    <ul>
+      <li><strong>Prefix collision.</strong> The identifier you match on is not unique in the way you assumed. <code class="inline">user:alex</code> and <code class="inline">user:alexandra</code>, <code class="inline">project:atlas</code> and <code class="inline">project:atlas-migration</code>, a phone number stored with and without a country code. A prefix or substring match over identifiers will over-delete, and over-deletion in an amnesia operation is exactly the width failure that takes out the siblings.</li>
+      <li><strong>Partial supersession.</strong> The new fact updates part of a composite value and the system replaces or retains the whole. "I've moved to the suburbs" updates the city and, implicitly, the postcode and the commute, but not the country — and a system that treats the address as one opaque string either drops the parts it should have kept or keeps the parts it should have dropped. Composite attributes need field-level supersession or they need to be decomposed at write time.</li>
+    </ul>
+
+    <p>The practical consequence is that a memory store keyed by embeddings alone cannot implement four of five primitives, because it has no identifiers to operate on. The minimum schema that makes forgetting expressible is short, and each field pays for itself:</p>
+
+    <pre class="standalone"><span class="c-cm"># the fields forgetting actually needs</span>
+
+entity_id        resolved, canonical, not a surface string
+attribute        namespaced; composites decomposed
+value
+valid_from       when the fact became true
+valid_until      null = current; set on supersede
+supersedes       id of the fact this replaces  -> drift chain
+source_channel   which conversation / tool / document
+volatility       stable | periodic | volatile
+asserted_by      user | inference | third party
+
+<span class="c-cm"># then the four operations are cheap:</span>
+supersede  set valid_until on the prior, insert with supersedes
+decay      set valid_until; keep the row for audit
+amnesia    delete where entity_id = X  (exact, not prefix)
+purge      delete by id, cascade the drift chain, log it</pre>
+
+    <p>Note what the <code class="inline">asserted_by</code> field buys. A fact the user stated outranks a fact the agent inferred, and an inference derived from a superseded fact should be invalidated along with it — provenance-scoped invalidation, which is the only mechanism that keeps derived memories from outliving their premises. This is also a defence surface: an attacker who can write memories can supersede true ones, which is the angle taken in <a class="xref" href="/deep-dives/memory-and-context/memory-poisoning-defenses">memory poisoning defenses</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Rankings invert with tenure, so a benchmark run at three weeks tells you the wrong thing.</h3>
+
+    <p>The July 2026 longitudinal study is the result that should change how you choose a memory backend. It generated a corpus from a seeded life-script sampler — facts emitted with validity intervals, volatility classes and source channels <em>before</em> any text existed, so gold answers are script-valid by construction — then compared five memory architectures plus a no-memory control across two horizons. The backend rankings invert with history length: the budgeted curated-map memory that led at three weeks fell from 96% to 72% recall of evicted content by nine weeks, while a provenance-typed graph rose to 90%.</p>
+
+    <p>That crossover is not a curiosity; it is a warning about every memory comparison you have read, including the ones you ran. Almost all of them are short-tenure. A curated map with a token budget looks excellent early because summarisation is a genuine win when the history is small and the summary can hold most of it. Its eviction policy is a slow information leak, and the leak only shows up after the horizon most evaluations stop at.</p>
+
+    <ul>
+      <li><strong>Evaluate at the tenure you will operate at.</strong> If your agent is meant to hold a customer relationship for a year, a two-week eval is not a smaller version of the right experiment — it is a different experiment that reverses the answer.</li>
+      <li><strong>Distrust summarisation as a memory strategy for long tenures.</strong> Compaction is lossy on purpose, and the loss is unrecoverable and untracked. Use it for context assembly, where it belongs; see <a class="xref" href="/deep-dives/memory-and-context/context-compaction">context compaction</a>.</li>
+      <li><strong>Typed provenance wins late.</strong> The architecture that improves with tenure is the one that keeps the fields from Step 4 and can therefore answer "what is current" rather than "what did I summarise". That is the same conclusion <a class="xref" href="/deep-dives/memory-and-context/memory-stores">memory stores</a> reaches from the storage side.</li>
+      <li><strong>Generate the corpus from the facts, not the facts from the corpus.</strong> The reason the study can measure currency at all is that it planted facts with validity intervals first and rendered text second. If your eval set was built by labelling existing transcripts, your gold answers inherit whatever the labeller believed was current — see <a class="xref" href="/operations/evaluation-and-observability/eval-set-maintenance">eval set maintenance</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Ship it: the four numbers and the one control plane.</h3>
+
+    <p>The build is not large, and it is mostly schema plus one interception point. What makes it tractable is that every primitive becomes cheap once the write path is allowed to be a decision rather than an append.</p>
+
+    <ul>
+      <li><strong>Put a mutation control plane in front of the store.</strong> Every write passes through a step that classifies it: new fact, supersession of a named prior, release, entity-wide erasure, hard delete. This is where model assistance pays — the classification needs intent, which is present exactly here, and nowhere later. Deny-by-default on ambiguity: an unclassifiable write becomes a new fact plus a flagged candidate conflict, never a silent overwrite.</li>
+      <li><strong>Resolve entities before you store, not when you query.</strong> Exact canonical identifiers, never prefix or substring matching. If resolution fails, store the fact with an unresolved marker and leave it out of the supersession path — a fact you cannot name is a fact you cannot update, and pretending otherwise produces the width failures from Step 4.</li>
+      <li><strong>Make current-ness a query-time invariant, not a ranking feature.</strong> The default read filters <code class="inline">valid_until IS NULL</code>. Historical reads are an explicit, separate call with an as-of timestamp, used by audit and by nothing else. If a stale fact can reach the context through the normal path, no ranker will save you.</li>
+      <li><strong>Measure four things.</strong> Currency accuracy over facts updated at least once, stratified by tenure. Contradiction rate — pairs of active facts on the same entity-attribute, which should be zero and never is. Time-to-currency, from the correction landing to the store answering with it. Orphaned-inference count, derived memories whose premise has been superseded.</li>
+      <li><strong>Test the adversarial cases in CI.</strong> A prefix-collision case, a partial-supersession case, an amnesia case with siblings present, and a purge that must cascade a three-link drift chain. Four fixtures, and they catch the failures that look like passes.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you do one thing this week: take a hundred real memories from your store, group them by entity and attribute, and count how many groups contain two or more mutually exclusive active values. That count is your contradiction rate, it is the number that predicts your currency accuracy, and nobody has ever run it and been pleased. Then add <code class="inline">valid_until</code> and <code class="inline">supersedes</code> to the schema and make the default read filter on the first one — that single change implements supersession and decay, which is two of the five primitives for an afternoon's work. For where this sits in the wider system, <a class="xref" href="/concepts/agent-memory">agent memory</a> is the one-page version, <a class="xref" href="/deep-dives/memory-and-context/retrieval-augmented-memory">retrieval-augmented memory</a> is the read side, and <a class="xref" href="/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">index freshness and invalidation</a> is the same problem where the facts live in documents rather than in a memory store.</p>
+    </div>
+  </div>
+</section>
