@@ -1,0 +1,150 @@
+<p class="lede">Rule-library size decides nothing here, and neither does detection versus prevention. The axis that determines whether a runtime sensor is useful in front of an agent is whether it can attribute a syscall to a tool call — because the entire Kubernetes runtime-security model assumes one workload has one behavioural baseline, and a coding agent's baseline is "anything a developer might do." Get that wrong and you buy a sensor that alerts on every <code>curl</code> the agent was supposed to run. Get it right and the second decision is the one nobody frames properly: killing a tool subprocess does not stop an agent, it hands the loop an unexplained crash and a reason to retry differently.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four projects, four different answers to "and then what".</p>
+
+  <table>
+    <thead>
+      <tr><th>Project</th><th>Origin &amp; status</th><th>Mechanism</th><th>Strongest at</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Falco</td>
+        <td>Sysdig, 2016; donated to CNCF 2018; graduated 2024</td>
+        <td>eBPF driver (or kernel module) feeding a YAML rule engine over tracepoints and kprobes</td>
+        <td>Breadth. The largest community rule library, ATT&amp;CK-mapped, and the detections everyone else is compared against</td>
+      </tr>
+      <tr>
+        <td>Tetragon</td>
+        <td>Isovalent / Cilium, CNCF</td>
+        <td>eBPF-native sensors plus <code>TracingPolicy</code>; an override action that stops a syscall before its body runs</td>
+        <td>Process lineage and in-kernel enforcement, at the lowest measured overhead of the four</td>
+      </tr>
+      <tr>
+        <td>Tracee</td>
+        <td>Aqua Security, open source</td>
+        <td>eBPF-native sensor with a built-in signature library plus Rego policy, and artefact capture</td>
+        <td>Forensics. Container escape, injection and privilege-escalation signatures, with the evidence attached</td>
+      </tr>
+      <tr>
+        <td>KubeArmor</td>
+        <td>AccuKnox, 2021; CNCF Sandbox, applying for Incubation</td>
+        <td>AppArmor, SELinux or BPF-LSM policy so the kernel denies the operation; eBPF for visibility</td>
+        <td>Declarative least-permission. An allow-list of binaries, paths and destinations, enforced inline</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/falco-vs-tetragon-vs-tracee-vs-kubearmor/data-cpu-overhead.svg" alt="Horizontal bar chart of sensor CPU cost in millicores on a 2-vCPU node: Falco about 430, Tracee about 92, Tetragon about 6.5, with KubeArmor not measured" width="900" height="400" loading="lazy" />
+    <figcaption>One 2025 comparison, one workload shape. The ordering is the finding; the digits are not portable.</figcaption>
+  </figure>
+
+  <p>That spread matters more for agents than for ordinary services, and for a mechanical reason: these sensors cost per event, and an agent harness execs a new process for every tool call. A service that starts once and serves requests generates almost no exec events. An agent running a twenty-step task with a shell tool generates hundreds, plus every child process of every command it runs. Whatever the absolute numbers are on your kernel, your agent nodes are the ones where a per-event sensor gets expensive.</p>
+</section>
+
+<section>
+  <h2>Why the standard model breaks on an agent workload</h2>
+  <p>Kubernetes runtime security is built on an assumption that is almost always true and is false here. The assumption is that a workload has a describable baseline: this image runs these binaries, opens these paths, connects to these services, and anything else is worth an alert. That is what makes a shared rule library possible — "a shell was spawned in a container" is a good detection because in a normal container it is a good detection.</p>
+  <p>An agent inverts it. A coding agent's job is to run a shell, install packages, clone repositories, execute test suites, spawn compilers and open network connections to registries. Point Falco's default ruleset at a coding-agent node and you will trip <em>Terminal shell in container</em>, <em>Launch package management process</em>, <em>Write below etc</em> and a dozen others on the first successful task. The usual response — suppress those rules for that namespace — leaves you with a sensor watching an agent with most of its detections disabled, which is worse than not deploying it, because now there is a dashboard implying coverage.</p>
+  <p>So the question to ask a candidate sensor is not "what does it detect" but "what can it tell apart". Three capabilities carry the weight:</p>
+  <ul>
+    <li><strong>Process lineage.</strong> Can a rule express "this <code>curl</code> is a descendant of the agent's shell tool at depth three", as opposed to "a <code>curl</code> happened in this pod"? The agent's own tool invocations and a payload's subprocess look identical at the pod level and completely different in the exec tree.</li>
+    <li><strong>Per-process policy, not per-image policy.</strong> An agent pod usually runs one long-lived harness process and a stream of short-lived children. A policy scoped to the image covers both with one rule; a policy scoped to a process subtree can allow the harness to do things and constrain the children.</li>
+    <li><strong>A run identifier that survives into the event.</strong> None of the four gives you this natively, and it is the gap worth engineering around: your harness knows which run and which tool call is executing, and the sensor knows which PID did what. Joining them means stamping something the kernel can see — a cgroup per run, a dedicated uid or gid per session, or a process-group label the sensor exports — and it turns a stream of anonymous syscalls into attributable actions. This is the same join argument as in <a href="/deep-dives/multi-agent-systems/unintended-coordination-between-agents">isolated runs that find each other</a>, applied one layer down.</li>
+  </ul>
+  <div class="callout">
+    <p>Practical consequence for the shortlist: Tetragon's strength is exactly the first two, because process lineage is its native model rather than an enrichment. That is a better reason to pick it for agent workloads than its overhead number, which is the one everybody quotes.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Where each one actually attaches</h2>
+  <figure>
+    <img src="/blogs/falco-vs-tetragon-vs-tracee-vs-kubearmor/arch-hook-points.svg" alt="Diagram of a syscall passing LSM hooks then the kernel's permission decision, with KubeArmor and Tetragon's override on the prevention side, Falco and Tracee on the reporting side, and OpenShell shown as a per-process comparison" width="900" height="500" loading="lazy" />
+    <figcaption>The dashed line is the kernel's permission decision. Left of it you can say no; right of it you can only say something happened.</figcaption>
+  </figure>
+
+  <h3>Falco</h3>
+  <p>Falco is the reference point and deserves to be. Created at Sysdig in 2016, donated to the CNCF in 2018 and graduated in 2024, it reads a stream of kernel events through an eBPF driver and evaluates them against rules in a readable YAML syntax, with the broadest community library available and ATT&amp;CK mappings maintained. Its model is alerting: a match produces an event, and doing something about it is a separate component in the ecosystem rather than part of the engine. For agents, treat it as your discovery tool — run it in alert-only mode over a fleet of agent nodes for a fortnight and the output is a behavioural inventory of what your agents actually do, which is the thing you needed before you could write a policy for anything else on this list.</p>
+
+  <h3>Tetragon</h3>
+  <p>Tetragon is eBPF-native and built around the process tree, which is the property that matters here. A <code>TracingPolicy</code> can match on kernel functions and arguments, and its override action stops the call before the syscall body executes — genuinely preventive rather than reactive. Its own documentation is careful about the distinction that most coverage flattens: the override prevents, while a <code>Sigkill</code> action terminates the process but does not guarantee the in-flight operation was stopped. Hold onto that sentence; it is the whole of the next section. It also measured lowest of the three sensors in the comparison above by a wide margin, which for high-exec-churn agent nodes is not a rounding detail.</p>
+
+  <h3>Tracee</h3>
+  <p>Tracee is the forensics answer. It ships a signature library with ATT&amp;CK mappings, supports Rego policy for custom detections, and its differentiator is artefact capture — when something fires, you get the evidence rather than a line in a log. It is notably strong on container escape and process-injection patterns, which is the right shortlist for an agent that is running untrusted code by design. If your failure mode is "an incident happened and we reconstructed almost nothing", which is the position described in <a href="/blogs/only-one-side-could-see-the-breach">only one side could see the breach</a>, this is the project that addresses it directly.</p>
+
+  <h3>KubeArmor</h3>
+  <p>KubeArmor is the odd one out and the best fit for a specific job. It does not use eBPF for enforcement at all — it compiles policy down to AppArmor, SELinux or BPF-LSM so the kernel itself denies the operation, using eBPF only for visibility. Created by AccuKnox in 2021, it has been at CNCF Sandbox since November 2021 and is applying for Incubation. The shape it wants is a declarative allow-list: these binaries may execute, these paths may be written, these destinations may be reached. For an agent whose legitimate tool surface you can enumerate — a support agent, a data-analysis agent, an ops agent with six scripts — this is very close to the right control, and it is the same posture OpenShell takes with Landlock and seccomp, differing mainly in who owns the policy.</p>
+</section>
+
+<section>
+  <h2>The response action is the decision, and "kill it" is usually wrong</h2>
+  <figure>
+    <img src="/blogs/falco-vs-tetragon-vs-tracee-vs-kubearmor/compare-response-actions.svg" alt="Three columns comparing alert-only, SIGKILL and deny-before-execute, and what each does to a running agent loop" width="900" height="300" loading="lazy" />
+    <figcaption>The same detection, three futures. Only one of them tells the agent what happened.</figcaption>
+  </figure>
+
+  <p>For a conventional workload, detection and prevention sit on a straightforward axis: alerting is cheaper and safer, blocking is stronger and riskier, and killing a process is the blunt version of blocking. For an agent, that axis bends, because the thing you are responding to is not the process — it is a loop that will observe the outcome and act again.</p>
+  <p>Kill the subprocess and the agent sees a tool that exited without output. It has no idea why, it has no reason to believe the action was forbidden rather than flaky, and its trained response to a flaky tool is to try again, often by a different route. You have suppressed one attempt and taught the loop nothing, at the cost of a signal that looked like enforcement on your dashboard. Worse, per Tetragon's own caveat, the operation already in flight when the signal landed may well have completed.</p>
+  <p>Deny the syscall and the shape changes entirely. The tool gets <code>EPERM</code>, your harness surfaces that as a tool error, and the model reads a sentence describing a refusal. Now it can adapt, ask, or stop, and your trace contains an attributable refusal tied to a named rule rather than an unexplained exit code. That is the difference between a control the agent can reason about and a control it can only stumble into, and it is the same argument as <a href="/deep-dives/agent-security/structured-refusal-and-why-trails">structured refusal and why-trails</a> made at the kernel boundary instead of the tool boundary.</p>
+  <ul>
+    <li><strong>Prefer deny-before-execute for anything you can name.</strong> LSM-hook enforcement (KubeArmor, or Tetragon's override) returns an error instead of a corpse.</li>
+    <li><strong>Reserve the kill for the agent process, not the tool.</strong> If the conclusion is "this run must stop", stop the run — the harness, the loop, the whole thing — and record why. Killing a child is a half-measure that reads as a full one.</li>
+    <li><strong>Make sure the denial reaches the model as text.</strong> A policy denial that surfaces as an empty stderr is functionally the same as a kill. This is harness work, and it is the part teams skip.</li>
+    <li><strong>Alert-only is a legitimate steady state for agent nodes.</strong> Given how wide a legitimate agent's behaviour is, a high-recall detector plus a human queue beats an over-tuned blocker that breaks tasks. Accept that and instrument it properly rather than pretending you will block your way to safety.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Start with</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>You have agents in production and no runtime visibility at all</td><td>Falco, alert-only</td><td>Broadest detections and the fastest path to a behavioural inventory; tune later, on data</td></tr>
+      <tr><td>Agent nodes with heavy tool-call churn, and you care about attribution</td><td>Tetragon</td><td>Process lineage is native, and the per-event cost is the lowest measured of the group</td></tr>
+      <tr><td>You already run Cilium</td><td>Tetragon</td><td>Same project family, same operational model, one fewer agent on the node</td></tr>
+      <tr><td>The agent's legitimate tool surface is enumerable</td><td>KubeArmor</td><td>A declarative allow-list enforced at LSM hooks is the cheapest correct control for a bounded surface</td></tr>
+      <tr><td>You need to reconstruct incidents, not just notice them</td><td>Tracee</td><td>Artefact capture plus escape and injection signatures give you evidence rather than a log line</td></tr>
+      <tr><td>You want one enforcement layer the agent cannot relax</td><td>OpenShell or KubeArmor</td><td>Both compile to kernel primitives; pick by who should own the policy, the harness or the platform team</td></tr>
+    </tbody>
+  </table>
+  <p>The common production shape is two of these, not one: a high-recall detector in alert mode for the behaviour you cannot enumerate, and an inline allow-list for the part you can. That is not indecision — the two answer different questions, and running only the second one means you never learn what you got wrong.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Do I need one of these if I already run OpenShell or a seccomp profile?</h3>
+  <p>They answer different questions. A per-process kernel policy bounds what one agent may do and is installed by whoever launches it. These four are node-wide sensors owned by a platform team, and they see across workloads — including the agent's children, the sidecars and anything that escaped. The overlap is real at the enforcement layer and the visibility is not duplicated.</p>
+  <h3>Will Falco's default rules work on agent nodes?</h3>
+  <p>Not as shipped. Detections like a shell spawning in a container or a package manager running are correct for normal workloads and describe an agent's ordinary Tuesday. Expect to rewrite rather than suppress, and to write rules that reference process lineage rather than image identity.</p>
+  <h3>Is eBPF enforcement safe in production?</h3>
+  <p>Enforcement at LSM hooks is a supported kernel mechanism, and KubeArmor's path through AppArmor and SELinux is decades old. The risk is not the mechanism, it is your policy: a false positive on an inline denial breaks a task. Run any new policy in audit mode first and promote per rule.</p>
+  <h3>How do I get a run or session identifier into the sensor's events?</h3>
+  <p>Stamp something the kernel can see. A cgroup per run, a dedicated uid or gid per session, or a distinct process group are all visible to these sensors and join cleanly to your harness's own trace. Doing this before you write policy is what makes lineage-based rules possible at all.</p>
+  <h3>Which one would have caught an agent exfiltrating through a URL shortener?</h3>
+  <p>None of them, as configured by default — an HTTPS connection to a popular host is not anomalous at the syscall layer. That failure class is an egress-policy problem, not a runtime-sensor problem; the mechanics are in <a href="/blogs/get-only-was-a-write-channel">GET-only was a write channel</a>. These tools see the process that made the connection, which is useful afterwards and not a control.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/reference-monitor">The Reference Monitor</a> — why the hook point and the trust domain decide whether any of this is a control.</li>
+    <li><a href="/deep-dives/agent-security/sandbox-and-isolation-patterns">Sandbox and Isolation Patterns</a> — how node-wide sensors compose with per-process policy.</li>
+    <li><a href="/operations/safety-and-security/detecting-agent-compromise">Detecting Agent Compromise</a> — what the signal looks like above the syscall layer.</li>
+    <li><a href="/deep-dives/agent-security/structured-refusal-and-why-trails">Structured Refusal &amp; Why-Trails</a> — making a denial readable to the loop that hit it.</li>
+    <li><a href="/operations/safety-and-security/egress-control-for-agents">Egress Control for Agents</a> — the failure class these sensors do not cover.</li>
+    <li><a href="/blogs/the-tamper-proof-half-did-not-ship">The tamper-proof half did not ship</a> — the same primitives sold as a platform, and what the DPU layer would add.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://falco.org/">Falco</a> — CNCF graduated runtime security project.</li>
+    <li><a href="https://tetragon.io/">Tetragon</a> — eBPF-based security observability and runtime enforcement.</li>
+    <li><a href="https://aquasecurity.github.io/tracee/">Tracee</a> — runtime security and forensics using eBPF.</li>
+    <li><a href="https://kubearmor.io/">KubeArmor</a> — runtime security enforcement using LSMs.</li>
+  </ul>
+</section>

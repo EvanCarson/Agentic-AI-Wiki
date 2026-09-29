@@ -1,0 +1,150 @@
+<p class="lede">在这件事上，规则库大小什么也决定不了，「检测 vs 阻止」也一样。真正决定一个运行时传感器摆在智能体前面有没有用的那根轴，是它能不能把一次系统调用归因到某一次工具调用——因为整套 Kubernetes 运行时安全模型都假定「一个工作负载有一条行为基线」，而一个编码智能体的基线是「一个开发者可能做的任何事」。这件事弄错，你买到的是一个对智能体本该跑的每一次 <code>curl</code> 都报警的传感器。弄对了，第二个决定才是那个从没被人正确表述过的：杀掉一个工具子进程并不能停下一个智能体，它只是给那个循环递去一次无从解释的崩溃，以及一个「换个方式再试」的理由。</p>
+
+<section>
+  <h2>一眼概览</h2>
+  <p>四个项目，对「然后呢」给出四个不同的答案。</p>
+
+  <table>
+    <thead>
+      <tr><th>项目</th><th>出身与状态</th><th>机制</th><th>最擅长</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Falco</td>
+        <td>Sysdig，2016 年；2018 年捐给 CNCF；2024 年毕业</td>
+        <td>eBPF 驱动（或内核模块）把 tracepoint 与 kprobe 事件喂给一个 YAML 规则引擎</td>
+        <td>广度。最大的社区规则库、映射到 ATT&amp;CK，也是别家都拿来对标的那套检测</td>
+      </tr>
+      <tr>
+        <td>Tetragon</td>
+        <td>Isovalent / Cilium，CNCF</td>
+        <td>eBPF 原生传感器加 <code>TracingPolicy</code>；一个 override 动作能在系统调用主体运行之前把它拦下</td>
+        <td>进程谱系与内核内强制，而且是四者中实测开销最低的</td>
+      </tr>
+      <tr>
+        <td>Tracee</td>
+        <td>Aqua Security，开源</td>
+        <td>eBPF 原生传感器，自带特征库加 Rego 策略，并能抓取制品</td>
+        <td>取证。容器逃逸、注入与权限提升的特征，而且证据一并带上</td>
+      </tr>
+      <tr>
+        <td>KubeArmor</td>
+        <td>AccuKnox，2021 年；CNCF Sandbox，正在申请 Incubation</td>
+        <td>用 AppArmor、SELinux 或 BPF-LSM 策略让内核直接拒绝该操作；eBPF 只用于可见性</td>
+        <td>声明式最小权限。一张关于二进制、路径与目的地的允许清单，就地强制</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/falco-vs-tetragon-vs-tracee-vs-kubearmor/data-cpu-overhead.svg" alt="横向条形图：传感器在 2 vCPU 节点上的 CPU 开销，单位毫核——Falco 约 430、Tracee 约 92、Tetragon 约 6.5，KubeArmor 未被测量" width="900" height="400" loading="lazy" />
+    <figcaption>一份 2025 年的对比、一种工作负载形状。发现在于次序；那些数字本身搬不走。</figcaption>
+  </figure>
+
+  <p>这个差距对智能体比对普通服务更要紧，而原因是机械的：这些传感器按事件计费，而一个智能体外壳会为每一次工具调用 exec 出一个新进程。一个启动一次、然后处理请求的服务几乎不产生 exec 事件。一个带 shell 工具、跑二十步任务的智能体会产生几百个，再加上它跑的每条命令的每个子进程。不管在你的内核上绝对数字是多少，你的智能体节点就是那些「按事件计费的传感器会变贵」的节点。</p>
+</section>
+
+<section>
+  <h2>为什么那套标准模型在智能体工作负载上会坏掉</h2>
+  <p>Kubernetes 运行时安全建立在一条几乎总成立、而在这里不成立的假设上。这条假设是：一个工作负载有一条可被描述的基线——这个镜像会跑这些二进制、打开这些路径、连这些服务，别的任何事都值得一条告警。正是这条假设让共享规则库成为可能——「容器里起了一个 shell」是一条好检测，因为在一个正常容器里它确实是条好检测。</p>
+  <p>智能体把它翻了过来。一个编码智能体的工作就是起 shell、装包、克隆仓库、跑测试套件、拉起编译器，并向各种源开网络连接。把 Falco 的默认规则集指向一个编码智能体节点，你会在第一个成功任务上就触发 <em>Terminal shell in container</em>、<em>Launch package management process</em>、<em>Write below etc</em> 以及十几条别的。而通常的应对——对那个命名空间把这些规则压掉——留给你的是一个「盯着智能体、而大部分检测已被关掉」的传感器，那比不部署更糟，因为现在多出了一块暗示自己有覆盖的仪表盘。</p>
+  <p>所以该问候选传感器的不是「它能检测什么」，而是「它能分辨什么」。有三项能力承担着分量：</p>
+  <ul>
+    <li><strong>进程谱系。</strong>一条规则能不能表达「这个 <code>curl</code> 是智能体那个 shell 工具在第三层的后代」，而不是「这个 pod 里发生了一次 <code>curl</code>」？智能体自己的工具调用与一段载荷的子进程，在 pod 这一级看起来一模一样，在 exec 树上则完全不同。</li>
+    <li><strong>按进程的策略，而不是按镜像的策略。</strong>一个智能体 pod 通常跑着一个长寿的外壳进程，加上一串短命的子进程。一条按镜像划范围的策略用一条规则把两者都盖住；一条按进程子树划范围的策略能允许外壳做事、同时约束那些子进程。</li>
+    <li><strong>一个能活着进到事件里的运行标识。</strong>四者都不原生提供它，而这正是值得围着它做工程的那道缝：你的外壳知道当下是哪次运行、哪次工具调用，而传感器知道是哪个 PID 干了什么。把两者 join 起来，意味着要盖一个内核看得见的印——按运行划一个 cgroup、按会话给一个专用 uid 或 gid，或者一个传感器会导出的进程组标签——而它能把一串匿名系统调用变成可归因的动作。这与<a href="/zh/deep-dives/multi-agent-systems/unintended-coordination-between-agents">各自隔离的运行，互相找到了对方</a>里的那套 join 论点是同一个，只是往下挪了一层。</li>
+  </ul>
+  <div class="callout">
+    <p>对候选名单的实际后果：Tetragon 的长处恰恰是前两项，因为进程谱系是它的原生模型、而不是一项富化。把它选来跑智能体工作负载，这是个比它那个人人都在引用的开销数字更好的理由。</p>
+  </div>
+</section>
+
+<section>
+  <h2>每一个究竟挂在哪里</h2>
+  <figure>
+    <img src="/blogs/falco-vs-tetragon-vs-tracee-vs-kubearmor/arch-hook-points.svg" alt="示意图：一次系统调用先经过 LSM 钩子、再到内核的许可判定，KubeArmor 与 Tetragon 的 override 在「可阻止」那侧，Falco 与 Tracee 在「只能上报」那侧，OpenShell 作为按进程的对照列在一旁" width="900" height="500" loading="lazy" />
+    <figcaption>那条虚线是内核的许可判定。在它左边你能说不；在它右边你只能说「发生过一件事」。</figcaption>
+  </figure>
+
+  <h3>Falco</h3>
+  <p>Falco 是那个参照点，而它对得起这个位置。2016 年生于 Sysdig、2018 年捐给 CNCF、2024 年毕业，它通过一个 eBPF 驱动读取内核事件流，并拿一套可读的 YAML 语法规则去求值，配着可得的最广社区规则库与持续维护的 ATT&amp;CK 映射。它的模型是告警：一次命中产出一个事件，而「拿它做点什么」是生态里另一个组件的事、不是引擎的一部分。对智能体而言，请把它当成你的勘探工具——在一批智能体节点上以纯告警模式跑两周，它的输出就是一份「你的智能体实际都在干什么」的行为清单，而那正是你在能为本清单上任何别的东西写策略之前所需要的东西。</p>
+
+  <h3>Tetragon</h3>
+  <p>Tetragon 是 eBPF 原生的，而且是围着进程树建起来的，而这正是在这里要紧的那条性质。一条 <code>TracingPolicy</code> 能匹配内核函数与参数，而它的 override 动作会在系统调用主体执行之前把这次调用拦下——是真正的预防、而不是事后反应。它自己的文档对那个多数报道会抹平的区别很谨慎：override 是阻止，而一个 <code>Sigkill</code> 动作会终止该进程、但不保证那次正在飞的操作被停住了。请记住这句话；它就是下一节的全部内容。它在上面那份对比里也以很大差距成为三个传感器里开销最低的，而对 exec 频繁的智能体节点来说，这不是一个可以四舍五入掉的细节。</p>
+
+  <h3>Tracee</h3>
+  <p>Tracee 是那个取证答案。它带一套映射到 ATT&amp;CK 的特征库、支持用 Rego 写自定义检测，而它的差异化在于制品抓取——某条规则命中时，你拿到的是证据、而不是日志里的一行。它在容器逃逸与进程注入模式上尤其强，而对一个按设计就在运行不可信代码的智能体来说，那正是对的那份候选名单。如果你的失败模式是「出了一次事故，而我们几乎什么都重建不出来」——也就是<a href="/zh/blogs/only-one-side-could-see-the-breach">只有一边看得见那次入侵</a>里描述的处境——那这个项目正是直接冲着它去的。</p>
+
+  <h3>KubeArmor</h3>
+  <p>KubeArmor 是这里的异类，也是某件具体活儿的最佳人选。它压根不用 eBPF 来做强制——它把策略编译到 AppArmor、SELinux 或 BPF-LSM，让内核自己去拒绝那个操作，eBPF 只用来做可见性。它由 AccuKnox 在 2021 年创建，自 2021 年 11 月起处于 CNCF Sandbox，目前正在申请 Incubation。它想要的形状是一张声明式允许清单：这些二进制可以执行、这些路径可以写、这些目的地可以到。对一个「合法工具面你数得出来」的智能体——一个客服智能体、一个数据分析智能体、一个只有六个脚本的运维智能体——这非常接近对的那道控制；而它与 OpenShell 用 Landlock 和 seccomp 摆出的姿态相同，主要区别在于策略归谁所有。</p>
+</section>
+
+<section>
+  <h2>响应动作才是那个决定，而「杀掉它」通常是错的</h2>
+  <figure>
+    <img src="/blogs/falco-vs-tetragon-vs-tracee-vs-kubearmor/compare-response-actions.svg" alt="三列对比：仅告警、SIGKILL 与「执行前拒绝」，以及各自对一个正在跑的智能体循环做了什么" width="900" height="300" loading="lazy" />
+    <figcaption>同一条检测，三种未来。只有一种会告诉智能体发生了什么。</figcaption>
+  </figure>
+
+  <p>对一个常规工作负载来说，检测与阻止坐在一根直白的轴上：告警更便宜更安全，拦截更强更有风险，而杀掉一个进程是拦截的钝版本。对智能体而言，这根轴会弯，因为你要响应的那个东西不是那个进程——而是一个会观察结果、然后再次行动的循环。</p>
+  <p>杀掉那个子进程，智能体看到的是一个「退出了、没有输出」的工具。它完全不知道为什么，它没有理由相信这个动作是被禁止的、而不是不稳定的，而它对一个不稳定工具受训得来的反应就是再试一次，常常换条路。你压掉了一次尝试、什么也没教给那个循环，代价是仪表盘上多了一个看起来像强制的信号。更糟的是，按 Tetragon 自己的提醒，那个在信号落地时已经在飞的操作很可能已经完成了。</p>
+  <p>换成拒绝那次系统调用，形状就整个变了。工具拿到 <code>EPERM</code>，你的外壳把它呈现成一次工具错误，而模型读到的是一句描述「被拒绝了」的话。现在它可以调整、可以提问、可以停下，而你的追踪里装着一次可归因、挂在一条具名规则上的拒绝，而不是一个无从解释的退出码。这就是「一道智能体能推理的控制」与「一道它只能撞上去的控制」之间的区别，也正是<a href="/zh/deep-dives/agent-security/structured-refusal-and-why-trails">结构化拒绝与「为什么」轨迹</a>那套论点，只是搬到内核边界、而不是工具边界上讲。</p>
+  <ul>
+    <li><strong>对任何你叫得出名字的东西，优先选「执行前拒绝」。</strong>挂在 LSM 钩子上的强制（KubeArmor，或 Tetragon 的 override）返回的是一个错误、而不是一具尸体。</li>
+    <li><strong>把「杀」留给智能体进程，而不是工具。</strong>如果结论是「这次运行必须停」，那就停这次运行——外壳、循环、整个东西——并把原因记下来。杀掉一个子进程是一个被读成完整措施的半措施。</li>
+    <li><strong>确保那次拒绝以文字形式抵达模型。</strong>一次以空 stderr 形式呈现的策略拒绝，功能上与一次杀掉无异。这是外壳侧的工作，也是团队会跳过的那部分。</li>
+    <li><strong>对智能体节点来说，纯告警是一个正当的稳态。</strong>考虑到一个合法智能体的行为面有多宽，一个高召回检测器加一条人工队列，胜过一个调得过头、会弄坏任务的拦截器。请接受这一点，并把它好好埋点，而不是假装你能靠拦截拦到安全。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>什么时候选哪个</h2>
+  <table>
+    <thead>
+      <tr><th>处境</th><th>先上</th><th>因为</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>生产里已经有智能体，而运行时可见性完全为零</td><td>Falco，纯告警</td><td>检测面最广，也是拿到行为清单最快的路；之后再基于数据去调</td></tr>
+      <tr><td>工具调用频繁的智能体节点，而你在意归因</td><td>Tetragon</td><td>进程谱系是原生的，而按事件的开销是这组里实测最低的</td></tr>
+      <tr><td>你本来就在跑 Cilium</td><td>Tetragon</td><td>同一个项目家族、同一套运维模型，节点上少一个 agent</td></tr>
+      <tr><td>智能体的合法工具面数得出来</td><td>KubeArmor</td><td>对一个有界的面来说，挂在 LSM 钩子上强制的声明式允许清单是最便宜的正确控制</td></tr>
+      <tr><td>你需要重建事故，而不只是察觉它们</td><td>Tracee</td><td>制品抓取加逃逸与注入特征，给你的是证据而不是一行日志</td></tr>
+      <tr><td>你想要一层智能体放宽不了的强制</td><td>OpenShell 或 KubeArmor</td><td>两者都编译到内核原语；按「策略该归谁所有」来挑——外壳还是平台团队</td></tr>
+    </tbody>
+  </table>
+  <p>常见的生产形状是其中两个、而不是一个：一个高召回检测器以告警模式盯着你数不出来的那部分行为，加一张就地强制的允许清单管住你数得出来的那部分。这不是拿不定主意——这两者回答的是不同的问题，而只跑后一个意味着你永远学不到自己哪里弄错了。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>如果我已经在跑 OpenShell 或一个 seccomp 档位，还需要这里的某一个吗？</h3>
+  <p>它们回答不同的问题。一条按进程的内核策略框住的是「一个智能体可以做什么」，并且由启动它的那一方装上。这四个是由平台团队拥有的节点级传感器，它们跨工作负载地看——包括智能体的子进程、旁挂容器，以及任何逃出来的东西。强制那一层确有重叠，可见性并不重复。</p>
+  <h3>Falco 的默认规则在智能体节点上管用吗？</h3>
+  <p>按原样不管用。像「容器里起了一个 shell」或「跑了一个包管理器」这样的检测，对正常工作负载是对的，而它们描述的是一个智能体平平无奇的周二。请预期要重写、而不是压制，并且要写引用进程谱系、而不是引用镜像身份的规则。</p>
+  <h3>eBPF 强制在生产里安全吗？</h3>
+  <p>挂在 LSM 钩子上的强制是一条受支持的内核机制，而 KubeArmor 走的 AppArmor 与 SELinux 那条路已有数十年历史。风险不在机制，而在你的策略：一次就地拒绝上的误报会弄坏一个任务。任何新策略都请先以审计模式跑，再按规则逐条提升。</p>
+  <h3>怎么把一个运行或会话标识送进传感器的事件里？</h3>
+  <p>盖一个内核看得见的印。按运行划一个 cgroup、按会话给一个专用 uid 或 gid、或者一个独立的进程组，这些对这些传感器都是可见的，并且能与你外壳自己的追踪干净地 join 上。在写策略之前先把这件事做掉，才让基于谱系的规则成为可能。</p>
+  <h3>哪一个会抓住一个通过短链服务外泄的智能体？</h3>
+  <p>按默认配置，一个都不会——一次发往热门主机的 HTTPS 连接在系统调用层面并不异常。那个失败类别是出站策略问题，不是运行时传感器问题；机制在<a href="/zh/blogs/get-only-was-a-write-channel">「只允许 GET」本身就是一条写信道</a>里。这些工具看得见发起那次连接的进程，那在事后有用，但不是一道控制。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站：</h3>
+  <ul>
+    <li><a href="/zh/concepts/reference-monitor">引用监视器</a>——为什么挂载点与信任域才决定这一切算不算一道控制。</li>
+    <li><a href="/zh/deep-dives/agent-security/sandbox-and-isolation-patterns">沙箱与隔离模式</a>——节点级传感器如何与按进程的策略叠在一起。</li>
+    <li><a href="/zh/operations/safety-and-security/detecting-agent-compromise">察觉智能体被攻破</a>——在系统调用层之上，信号长什么样。</li>
+    <li><a href="/zh/deep-dives/agent-security/structured-refusal-and-why-trails">结构化拒绝与「为什么」轨迹</a>——把一次拒绝做成撞上它的那个循环读得懂的东西。</li>
+    <li><a href="/zh/operations/safety-and-security/egress-control-for-agents">智能体的出站控制</a>——这些传感器覆盖不到的那个失败类别。</li>
+    <li><a href="/zh/blogs/the-tamper-proof-half-did-not-ship">防篡改的那一半没有交付</a>——同样的原语被当成平台来卖，以及 DPU 那一层会添上什么。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://falco.org/">Falco</a>——CNCF 已毕业的运行时安全项目。</li>
+    <li><a href="https://tetragon.io/">Tetragon</a>——基于 eBPF 的安全可观测性与运行时强制。</li>
+    <li><a href="https://aquasecurity.github.io/tracee/">Tracee</a>——用 eBPF 做运行时安全与取证。</li>
+    <li><a href="https://kubearmor.io/">KubeArmor</a>——用 LSM 做运行时安全强制。</li>
+  </ul>
+</section>

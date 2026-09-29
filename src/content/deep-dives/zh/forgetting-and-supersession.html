@@ -1,0 +1,152 @@
+<section class="phase">
+  <div class="phase-num">M12</div>
+  <div class="week">深入解析 · 记忆与上下文工程</div>
+  <h2>遗忘不是一个操作，也不是一项检索设置——它是五种不同的变更，全都在写路径上被决定，而写路径恰恰是整个记忆栈里没人放模型的那一段。</h2>
+  <p class="goal">一个只会不停累积的记忆系统不会优雅地退化；它会退化成一个「错答案排在对答案前面」的存储，而再怎么调召回也救不回来。2026 年的测量对这有多糟说得很直白：一个专门用强化学习训练去「按事实的当前取值而不是被取代的旧值」作答的小型开源模型，在留出对话上把准确率大致翻了一倍，最后落在 16.7%——也就是说六个回答里仍有五个引用的是用户早已纠正过的东西。解法不是一个时新度权重。遗忘可以分解成五种结构上不同的操作，其中四种需要「只在写入那一刻才存在」的意图，而能把它们救回来的架构是一个管变更的控制平面，不是一个更聪明的排序器。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>人们说「遗忘」时指的那五件事。</h3>
+
+    <p>「让智能体忘掉那个」是一句话，底下至少盖着五种操作，各有不同的正确性条件、不同的失败模式、不同的法律份量。2026 年 7 月那份提出 ForgetEval 基准（1,385 个用例，其中 385 个对抗性）的架构研究给它们取了名字，而这套分类值得采纳，因为它能拦住「上了一套机制、就以为覆盖了整组」的团队。</p>
+
+    <pre class="standalone"><span class="c-cm"># five forgetting primitives, and what "correct" means for each</span>
+
+supersession  a new value replaces an old one
+              correct = the new fact wins recall AND the old
+              one leaves top-k          e.g. moved city
+
+decay         a fact was released and should stop surfacing
+              correct = stays out of top-k without deletion
+                                        e.g. TTL, consumed OTP
+
+amnesia       forget everything about one entity
+              correct = width control — siblings survive
+                                        e.g. "forget my ex"
+
+purge         hard-delete by identifier
+              correct = the row is gone, provably
+                                        e.g. GDPR Art. 17
+
+drift         a chain of supersedes
+              correct = only the latest wins; intermediates
+              unreachable                e.g. price v1→v2→v3</pre>
+
+    <p>把「correct」那一列竖着读下来，问题的形状就显出来了。取代有一个两段式的条件，而几乎每一套生产系统只满足前半段——新事实写进去了、也确实排上来了，而旧的那个还坐在存储里、排得几乎一样好。衰减不是删除，也不该是，因为一条过期的事实往往为了审计还得留着。遗忘一个实体是一个「宽度」问题而不是「匹配」问题：难的不是找到关于该实体的那些事实，而是不把邻居一起端走。硬删除是唯一一个「语义相似度明确是错工具」的原语——一项删除义务是对着标识符履行的，不是对着向量，这正是<a class="xref" href="/zh/operations/governance-compliance/erasure-against-agent-memory">对智能体记忆执行删除权</a>展开的那一点。而漂移是那个悄悄把评测搞坏的：一个同时装着 v1、v2、v3 的存储，会乐呵呵地支撑三个互不相容的答案。</p>
+
+    <div class="callout">
+      <p>这套分类也解释了「加个 TTL 就行」为什么是个如此顽固的非答案。TTL 实现的是衰减，且只有衰减。它表达不了取代（并没有哪个时钟点让「底特律」变错——是一句话让它变错的），它表达不了实体级遗忘（它没有「实体宽度」这个概念），它也履行不了硬删除（过期不是删除）。五个原语里的一个，而且是后果最小的那个。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>为什么读这一侧修不了它，排序器再好也一样。</h3>
+
+    <p>本能反应是在检索处解决，因为检索是团队本来就有把手的地方：一个时新度加权、一个作用在相似度分上的衰减因子、一个对 <code class="inline">valid_until</code> 的过滤、一个带新鲜度特征的重排器。这每一项都有一点用，而没有一项是解法，原因值得说得精确。</p>
+
+    <p>检索是在候选集上排序。被取代的事实是极好的候选。「用户住在底特律」与「用户住在哪里」在语义上几乎一模一样——往往比那条纠正更近，因为纠正可能是以一句顺带的插话形式抵达的——所以那条过时事实是凭实力坐在候选集靠前位置的。一个时新度加权把一个强匹配变成一个略弱一点的强匹配；当 top-k 取 8 时，旧事实与新事实几乎总是双双被取回，于是决策挪进了模型的上下文，在那里它变成了一个注意力问题，而不再是记忆问题。模型现在手上有两条都站得住、却互斥的事实，其中一条恰好在时间戳上更旧——而它并没有什么特别的理由要给那个时间戳加权。</p>
+
+    <ul>
+      <li><strong>时新度是「当前性」的一个很弱的代理。</strong>各类事实的易变程度差异极大。家庭住址能稳好几年；值班轮换每周变；一句随口说过一次的偏好压不住任何东西。一条全局衰减曲线把这三者定成同一个价，而稳定的那些事实恰恰是你最想留住的，所以为了治过时去调那条曲线，最先赔掉的就是那些持久的规则。</li>
+      <li><strong>top-k 是错的那道闸。</strong>取代要求旧事实<em>离开</em>候选集，而不是排第二。对于一个语义上完美的匹配，没有哪个排序权重能稳定地做出「不在场」这个结果。</li>
+      <li><strong>读时过滤需要一个没人写过的字段。</strong>对有效区间做过滤，前提是写入时记下了一个区间。如果写路径存的是一句话加一个向量，过滤就没有东西可绑——而这正是常见情形。</li>
+      <li><strong>上下文里的矛盾不是中性的。</strong>两条互相冲突的取回事实不会产出一句模棱两可的话；它们会产出一个自信的答案，而这个答案是由显著性、位置与措辞挑出来的。见<a class="xref" href="/zh/deep-dives/memory-and-context/long-context-effective-vs-advertised">长上下文：有效 vs 广告</a>，看看单靠位置就能如何拍板。</li>
+    </ul>
+
+    <p>随之而来的那个架构性发现才是有用的。把模型辅助放在<em>变更时刻</em>的控制平面上——写入抵达、而它背后的意图仍在场的那一刻——能把「懂意图的删除」救回来，并在 ForgetEval 各族上达到 91.7–93.2% 的整体遗忘准确率，相对的是那些只在读时放模型的系统。这种不对称就是本文的全部论点：在写入时你知道这句话是一次纠正、它关于哪个实体、以及这次改动该有多宽。到了读取时，这一切都已被压进一个向量，而那些信息就是没了。</p>
+
+    <div class="callout">
+      <p>这与<a class="xref" href="/zh/deep-dives/memory-and-context/memory-write-path-architectures">记忆写路径架构</a>是同一个教训，只是再往前推了一步。那一页论证写路径决定了一个记忆系统是什么；这一页补上：写路径也是遗忘唯一能被规定的地方，因为遗忘是一句关于「新事实与某条既有事实之间关系」的话——而那段关系只存在恰好一瞬。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>取代差距，以及对那些数字的老实读法。</h3>
+
+    <p>值得内化的那项测量来自 2026 年 6 月的 <em>Supersede</em> 工作，它把事实更新单独拎出来当作评测目标，并把这项测量变成了一个强化学习环境：智能体按当前取值作答得到奖励、给出过时值受到惩罚。四个发现，按「该改动你路线图多少」降序排列。</p>
+
+    <ul>
+      <li><strong>失败出在维护，不出在阅读。</strong>当更新就摆在眼前时，智能体完全读得懂。它做不到的是在有界记忆下把它维护住——在那里，这条更新得活过压缩、淘汰，以及来自原始事实的竞争。</li>
+      <li><strong>对话越长，差距越深。</strong>这与你想要的形状正好相反，而它意味着短会话评测会系统性地低估它。如果你的评测会话只有十轮长，那你量的是这个问题几乎还不存在的那个区间。</li>
+      <li><strong>更大的模型与更大的记忆，哪一个都关不上它。</strong>这个发现应该让某一条路线图条目停下来。把存储做大只会增加过时候选的数量；把模型做大改进的是那个本来就不是瓶颈的「读」。</li>
+      <li><strong>它是可训练的。</strong>在 Supersede 环境上对一个小型开源模型（Qwen2.5-3B）做 GRPO 微调，把留出的、真实未见对话上的取代准确率大致翻了一倍，从 9.0% 到 16.7%——这是「这道差距能被训下去、而不只是被量出来」的首份证据。</li>
+    </ul>
+
+    <p>现在请用一个运维者该有的方式读最后那个数。翻倍是一项真实成果，而 16.7% 是一场灾难。它是这项任务上已发表的最强训练信号，却依然意味着：关于一条被更新过的事实，大约六个回答里有五个引用的是用户早已纠正过的取值。由此得出两个结论，而它们并不互相矛盾。训练有用，也值得跟踪。以及：如果你这个季度就要交付，你没法拿一个模型把自己从取代差距里买出来——你必须让存储停止返回旧值，而那是一个模式与写路径的问题，不是一个权重问题。</p>
+
+    <div class="callout">
+      <p>这里还有一个测量陷阱。标准记忆基准给「植入事实的召回」打分，而一个从不遗忘的系统按构造就能在上面考得不错。一个回答「底特律」的存储并不是召回失败——它是召回成功、当前性失败，而这是两个不同的指标，多数测试台并不把它们分开。<a class="xref" href="/zh/deep-dives/memory-and-context/evaluating-memory">评估记忆</a>覆盖一般情形；这里具体要的，是一个只在「至少被更新过一次」的事实上计算的当前性指标。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>叫不出名字的东西，你取代不了。</h3>
+
+    <p>除衰减之外，每一个原语都要求识别出一条在先的事实，这让实体与属性解析成了整份设计的承重依赖。ForgetEval 那对抗性的一半之所以存在，正是因为系统在这里坏掉的样子看起来像成功，而其中两个被点了名的失败值得为它们写测试。</p>
+
+    <ul>
+      <li><strong>前缀碰撞。</strong>你用来匹配的那个标识符，并不像你以为的那样唯一。<code class="inline">user:alex</code> 与 <code class="inline">user:alexandra</code>、<code class="inline">project:atlas</code> 与 <code class="inline">project:atlas-migration</code>、同一个电话号码带国家码存了一份、不带又存了一份。对标识符做前缀或子串匹配会删多，而在一次实体级遗忘中删多，恰恰就是那个把邻居一起端走的宽度失败。</li>
+      <li><strong>部分取代。</strong>新事实更新的是一个复合取值的一部分，而系统要么整块替换、要么整块保留。「我搬到郊区了」更新了城市，并隐含地更新了邮编与通勤，但没更新国家——而一个把地址当成一整条不透明字符串的系统，要么丢掉了本该留下的部分，要么留下了本该丢掉的部分。复合属性需要字段级的取代，否则就需要在写入时被分解开。</li>
+    </ul>
+
+    <p>实际后果是：一个只按向量建键的记忆存储实现不了五个原语里的四个，因为它没有可供操作的标识符。让遗忘变得可表达的最小模式很短，而每个字段都对得起自己的位置：</p>
+
+    <pre class="standalone"><span class="c-cm"># the fields forgetting actually needs</span>
+
+entity_id        resolved, canonical, not a surface string
+attribute        namespaced; composites decomposed
+value
+valid_from       when the fact became true
+valid_until      null = current; set on supersede
+supersedes       id of the fact this replaces  -> drift chain
+source_channel   which conversation / tool / document
+volatility       stable | periodic | volatile
+asserted_by      user | inference | third party
+
+<span class="c-cm"># then the four operations are cheap:</span>
+supersede  set valid_until on the prior, insert with supersedes
+decay      set valid_until; keep the row for audit
+amnesia    delete where entity_id = X  (exact, not prefix)
+purge      delete by id, cascade the drift chain, log it</pre>
+
+    <p>请留意 <code class="inline">asserted_by</code> 这个字段买到了什么。用户亲口说的事实压过智能体推断出来的事实；而一条从被取代事实推导出来的推断，应该随它一起失效——按来源作用域的失效，这是唯一能防止派生记忆活得比自己前提更久的机制。这同时也是一个防御面：一个能写记忆的攻击者可以去取代真实的记忆，这正是<a class="xref" href="/zh/deep-dives/memory-and-context/memory-poisoning-defenses">记忆毒化防御</a>切入的角度。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>排名会随「在役时长」反转，所以跑在三周上的基准告诉你的是错事。</h3>
+
+    <p>2026 年 7 月那份纵向研究，是该改变你选记忆后端方式的那个结果。它用一个带种子的「人生剧本」采样器生成语料——事实带着有效区间、易变类别与来源通道被发出，而这发生在<em>任何文本存在之前</em>，于是黄金答案按构造就与剧本一致——然后在两个时间跨度上比较了五种记忆架构外加一个无记忆对照。后端排名随历史长度反转：那个在三周时领先的、有预算的策划式映射记忆，到九周时对已淘汰内容的召回从 96% 掉到 72%，而一个带来源类型的图则升到 90%。</p>
+
+    <p>这次交叉不是一桩趣闻；它是对你读过的每一份记忆对比——包括你自己跑过的那些——的一记警告。它们几乎全是短在役时长的。一个带令牌预算的策划式映射早期看起来很出色，因为当历史还小、摘要还装得下大部分内容时，摘要确实是一项真实的胜利。它的淘汰策略是一处缓慢的信息泄漏，而这处泄漏只会在多数评测停下的那个跨度之后才显形。</p>
+
+    <ul>
+      <li><strong>在你将要运营的那个在役时长上做评测。</strong>如果你的智能体要维持一段长达一年的客户关系，那么一次两周的评测不是「正确实验的一个缩小版」——它是一个把答案反过来的不同实验。</li>
+      <li><strong>对长在役时长，别把摘要当作记忆策略来信。</strong>压缩是刻意有损的，而那份损失既不可恢复也没人记账。把它用在上下文组装上，那才是它该在的地方；见<a class="xref" href="/zh/deep-dives/memory-and-context/context-compaction">上下文压缩</a>。</li>
+      <li><strong>带类型的来源信息赢在后期。</strong>那个随在役时长变好的架构，正是保留了 STEP 4 那些字段、因而能回答「当前是什么」而不是「我摘要过什么」的那一个。这与<a class="xref" href="/zh/deep-dives/memory-and-context/memory-stores">记忆存储</a>从存储那一侧得到的结论相同。</li>
+      <li><strong>从事实生成语料，而不是从语料生成事实。</strong>那份研究之所以能量出当前性，是因为它先植入了带有效区间的事实、再渲染文本。如果你的评测集是靠给既有转写稿打标签搭出来的，那你的黄金答案就继承了标注者当时以为的「当前」——见<a class="xref" href="/zh/operations/evaluation-and-observability/eval-set-maintenance">评测集维护</a>。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>交付它：四个数字与一个控制平面。</h3>
+
+    <p>这份工程量不大，而且主要就是模式加一个拦截点。让它变得可做的是：一旦允许写路径成为一次决策而不是一次追加，每个原语都变得很便宜。</p>
+
+    <ul>
+      <li><strong>在存储前面摆一个变更控制平面。</strong>每一次写入都要过一道把它归类的工序：新事实、对某条具名在先事实的取代、释放、实体级擦除、硬删除。这里才是模型辅助能付得出回报的地方——归类需要意图，而意图恰恰在此在场，之后任何地方都不在。对含糊者默认拒绝：一次无法归类的写入变成「一条新事实加一条被标记的候选冲突」，永远不要变成一次无声的覆盖。</li>
+      <li><strong>在存之前解析实体，而不是在查的时候。</strong>要精确的规范标识符，绝不要前缀或子串匹配。如果解析失败，就把那条事实带着「未解析」标记存下来、并把它排除在取代路径之外——一条你叫不出名字的事实就是一条你更新不了的事实，而装作不是这样只会产出 STEP 4 里那些宽度失败。</li>
+      <li><strong>把「当前性」做成查询时的不变式，而不是一项排序特征。</strong>默认的读取过滤 <code class="inline">valid_until IS NULL</code>。历史读取是一次显式的、独立的调用，带一个 as-of 时间戳，只供审计使用、别无他用。如果一条过时事实能走正常路径抵达上下文，那没有哪个排序器救得了你。</li>
+      <li><strong>量四样东西。</strong>在「至少被更新过一次」的事实上算当前性准确率，并按在役时长分层。矛盾率——同一实体—属性上处于生效状态的互斥事实对数，它应该是零而从来不是。抵达当前性的时间，从纠正落地到存储能用它作答。孤立推断数，即前提已被取代的派生记忆。</li>
+      <li><strong>把对抗性用例放进 CI。</strong>一个前缀碰撞用例、一个部分取代用例、一个邻居在场的实体级遗忘用例，以及一次必须级联三环漂移链的硬删除。四个夹具，而它们抓的正是那些看起来像通过的失败。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>这周只做一件事的话：从你的存储里取一百条真实记忆，按实体与属性分组，数一数有多少组里含着两个或更多互斥且生效的取值。那个计数就是你的矛盾率，它是预测你当前性准确率的那个数，而从没有人跑过它之后还高兴得起来。然后往模式里加上 <code class="inline">valid_until</code> 与 <code class="inline">supersedes</code>，并让默认读取按前者过滤——单这一项改动就实现了取代与衰减，五个原语里的两个，只花一个下午。要看它在更大系统里的位置：<a class="xref" href="/zh/concepts/agent-memory">智能体记忆</a>是一页版，<a class="xref" href="/zh/deep-dives/memory-and-context/retrieval-augmented-memory">检索增强记忆</a>是读的那一侧，而<a class="xref" href="/zh/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">索引新鲜度与失效</a>是同一个问题、只不过事实住在文档里而不是记忆存储里。</p>
+    </div>
+  </div>
+</section>
