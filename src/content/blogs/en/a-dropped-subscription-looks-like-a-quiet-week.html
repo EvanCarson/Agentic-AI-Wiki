@@ -1,0 +1,135 @@
+<p class="lede">An agent that polls a tool gets an error when something breaks; an agent that subscribes to events gets silence, and silence is also what a quiet week looks like. At DevDay on 29 September 2026 OpenAI shipped plugin automations against MCP Events — a design sketch that still carries no SEP number and lives in a repository whose README calls its contents "exploratory and do not represent official MCP specifications or recommendations" — and the parts of that draft its integration does not consume are precisely the two envelopes that tell a client its stream ended rather than emptied. The draft defines them. It makes neither mandatory. That is the whole problem with event-driven agents in one design decision.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four ways an event stream goes quiet, and who is supposed to tell you which one happened.</p>
+  <table>
+    <thead>
+      <tr><th>Cause</th><th>Signal in the draft</th><th>Strength</th><th>In the shipped integration</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Subscriber's access revoked</td>
+        <td><code>notifications/events/terminated</code></td>
+        <td>Re-check is a SHOULD</td>
+        <td>Not consumed</td>
+      </tr>
+      <tr>
+        <td>Server restart drops the buffer</td>
+        <td><code>{"type":"gap"}</code> envelope</td>
+        <td>At-most-once for emit-only types</td>
+        <td>Not consumed</td>
+      </tr>
+      <tr>
+        <td>Callback unreachable</td>
+        <td><code>deliveryStatus</code> on refresh</td>
+        <td>Visible only at the next refresh</td>
+        <td>Refresh exists</td>
+      </tr>
+      <tr>
+        <td>Genuinely nothing happened</td>
+        <td>— none needed —</td>
+        <td>—</td>
+        <td>Indistinguishable from the above</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/a-dropped-subscription-looks-like-a-quiet-week/arch-four-silences.svg" alt="Diagram showing four causes of an empty event stream — revoked access, server restart, failing delivery and a genuinely quiet upstream — converging on one indistinguishable outcome when the control envelopes are not consumed." width="900" height="500" loading="lazy" />
+    <figcaption>Drop the control envelopes and the first three causes collapse into the fourth.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>What shipped, and what it shipped against</h2>
+  <p>MCP Events is a Triggers and Events Working Group document — leads Clare Liguori of AWS and Peter Alexander of Anthropic — whose charter was merged on 25 March 2026 and whose single deliverable, "SEP: Events in MCP v1 RFC", still reads <em>Ideating</em> with a target date of "End April" that has not been revised since. The design sketch itself is dated 19 February 2026 and marked "Draft proposal". There is no SEP file for it in the specification repository's <code>seps/</code> directory, and the incubation repo carries the <code>experimental-</code> prefix rather than the <code>ext-</code> prefix that marks an official MCP extension. The August roadmap lists server-initiated events as current work and asks for a composition review across the Agents, Transports and Triggers groups — which is to say the primitive is not finished and its interaction with Tasks is an open question.</p>
+  <p>OpenAI's own announcement wording is careful and correct: support for "the proposed MCP Events specification". The availability line is not careful in the same way — all plans. So a proposal with no SEP acquired, in one afternoon, the largest client implementation it will ever have, and the working group that owns it meets weekly on a thirty-minute cadence.</p>
+  <p>This is not an argument that OpenAI should have waited. Specs without implementations do not converge either, and the integration faithfully implements the webhook half. It is an argument about what happens next: the optional parts of a draft, once a dominant client has skipped them, stop being optional in the direction you would hope.</p>
+</section>
+
+<section>
+  <h2>Three delivery modes, and the load-bearing sentence is "none is mandatory"</h2>
+  <p>The draft specifies poll (<code>events/poll</code>), push (<code>events/stream</code>) and webhook (<code>events/subscribe</code>), advertised per event type, and it is explicit about the cost: "This goes against MCP's usual stance of offering one way to do a thing, and the cost is real: roughly 3× spec and SDK surface." None of the three is required of a server.</p>
+
+  <figure>
+    <img src="/blogs/a-dropped-subscription-looks-like-a-quiet-week/arch-three-delivery-modes.svg" alt="Three lanes between an MCP server and an agent client: poll with a cursor, push over a long-lived stream with heartbeats, and webhook delivery to a client-supplied HTTPS callback with a client-supplied secret." width="900" height="500" loading="lazy" />
+    <figcaption>Webhook is the lane the shipped integration implements; poll and push are not supported by it.</figcaption>
+  </figure>
+
+  <p>Optionality at the mode level has a direct consequence for anyone building a server: conformance is not interoperability. A server that implements only poll and a client that implements only webhook can both be correct and still have nothing to say to each other. Today that resolves to a de facto requirement — implement webhook, because that is what the largest client speaks, which also means persistent subscription storage and an outbound HTTPS path from your server, neither of which a tools-only MCP server needed.</p>
+  <p>Note which way the authorisation runs. Webhook subscriptions must be made by an authenticated principal — a server must reject an unauthenticated <code>events/subscribe</code> with <code>-32012 Forbidden</code> — and the subscription key is <code>(principal, delivery.url, name, arguments)</code>. The client supplies the signing secret. Poll and push, by contrast, are available to unauthenticated servers. So the mode choice is also a choice about whether there is a principal behind the stream at all.</p>
+</section>
+
+<section>
+  <h2>Silence is the failure mode, and the draft knows it</h2>
+  <p>The draft's own summary states the point plainly: events let a client subscribe and "have the agent react when they occur, without the user being present". Nobody is waiting on the result, so nobody notices its absence. Four things then produce an empty stream.</p>
+  <p>The first is revocation. Authorisation is checked at subscribe time as a MUST; after that, "the server SHOULD periodically re-verify permissions", and when access is lost the subscription is terminated and a <code>terminated</code> envelope carries <code>-32012 Forbidden</code> with a reason. Note the modal verbs: the initial check is required, the ongoing check is advisory, and the notification is a message your client has to be listening for. A client that ignores it learns at its next refresh, because <code>events/subscribe</code> doubles as the refresh call — and the draft lets a server grant <code>refreshBefore: null</code>, meaning no expiry, at which point the SDK's refresh loop "drops to an occasional health-check cadence". Your agent's belief that it is still subscribed is only ever as fresh as its last refresh, and the draft permits that interval to be very long.</p>
+  <p>The second is a restart. Guarantees are at-least-once only "when the cursor is backed by a durable upstream"; for emit-only event types the draft is blunt — "at-most-once across server restarts — the in-memory buffer and its cursors do not survive". The third is delivery failure: webhook retries are independent per event, so arrivals reorder, and the client's view of failure is the <code>deliveryStatus</code> field it reads at the next refresh. The fourth is that nothing happened.</p>
+  <p>And the draft is honest about the floor: "This design intentionally does not provide protocol-level guarantees around event ordering, exactly-once delivery, or transactional consistency. There are no logical clocks, sequence numbers, or cross-subscription ordering constraints." Exactly-once requires application-level deduplication on <code>eventId</code>. That is a defensible choice — Stripe, GitHub and Shopify all ship it — but it lands on a consumer that is an agent loop, which is the least idempotent component in anybody's stack. A duplicate webhook does not re-render a page; it re-runs a plan.</p>
+  <p>There is already a field report of exactly this class of blindness in the incubation repo, filed on 24 August 2026 against long-polling: a 30-day pilot, 74 successful calls, median 45.9 seconds and p95 241.7 seconds, with 22 of them past 60 seconds. The author's stated show-stopper is one sentence — "Client abandonment is invisible. All 22 calls past 60 s were recorded <code>ok</code>." The server could not tell that nobody was listening any more. That is the same problem as the four silences, arriving from the other end.</p>
+</section>
+
+<section>
+  <h2>The webhook plumbing is the part they got right</h2>
+  <p>It is worth being precise about where the criticism does and does not apply, because the security engineering in this draft is better than the discourse around server-initiated events would suggest. Compared with A2A's push notifications — the nearest prior art, where an agent POSTs task updates to a client-provided webhook with credentials from a configured <code>authentication</code> field — MCP Events is stricter on every axis.</p>
+
+  <figure>
+    <img src="/blogs/a-dropped-subscription-looks-like-a-quiet-week/data-draft-vs-shipped.svg" alt="Matrix comparing the MCP Events draft, the ChatGPT plugin integration and A2A push notifications across delivery modes, control envelopes, endpoint verification, HTTPS, replay window and ordering." width="900" height="400" loading="lazy" />
+    <figcaption>Hardening is covered; the control plane that reports absence is the optional column.</figcaption>
+  </figure>
+
+  <p>The callback URL must be <code>https</code> — a MUST, where A2A says SHOULD. Delivery carries a Standard Webhooks HMAC signature with a client-supplied <code>whsec_</code> secret, so the server never mints the credential that authenticates its own deliveries. There is a mandatory endpoint-verification handshake before delivery activates, cached per <code>(principal, url)</code>, specifically to stop a subscription being used as a reflection or amplification primitive against a third party — A2A specifies no equivalent. Replay is bounded by a <code>webhook-timestamp</code> freshness window the draft puts at five minutes, plus <code>eventId</code> deduplication and a single-use nonce. SSRF defence is delivery-time IP validation against the IANA special-purpose registries, connecting to the validated IP with the original Host and SNI, and no redirects.</p>
+  <p>The draft also closes the door the obvious way on the question everyone asks first. Event receipt "does NOT constitute authorization to act" — the agent's response goes through normal MCP authorisation — and payloads are "untrusted data with the same injection considerations as tool results". There is deliberately no token pass-through, no client-credentials grant and no OIDC identity token on a tenant's behalf. Whatever you think about event-driven agents, the people writing this have read the threat model.</p>
+  <p>Which is what makes the omission interesting. The hard security problems got MUSTs. The problem of telling a client that its stream ended got an optional envelope, and optional envelopes do not get implemented, because nobody files a bug about an event that never arrived.</p>
+</section>
+
+<section>
+  <h2>What to change this week</h2>
+  <p>If you are building an MCP server that will carry events, or wiring an agent to consume them:</p>
+  <ul>
+    <li><strong>Treat absence as an alertable condition, not a quiet state.</strong> Record an expected-arrival rate per subscription and alarm when the stream goes flat for longer than that rate predicts. This is the same discipline as watching for absence in <a href="/operations/agentops/scheduled-and-triggered-agents">scheduled and triggered agents</a>, and it is the only thing that works regardless of which envelopes your client consumes.</li>
+    <li><strong>Re-verify at delivery time even though it is a SHOULD.</strong> If you are the server, check the principal's permission on the way out, not only at subscribe. The alternative is delivering a Slack channel's messages to an agent whose user left the channel in March.</li>
+    <li><strong>Make the event handler idempotent on <code>eventId</code> before you ship it.</strong> Not after the first duplicate. The draft hands you at-least-once at best and at-most-once for emit-only types; both of those break an agent loop in ways a web backend absorbs silently — <a href="/operations/agentops/idempotency-and-retries">idempotency and retries</a>.</li>
+    <li><strong>Bound what an event may cause.</strong> A trigger with no requester in the room is the configuration with the widest gap between intent and effect, so cap spend, scope writes, and keep reversibility in the path. <a href="/concepts/blast-radius">Blast radius</a>, and <a href="/concepts/ambient-authority">ambient authority</a> for where the extra reach comes from.</li>
+    <li><strong>Pin the protocol version and expect it to move.</strong> The integration requires <code>2026-07-28</code>; the events surface itself is pre-SEP and the working group meets weekly. Write the version into your server's contract tests rather than your memory — <a href="/deep-dives/mcp/mcp-revision-2026-07-28">the 2026-07-28 revision</a>, and <a href="/operations/agentops/protocol-revisions-and-deprecation-windows">protocol revisions and deprecation windows</a>.</li>
+    <li><strong>Log the subscription as a grant.</strong> It is derived from a permission check that happened once, it refreshes itself, and it can outlive the project that asked for it. Put it in the registry next to the credentials — <a href="/operations/governance-compliance/access-reviews-for-agent-credentials">access reviews for agent credentials</a>.</li>
+  </ul>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Is MCP Events part of the MCP specification?</h3>
+  <p>No. As of 1 October 2026 there is no SEP file for it in the specification repository, the working group's charter lists its RFC as "Ideating", the design sketch is marked "Draft proposal", and the incubation repository's README states that its contents "are exploratory and do not represent official MCP specifications or recommendations". OpenAI's own wording — "the proposed MCP Events specification" — is accurate.</p>
+
+  <h3>Does a revoked permission keep delivering events?</h3>
+  <p>Not if the server behaves as the draft intends: it terminates the subscription when it detects the loss. The gap is on the client's side of the boundary. The delivery-time re-verification is a SHOULD rather than a MUST, and the notification that the subscription ended is an envelope a client has to consume — so the realistic failure is an agent that believes it is still watching something and is not, for however long its refresh interval is.</p>
+
+  <h3>Why does webhook-only matter if webhook works?</h3>
+  <p>Because it changes what an MCP server is. Tools-only servers answer requests; a webhook publisher needs persistent subscription storage, an outbound HTTPS path, signature generation and a verification handshake. That is a stateful service with a delivery SLA, which is a different operational commitment from the one most MCP servers were built under — <a href="/deep-dives/mcp/mcp-ops-in-production">MCP ops in production</a>.</p>
+
+  <h3>How is this different from A2A push notifications?</h3>
+  <p>A2A notifies about a task the client itself created, so there is always a prior user action behind the stream. MCP Events subscribes to an upstream third-party system with, in the draft's own words, the user not present. The webhook mechanics are similar and MCP's are stricter; the new risk is the missing requester, not the transport.</p>
+
+  <h3>Should I wait for the SEP before building against it?</h3>
+  <p>Build the server if the use case is real — the webhook surface is small and the hardening requirements are clear. Do not build business logic that assumes ordering, exactly-once delivery or a reliable termination signal, because the draft explicitly declines to provide the first two and makes the third optional. Those are the parts most likely to change, and the parts your correctness should not depend on either way.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/operations/agentops/scheduled-and-triggered-agents">Scheduled &amp; Triggered Agents</a> — the three defaults that invert when the user is gone.</li>
+    <li><a href="/deep-dives/mcp/mcp-revision-2026-07-28">The 2026-07-28 MCP Revision</a> — the protocol version this integration requires.</li>
+    <li><a href="/deep-dives/mcp/mcp-ops-in-production">MCP Ops in Production</a> — what running a stateful MCP server actually costs.</li>
+    <li><a href="/operations/agentops/idempotency-and-retries">Idempotency, Retries &amp; Side-Effect Safety</a> — why at-least-once lands hardest on an agent loop.</li>
+    <li><a href="/deep-dives/protocols-and-interop/a2a-v1-deep-dive">A2A v1</a> — the nearest prior art for server-initiated delivery.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md">MCP Events — Design Sketch</a>, 19 February 2026, the source of every quoted requirement here.</li>
+    <li><a href="https://github.com/modelcontextprotocol/experimental-ext-triggers-events">Triggers &amp; Events incubation repository</a>, including the "exploratory" disclaimer and the long-polling field report.</li>
+    <li><a href="https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/main/docs/community/working-groups/triggers-events.mdx">Triggers and Events working-group charter</a>, with the "Ideating" deliverable status.</li>
+    <li><a href="https://raw.githubusercontent.com/a2aproject/A2A/main/docs/specification.md">A2A specification</a>, §4.3.3 and §13.2 on push-notification authentication.</li>
+  </ul>
+</section>
