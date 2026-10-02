@@ -1,0 +1,142 @@
+<section class="phase">
+  <div class="phase-num">O30</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Regional failover for agents.</h2>
+  <p class="goal">Your disaster-recovery plan is written in RTO and RPO, and both of those numbers assume the unit of recovery is a request — something that either completed or did not, and can be safely retried in another region. An agent run is neither: at the moment a region goes dark, a forty-minute task has created three tickets, sent one email, and is halfway through a fourth tool call, so the failover that restores availability is also the failover that sends the email twice. The objective you actually need is a third one next to RTO and RPO: a resume point with exactly-once side effects. Everything useful about agent DR follows from taking the task, not the request, as the thing you are recovering.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Add a third objective, because availability and correctness come apart here.</h3>
+
+    <p>RTO asks how long you can be down. RPO asks how much committed data you can lose. Both are well-posed for a stateless service in front of a replicated database, and both are silent on the question that decides whether an agent failover was a success: how many side effects got applied twice.</p>
+
+    <p>Write the third objective down explicitly, because it behaves differently from the other two. RTO and RPO are dials — you buy a better number with money. Side-effect correctness is closer to a binary: either every externally visible action in a resumed task is keyed and deduplicated, or your failover procedure includes an unknown number of duplicate payments, duplicate tickets and duplicate messages to customers, and the recovery you are proud of produces an incident of its own.</p>
+
+<pre class="standalone"><span class="c-cm"># The three objectives, for an agent system</span>
+
+RTO   how long until new tasks can be admitted elsewhere
+RPO   how much committed task history can be lost
+SEO   side-effect exactness: may a resumed task re-apply an action?
+      (the only one of the three that is not a dial)
+
+<span class="c-cm"># Why the third one is where agents differ</span>
+
+a request    is idempotent or it is not — one decision, at design time
+a task       has already applied k of n actions when the region dies
+             and k is not recorded unless you recorded it on purpose
+</pre>
+
+    <p>That last line is the whole engineering problem. A task's position is only recoverable if you were writing a side-effect ledger before the outage — an append-only record of "action X with key K was attempted, then confirmed" committed to storage that survives the region. If your agent's history is a conversation transcript, you can reconstruct what the model intended and not what the world received. The machinery for this is <a class="xref" href="/operations/agentops/durable-state-and-resumability">durable state and resumability</a>; this page is about what happens to it when the region it was running in disappears.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Inventory what is region-pinned, and notice how much of it is not yours.</h3>
+
+    <p>The reason agent failover surprises teams that have done DR before is that an unusually large share of the state lives at providers, scoped to a region or an account you do not control, and replicates nowhere. Enumerate it by who owns it and what it costs to rebuild.</p>
+
+<pre class="standalone"><span class="c-cm"># State classes, by owner and rebuild cost</span>
+
+event log / task history   yours      replicates if you set it up
+side-effect ledger         yours      must be in the same commit as the action
+vector index               yours      rebuildable in hours; costs embedding spend
+object storage (artifacts) yours      cross-region replication is a checkbox
+prompt / context cache     provider   NOT state — it is cost, see Step 4
+conversation + response ids provider   region- and account-scoped, do not move
+uploaded files at provider  provider   re-upload, or keep your own copy
+sandbox volumes            platform   gone; treat as scratch, always
+running containers         platform   gone; the task must be resumable without them
+tickets, emails, payments  3rd party  already applied — nothing to fail over
+</pre>
+
+    <p>Three rows deserve a second look. Provider-side conversation and response identifiers are the quiet one: if your agent's continuation depends on an opaque id held by the model provider, that id does not exist in your other region, and a design that leans on provider-side conversation state has made its own portability decision. Keep the authoritative transcript on your side and treat provider-side state as a cache.</p>
+
+    <p>The vector index is the row that looks worse than it is: rebuilding costs embedding spend and hours, so the right call is usually a warm standby index rather than cross-region replication, with the freshness gap written down — the same trade as <a class="xref" href="/operations/agentops/reindexing-and-embedding-migrations">reindexing and embedding migrations</a>. And sandbox volumes are the row to get right by discipline rather than by engineering: if a task cannot survive losing its sandbox, it cannot survive a routine <a class="xref" href="/operations/agentops/sandbox-pools-and-cold-starts">cold start</a> either, so that is a bug you have in normal operation and have not noticed.</p>
+
+    <div class="callout">
+      <p>If you operate under a residency constraint, this inventory is also the honest version of your residency story: the rows marked <em>provider</em> are the ones where "which region" is answered by a contract rather than by your Terraform. That is the operational half of <a class="xref" href="/concepts/data-residency-and-sovereignty">data residency and sovereignty</a>, and it is worth filling in before someone asks in an audit.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Failover semantics belong to the task class, not to the service.</h3>
+
+    <p>DR runbooks are written per service because a service has one behaviour. An agent platform runs several kinds of task with incompatible recovery semantics, and a single switch for all of them is how a region failover turns into a reconciliation project. Classify tasks at admission, store the class on the task, and let the class decide.</p>
+
+    <ul>
+      <li><strong>Read-only tasks</strong> — research, summarisation, retrieval-only question answering. Resume anywhere, from scratch if necessary. Cost is wasted tokens, and the right policy is usually to restart rather than resume, because restart is simpler and the cost is bounded.</li>
+      <li><strong>Keyed, idempotent tasks</strong> — anything whose external actions carry an idempotency key the receiving system honours. Replay the log up to the recorded frontier, then continue. This is the class you want most of your work in, and getting work into it is engineering you do before the outage, not during it; see <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a>.</li>
+      <li><strong>Unkeyed side-effect tasks</strong> — a message to a person, a payment to a vendor whose API has no idempotency key, a physical action. Do not auto-resume these. Park them in a reconciliation queue with their last confirmed frontier, and let a human close them out. Automatic resumption of an unkeyed action is a decision to accept duplicates, which is fine if you decided it and a severe incident if the runbook decided it for you.</li>
+    </ul>
+
+    <p>The ratio across those three classes is the most useful single number about your DR posture, and most teams have never computed it. If 80% of your task volume is unkeyed, your regional failover plan is a reconciliation plan with a failover attached, and the highest-value engineering is not multi-region at all — it is pushing tasks from the third class into the second by adding keys at the integration boundary.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The failover's own failure mode is capacity, and it is the common one.</h3>
+
+    <p>This is the part that fails in practice, ahead of anything about state. You cut over to the standby region, and three things change at once, in the same direction.</p>
+
+    <ul>
+      <li><strong>Every cache is cold.</strong> Prompt and context caching is per-provider and effectively per-region, so the first minutes of a failover run at the uncached price and the uncached latency, on top of whatever retry traffic the outage generated. For a long-context agent this is not a rounding error — see <a class="xref" href="/concepts/prompt-caching">prompt caching</a> for the size of the discount you just lost.</li>
+      <li><strong>Rate limits are per-region, and yours are small there.</strong> Quota you negotiated or earned in the primary region does not follow you, and a standby region that has served 2% of your traffic has limits sized for 2% of your traffic. Request the quota in advance and keep a trickle of real traffic flowing through it, as in <a class="xref" href="/operations/agentops/rate-limits-and-provider-capacity">rate limits and provider capacity</a>.</li>
+      <li><strong>Commitments may not apply.</strong> Provisioned throughput and committed-spend arrangements are frequently scoped to a region or a deployment, so your failover can be both slower and more expensive per token than normal operation. Check the scope of yours rather than assuming — <a class="xref" href="/operations/economics-roi/provisioned-throughput-and-commitments">provisioned throughput and commitments</a>.</li>
+    </ul>
+
+    <p>Add those together and the characteristic agent failover incident is not data loss; it is a successful cutover that immediately throttles, producing a retry storm against a quota sized for a tenth of the load, which looks exactly like the original outage and is much harder to diagnose because you are now in an unfamiliar region. The mitigation is admission control, not capacity: cap the rate at which the standby region accepts new tasks, and let the queue absorb the difference.</p>
+
+    <div class="callout tip">
+      <p>Keep the standby region warm with real work — a single-digit percentage of production traffic, continuously. It costs a few percent and it buys three things no rehearsal can: quota that has been exercised, caches that are not stone cold, and a configuration you know is current, because it has been serving. A standby region that has never served a request is a hypothesis.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Drain and admit, rather than evacuate.</h3>
+
+    <p>Classical failover is an evacuation: move everything to the other region. For agents that framing is wrong, because the expensive thing — a long-running task with a sandbox, a frontier and partly applied side effects — is the thing that cannot be moved. Separate the two decisions that the word "failover" bundles together.</p>
+
+<pre class="standalone"><span class="c-cm"># Two independent switches, flipped in this order</span>
+
+1  ADMISSION   stop admitting new tasks in the sick region
+               (cheap, instant, reversible, no state involved)
+2  IN-FLIGHT   per task class, from Step 3:
+               read-only    -> abandon, restart elsewhere
+               keyed        -> resume elsewhere from the frontier
+               unkeyed      -> park in reconciliation, notify owner
+
+<span class="c-cm"># What you get from separating them</span>
+
+   admission control alone handles most partial degradations
+   and it is the only move that is safe to automate
+</pre>
+
+    <p>Most regional events are partial: a provider is degraded, one dependency is slow, error rates are up. Flipping admission alone handles all of those, costs nothing, and is reversible — which makes it the one step worth automating on a signal rather than on a human decision. The in-flight decision is the dangerous one and should stay manual for the unkeyed class no matter how good your detection is. That ordering is the same instinct as <a class="xref" href="/operations/agentops/graceful-degradation-and-fallback">graceful degradation</a>: shed what you have not yet committed to before you touch what is already in progress.</p>
+
+    <p>One corollary worth stating. If your tasks are long enough that draining takes hours, you have the problem described in <a class="xref" href="/operations/agentops/long-lived-sessions-and-deploys">long-lived sessions and deploys</a>, and the fix is the same fix: bound maximum task age deliberately, so that "wait for the drain" is a known quantity rather than an open-ended one. A DR plan whose first step takes an unbounded amount of time is not a plan.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Rehearse the part that is actually unrehearsed.</h3>
+
+    <p>Everyone rehearses the cutover. Almost nobody rehearses resumption with partly applied side effects, which is the only part where the agent-specific failure lives. Six things to have, each checkable.</p>
+
+    <ul>
+      <li><strong>A side-effect ledger committed with the action, not after it.</strong> If the ledger write and the action can diverge, your frontier is a guess.</li>
+      <li><strong>A task class on every task, assigned at admission.</strong> Unclassified tasks must default to the unkeyed class, because the safe default is the expensive one.</li>
+      <li><strong>Admission control as a switch, not a deploy.</strong> Per-region, flippable in seconds, reversible, and exercised monthly.</li>
+      <li><strong>A reconciliation queue with an owner.</strong> Parked tasks that nobody owns become a silent backlog, and the backlog is where the duplicate payment is sitting.</li>
+      <li><strong>Standby quota requested and exercised.</strong> Not a ticket you plan to file during the incident.</li>
+      <li><strong>One rehearsal that kills the region mid-task.</strong> Not between tasks. Kill it while a keyed task is between its third and fourth action, and verify that resumption applies the fourth and not the third — see <a class="xref" href="/operations/agentops/fault-injection-for-agents">fault injection for agents</a> for how to do this without a real outage.</li>
+    </ul>
+
+    <p>Scope note: this page is about losing a region or a provider's regional capacity. Losing a model — deprecation, a vendor change, a capability regression on the same endpoint — is a different failure with a different answer, in <a class="xref" href="/operations/agentops/graceful-degradation-and-fallback">graceful degradation and fallback</a> and <a class="xref" href="/operations/agentops/model-deprecation-and-migration">model deprecation and migration</a>. And the cleanup for side effects that did get applied twice is <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a>.</p>
+
+    <div class="callout tip">
+      <p>Do this today: pick your highest-volume task type and answer one question — if the region died right now, mid-run, does any record outside the region say which external actions have already been confirmed? If the answer is "the transcript", you do not have a resume point, you have a reconstruction, and a reconstruction from a transcript will tell you what the model decided to do rather than what the world received. That gap is the whole of agent DR, and it costs days to close while the region is up and a quarter of trust to discover while it is down.</p>
+    </div>
+  </div>
+</section>

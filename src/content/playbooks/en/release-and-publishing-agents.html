@@ -1,0 +1,146 @@
+<section class="phase">
+  <div class="phase-num">U28</div>
+  <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
+  <h2>Release &amp; publishing agents.</h2>
+  <p class="goal">Every other coding-agent task is revertible: a bad patch gets a revert commit, a bad migration gets rolled back, a bad CI change gets fixed in the next push. A published release is the one output your agent can produce that nobody can take back — npm's unpublish window is 72 hours, the version number can never be reused, and every consumer whose lockfile already resolved it has it forever regardless. So the design centre of a release agent is not the automation, which is easy; it is the signing boundary and the forward path. Let the agent prepare everything, never let it hold the publish credential, and measure the one number that decides whether automated releases are safe: how long it takes you to supersede a bad one.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>A yank is not a rollback, and the registry rules say so out loud.</h3>
+
+    <p>Start with what the ecosystem actually permits, because the mental model most engineers carry — "we can always unpublish" — is wrong in a way that changes the design.</p>
+
+    <p>On npm, unpublishing is bounded to a 72-hour window, and once a version number has existed it can never be reused. PyPI does not let you re-upload a filename at all. Container registries let you delete a tag but not un-pull it. In every case, the registry is the lesser problem: the consumers who resolved your version in the eight minutes before you noticed now have it pinned in a lockfile, cached in a CI image, and baked into a container they shipped to their own customers. Deleting the artefact does not reach any of those places.</p>
+
+    <p>So a release has exactly one reverse gear, and it is forward: publish a corrected version and get people onto it. That reframes the whole problem. The question is not "what if the agent publishes something wrong" — it will, eventually, like every release process ever built. The question is how fast the corrected version becomes the one a default install resolves.</p>
+
+    <div class="callout">
+      <p>This is the property that makes release different from everything else in <a class="xref" href="/playbooks/coding-and-computer-use-agents/coding-agent-architecture">coding-agent architecture</a>. A merge to main is visible to your team; a publish is visible to everyone downstream, immediately, and their <a class="xref" href="/concepts/pinning-and-verification">pins</a> are what make it permanent. Treat the publish step as the one action in your agent's repertoire with an unbounded <a class="xref" href="/concepts/blast-radius">blast radius</a>, because it is the only one whose effects live in other people's infrastructure.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Split preparation from publication, and put the credential on the far side.</h3>
+
+    <p>Nearly all the work in cutting a release is preparation, and preparation is both reversible and reviewable. That is where an agent earns its keep. Publication is one irreversible instant, and it should be the only part a human authorises.</p>
+
+<pre class="standalone"><span class="c-cm"># The agent does all of this — every line reversible</span>
+
+version bump          per the diff's actual surface change
+changelog entry       one line per user-visible change
+migration notes       for every breaking item it detected
+release notes draft   from the diff, not from the PR titles
+tag candidate         annotated, pushed to a branch, NOT to refs/tags
+dry-run publish       --dry-run, with the file list diffed vs last release
+
+<span class="c-cm"># A human does exactly one thing</span>
+
+approve               a workflow_dispatch on a protected ref
+
+<span class="c-cm"># The credential exists only inside that run</span>
+
+OIDC exchange         short-lived, run-scoped, nothing stored
+</pre>
+
+    <p>The last line is not a policy you have to enforce; the ecosystem has arranged for it. npm disabled creation of classic tokens in November 2025 and revoked all of them on 9 December 2025. Newly created write-enabled granular tokens default to a 7-day lifetime and cap at 90 days. Trusted publishing goes further: a CI run exchanges an OIDC identity for a short-lived, run-scoped token, so there is no npm token stored anywhere for an agent to read, exfiltrate or be tricked into using.</p>
+
+    <p>Design to that. If your release path has no long-lived publish secret, then "the agent must not publish unilaterally" stops being a rule in a prompt — which competes with the task and loses — and becomes a property of the system. That is the same argument as <a class="xref" href="/operations/safety-and-security/scoped-credentials-for-agents">scoped credentials for agents</a>, with an unusually clean implementation available for once.</p>
+
+    <div class="callout tip">
+      <p>Do not model the human approval as a chat confirmation. Bind it to the artefact: the approval should name the commit SHA and the digest of the tarball the dry run produced, and the publishing job should refuse if either changed. Otherwise you have approved an intention, not an artefact — the failure mode catalogued in <a class="xref" href="/playbooks/agent-ux-and-human-interaction/approval-and-confirmation-ux">approval and confirmation UX</a>.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Provenance attests where it was built, not that it is right.</h3>
+
+    <p>Trusted publishing attaches provenance automatically, and the attestation is genuinely strong: it binds the artefact to a repository, a workflow file and a commit, signed by the forge's identity rather than by a human-held key. It is a large improvement over a token in a secrets store, and it is routinely over-read.</p>
+
+    <p>What provenance asserts is a build location. It does not assert that the contents correspond to source anyone reviewed, that the build was deterministic, or that the commit being built is the commit a human approved. Those are separate claims, and only the last one is cheap to get.</p>
+
+    <p>Which produces the one agent-specific failure worth designing against. If your agent can push to the branch your trusted publisher builds from, then provenance will faithfully sign the agent's commit with your organisation's identity, and every downstream verifier will report success. The attestation is valid and says precisely the wrong thing: it tells consumers the artefact came from your repository, which is true, while the thing they wanted to know — that a person agreed to ship it — was never in scope.</p>
+
+<pre class="standalone"><span class="c-cm"># The invariant that makes the attestation mean what readers think</span>
+
+release workflow triggers ONLY on a protected ref
+protected ref is NOT writable by any agent identity
+agent identity can open PRs; it cannot push to the ref
+tag creation is a side effect of the release job, not an input
+
+<span class="c-cm"># Check it the way an attacker would</span>
+
+can the agent's token push to refs/heads/release?
+can it edit .github/workflows/publish.yml on that ref?
+can it change which ref the workflow trusts?
+   any yes -> provenance is attesting your agent's intent
+</pre>
+
+    <p>Verify this against the agent's actual token, not the documented policy. This is the branch of <a class="xref" href="/deep-dives/agent-security/agent-supply-chain-security">agent supply-chain security</a> where you are the supplier, and the attestation you emit is load-bearing for other people's risk decisions — the provenance half of <a class="xref" href="/operations/governance-compliance/disclosure-and-content-provenance">disclosure and content provenance</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Release notes are the part a model is good at — and the part with a real correctness test.</h3>
+
+    <p>Drafting notes from a diff is close to an ideal agent task: mechanical, high-volume, and tedious enough that humans do it badly. It also has something most agent outputs lack, which is a correctness test you can actually run. The test is coverage, not style: does every user-visible behaviour change present in the diff appear somewhere in the notes?</p>
+
+    <p>That turns review of the notes into a checkable claim rather than a vibe check. Build the coverage set mechanically — exported API surface diff, public schema diff, configuration-default diff, migration files added — and fail the release if an item in that set has no corresponding line. The agent writes the prose; the detector decides what must be mentioned.</p>
+
+    <div class="callout">
+      <p>One ordering detail matters more than it looks. Have the notes drafted in a context that sees the diff and <em>not</em> the authoring agent's reasoning. A model summarising a change it just made writes notes consistent with what it intended, and a release note that describes the intent instead of the behaviour is worse than no note, because it tells the reader the upgrade is safe. Use a separate run with the diff as its only input — the generator-and-checker separation argued in <a class="xref" href="/concepts/generator-verifier-gap">the generator–verifier gap</a>, applied to prose.</p>
+    </div>
+
+    <p>The same split applies to breaking-change classification. Do not ask the model whether a change is breaking; give it the surface diff and ask it to explain each removal. Classification is a schema question with a deterministic answer, and handing a deterministic question to a model is how you get a plausible wrong answer at 2 a.m. on a Friday.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Time-to-supersede is the metric. Build the forward path before the first release.</h3>
+
+    <p>Release frequency is the number teams instrument, and it is the wrong one for deciding whether to let an agent near the pipeline. The number that decides is how long it takes you to get a corrected version in front of a default install, measured end to end, from the moment you know something is wrong.</p>
+
+<pre class="standalone"><span class="c-cm"># Time-to-supersede, decomposed — measure each leg once</span>
+
+detect        a consumer tells you, or your canary does
+decide        who can say "ship the fix" at 02:00?
+build         is the fix branch buildable without the broken release?
+publish       same approval path, or a documented break-glass?
+propagate     dist-tag moved, old version deprecated, advisory filed
+
+<span class="c-cm"># The leg that is always worst is the last one</span>
+
+   npm         dist-tag latest -> fixed; deprecate the bad version
+   PyPI        yank the release (resolvable only if explicitly pinned)
+   containers  retag; the digest stays pullable forever
+   OS packages measured in days, not minutes
+</pre>
+
+    <p>Run the whole path once, deliberately, with a deliberately broken patch release on a scratch package. That rehearsal is what converts the checklist above from prose into something your agent can execute, and it is the only way to discover which leg is actually slow — in practice it is almost never the build.</p>
+
+    <p>Then give the supersede path to the agent as a tool, not as documentation. "Publish a patch that reverts commit X, move the dist-tag, deprecate the bad version with a message pointing at the fix" is a sequence of five calls that an agent performs faster and more reliably than a human at 2 a.m., and every step is forward-only, so the irreversibility argument from Step 1 does not apply. This is the one place in the release process where more autonomy is strictly safer, and it pairs with <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a> for the parts that already escaped.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to have in place before an agent touches a release.</h3>
+
+    <p>Six preconditions. They are deliberately boring, and each one has a yes-or-no answer you can check this week.</p>
+
+    <ul>
+      <li><strong>No long-lived publish credential exists.</strong> Trusted publishing or an equivalent OIDC exchange, so there is nothing for an agent to hold. If you still have a stored token, that is the first thing to delete — see <a class="xref" href="/operations/safety-and-security/secrets-management-for-agents">secrets management for agents</a>.</li>
+      <li><strong>The release ref is not writable by any agent identity.</strong> Checked against the token, not the policy document, including the workflow file and the ref the workflow trusts.</li>
+      <li><strong>Approval is bound to a digest.</strong> The job refuses to publish if the commit or the tarball digest differs from what was approved.</li>
+      <li><strong>A mechanical breaking-change detector gates the notes.</strong> Surface diff, schema diff, config-default diff. The model writes; the detector decides what must be covered.</li>
+      <li><strong>Time-to-supersede has been measured, not estimated.</strong> One rehearsed bad release on a scratch package, with the propagation leg timed.</li>
+      <li><strong>The supersede sequence is a tool the agent can call.</strong> Forward-only, so it needs no approval gate, and it is the step where automation pays most.</li>
+    </ul>
+
+    <p>Scope note: this page is about shipping artefacts to a registry. Rolling a change out to your own running service is a different problem with a different reverse gear — that is <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout and versioning</a>. And the upstream half, where your agent consumes other people's releases rather than producing them, is <a class="xref" href="/playbooks/coding-and-computer-use-agents/dependency-upgrade-agents">dependency-upgrade agents</a>.</p>
+
+    <div class="callout tip">
+      <p>Do this today: check whether your coding agent's token can push to the branch your release workflow builds from. If it can, you are already publishing artefacts whose provenance attests your organisation's identity over commits no human approved — and the attestation makes that look better to every downstream verifier than an unsigned release would. Fix that one permission before you automate anything else on this page; it is a ten-minute change and it is the only item here that is currently making your supply chain look safer than it is.</p>
+    </div>
+  </div>
+</section>
