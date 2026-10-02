@@ -1,0 +1,142 @@
+<section class="phase">
+  <div class="phase-num">O30</div>
+  <div class="week">运维 · 智能体运维：部署与运营</div>
+  <h2>智能体的跨区域故障切换。</h2>
+  <p class="goal">你的灾备方案是用 RTO 与 RPO 写的，而这两个数字都假设恢复的单位是一次请求——一件要么完成、要么没完成，并且可以安全地在另一个区域重试的事。一次智能体运行两者都不是：在某个区域黑掉的那一刻，一个跑了四十分钟的任务已经建了三张工单、发了一封邮件，而第四个工具调用正进行到一半；于是那次恢复了可用性的切换，同时也是那次把邮件发了两遍的切换。你真正需要的目标是 RTO 与 RPO 旁边的第三个：一个带「副作用恰好一次」的恢复点。关于智能体灾备，一切有用的东西都源自把任务、而不是请求，当成你要恢复的那个东西。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>加上第三个目标，因为在这里可用性与正确性会分开。</h3>
+
+    <p>RTO 问的是你能停多久。RPO 问的是你能丢掉多少已提交的数据。对于一个无状态服务加一个带复制的数据库，这两者都定义良好；而对于「这次智能体故障切换算不算成功」真正起决定作用的那个问题，它们都沉默不语：有多少副作用被施加了两遍。</p>
+
+    <p>请把第三个目标明确写下来，因为它的行为与另两个不同。RTO 与 RPO 是旋钮——你花钱买一个更好的数字。而副作用的恰好性更接近一个二值：要么被恢复的任务里每一个对外可见的动作都带键且已去重，要么你的切换流程里包含了数量未知的重复付款、重复工单和重复发给客户的消息，而那次让你自豪的恢复会自己造出一起事故。</p>
+
+<pre class="standalone"><span class="c-cm"># The three objectives, for an agent system</span>
+
+RTO   how long until new tasks can be admitted elsewhere
+RPO   how much committed task history can be lost
+SEO   side-effect exactness: may a resumed task re-apply an action?
+      (the only one of the three that is not a dial)
+
+<span class="c-cm"># Why the third one is where agents differ</span>
+
+a request    is idempotent or it is not — one decision, at design time
+a task       has already applied k of n actions when the region dies
+             and k is not recorded unless you recorded it on purpose
+</pre>
+
+    <p>最后那一行就是整个工程问题。一个任务的位置只有在你早已在写副作用台账的情况下才是可恢复的——一份只追加的记录，写着「带键 K 的动作 X 被尝试过，随后被确认」，并提交到能活过该区域的存储里。如果你的智能体的历史是一份对话记录，那你能重建的是模型意图做什么，而不是世界实际收到了什么。这套机械装置就是<a class="xref" href="/zh/operations/agentops/durable-state-and-resumability">持久状态与可恢复性</a>；而这一页讲的是，当它所在的那个区域消失时，它会怎样。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>把被钉在区域上的东西清点出来，并注意其中有多少不归你。</h3>
+
+    <p>智能体的故障切换之所以会让做过灾备的团队吃惊，是因为异常大的一部分状态住在各家供应商那里，被限定在某个区域或某个你并不掌控的账号下，而且哪儿都不复制。请按「谁拥有它」和「重建它要花什么」来枚举。</p>
+
+<pre class="standalone"><span class="c-cm"># State classes, by owner and rebuild cost</span>
+
+event log / task history   yours      replicates if you set it up
+side-effect ledger         yours      must be in the same commit as the action
+vector index               yours      rebuildable in hours; costs embedding spend
+object storage (artifacts) yours      cross-region replication is a checkbox
+prompt / context cache     provider   NOT state — it is cost, see Step 4
+conversation + response ids provider   region- and account-scoped, do not move
+uploaded files at provider  provider   re-upload, or keep your own copy
+sandbox volumes            platform   gone; treat as scratch, always
+running containers         platform   gone; the task must be resumable without them
+tickets, emails, payments  3rd party  already applied — nothing to fail over
+</pre>
+
+    <p>其中三行值得再看一眼。供应商那侧的会话与响应标识符是最安静的那一个：如果你的智能体要接着往下走，依赖的是一个由模型供应商持有的不透明 id，那这个 id 在你另一个区域里并不存在；而一个倚靠供应商侧会话状态的设计，已经替自己做了可迁移性上的决定。请把权威的那份记录留在你这边，并把供应商侧的状态当作缓存。</p>
+
+    <p>向量索引这一行看起来比实际更糟：重建要花嵌入费用和若干小时，所以通常正确的做法是一个预热的备用索引，而不是跨区域复制，同时把新鲜度的落差写下来——这与<a class="xref" href="/zh/operations/agentops/reindexing-and-embedding-migrations">重建索引与嵌入迁移</a>是同一笔取舍。而沙箱卷那一行要靠纪律而不是靠工程来做对：如果一个任务挺不过丢失自己的沙箱，那它同样挺不过一次例行的<a class="xref" href="/zh/operations/agentops/sandbox-pools-and-cold-starts">冷启动</a>，所以那是你在正常运行中就有、却一直没察觉的一个缺陷。</p>
+
+    <div class="callout">
+      <p>如果你在某个数据驻留约束下运营，这份清点同时也是你那套驻留说法的诚实版本：标着<em>provider</em> 的那几行，正是「在哪个区域」由一份合同而不是由你的 Terraform 来回答的那几行。这是<a class="xref" href="/zh/concepts/data-residency-and-sovereignty">数据驻留与主权</a>在运维上的那一半，值得在有人在审计里问起之前就填好。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>切换语义属于任务类别，不属于服务。</h3>
+
+    <p>灾备手册是按服务写的，因为一个服务只有一种行为。而一个智能体平台会跑好几种恢复语义互不兼容的任务，给它们共用一个开关，正是一次区域切换变成一个对账项目的方式。请在准入时对任务分类、把类别存在任务上，并让类别来决定。</p>
+
+    <ul>
+      <li><strong>只读任务</strong>——调研、摘要、只检索的问答。可以在任何地方恢复，必要时从头来。代价是浪费掉的令牌，而正确的策略通常是重启而不是恢复，因为重启更简单且代价有界。</li>
+      <li><strong>带键的幂等任务</strong>——任何对外动作都带着接收系统真会遵守的幂等键的任务。把日志重放到已记录的前沿，然后继续。这是你希望大部分工作所处的那一类，而把工作搬进这一类是停机之前做的工程，不是停机当中做的；见<a class="xref" href="/zh/operations/agentops/idempotency-and-retries">幂等与重试</a>。</li>
+      <li><strong>无键副作用任务</strong>——发给某个人的消息、付给某家没有幂等键的 API 的供应商款项、某个物理动作。不要自动恢复这些。请把它们连同最后一个已确认的前沿一起停到一条对账队列里，交由人来收尾。自动恢复一个无键动作是一个「接受重复」的决定——如果是你做的这个决定，那没问题；如果是手册替你做的，那是一起严重事故。</li>
+    </ul>
+
+    <p>这三类之间的比例，是关于你灾备姿态的最有用的单一数字，而大多数团队从未算过它。如果你任务量的 80% 是无键的，那你的跨区域切换方案其实是一份附带了切换动作的对账方案；而价值最高的工程根本不是多区域——而是在集成边界上加键，把任务从第三类推进第二类。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>切换本身的失败模式是容量，而且它就是最常见的那一个。</h3>
+
+    <p>这是实践中真正会失手的部分，排在任何关于状态的问题之前。你切到备用区域，于是三件事同时朝同一个方向变化。</p>
+
+    <ul>
+      <li><strong>每一块缓存都是冷的。</strong>提示与上下文缓存是按供应商、实际上也是按区域来的，所以切换后的头几分钟是按未缓存的价格、未缓存的延迟在跑，而这还要叠加停机本身生成的那些重试流量。对一个长上下文智能体来说，这不是一个舍入误差——你刚丢掉的那份折扣有多大，见<a class="xref" href="/zh/concepts/prompt-caching">提示缓存</a>。</li>
+      <li><strong>速率上限是按区域算的，而你在那边的额度很小。</strong>你在主区域谈下来或攒出来的配额不会跟着你走，而一个一直只承担你 2% 流量的备用区域，它的上限是按 2% 的流量配的。请提前申请配额，并让一小股真实流量持续流经它，如<a class="xref" href="/zh/operations/agentops/rate-limits-and-provider-capacity">速率上限与供应商容量</a>所述。</li>
+      <li><strong>承诺额度可能不适用。</strong>预留吞吐与承诺消费的安排常常被限定在某个区域或某个部署上，所以你的切换可能既更慢、每令牌又更贵。请去查你自己那份的适用范围，而不是假设——见<a class="xref" href="/zh/operations/economics-roi/provisioned-throughput-and-commitments">预留吞吐与承诺额度</a>。</li>
+    </ul>
+
+    <p>把这三者加起来，那个有代表性的智能体切换事故就不是数据丢失，而是：一次成功的切换紧接着被限流，向一个按十分之一负载配置的配额打出一场重试风暴，看起来跟原本那次停机一模一样，而且难诊断得多——因为你此刻身处一个不熟悉的区域。缓解办法是准入控制，不是容量：给备用区域接受新任务的速率设个上限，让队列去吸收差额。</p>
+
+    <div class="callout tip">
+      <p>请用真实工作把备用区域养热——持续地给它一个个位数百分比的生产流量。它会花掉百分之几的成本，而买到三样任何演练都买不到的东西：被实际用过的配额、不是冰冷的缓存，以及一份你知道是最新的配置（因为它一直在服务）。一个从未服务过任何请求的备用区域，是一个假设。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>要排空与准入，而不是撤离。</h3>
+
+    <p>经典的故障切换是一次撤离：把一切搬到另一个区域。对智能体来说这个框架是错的，因为那个昂贵的东西——一个带沙箱、带前沿、带已部分施加的副作用的长时任务——正是搬不走的那个。请把「故障切换」这个词捆在一起的两个决定拆开。</p>
+
+<pre class="standalone"><span class="c-cm"># Two independent switches, flipped in this order</span>
+
+1  ADMISSION   stop admitting new tasks in the sick region
+               (cheap, instant, reversible, no state involved)
+2  IN-FLIGHT   per task class, from Step 3:
+               read-only    -> abandon, restart elsewhere
+               keyed        -> resume elsewhere from the frontier
+               unkeyed      -> park in reconciliation, notify owner
+
+<span class="c-cm"># What you get from separating them</span>
+
+   admission control alone handles most partial degradations
+   and it is the only move that is safe to automate
+</pre>
+
+    <p>大多数区域级事件是局部的：某家供应商降级了、某个依赖变慢了、错误率上去了。只扳准入这一下就能应付上述全部情形，不花什么代价，而且可逆——这使它成为唯一值得凭信号而不是凭人工决定来自动化的那一步。在途任务那个决定是危险的那个，而无论你的检测做得多好，无键那一类都应当保持手动。这个先后次序与<a class="xref" href="/zh/operations/agentops/graceful-degradation-and-fallback">优雅降级</a>出自同一种直觉：先卸掉你还没承诺下去的，再去碰已经在进行中的。</p>
+
+    <p>有一个推论值得说明。如果你的任务长到排空要花好几个小时，那你有的是<a class="xref" href="/zh/operations/agentops/long-lived-sessions-and-deploys">长寿会话与部署</a>里描述的那个问题，而解法也是同一个：有意地给任务的最大寿命设界，好让「等排空」成为一个已知量，而不是一个没有尽头的量。一份第一步就要花掉无界时间的灾备方案，不是方案。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>去演练那个真正没被演练过的部分。</h3>
+
+    <p>所有人都演练切换。几乎没有人演练「带着已部分施加的副作用去恢复」，而那恰恰是智能体特有的失败所住的唯一地方。六样该有的东西，每一样都可核查。</p>
+
+    <ul>
+      <li><strong>一份与动作同一次提交写下的副作用台账。</strong>如果台账写入与动作本身可能分叉，那你的前沿只是一个猜测。</li>
+      <li><strong>每个任务都有一个在准入时赋予的任务类别。</strong>未分类的任务必须默认落进无键那一类，因为安全的默认值就是昂贵的那一个。</li>
+      <li><strong>把准入控制做成一个开关，而不是一次部署。</strong>按区域、数秒内可扳、可逆，并且每月实际演练一次。</li>
+      <li><strong>一条有主的对账队列。</strong>没人认领的停泊任务会变成一条无声的积压，而那笔重复付款就坐在那条积压里。</li>
+      <li><strong>备用区域的配额已申请并已被实际使用。</strong>不是一张你打算在事故当中去提的工单。</li>
+      <li><strong>一次在任务进行到一半时杀掉区域的演练。</strong>不是在两个任务之间。请在一个带键任务做完第三个动作、还没做第四个的时候杀掉它，并核验恢复后施加的是第四个而不是第三个——如何在不制造真实停机的情况下做到这件事，见<a class="xref" href="/zh/operations/agentops/fault-injection-for-agents">面向智能体的故障注入</a>。</li>
+    </ul>
+
+    <p>范围说明：这一页讲的是失去一个区域、或失去某家供应商在该区域的容量。失去一个模型——弃用、换厂商、同一端点上的能力回退——是另一种失败，有另一套答案，在<a class="xref" href="/zh/operations/agentops/graceful-degradation-and-fallback">优雅降级与回退</a>与<a class="xref" href="/zh/operations/agentops/model-deprecation-and-migration">模型弃用与迁移</a>里。而对那些确实被施加了两遍的副作用做善后，是<a class="xref" href="/zh/operations/agentops/repairing-agent-side-effects">修复智能体的副作用</a>。</p>
+
+    <div class="callout tip">
+      <p>今天就做这件事：挑出你量最大的那种任务类型，回答一个问题——如果该区域此刻就死掉、而任务正跑到一半，该区域之外有没有任何记录能说出哪些对外动作已经被确认过了？如果答案是「那份对话记录」，那你没有恢复点，你有的是一次重建；而从一份对话记录做出的重建，告诉你的是模型决定做什么，而不是世界实际收到了什么。那道落差就是智能体灾备的全部，而在区域还活着的时候把它补上要花几天，在区域已经死掉的时候把它发现，要花掉一个季度的信任。</p>
+    </div>
+  </div>
+</section>
