@@ -1,0 +1,165 @@
+<section class="phase">
+  <div class="phase-num">S10</div>
+  <div class="week">Deep Dive · Agent Security</div>
+  <h2>Time-of-check to time-of-use.</h2>
+  <p class="goal">Every approval, policy evaluation and precondition check in an agent system is a statement about a world that has already moved on by the time the action lands — and the gap is no longer microseconds, it is the thirty seconds the model spent thinking plus the eleven minutes the human took to click. That turns a classic race condition into a design constant: the window is long enough that things genuinely change inside it, and the reflex fix of adding another review widens the window instead of closing it. The way out is to stop validating state and start binding the decision to the effect, so that a stale decision fails loudly at the boundary rather than succeeding against a resource nobody checked twice.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The window used to be microseconds. Now you can measure it with a wall clock.</h3>
+
+    <p>Time-of-check-to-time-of-use is one of the oldest bug classes in systems programming: a program verifies a property, acts on the verification, and loses because the property changed in between. The classic cases are brutal because the window is tiny and the attacker has to win a race — <code class="inline">access()</code> followed by <code class="inline">open()</code>, with a symlink swapped in the gap.</p>
+
+    <p>An agent loop inverts the difficulty. Nothing about the structure is new; what is new is that the window is four to six orders of magnitude longer, and that the thing moving inside it is usually not an attacker at all. It is a colleague editing a document, a queue draining, a price updating, a ticket being closed by someone else, a policy being redeployed. You do not need an adversary to lose a race measured in minutes.</p>
+
+    <pre class="standalone"><span class="c-cm"># Where the time goes in one "approved" write</span>
+
+t0   agent reads state                     (the CHECK)
+     +   900 ms   retrieval and tool calls
+     + 30000 ms   model reasons over the result
+     +  2000 ms   policy engine evaluates the proposed action
+     + ~11 min    human reviews the approval card
+     +   400 ms   agent re-plans with the approval in context
+t1   agent writes                           (the USE)
+
+<span class="c-cm"># Window, t1 - t0, by autonomy level</span>
+
+fully autonomous, single step      1-5 s
+autonomous, multi-step plan        30 s - 5 min
+human-in-the-loop approval         2 min - hours
+queued / asynchronous agent        hours - days
+</pre>
+
+    <p>Read the second block as a risk ranking, because it inverts the usual intuition. The configuration most organisations consider <em>safest</em> — a human approving each risky action — has by far the widest TOCTOU window, and a queued agent that picks work up the next morning has a window in which an entire business day of changes can land. Autonomy level and staleness exposure move in opposite directions, which is why "add a human" is not a complete answer to anything in this family. It is a trade, and the thing being traded away is freshness.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Four things change inside the window, and your checks re-read at most one.</h3>
+
+    <p>"Did the state change?" is too coarse to act on. Four separable things drift between check and use, they drift at different rates, and almost every implementation re-validates only the first.</p>
+
+    <ul>
+      <li><strong>The resource.</strong> The record, file, ticket or balance the action targets. This is the drift everyone models, and the only one with a standard remedy — a version, an ETag, a sequence number.</li>
+      <li><strong>The policy.</strong> The rules that authorised the action. A policy bundle redeployed mid-window means the decision was made under a ruleset that is no longer in force, and almost no agent stack records which bundle version produced a given allow. The <a class="xref" href="/deep-dives/agent-security/policy-as-code-for-agents">policy decision</a> is treated as a boolean rather than as a dated artefact.</li>
+      <li><strong>The authority.</strong> The credential, scope or delegation the agent is acting under. Tokens get revoked, group memberships change, an on-call rotation ends. Here the usual failure is the opposite of a security hole: the agent holds a token minted before the revocation and the action succeeds, because <a class="xref" href="/concepts/ambient-authority">ambient authority</a> is evaluated when the credential was issued rather than when it is used.</li>
+      <li><strong>The goal.</strong> The user's intent. Over a long window a human changes their mind, cancels in another channel, or has the underlying need resolved by someone else. This is the drift with no technical remedy at all and it is the most common one in practice — see <a class="xref" href="/concepts/goal-drift">goal drift</a> for the loop-internal version of the same problem.</li>
+    </ul>
+
+    <p>The asymmetry matters for prioritisation. Resource drift is cheap to fix and usually already half-fixed by whatever database sits underneath. Policy and authority drift require you to carry a version through the loop, which is maybe a day of work and almost nobody has done it. Goal drift requires a cancellation path, which is a product decision rather than an engineering one.</p>
+
+    <div class="callout">
+      <p>There is a fifth item that looks like drift and is not: the agent's own earlier observations. A tool result read at t0 and still sitting in context at t1 is not stale state, it is <em>remembered</em> state, and the model cannot tell the difference. This is why an agent asked to re-check something frequently answers from context instead of calling the tool again — the check appears to happen and no read occurs. Treat "re-verify before acting" as an instruction the harness enforces, never as one the prompt requests.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Another layer of review makes the window longer, not the action safer.</h3>
+
+    <p>The instinct, on being shown a stale action, is to add a check. It is worth working out why that mostly makes things worse. An approval is itself a check, so it inherits the same structure: the reviewer forms a belief about the world at the moment the card renders, and the action executes later. Adding a reviewer therefore adds a window — and human review is the longest single segment in the table above, so it adds the biggest one available.</p>
+
+    <p>Worse, the reviewer's window has a property the machine's does not: the card is a rendering of state captured at t0. A human approving "close ticket 4417 as duplicate of 4390" is approving a sentence, not a transaction. If 4390 was reopened four minutes ago, nothing in the card changes, nothing in the reviewer's experience is different, and the approval is now wrong in a way no amount of attention would catch. A reviewer cannot be more current than the artefact you showed them.</p>
+
+    <p>This is the same structural point as <a class="xref" href="/deep-dives/agent-security/separation-of-duties-for-agents">separation of duties for agents</a>, arriving from the time axis instead of the correlation axis: a second opinion fails when it shares an input with the first, and here the shared input is a snapshot. Two independent reviewers looking at the same stale card agree perfectly and are both wrong.</p>
+
+    <div class="callout tip">
+      <p>If you keep human approval — and you should, for actions whose cost of error is high — make the card self-invalidating. Render it with the resource version it was built from, re-fetch on focus, and expire it. An approval card that has been open for an hour should refuse to submit and offer to refresh, exactly as a checkout page does with a reserved seat. This is a one-afternoon change to an approval surface and it removes the longest window in the system.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Bind the decision to the effect, not to the state.</h3>
+
+    <p>The durable fix is to stop asking "is the world still as I found it?" and start making the write itself conditional on the world the decision assumed. The decision then carries its own preconditions, and a stale decision cannot quietly succeed — it fails at the boundary with a reason you can log.</p>
+
+    <pre class="standalone"><span class="c-cm"># STALE-CAPABLE: validate, then act</span>
+
+state = read(resource)                 # t0
+if policy.allows(action, state):       # decision about t0
+    write(resource, action)            # lands at t1, unchecked
+
+<span class="c-cm"># BOUND: the write asserts what the decision assumed</span>
+
+state = read(resource)
+decision = policy.evaluate(action, state)
+write(
+  resource,
+  action,
+  if_version      = state.version,     # resource drift
+  policy_bundle   = decision.bundle,   # policy drift
+  on_behalf_of    = decision.subject,  # authority drift
+  intent_digest   = sha256(rendered_card),  # goal drift
+  idempotency_key = decision.id,       # retry safety
+)
+
+<span class="c-cm"># The four outcomes, all of which you want to be distinguishable</span>
+
+200  applied
+409  resource moved     -> re-plan, do not retry blindly
+412  policy superseded  -> re-evaluate under the new bundle
+403  authority revoked  -> stop, surface to a human
+</pre>
+
+    <p>Four mechanisms, in rough order of how much they pay. A <strong>resource version precondition</strong> — <code class="inline">If-Match</code>, a <code class="inline">WHERE version = n</code> clause, a compare-and-set — is the cheapest and most broadly available, and if you do only one thing, do this. A <strong>policy bundle identifier</strong> stamped into the decision and re-asserted at the write converts silent policy drift into a 412 you can count. An <strong>on-behalf-of assertion</strong> re-resolved at execution time, rather than a bearer token minted at planning time, closes the revocation gap. And an <strong>intent digest</strong> — a hash of exactly the text the human approved — is what makes an approval bind to one effect rather than to a description that still parses after the world changed.</p>
+
+    <p>The last one deserves emphasis because it is the one people skip. An approval that is not bound to a digest of the specific proposed effect is an approval of a <em>category</em> of effect, and categories survive state changes. That is the mechanism by which an approved "refund order 8812" becomes a refund of a different amount after the order was edited — nothing was bypassed, the approval simply described something looser than it appeared to. The <a class="xref" href="/deep-dives/agent-security/decision-receipts-and-audit">decision receipt</a> you may already be writing for audit reasons is most of the structure you need; the change is to make the write consume it rather than merely record it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The arithmetic that tells you whether this is your problem.</h3>
+
+    <p>Not every system needs any of this, and the test is one multiplication rather than a judgement call. For a given action type, the expected number of stale executions is the window length times the rate at which the targeted resource changes times your volume. All three are measurable from data you already have.</p>
+
+    <pre class="standalone"><span class="c-cm"># Expected stale actions per month</span>
+
+  E  =  W  x  R  x  V
+
+  W  window, check -> use, in hours      (p50 and p95, measure both)
+  R  mutations per hour on the target resource, by OTHER writers
+  V  actions of this type per month
+
+<span class="c-cm"># Worked: ticket triage with human approval</span>
+
+  W  = 0.25 h  (p50)   /  2.5 h  (p95)
+  R  = 0.04    (a given ticket is touched once per 25 h)
+  V  = 4,000
+
+  E(p50)  = 0.25 x 0.04 x 4000  =  40 stale actions / month
+  E(p95)  = 2.5  x 0.04 x 4000  = 400 stale actions / month
+
+<span class="c-cm"># The sensitivity nobody expects</span>
+
+E is linear in W, and W is dominated by ONE segment: the human.
+Halving approval latency halves the staleness. Doubling the
+number of reviewers roughly doubles it.
+</pre>
+
+    <p>The hard input is <code class="inline">R</code>, and there is a cheap way to get it that does not require instrumenting anything new: for a sample of actions your agent has already taken, re-read the target resource's modification history and count writes by other principals inside the window. A few hundred samples give you a usable rate per action type, and the distribution is almost always heavy-tailed — a small set of hot resources carries most of the exposure. Fix the preconditions on those first and leave the cold ones alone.</p>
+
+    <p>Two sanity checks on the output. If <code class="inline">E</code> comes out near zero for every action type, you have either a genuinely quiet domain or an <code class="inline">R</code> you measured against your own agent's writes rather than other writers'. If it comes out enormous, check whether the stale actions are actually harmful — many are self-correcting, and an idempotent write against a moved resource is often a no-op rather than a defect. The number worth escalating is not stale executions but stale executions with an irreversible effect, which is the intersection of this page and <a class="xref" href="/concepts/blast-radius">blast radius</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to build, in the order that pays.</h3>
+
+    <p>The work here is unusually well-ordered: each step is cheap, each one is independently useful, and the first two cover most of the exposure in most systems.</p>
+
+    <ul>
+      <li><strong>Put a version precondition on every write that targets a mutable resource.</strong> One field, derived from the read you already did. The payoff is that stale writes start failing visibly instead of applying quietly, which converts an unknown rate into a counted one.</li>
+      <li><strong>Count the 409s and 412s as a product metric.</strong> They are not errors to suppress; they are your staleness rate, finally measurable. A 409 that triggers a blind retry is strictly worse than no precondition at all, so make re-plan the default handler and alert on the retry path — the failure mode in <a class="xref" href="/concepts/retry-amplification">retry amplification</a>.</li>
+      <li><strong>Expire approval cards and bind them to a digest.</strong> This is the single largest window in the system and the change does not touch the agent at all, only the review surface.</li>
+      <li><strong>Re-resolve authority at execution, not at planning.</strong> Short-lived credentials fetched at the action boundary, not carried through the loop. This is already the recommendation in <a class="xref" href="/operations/safety-and-security/scoped-credentials-for-agents">scoped credentials for agents</a>; TOCTOU is a second, independent reason for it.</li>
+      <li><strong>Give long-window work a cancellation path.</strong> For queued and asynchronous agents, a user-visible cancel that actually reaches the executor is the only mitigation for goal drift. If a user cannot stop a run they started this morning, your longest window has no remedy — see <a class="xref" href="/operations/agentops/kill-switches">kill switches</a>.</li>
+    </ul>
+
+    <p>One thing not to do: do not attempt to solve this by shortening the model's thinking time or trimming tool calls. Those segments are milliseconds to tens of seconds, and the window is dominated by human latency and queue depth. Optimising the fast part of a sum does nothing to the sum, and you will have spent the effort degrading the part of the system that was working.</p>
+
+    <div class="callout tip">
+      <p>Do this today: pick your highest-volume write action, pull fifty traces, and for each one measure the wall-clock gap between the read that informed it and the write that executed it. Then ask your datastore how often those target resources were modified by someone else in a window that long. You will have a staleness rate in an hour, and it will tell you whether the next piece of work is a precondition field, an expiring approval card, or nothing at all. Then read <a class="xref" href="/concepts/fail-closed-and-fail-open">fail-closed and fail-open</a> for what the boundary should do when the precondition does fire, and <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a> for how to make the re-plan safe.</p>
+    </div>
+  </div>
+</section>

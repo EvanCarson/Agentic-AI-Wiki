@@ -1,0 +1,144 @@
+<section class="phase">
+  <div class="phase-num">E23</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>Refusal monitoring in production.</h2>
+  <p class="goal">A refusal is the only quality failure in your system that produces a 200, a normal token count, no exception, no retry and no complaint — the user reads "I can't help with that", closes the tab, and your dashboards record a successful request. It is also the single most volatile property of a deployed model, able to move in either direction without a version number changing, which means refusal rate is simultaneously the thing most likely to break and the thing least likely to be noticed. Inside an agent loop it gets worse: a refusal is not a visible "no" but a tool call that never happened and a plan step that silently vanished, and the run reports success. Measuring it is a day of work, and nothing else you can build this quarter has a better ratio of cost to blind spot removed.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why every existing signal is blind to this.</h3>
+
+    <p>Work through your monitoring stack and ask what each layer would show if your model started declining 8% of a previously-fine request class tomorrow morning.</p>
+
+    <ul>
+      <li><strong>HTTP status:</strong> 200. A refusal is a successful completion. Nothing in the transport layer distinguishes it from an answer.</li>
+      <li><strong>Latency:</strong> faster, if anything. Refusals are short. Your p95 improves, which reads as a win.</li>
+      <li><strong>Token count:</strong> down. Output tokens drop, so your cost per request falls. This is the cruel one — the metric moves in the direction everyone celebrates.</li>
+      <li><strong>Error rate:</strong> unchanged. There is no exception, no failed tool call, no non-zero exit.</li>
+      <li><strong>Thumbs-down rate:</strong> barely moves. Users who are refused mostly leave rather than rate, and the ones who do rate are a biased sample of the angry.</li>
+      <li><strong>Eval suite:</strong> green. Your offline set was built from requests the model answered, so it contains very few of the prompts now being declined.</li>
+    </ul>
+
+    <p>So a material quality regression presents as: cost down, latency down, errors flat, evals green. That combination is indistinguishable from an optimisation win, and more than one team has congratulated itself on a cost reduction that was a policy tightening. The reason is structural rather than negligent — every one of those signals was designed to detect a failure that produces an artefact, and a refusal is the absence of one.</p>
+
+    <div class="callout">
+      <p>The one existing signal with any power is the <em>abandonment</em> rate: sessions that end immediately after an assistant turn with no follow-up. It is noisy, it conflates "refused" with "answered perfectly", and it is still better than nothing if you have it already. Treat it as a smoke alarm that tells you to go and look, not as the measurement.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Four things look like a refusal and only one is one.</h3>
+
+    <p>Before building a detector, fix the taxonomy, because the four cases have different owners and three of them are not the model's policy at all. Classify every terminal turn where the agent did not do the thing into exactly one bucket.</p>
+
+    <pre class="standalone"><span class="c-cm"># Terminal non-completions, by cause and owner</span>
+
+POLICY REFUSAL      model declines on safety/policy grounds
+                    owner: vendor policy + your system prompt
+                    signal: hedging language, no tool call attempted
+
+GUARDRAIL BLOCK     your own classifier or policy engine denied it
+                    owner: you
+                    signal: a logged decision with a rule id
+
+TOOL DENIAL         the action was attempted and refused downstream
+                    owner: your authz layer
+                    signal: a 403 in the tool span
+
+CAPABILITY MISS     the model tried and could not
+                    owner: model choice / scaffold
+                    signal: attempts, retries, then a concession
+</pre>
+
+    <p>Only the first is invisible, and that is exactly why it dominates. A guardrail block and a tool denial both produce a logged decision with an identifier — if you have taken the advice in <a class="xref" href="/deep-dives/agent-security/structured-refusal-and-why-trails">structured refusal and why-trails</a>, those two are already counted and attributable. A capability miss leaves a trail of attempts. The policy refusal leaves nothing but prose.</p>
+
+    <p>Getting the taxonomy right is also what makes the number actionable. "Refusals are up 3%" prompts a meeting. "Policy refusals are up 3% while guardrail blocks and tool denials are flat" tells you the change came from outside your deployment, which is a different investigation with a different owner and, often, a vendor ticket.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>In an agent loop, measure at the step, not at the response.</h3>
+
+    <p>Classifying final assistant turns is the right starting point for a chat product and roughly half the story for an agent. An agent's refusals mostly do not surface as a terminal "I can't" — they surface as a step that quietly did not happen inside a run that otherwise completed and reported success.</p>
+
+    <p>The characteristic shape is a plan with five steps, four tool calls, and a summary written as though five things were done. Nothing failed. The agent declined one action, continued, and produced a confident report with a hole in it — which is strictly worse than a visible refusal, because downstream automation consumes the report. This is the loop-level cousin of the problem in <a class="xref" href="/operations/evaluation-and-observability/outcome-vs-trajectory-eval">outcome vs trajectory evaluation</a>: the outcome looks fine and the trajectory is where the defect lives.</p>
+
+    <p>Three detectors catch most of it, in increasing order of effort. <strong>Plan-versus-execution diff</strong>: if your agent emits a plan, count declared steps against executed tool calls and flag the gap — cheap, and it catches the common case. <strong>Per-step classification</strong>: run the refusal classifier over every assistant turn in the trace rather than only the last one, which finds the mid-run decline that the summary papered over. <strong>Tool-call expectation</strong>: for task types where a specific tool should always fire, alarm on runs that completed without it. The third is the most precise and the only one that needs per-task-type configuration, so build it for your two or three highest-stakes task types and not for everything.</p>
+
+    <div class="callout tip">
+      <p>Add one field to your trace schema: <code class="inline">refusal_class</code> on every assistant span, with the four values from the taxonomy plus <code class="inline">none</code>. Backfilling it later over archived traces is possible but expensive; writing it at ingest costs one classifier call per span and turns every subsequent question in this page into a group-by.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Build the detector: a cheap classifier plus a fixed canary set.</h3>
+
+    <p>You need two instruments, and they answer different questions. The classifier tells you what is happening to real traffic; the canary set tells you whether the model changed underneath you. Neither works without the other, because production traffic drifts and a fixed probe set is not your distribution.</p>
+
+    <p>The <strong>classifier</strong> can be small and should be. A compact model, or even a well-tuned pattern match as a first pass, classifying terminal and intermediate assistant turns into the four buckets. Two implementation notes matter more than the model choice. First, label on a few hundred of your own turns before trusting it — refusal phrasing is extremely domain-specific and a generic detector will mistake a legitimate "no results found" for a policy refusal in any search product. Second, run it on a sample for cost and on every turn for your highest-stakes task types, which is the same sampling logic as everything else in <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a>.</p>
+
+    <p>The <strong>canary set</strong> is 200 to 400 prompts drawn from your own answered traffic, frozen, and replayed daily against the production configuration. Its whole job is to hold the input distribution constant so that any movement in the refusal rate is attributable to the stack rather than to what users happened to ask. Include a deliberate spread: clearly benign, legitimately sensitive-but-answerable for your domain, and a handful that should be refused — the last group is how you detect loosening, which is a real and under-monitored failure direction.</p>
+
+    <div class="callout">
+      <p>Published over-refusal benchmarks are useful for model selection and nearly useless as production monitors. XSTest is around 250 hand-crafted prompts pairing safe and unsafe phrasings; OR-Bench carries roughly 80,000 over-refusal prompts with a hard subset near 1,000 and about 600 toxic controls. They measure a general distribution designed to provoke exaggerated refusal. Your production refusals cluster in your domain's vocabulary — a medical-records product, a security tool and a children's education app disagree about which words are risky, and none of them look like a benchmark. Use the benchmarks to choose a model; use your own frozen set to watch it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Alarm on the delta, and know the three things that move it.</h3>
+
+    <p>The level is not interpretable. There is no correct refusal rate — a children's product should refuse far more than a penetration-testing tool, and a 4% rate is either healthy or catastrophic depending on what the 4% is. So alarm on change: a statistically meaningful shift in the canary set's refusal rate, or in the per-task-type production rate, against a trailing baseline.</p>
+
+    <p>When it moves, there are exactly three causes, and the two instruments separate them in one glance.</p>
+
+    <ul>
+      <li><strong>The vendor changed policy.</strong> Canary rate moves, your deployment did not change, input mix is stable. This is the case the whole page exists for, because it is the one with no release to correlate against — refusal behaviour drifts between server-side updates that carry no version bump, the phenomenon catalogued in <a class="xref" href="/operations/agentops/unpinned-vendor-defaults">unpinned vendor defaults</a>. Capture an example pair, file it with the vendor, and decide whether to pin a dated model alias if one is offered.</li>
+      <li><strong>You changed something.</strong> Canary rate moves and correlates with your own deploy. Usually a system-prompt edit: safety language added to fix one incident routinely costs several points of refusal rate across unrelated request classes, and nobody measured the trade because nobody was measuring refusals. Catch it in CI by running the canary set pre-merge, as in <a class="xref" href="/operations/evaluation-and-observability/eval-driven-agent-development">eval-driven agent development</a>.</li>
+      <li><strong>The traffic changed.</strong> Production rate moves, canary rate is flat. Nothing is wrong with the model; new users or a new feature are asking different questions. This is the case where the correct response is often to do nothing to the stack and instead look at who arrived.</li>
+    </ul>
+
+    <p>Hold one number alongside the rate, because the rate alone will push you the wrong way: the <strong>false-refusal share</strong> — of sampled refusals, how many a human reviewer judges should have been answered. Driving refusal rate down is not the goal; driving the false share down is. Published work finds a strong positive correlation between refusing genuinely harmful prompts and refusing harmless ones, so the two move together and optimising one blindly degrades the other. A weekly review of twenty sampled refusals is enough to keep the share honest, and it is the cheapest annotation task you will ever stand up.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The dashboard, and what to do in the first week.</h3>
+
+    <p>Five panels, which is the whole thing. Anything beyond these is for an investigation rather than a wall.</p>
+
+    <pre class="standalone"><span class="c-cm"># Refusal panel — five things, nothing else</span>
+
+1  policy refusal rate, by task type, trailing 28 days
+   (the four classes stacked, so causes stay separable)
+
+2  canary set refusal rate, daily, with deploy markers
+   (your own deploys AND the dates vendor behaviour shifted)
+
+3  plan-vs-execution gap: runs completing with missing steps
+   (the agent-specific signal; chat products can skip it)
+
+4  false-refusal share, weekly, from 20 sampled reviews
+   (the only quality number here; the rate is just volume)
+
+5  should-have-refused count on the canary controls
+   (loosening detection — low-frequency, high-consequence)
+
+<span class="c-cm"># Alarm thresholds that work in practice</span>
+
+canary rate       +/- 2 percentage points vs 14-day baseline
+production rate   +/- 25% relative, per task type
+missing steps     any run in a tier-1 task type
+</pre>
+
+    <p>In the first week, do these four things in order. Add <code class="inline">refusal_class</code> to the trace schema and start writing it, even if the classifier is a regex at first — the field is the expensive part, the classifier is replaceable. Freeze a canary set from traffic the model answered successfully last month and schedule a daily replay. Run the classifier retrospectively over thirty days of archived traces to get a baseline you did not have to wait a month for. Then review twenty sampled refusals by hand, because that review is what tells you whether the number you have just built is measuring anything you care about.</p>
+
+    <p>One thing not to do: do not respond to a refusal-rate increase by adding reassurance to your system prompt. It is the reflex, it occasionally works, and it is unmeasurable — you have changed a global input to fix a specific class, and the side effects land on request types you are not looking at. Fix the specific case with a specific instrument: a narrower tool permission, an explicit context statement for the legitimate sensitive case, or a different model for that task type. Then watch the canary set to confirm you did not pay for it somewhere else.</p>
+
+    <div class="callout tip">
+      <p>Do this today: pull a hundred random assistant turns from last week, read them, and count how many are refusals. If the answer is more than two or three, you have a live quality problem that nothing in your current monitoring would ever have surfaced. Then read <a class="xref" href="/concepts/refusals-and-capability-gating">refusals and capability gating</a> for why the rate is this volatile in the first place, and <a class="xref" href="/operations/evaluation-and-observability/quality-regression-detection">quality regression detection</a> for wiring this into the same alerting path as every other regression you watch.</p>
+    </div>
+  </div>
+</section>
