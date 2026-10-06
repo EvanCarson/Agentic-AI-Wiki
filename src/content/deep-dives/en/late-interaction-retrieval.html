@@ -1,0 +1,114 @@
+<section class="phase">
+  <div class="phase-num">R12</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Late-interaction retrieval.</h2>
+  <p class="goal">The standard objection to late interaction — one vector per token is a hundred times the storage — has been obsolete for about four years, and almost every architecture decision in the wild still assumes it. ColBERTv2's residual compression takes an MS MARCO index from 154 GiB to 25 GiB at two bits per dimension, which is the same order as a plain float32 single-vector index over the same 8.8 million passages, and token pooling removes another half of the vectors with virtually no measured loss. The decision that remains is not about disk. For text it is whether your failures are recall failures, because that is the only thing a better first stage can fix; for page images it is whether you are willing to delete your parsing pipeline, which is what actually justifies the footprint.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>One property does all the work: scoring is deferred, but encoding is not.</h3>
+
+    <p>A single-vector retriever pools a whole passage into one point in space, so every aspect of that passage — its topic, its entities, its numbers, its caveats — has to survive as one average. A cross-encoder avoids the averaging by reading the query and the document together, which is why it ranks better and why it cannot precompute anything: every query-document pair is a forward pass.</p>
+
+    <p>Late interaction sits exactly in between, and it is worth being precise about the mechanism because the cost model follows from it. Each document token gets its own vector, projected down to 128 dimensions, at indexing time. Each query token gets its own vector at query time. The score is <code class="inline">MaxSim</code>: for every query token, take its highest similarity against any document token, then sum those maxima. No parameters are shared between the query and the document encoders at scoring time, so documents stay precomputable; but the comparison happens at token granularity, so nothing had to be averaged away.</p>
+
+    <ul>
+      <li><strong>It is term matching with learned terms.</strong> The structural behaviour is BM25-like — a query term either finds a match in the document or it does not — except the terms are contextual embeddings, so "deprecated" can match "no longer supported". That is why it behaves well on exactly the queries where dense retrieval is weakest.</li>
+      <li><strong>The index is a set of token vectors, not a set of document vectors.</strong> Everything about the engineering, from storage to ANN strategy to the shape of the query pipeline, follows from that one change.</li>
+      <li><strong>It is a first-stage retriever, not a reranker.</strong> It can be used as a reranker, and often is, but that use throws away the property that distinguishes it: the ability to find a document the first stage missed. See <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a> for the staged pipeline this slots into.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Do the storage arithmetic yourself, because the folklore is a decade old.</h3>
+
+    <p>The uncompressed version is genuinely bad: 128 dimensions at float32 is 512 bytes per token, and a passage corpus has a lot of tokens. ColBERTv2's residual compression replaces each vector with the ID of its nearest centroid plus a quantised residual, which lands at roughly 20 to 32 bytes per vector depending on settings — a 6 to 10× reduction that takes the MS MARCO passage index from 154 GiB to 25 GiB at two bits per dimension, or 16 GiB at one bit.</p>
+
+    <p>Now put the comparison next to it instead of accepting it as a ratio. MS MARCO is about 8.84 million passages. A single-vector index over the same corpus at 1024 dimensions in float32 is 8.84M × 1024 × 4 bytes ≈ 36 GB; at 768 dimensions ≈ 27 GB. The compressed late-interaction index is <em>smaller than the uncompressed single-vector index of the same corpus</em>. The honest statement of the cost is therefore: late interaction costs roughly what you are already paying if you never quantised your dense vectors, and roughly 4× if you did.</p>
+
+    <ul>
+      <li><strong>Token pooling is the first knob, and it is free.</strong> Hierarchical clustering of a document's token vectors before indexing cuts the vector count by 2–3× with no architectural change and no query-time work: around 50% with virtually no retrieval degradation, and 66–75% with under 5% degradation on most datasets. It composes with the two-bit quantisation above rather than competing with it.</li>
+      <li><strong>Pooling-aware fine-tuning goes further.</strong> A 2026 line of work trains the model to expect pooling, reporting accuracy that matches or exceeds the unpooled baseline at considerable compression — so the trade-off curve is still moving in your favour.</li>
+      <li><strong>Latency was solved separately.</strong> PLAID prunes candidate documents using centroid interaction before scoring, reporting up to 7× lower latency on GPU and 45× on CPU against vanilla ColBERTv2 — in absolute terms, 38.4 ms on a GPU and 352.3 ms on a single CPU core at k=1000 on MS MARCO. Tens of milliseconds on a GPU is not the bottleneck in an agent loop that is about to spend two seconds generating.</li>
+      <li><strong>The remaining cost is memory bandwidth, not bytes.</strong> Scoring touches many small vectors scattered across the index, so the number that predicts your p99 is whether the hot portion of the index stays in page cache. That is a capacity-planning question with a different answer from "how big is it on disk".</li>
+    </ul>
+
+    <div class="callout">
+      <p>Carry one number into the design review: <strong>20–32 bytes per token after compression, halved again by pooling</strong>. For a 10-million-token internal corpus that is on the order of a hundred megabytes, which is nobody's budget problem. The storage objection survives mainly because it was formed against ColBERTv1 and never re-derived — and <a class="xref" href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">vector-database selection</a> is full of defaults that were correct in 2021.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What the quality gain actually is, and the query shapes that produce it.</h3>
+
+    <p>The reproducible claim from ColBERTv2 is out-of-domain robustness rather than peak in-domain score: 39.7 MRR@10 on MS MARCO and 50.0 mean nDCG@10 on BEIR, with the highest quality on 22 of 28 out-of-domain BEIR tests and up to an 8% relative gain over the next best retriever — while using the compressed representation. Out-of-domain is the regime you are always in, because your corpus is not MS MARCO and you are not going to fine-tune an embedding model on it.</p>
+
+    <p>In 2026 that empirical picture acquired a theoretical floor. A Microsoft Research India paper gives the first explicit family of query and document sets for which single-vector embeddings need <em>exponential</em> dimension to rank all relevant documents above irrelevant ones, where polynomial-size multi-vector embeddings suffice, and introduces a benchmark (ANDOR) that instantiates those hard cases — on which state-of-the-art single-vector models do poorly zero-shot while multi-vector models hold up. A companion line of work argues the same separation from expressivity.</p>
+
+    <p>Read the construction, not just the headline, because it tells you which of your queries are affected. The hard cases are conjunctive and disjunctive compositions — documents that must satisfy <em>this</em> and <em>that</em>, where each condition is individually common. A single vector has to place the document at one point that is simultaneously near every aspect; token-level matching can satisfy each condition against a different token.</p>
+
+    <ul>
+      <li><strong>Agent queries are mostly that shape.</strong> "The config that sets the retry budget and was changed after the incident." "The clause about termination in the contract with the Dutch subsidiary." Multi-constraint, entity-heavy, conjunctive — the exact structure the separation result is about, which is why this matters more for <a class="xref" href="/deep-dives/retrieval-and-rag/agentic-retrieval">agentic retrieval</a> than for a search box.</li>
+      <li><strong>Short, topical queries are not that shape.</strong> If your traffic is "how do I reset my password", a single vector pools fine and late interaction buys you very little.</li>
+      <li><strong>Rare tokens survive.</strong> Identifiers, error codes, part numbers and version strings keep their own vectors instead of being averaged into a topic, which is the same gap hybrid search papers over with BM25.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Compare it against the pipeline you already have, not against naive dense retrieval.</h3>
+
+    <p>The relevant alternative is almost never "one dense index". It is dense plus BM25 fused, then a cross-encoder reranking the top 50 or 100. Against that stack, late interaction is not obviously better — and the discriminating question is diagnostic rather than architectural.</p>
+
+    <ul>
+      <li><strong>If the right document was never in the candidate set</strong>, a reranker cannot help you by construction: it only reorders what it is given. This is a recall failure, and it is what a better first stage — hybrid, or late interaction, or both — exists to fix.</li>
+      <li><strong>If the right document was in the top 100 but at rank 40</strong>, a cross-encoder is the cheaper and stronger answer. It reads both texts together and will usually beat MaxSim at the top of the list.</li>
+      <li><strong>If your latency budget cannot hold a cross-encoder over 100 candidates</strong>, late interaction is the compromise with the best evidence: the ranking happens inside the retrieval step, so you pay once.</li>
+      <li><strong>If the content is genuinely multi-aspect</strong> — technical documentation, contracts, incident reports — the separation result above says the gap is structural and will not close with a better pooled embedding.</li>
+    </ul>
+
+    <p>So run the diagnostic before the migration: take fifty failed queries, check whether the correct document appeared anywhere in the top 100 of your current first stage, and split them. The ratio tells you which half of the pipeline to spend on, and it takes an afternoon. <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">Evaluating RAG</a> has the measurement scaffolding; recall@k on your own queries is the metric that decides this, and nothing in a vendor benchmark can substitute for it.</p>
+
+    <p>Two cheaper interventions should also be on the table first, because both attack recall without changing your index format: query decomposition, which turns one conjunctive query into several simple ones (see <a class="xref" href="/deep-dives/retrieval-and-rag/query-understanding-for-rag">query understanding</a>), and <a class="xref" href="/deep-dives/retrieval-and-rag/contextual-retrieval">contextual retrieval</a>, which fixes the orphaned-chunk problem that masquerades as a ranking problem.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The case that actually justifies the footprint is page images.</h3>
+
+    <p>The strongest use of late interaction has nothing to do with text ranking. ColPali-style models embed a document <em>page image</em> as a grid of patch vectors — at 448×448 pixels, a ViT encoder produces about 1,030 patch tokens per page, each projected to 128 dimensions, for roughly 256 KB per page in half precision — and score the query's tokens against those patches with the same MaxSim. ColQwen-style successors report around +5.3 nDCG@5 over the original ColPali on the ViDoRe benchmark, and ViDoRe v2 exists because the first version saturated.</p>
+
+    <p>Against a single pooled page embedding at 4 KB, that is a 60× footprint, and this time the ratio is real. What buys it is not ranking quality. It is the deletion of an entire pipeline:</p>
+
+    <ul>
+      <li><strong>Parsing errors are unrecoverable; ranking errors are not.</strong> If your layout analysis merged two table columns or your OCR dropped a footnote, no retriever downstream can find what was never extracted. That asymmetry is the whole argument of <a class="xref" href="/deep-dives/retrieval-and-rag/document-parsing-for-rag">document parsing and ingestion quality</a>, and visual late interaction removes the stage where it happens.</li>
+      <li><strong>The hard corpora are visual.</strong> Scanned forms, financial statements, engineering drawings, slide decks, anything where the information is in the arrangement. Converting those to linear text is the lossy step, and it is the step you are maintaining.</li>
+      <li><strong>The cost scales per page, which is a smaller number than per token.</strong> A hundred thousand pages at 256 KB is 25 GB. That is a real index, and it is an ordinary one.</li>
+      <li><strong>The patch-pruning literature exists for a reason.</strong> Adaptive patch-level pruning and pooling are active 2025–2026 research precisely because the per-page footprint is the adoption blocker; expect this number to keep falling, and do not architect around today's value.</li>
+    </ul>
+
+    <p>When not to: a corpus that was born as text. Converting clean Markdown or HTML into page images to retrieve it visually is paying the footprint for a parsing problem you do not have.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Engineering it in production: support, the two-stage pattern, and the acceptance test.</h3>
+
+    <p>Native multi-vector indexing stopped being exotic. Qdrant has had it since v1.10, Weaviate since v1.29, Vespa for years, LanceDB since v0.15.0, and Milvus added it in v2.6.4. Plain pgvector does not have a MaxSim operator; the VectorChord extension adds one to Postgres, which matters because "we are already on Postgres" is the most common reason this gets ruled out without a measurement.</p>
+
+    <ul>
+      <li><strong>The standard pattern is prefetch then rerank.</strong> Retrieve candidates with a cheap single-vector index, then rescore them with the stored multi-vectors. It is a good default and it reintroduces the recall ceiling you adopted late interaction to remove — if the prefetch misses the document, MaxSim never sees it. Decide deliberately which property you are buying.</li>
+      <li><strong>MUVERA is the principled version of that pattern.</strong> It encodes a multi-vector set into a single fixed-dimensional vector so retrieval becomes ordinary MIPS, then reranks with the full multi-vectors. Weaviate reports 3× faster ingestion and 1.8× faster queries with it enabled in their own test. Note the implication for capacity: you are now storing both representations.</li>
+      <li><strong>The failure to plan for is the rerank stage, not the search.</strong> Scoring many small vectors is random-access work, so the moment the multi-vector field outgrows page cache, p99 degrades sharply while your ANN metrics still look healthy. Size for residency, not for disk, and load-test at the index size you expect in a year.</li>
+      <li><strong>Reindexing is a migration, not a config change.</strong> Switching to or from late interaction rewrites the entire index and changes its size class; treat it with the discipline in <a class="xref" href="/operations/agentops/reindexing-and-embedding-migrations">reindexing and embedding migrations</a>, including a shadow index and a comparable recall@k measurement across the cut.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Before you migrate anything, run the diagnostic: fifty real failed queries, and the single question of whether the correct document was anywhere in the current top 100. If most failures are rank failures, buy a cross-encoder and stop. If most are recall failures on multi-constraint queries, pilot late interaction on one collection with token pooling on from day one — 50% fewer vectors at virtually no measured cost is not an optimisation to defer. And if the corpus is page images, skip the text debate: the comparison that matters there is against your parsing pipeline, not against your retriever.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/chunking-and-vector-search">chunking and vector search</a> for the baseline this departs from, <a class="xref" href="/concepts/embeddings">embeddings</a> for why pooling loses what it loses, and <a class="xref" href="/deep-dives/retrieval-and-rag/local-first-retrieval">local-first retrieval</a> for whether you need an index at all before optimising which one.</p>
+  </div>
+</section>
