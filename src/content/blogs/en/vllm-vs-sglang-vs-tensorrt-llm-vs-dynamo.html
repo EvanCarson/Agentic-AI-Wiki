@@ -1,0 +1,172 @@
+<p class="lede">Published head-to-heads between these projects put the winner's margin anywhere from 29% to 6.4×, on the same hardware class, for the same models. Both numbers are probably honest, and the reason they disagree by two orders of magnitude is that neither states the one parameter that decides an agent workload: how much of each request is a prefix you already paid to compute. Pick on that, and you discover the uncomfortable thing about this comparison — three of these four are engines, one is a router, and the moment you run a second replica your cache hit rate stops being an engine property at all.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Four projects that get compared as peers, which three of them are.</p>
+
+  <table>
+    <thead>
+      <tr><th>Project</th><th>What it is</th><th>Latest release</th><th>What you are actually choosing</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>vLLM</td>
+        <td>Inference engine</td>
+        <td>v0.31.0, 5 October 2026 (roughly every two weeks)</td>
+        <td>Breadth: hardware, model coverage, and the default everyone else integrates against</td>
+      </tr>
+      <tr>
+        <td>SGLang</td>
+        <td>Inference engine</td>
+        <td>v0.5.21, 2 October 2026 (roughly every two weeks)</td>
+        <td>A token-level radix tree over the prefix cache, now on a Rust core by default</td>
+      </tr>
+      <tr>
+        <td>TensorRT-LLM</td>
+        <td>Compiled inference engine, NVIDIA only</td>
+        <td>1.3.0rc line, still rc as of late September 2026</td>
+        <td>Peak per-GPU performance, paid for in setup time and vendor lock</td>
+      </tr>
+      <tr>
+        <td>Dynamo</td>
+        <td><strong>Router and serving platform over the engines</strong></td>
+        <td>v1.5.0, its 18th feature release</td>
+        <td>Which worker a request lands on &#8212; i.e. whether the prefix cache is hit at all</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-dynamo/data-cache-hit-by-routing.svg" alt="Bar chart of reported prefix cache hit rates: 85 to 97 percent for a session pinned to one worker, 89 percent with cache-aware routing across four replicas, and about 25 percent for an even spread across four replicas." width="900" height="400" loading="lazy" />
+    <figcaption>Same engine, same model, same traffic in all three rows. The variable is routing.</figcaption>
+  </figure>
+
+  <p>Hugging Face's TGI is the fourth engine that used to be in this table, and its absence is the most informative data point available. It went into maintenance mode in December 2025, the repository was archived read-only on 21 March 2026, and its own README now points readers at vLLM and SGLang. Nothing about its throughput got worse. The axis moved.</p>
+</section>
+
+<section>
+  <h2>One of these four is not an engine</h2>
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-dynamo/arch-router-above-engines.svg" alt="Layered diagram: agent traffic enters a router holding a global index of which key-value cache blocks live on which worker, dispatching to workers that each run vLLM, SGLang or TensorRT-LLM with their own local prefix cache." width="900" height="500" loading="lazy" />
+    <figcaption>Dynamo does not serve tokens. It decides which worker's cache your request meets.</figcaption>
+  </figure>
+
+  <p>The clearest evidence that Dynamo belongs on a different row is its own release notes: v1.5.0 pins SGLang v0.5.18, TensorRT-LLM v1.3.0rc25 and vLLM v0.28.0 as backends. It runs the other three. Comparing it to them on tokens per second is a category error, and comparing the other three to each other without saying what sits above them is the more common and more expensive one.</p>
+
+  <p>That pin list carries a second, quieter cost worth pricing before you adopt the platform: as of early October 2026 upstream vLLM is at v0.31.0 and SGLang at v0.5.21, several releases past what v1.5.0 pins. Taking the router means taking the router's engine calendar, which trails upstream by several releases on a two-week cadence. If you are on a self-hosted stack precisely because you need a model or kernel that landed last fortnight, that gap is the trade you are making, and it is not mentioned in any benchmark.</p>
+</section>
+
+<section>
+  <h2>Why the published comparisons disagree by 6×</h2>
+  <p>Read a handful of 2026 head-to-heads and the spread is startling. One reports TTFT at the median dropping from 310 ms to 195 ms at 80% shared prefix and 50 concurrent requests. Another reports up to 6.4× higher throughput on prefix-heavy traffic, while noting in passing that a 29% figure from the same family of tests applies to the workload that least favours the winner. A third finds one engine's multi-turn throughput sagging under cache pressure where the other holds steady.</p>
+
+  <p>These are not contradictory results; they are three different workloads wearing the same label. The missing axis is prefix reuse — the share of each request's tokens that the server has already computed for some earlier request. Agent traffic sits at the extreme end of it: a system prompt, a tool catalogue and a growing conversation history are re-sent on every turn, so the marginal request is mostly a prefix. One write-up puts agentic workloads with identical tool definitions at 75&#8211;95% reuse; that specific number is untraceable to a measurement, but the shape is not in dispute, and NVIDIA's own coding-agent example reports 85&#8211;97% cache hits on subsequent calls that reach the same worker.</p>
+
+  <p>So the benchmark that would decide your choice is one nobody publishes, because it is yours: what fraction of your tokens are prefix, and what is your current hit rate? Both are already in your server metrics. An engine comparison run at 0% reuse measures a regime your agent never operates in, and an engine comparison run at 90% reuse mostly measures the cache implementation — which is why the same two projects can swap places depending on who ran the test.</p>
+</section>
+
+<section>
+  <h2>The second replica is where the cache goes</h2>
+  <p>Here is the part that reorders the whole decision. A prefix cache is local to a worker process. With one replica, every turn of a session necessarily meets the cache that the previous turn populated, and you get the headline hit rates. With N replicas behind an ordinary load balancer, turn two lands on the worker that holds turn one's prefix with probability roughly 1/N — NVIDIA's own framing of the baseline, and an approximation for random placement rather than a measurement, but directionally exactly right.</p>
+
+  <p>Which means scaling out actively destroys the property you chose your engine for. Four replicas, round-robin, and a workload that was 90% prefix is now recomputing most of that prefix most of the time. Your throughput chart goes up because you added GPUs; your cost per task goes up too, and nothing in the engine comparison warned you.</p>
+
+  <p>Cache-aware routing is the fix, and it is a layer, not a setting. Dynamo's router maintains a global index of which KV blocks live on which worker, scores each candidate worker for overlap against the incoming request, and picks the one that minimises the combined cost of a cache miss and the worker's current decode load. One third-party test — Baseten, on Qwen3 Coder with roughly 50k-token inputs — reports an 89% hit rate across four replicas with a 50% reduction in time-to-first-token and 34% in time-per-output-token. Vendor-adjacent numbers, best-case workload, but the mechanism is sound and the baseline it beats is arithmetic rather than opinion.</p>
+
+  <p>Three things about that layer you should know before you depend on it:</p>
+  <ul>
+    <li><strong>Stickiness and load balance are in tension, by design.</strong> The overlap credit is a tunable, with a documented default that NVIDIA calls a reasonable starting point rather than an optimum; push it toward cache affinity and you concentrate traffic on cache-rich workers. There is no setting that gives you both.</li>
+    <li><strong>Tie-breaking is random.</strong> When two workers score identically the router picks among them at random, and there is an open report of exactly that case in a multi-turn chatbot with two decode workers holding matching blocks. In a two-replica deployment, "identical scores" is not a rare state.</li>
+    <li><strong>Multi-tier caches get partial credit.</strong> Overlap found in CPU-offloaded cache counts at a fraction of GPU-resident overlap, and disk or NVMe at a smaller fraction still. Your effective hit rate is not one number.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>What actually differs at the engine layer</h2>
+  <figure>
+    <img src="/blogs/vllm-vs-sglang-vs-tensorrt-llm-vs-dynamo/data-engine-matrix.svg" alt="Matrix of the four projects against prefix cache mechanism, breadth, setup cost and cross-replica routing, with Dynamo the only row strong on cross-replica routing." width="900" height="400" loading="lazy" />
+    <figcaption>Where each project leans hardest &#8212; and which column only one of them competes in.</figcaption>
+  </figure>
+
+  <p>With routing accounted for, the engine differences get smaller and more legible. Both of the open engines cache prefixes; they differ in how they index them. vLLM hashes fixed-size blocks, which is simple, cheap to look up, and aligned to its paged allocator. SGLang keeps a token-level radix tree, which shares partial prefixes more finely — and it has been investing there specifically, moving the prefix cache onto a Rust core by default in v0.5.21 after unifying the radix tree in the two releases before it. On traffic with many near-identical-but-not-identical prefixes, finer sharing is worth real money; on traffic where prefixes are identical or completely different, the mechanisms converge.</p>
+
+  <p>Breadth runs the other way. vLLM is where new hardware, new model architectures and third-party integrations land first, and it is the engine most other tools assume. SGLang's release notes read like a project optimising hard in one direction, which is a compliment and a risk assessment at once. TensorRT-LLM is the peak-performance option on NVIDIA silicon and asks for a compile step, a week or two of setup, and acceptance of single-vendor hardware; its 1.3 line was still shipping under release-candidate tags as of late September 2026, which is worth knowing if your change-management process wants to pin a stable version number.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>One or two GPUs, one model, agent traffic</td>
+        <td>vLLM</td>
+        <td>At single-replica scale the cache is hit by default; take the breadth and the biweekly releases, and spend your attention elsewhere</td>
+      </tr>
+      <tr>
+        <td>Prefix-heavy traffic with many partial-overlap variants</td>
+        <td>SGLang</td>
+        <td>Token-level radix sharing is the mechanism that matches that workload, and it is where the project is investing</td>
+      </tr>
+      <tr>
+        <td>Fixed model, NVIDIA fleet, latency is the product</td>
+        <td>TensorRT-LLM</td>
+        <td>Peak per-GPU numbers are real; budget the setup and accept the hardware lock</td>
+      </tr>
+      <tr>
+        <td>Three or more replicas serving sessions or agents</td>
+        <td>Dynamo over any of the above</td>
+        <td>Beyond two replicas the dominant term is routing, not the engine &#8212; and no engine choice recovers a 1/N hit rate</td>
+      </tr>
+      <tr>
+        <td>Still on TGI</td>
+        <td>Migrate</td>
+        <td>Archived read-only since March 2026; its own README sends you to vLLM or SGLang</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Is Dynamo a replacement for vLLM or SGLang?</h3>
+  <p>No. It runs them as backends &#8212; v1.5.0 pins specific versions of SGLang, TensorRT-LLM and vLLM &#8212; and its job is routing, disaggregation and fleet-level concerns. If you see it benchmarked head-to-head against an engine, the comparison is measuring a stack, not a peer.</p>
+
+  <h3>Which engine is fastest for agent workloads?</h3>
+  <p>Not answerable without your prefix reuse rate, which is why the published answers range from 29% to 6.4×. Measure the share of your tokens that are prefix and your current cache hit rate first; below a couple of replicas the engine choice dominates, above that routing does.</p>
+
+  <h3>Do I need cache-aware routing with only two replicas?</h3>
+  <p>Probably yes for sessions, and the caveat matters: at N=2 an even spread costs you about half your potential hit rate, but it is also the configuration where identical overlap scores are most common, and the router breaks ties at random. Verify your actual hit rate after enabling it rather than assuming it.</p>
+
+  <h3>Is TGI dead?</h3>
+  <p>Effectively. Maintenance mode from December 2025, repository archived read-only on 21 March 2026, and Hugging Face's own documentation now recommends vLLM and SGLang. Existing deployments keep running; new work should not start there.</p>
+
+  <h3>Why does TensorRT-LLM not have a stable 1.3.0?</h3>
+  <p>Its 1.3 line was still shipping under release-candidate tags as of late September 2026, and Dynamo pins an rc build as its backend. This is normal for the project's cadence but it is a genuine friction if your release process requires pinning a non-rc version.</p>
+
+  <h3>What is the one number I should measure before choosing?</h3>
+  <p>Prefix cache hit rate, segmented by replica count, on your own traffic. It is already exported by every engine here, it is the parameter all the public benchmarks leave unstated, and a low value tells you to fix routing before you change engines.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/deep-dives/architectures-and-patterns/context-caching-economics">Context caching economics</a> &#8212; the cost model behind the hit rate.</li>
+    <li><a href="/concepts/prompt-caching">Prompt caching</a> &#8212; the same mechanism as a hosted-API feature.</li>
+    <li><a href="/operations/agentops/self-hosted-inference-for-agents">Self-hosted inference for agents</a> &#8212; when running your own serving stack is worth it.</li>
+    <li><a href="/operations/agentops/serving-agent-traffic">Serving agent traffic</a> &#8212; why agent request shapes break request-oriented capacity planning.</li>
+    <li><a href="/concepts/prefill-and-decode">Prefill and decode</a> &#8212; the two phases that disaggregation separates.</li>
+    <li><a href="/concepts/inference-providers">Inference providers</a> &#8212; the hosted alternative to all of this.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://github.com/vllm-project/vllm">vLLM</a> &#8212; releases and engine docs.</li>
+    <li><a href="https://github.com/sgl-project/sglang">SGLang</a> &#8212; release notes, including the v0.5.21 Rust prefix cache.</li>
+    <li><a href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM</a> &#8212; release tags.</li>
+    <li><a href="https://github.com/ai-dynamo/dynamo">NVIDIA Dynamo</a> &#8212; router design, KV-aware routing and backend version pins.</li>
+    <li><a href="https://github.com/huggingface/text-generation-inference">Text Generation Inference</a> &#8212; archived, with its own migration advice.</li>
+  </ul>
+</section>
