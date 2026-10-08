@@ -1,0 +1,108 @@
+<section class="phase">
+  <div class="phase-num">O32</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Bulk and backfill runs.</h2>
+  <p class="goal">The first time you point a working agent at a hundred thousand historical records, you are not scaling a feature — you are running the first real test of every property you only ever exercised at N=1, and the way it fails is the expensive way: not a crash, but a hundred thousand plausible wrong writes that your completion-rate dashboard reports as a clean sweep. Design the backfill as its own system, with its own write posture, its own stop conditions, and an undo you rehearsed at two hundred rows, because at a hundred thousand it is not an undo.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Do the arithmetic before the architecture.</h3>
+
+    <p>A backfill inverts the safety model of an interactive agent. Interactive runs have a human reading the output by default and a <a class="xref" href="/concepts/blast-radius">blast radius</a> of one record; a bulk run has neither, and what bounds it instead is a set of properties nobody has checked above a single run. Four lines of arithmetic, done first, decide whether the project is viable at all:</p>
+
+    <pre class="standalone">records                 120,000
+cost per task           $0.14          -> $16,800 total, vs a $4,000 monthly budget
+median task latency     40 s
+target wall clock       12 h           -> 2.8 records/s -> ~111 concurrent runs
+third-party write cap   10 req/s       -> the real ceiling; 2.8/s is fine, 28/s is not
+needs-human-review      2 %            -> 2,400 reviews -> 5 reviewer-weeks</pre>
+
+    <p>Three of those four lines routinely kill the plan, and the one that kills it most often is the last. Human review capacity, not model throughput, is the actual rate limit on anything whose output a person has to accept — see <a class="xref" href="/operations/economics-roi/cost-of-human-review">the cost of human review</a> for pricing it and <a class="xref" href="/playbooks/agent-ux-and-human-interaction/review-queues-for-agent-output">review queues</a> for running it. Publish this block in the design doc before anyone writes an orchestrator; it is the cheapest artifact in the project and the one that cancels the bad version of it.</p>
+
+    <div class="callout">
+      <p>Per-task <a class="xref" href="/operations/agentops/cost-control-in-the-loop">cost ceilings</a> that work fine interactively mislead badly here, because the per-task figure you measured is a median and the bill is a sum over a long tail. Price the run at the 90th-percentile task cost, not the median; on agent workloads the gap between them is routinely 3× or more, driven by retry loops on exactly the records a backfill is full of.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Pick the write posture, and make the first pass produce an artifact instead of a change.</h3>
+
+    <p>There are only three postures, and the choice is the single most consequential decision in the run:</p>
+
+    <ul>
+      <li><strong>Propose.</strong> The agent reads, decides, and writes a proposed change to a separate store — one row per record, with the old value, the new value and the reasoning. No side effects on the system of record. This is the correct first pass every time, because it is the only posture in which you can audit the full output distribution before anything is irreversible.</li>
+      <li><strong>Stage.</strong> Writes land in a shadow column, a draft state, or a parallel table, and a separate promotion step moves them live. Good for migrations where the write itself is the hard part, and the posture that lets you promote in slices.</li>
+      <li><strong>Live.</strong> The agent writes to the system of record as it goes. Defensible only when the write is cheaply reversible per row and you have already run the propose pass on the same population.</li>
+    </ul>
+
+    <p>Putting the human gate at the promotion step rather than inside the loop is what makes a bulk run affordable: one reviewer approving a slice of five hundred proposals, sorted by a confidence or novelty signal, costs a fraction of the same reviewer approving five hundred individual runs, and the batch view is where distribution problems become visible at all.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Climb a pilot ladder, with exit criteria written before each rung.</h3>
+
+    <p>Twenty records, two hundred, two thousand, then the population — and the point of the ladder is not caution for its own sake, it is that each rung can only refute the plan if you decided the exit criterion in advance. "It looked fine" is not an exit criterion; "no more than one of twenty required a correction, and the output category distribution is within ten points of the historical base rate" is.</p>
+
+    <ul>
+      <li><strong>Stratify the early rungs; do not sample randomly.</strong> Twenty random records out of 120,000 will contain none of the cases that break you. Hand-pick for the shapes you already know are hard: the oldest records, the ones with empty optional fields, non-Latin text, the one tenant with the unusual configuration, the records written by a since-removed importer.</li>
+      <li><strong>Carry a gold slice through the whole run.</strong> A hundred records with human-established correct answers, interleaved with real work and tagged invisibly, give you an accuracy read <em>during</em> the run instead of a post-mortem after it. This is the single control that converts a twelve-hour run from an act of faith into a measurement.</li>
+      <li><strong>Treat a clean 2,000-row rung as weak evidence about 120,000.</strong> It establishes that the common path works. It says nothing about rate-limit behaviour, cache eviction, or the hour your provider is degraded — which is what <a class="xref" href="/operations/agentops/load-testing-agents">load testing</a> and <a class="xref" href="/operations/agentops/rate-limits-and-provider-capacity">provider capacity</a> are for.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Write the resume and the stop before you write the start.</h3>
+
+    <p>A bulk run will be interrupted. Accept that as a premise and the design falls out of it: a ledger with one row per record, and a cursor that is derived from the ledger rather than held in a process.</p>
+
+    <ul>
+      <li><strong>One ledger row per record</strong> — state in <code class="inline">pending | claimed | done | failed | needs_review</code>, a lease with an expiry so a dead worker's claims return to the pool, the attempt count, and the run id. Resume is then a query, not a recovery procedure. This is <a class="xref" href="/operations/agentops/durable-state-and-resumability">durable state and resumability</a> applied to a batch.</li>
+      <li><strong>Idempotency keys derived from the record, not the attempt.</strong> If the key changes when you retry, you have built an at-least-once writer with no deduplication — the failure dissected in <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a>, and the one that turns a resumed backfill into double writes.</li>
+      <li><strong>Three independent stops, all owned by the orchestrator and none by the agent.</strong> A cumulative spend ceiling; an error-rate circuit breaker on a sliding window rather than a cumulative average, so a failure that starts at hour nine still trips it; and a human <a class="xref" href="/operations/agentops/kill-switches">kill switch</a> that you have actually pressed in the pilot. An untested kill switch is a comment.</li>
+      <li><strong>Pin the behaviour triple for the run's lifetime.</strong> A twelve-hour run spans deploys. If the model, prompt or tool versions change mid-run you have produced two datasets under one name, and no way to tell which rows came from which — so pin to dated snapshots per <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout and versioning</a>, and stamp the triple on every ledger row.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Resist the instinct to maximise concurrency. The useful ceiling is set by whichever downstream system you are writing to, and a backfill is a beautifully efficient way to exhaust somebody else's rate limit — including, frequently, your own production API serving live users off the same quota. Run bulk work on separate credentials with their own caps so the backfill cannot starve the interactive path, and prefer a longer wall clock to a retry storm.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Audit the distribution, because the aggregates will look perfect.</h3>
+
+    <p>This is the step teams skip and the reason bulk runs go wrong quietly. The characteristic failure of a backfill is not an error rate — it is a high completion rate over output that is confidently, uniformly wrong. Completion rate, error rate and latency will all be green.</p>
+
+    <ul>
+      <li><strong>Compare the output distribution against a base rate you trust.</strong> If the agent assigns one category to 61% of records where the historical rate is 18%, the run has failed, whatever the error rate says. This single check catches more bad backfills than everything else in this page combined, and it costs one query.</li>
+      <li><strong>Blind-audit a continuous sample.</strong> Pull ten per thousand, show the reviewer the source record and the proposed output but <em>not</em> the agent's rationale, and have them answer independently. A reviewer shown the reasoning agrees with it; that is a known effect and it destroys the value of the audit.</li>
+      <li><strong>Watch for collapse toward the plausible default.</strong> An agent that cannot determine an answer and guesses produces output that is more uniform than reality, not more varied — which is <a class="xref" href="/concepts/failure-concealment">failure concealment</a> in aggregate form, and the one failure that a per-record review sample of twenty will cheerfully pass.</li>
+      <li><strong>Segment by the strata from STEP 3.</strong> A 94% accuracy that is 99% on recent records and 51% on records older than 2019 is not a 94% result; it is two results, and only one of them should ship.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Stamp the run id, and rehearse the undo at two hundred rows.</h3>
+
+    <p>Every row the run touches carries the run id. It is the highest-leverage line of code in the project, because it converts "we think the bad writes were on Tuesday" into a single predicate, and because without it reversal is archaeology.</p>
+
+    <p>From there you need one of two exits, decided in advance:</p>
+
+    <ul>
+      <li><strong>Reversal</strong> — keep the prior value per touched row and restore by run id. Available whenever the write is a field update, and it is worth storing the old value even when you are confident, because the storage is cheap and the alternative is a restore from backup that also reverts everybody else's work from the same window.</li>
+      <li><strong>Compensation</strong> — a second pass that corrects rather than restores, which is what you are left with when the write triggered something external: an email sent, a webhook delivered, an invoice issued. Design the compensating action at the same time as the forward action, per <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a>, and know which of your tools have no compensation at all — those are the ones that belong behind the promote gate from STEP 2, permanently.</li>
+    </ul>
+
+    <p>Then rehearse it. Roll back the two-hundred-row rung for real, verify the rows match their pre-run values, and time it. A rollback first attempted at scale, during an incident, with a cursor you are not sure about, is not a rollback — it is a second outage.</p>
+
+    <div class="callout tip">
+      <p>The minimum viable backfill, in the order that makes each step cheap: compute the four-line arithmetic and show someone; run the first pass in propose posture so nothing is irreversible; climb 20 → 200 → 2,000 on a hand-stratified sample with exit criteria written first; interleave a hundred-record gold slice so accuracy is live; pin the model-prompt-tool triple and stamp it with the run id on every row; and compare the output distribution to a historical base rate before you promote anything. If you only do two of these, do the propose posture and the distribution check — together they catch the failure that the other four exist to survive.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/agentops/reindexing-and-embedding-migrations">reindexing and embedding migrations</a> for the retrieval-shaped version of the same problem, <a class="xref" href="/operations/agentops/scheduled-and-triggered-agents">scheduled and triggered agents</a> for the recurring case, and <a class="xref" href="/playbooks/coding-and-computer-use-agents/large-scale-migration-agents">large-scale migration agents</a> for when the records are source files.</p>
+  </div>
+</section>
