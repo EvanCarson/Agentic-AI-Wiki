@@ -1,0 +1,110 @@
+<section class="phase">
+  <div class="phase-num">U31</div>
+  <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
+  <h2>Web-crawling &amp; site-reading agents.</h2>
+  <p class="goal">The thing that gets your agent blocked is almost never your total request volume — it is concurrency against one origin and the share of your reads that are repeats, and both are properties of a library you have not written yet. An agent fleet with a sensible aggregate rate will still take down one small server, because the rate that matters is per-origin and the agent has no idea how many of its siblings are reading the same page. Build the fetch layer first: a shared revalidating cache, a per-origin budget the agent cannot raise, and a route table that prefers the bulk API over the retail page. The prompt is not where politeness lives.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Decide whether you are crawling at all.</h3>
+
+    <p>Three access shapes are usually available for the same data and they differ by orders of magnitude in cost to both sides. Picking wrong here cannot be repaired downstream.</p>
+
+    <ul>
+      <li><strong>A bulk path.</strong> Dumps, data feeds, daily snapshots, a paid high-throughput API. Large sites increasingly sell exactly this, and some publicly ask AI companies to use it instead of scraping. If it exists, one scheduled job replaces the entire crawler and every problem in this playbook disappears.</li>
+      <li><strong>A query API.</strong> Rate-limited, documented, authenticated, with a contact behind the key. Pay per call and you also buy a relationship: a block becomes an email rather than a 403.</li>
+      <li><strong>Fetching pages.</strong> The fallback, and the only shape with no contract. Everything below is about making it defensible.</li>
+    </ul>
+
+    <p>Write this choice down per data source, in code, as a route table the fetch layer consults — target to sanctioned method. An agent selecting URLs at run time has no representation of which path your organisation pays for, so the preference has to be expressed where the request is made. This is the single most common structural failure in agent crawling: the contract exists and the agent takes the retail path, because the retail path returns 200.</p>
+
+    <div class="callout">
+      <p>Check the terms and the <code class="inline">robots.txt</code> before the architecture, not after. Whether robots applies to agent traffic is contested, but ignoring it is the fact a complaint will lead with, and "an LLM fetched it on a user's behalf" is not a position you want to argue for the first time in an email.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Put the fetch layer between the agent and the network.</h3>
+
+    <p>The agent must not hold an HTTP client. Give it a tool whose implementation owns identity, caching, budgets, retries and logging, because every one of those is a property you need enforced rather than requested.</p>
+
+    <pre class="standalone">agent  --fetch(url)-->  fetch service
+                          |- route table      bulk feed? API? page?
+                          |- cache lookup     fresh / revalidate / miss
+                          |- per-origin gate  token bucket, 1 concurrent
+                          |- identity         UA + contact URL + run id
+                          |- fetch            timeout, size cap, redirect cap
+                          |- log              origin, time, run id, status
+                          '- normalize        HTML -> text + extracted links</pre>
+
+    <p>Four properties fall out of this shape and out of no other. The agent cannot exceed a budget it does not hold. A retry storm becomes impossible because the gate is downstream of the retry. Every request is attributable to a run, which is what makes an <a class="xref" href="/operations/governance-compliance/abuse-reports-about-your-agent">abuse report</a> answerable in an hour. And the cache is shared across the fleet, which is the single biggest reduction in traffic available to you.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Make the cache shared, persistent and revalidating.</h3>
+
+    <p>Per-run caches are nearly worthless. The duplication in agent crawling is across runs and across agents: ten research runs on adjacent topics hit the same twenty authoritative pages, and a retry re-reads everything the first attempt read. A process-lifetime cache catches none of that.</p>
+
+    <ul>
+      <li><strong>Key on the normalized URL.</strong> Strip tracking parameters, resolve redirect chains once and store the terminal URL, and canonicalize trailing slashes and case where the host allows it. Half of apparent cache misses are the same page under four spellings.</li>
+      <li><strong>Store the validators and use them.</strong> Keep <code class="inline">ETag</code> and <code class="inline">Last-Modified</code> and send conditional requests. A 304 costs the origin almost nothing, keeps you honest about freshness, and is the mechanism that makes a high re-read rate acceptable rather than abusive.</li>
+      <li><strong>Separate the fetch cache from the extraction cache.</strong> Cache raw bytes and the parsed-text output under different keys, so improving your extractor does not re-crawl the web. This is the mistake that turns a parser bug fix into an incident.</li>
+      <li><strong>Age by volatility, not by one TTL.</strong> A documentation page, a pricing page and a status page have freshness requirements that differ by three orders of magnitude. One global TTL is either serving stale answers or re-fetching static content; see <a class="xref" href="/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">index freshness and invalidation</a>.</li>
+    </ul>
+
+    <p>Measure cache hit rate per origin and treat a low value as a bug in your own system rather than a fact about the web. On a mature research fleet the majority of fetches should be hits or 304s, and a hit is the only read that is free for everyone.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Budget per origin, and default to one request at a time.</h3>
+
+    <p>Aggregate rate limits are the wrong unit and they are the ones everybody builds. Ten requests per second spread over a thousand hosts is invisible; the same ten per second aimed at one small server is an outage. The budget has to be per registrable domain, enforced across the whole fleet, and held somewhere the agent cannot reach.</p>
+
+    <ul>
+      <li><strong>One concurrent request per origin by default.</strong> Serial reads with a short delay are enough for almost every agent task and are the difference between being unnoticed and being paged about. Raise it only per host, deliberately, for hosts you have a relationship with.</li>
+      <li><strong>Make the budget fleet-global.</strong> A per-process limit multiplied by fifty workers is not a limit. This needs a shared counter, which is the one piece of infrastructure this playbook actually requires.</li>
+      <li><strong>Back off on the signals, not just on errors.</strong> 429 and 503 with <code class="inline">Retry-After</code> are explicit, but rising latency from one origin is the earlier signal and the one that lets you stop before the error. Treat a latency climb as a soft 429.</li>
+      <li><strong>Never retry a timeout at full concurrency.</strong> The classic agent-crawl outage is a slow origin plus a retry policy: the slowdown multiplies in-flight requests, which deepens the slowdown. <a class="xref" href="/operations/agentops/idempotency-and-retries">Retry discipline</a> matters more here than anywhere, because the thing you are overwhelming is not yours.</li>
+      <li><strong>Cap the crawl, not just the rate.</strong> Maximum pages per run, per origin and per task, plus a depth limit and a total byte cap. An agent following links has no natural stopping point and will find a calendar with infinite pagination.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Identify yourself, and make the traffic traceable.</h3>
+
+    <p>Anonymity is what converts a capacity complaint into an attribution investigation, and the investigation is the expensive part for both sides.</p>
+
+    <ul>
+      <li><strong>An honest user-agent with a contact URL</strong> that resolves to a page explaining what the traffic is and how to stop it. Rotating user-agents and residential proxies to evade blocks move you from "a service with a bug" to "an actor evading controls", which is a different conversation with your customer's legal team.</li>
+      <li><strong>A run identifier on every request,</strong> opaque to the recipient, resolvable by you. This is what lets you answer which run, which tenant, which prompt, from a timestamp and an IP.</li>
+      <li><strong>Use the sanctioned identity mechanism where it exists.</strong> Signed-agent schemes let a site cryptographically verify traffic is yours, which gets you into the allowed category instead of the suspicious one. See <a class="xref" href="/concepts/bot-verification-and-agent-access">bot verification and agent access</a>.</li>
+      <li><strong>Respect the block.</strong> When an origin blocks you, stop and route the decision to a human. An agent that works around a 403 is doing unauthorised access on your behalf, and the fetch layer is where that gets prevented rather than discussed.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Fetched pages are untrusted input, and a crawl is the highest-volume injection surface you will ever operate. Everything the agent reads must be quarantined from its instructions, and the fetch layer is the natural choke point for stripping scripts, wrapping content in a clearly-marked envelope and refusing to let page text reach a tool-calling context unlabelled. See <a class="xref" href="/concepts/prompt-injection-101">prompt injection</a> and <a class="xref" href="/deep-dives/architectures-and-patterns/browser-agent-failure-modes">browser-agent failure modes</a>.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Monitor the thing the origin sees.</h3>
+
+    <p>Your dashboards measure task success and token spend. The origin measures requests per hour from your ranges, and nothing in your stack computes that number, which is why the first person to notice your crawl is usually the person it is happening to.</p>
+
+    <ul>
+      <li><strong>One chart: requests per origin per hour, fleet-wide.</strong> Sorted descending. It takes an afternoon from the fetch log and it is the single control that moves detection inside your organisation.</li>
+      <li><strong>Alert on new origins at volume.</strong> A host your fleet has never read, suddenly taking thousands of requests, is either a new data source nobody reviewed or an agent in a loop. Both want a human.</li>
+      <li><strong>Watch the 4xx and 5xx rate per origin.</strong> A climbing error rate from one host is that host defending itself. Treat it as a stop signal rather than a retry signal.</li>
+      <li><strong>Review the top twenty origins monthly.</strong> Any host you read heavily and repeatedly is a candidate to promote to a bulk path or an API key — which converts your largest risk into a contract.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If you ship one thing from this playbook, ship the fetch service with a fleet-global per-origin token bucket at one concurrent request, a shared cache that sends conditional requests, and a run id on every outbound call. Everything else here is tuning. Those three turn an agent fleet from something that will eventually appear in somebody's incident report into a well-behaved client — and they do it in the one place a prompt can never reach.</p>
+    </div>
+  </div>
+</section>
