@@ -1,0 +1,165 @@
+<p class="lede">每一份本地智能体沙箱的对比都在争论内核，而内核从来不是那个失手的地方。这四者如今都默认拒绝出站、都要你把域名点出来，所以那一栏什么也决定不了。仍然有天壤之别的那一项，是「你那枚 GitHub 令牌从箱子里面够不够得着」——四者中有三个把它挡在外面，而且是用三种不同的机制；而第四个恰恰是多数人已经在跑的那一个，因为它随 Claude Code 一起发出，而且它默认在任何地方都允许文件系统读取。</p>
+
+<section>
+  <h2>速览</h2>
+  <p>四者都跑在开发者自己的机器上。它们不是同一个想法的四种实现：一个是 OS 级的进程包装器，一个是把容器或 VM 包起来的策略层，另两个是 microVM 运行时。</p>
+
+  <table>
+    <thead>
+      <tr><th>项目</th><th>隔离</th><th>出站默认</th><th>凭据住在哪里</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Anthropic <code>srt</code>（sandbox-runtime）</td>
+        <td>OS 级、不用容器：macOS 上 Seatbelt、Linux 上 bubblewrap、Windows 上一个专用本地用户加 WFP（alpha）</td>
+        <td>拒绝；一个空的 <code>allowedDomains</code> 意味着压根没有网络</td>
+        <td>在真实文件系统上。读取在任何地方都是允许的，直到你写出一份 <code>denyRead</code> 清单</td>
+      </tr>
+      <tr>
+        <td>NVIDIA OpenShell</td>
+        <td>覆在 Docker、Podman 或宿主虚拟化之上的策略层；Kubernetes 用 Helm，而其 CNI 必须强制执行 <code>NetworkPolicy</code></td>
+        <td>每一个出站连接在离开之前都要过一次策略检查</td>
+        <td>在外面。智能体从不看见真实凭据；由一个 provider 只把它们附到获批的端点上</td>
+      </tr>
+      <tr>
+        <td>Docker Sandboxes（<code>sbx</code>）</td>
+        <td>每个智能体一个 microVM，有自己的内核和自己的 Docker daemon</td>
+        <td>经宿主侧网关拒绝；裸 TCP、UDP 与 ICMP（含 DNS）被拦</td>
+        <td>在外面，靠拓扑——只有你挂载的那个工作区会进去，而且挂在同一个绝对路径上</td>
+      </tr>
+      <tr>
+        <td>microsandbox</td>
+        <td>经 libkrun 的 microVM；macOS（Apple Silicon）、开了 KVM 的 Linux、开了 WHP 的 Windows；不需要常驻守护进程</td>
+        <td>按沙箱配置允许的主机与端口</td>
+        <td>在外面。密钥绑定到某个主机，而用项目自己的话说，它们从不进入 VM</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/srt-vs-openshell-vs-docker-sbx-vs-microsandbox/data-feature-matrix.svg" alt="四个项目对「自有内核、出站默认、凭据是否留在沙箱之外、许可证」的矩阵图。出站那一栏每一行都很强；而凭据那一栏有三个不同的答案。" width="900" height="400" loading="lazy" />
+    <figcaption>它们各自最用力的地方。有一栏是齐平的——而这正是它不再构成决定的原因。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>出站这个问题，答案重复了四遍</h2>
+  <p>两年前这就是整份对比，因为那时智能体沙箱出厂带着一条通往互联网的默认路由，而「一个容器」被当作一道网络控制来卖。那个时代结束了。<code>srt</code> 在 Linux 上干脆把网络命名空间拿掉，并把流量逼过宿主侧那些挂在 Unix 套接字上的代理——HTTP 与 HTTPS 走一个 HTTP 代理，其他 TCP 走一个 SOCKS5 代理；一份空白名单意味着没有网络。<code>sbx</code> 把一切都路由过一个宿主网关，拦掉裸 TCP、UDP 与 ICMP（含 DNS），并要你跑一句类似 <code>sbx policy allow network "*.npmjs.org,*.pypi.org,files.pythonhosted.org"</code> 的命令才能让一次构建跑起来。OpenShell 在每个出站连接离开之前都对它做一次策略检查，并且可以在智能体运行期间改动网络规则，而文件系统与进程规则在沙箱创建时就被锁死。microsandbox 按沙箱接收允许的主机与端口。</p>
+  <p>所以如果你的评判标准是「它限制网络吗」，那每个选项都过关，而你什么也没学到。这个问题有用的那个版本更窄，而且它关乎的是匹配器、不是策略：一份域名白名单是对「一个由智能体挑选的名字」做的一次字符串比较。我们稍后会回到这一点，因为这一组里部署最广的那个选项，其两次已公开的失手都是在那里被发现的。</p>
+</section>
+
+<section>
+  <h2>Anthropic srt——你大概已经在跑的那一个</h2>
+  <h3>它到底是什么</h3>
+  <p>Apache-2.0，约 5.5k 星标，被标为「Beta Research Preview」，而 Windows 支持明确标注为 alpha。它是一个 CLI 加一个库——<code>srt "curl example.com"</code> 回你一句 <em>Connection blocked by network allowlist</em>——而它约束的是任意进程、不只是智能体：MCP 服务器与 bash 命令都走同一个包装器。配置就一个文件，<code>~/.srt-settings.json</code>。有意思的工程在于各平台的后端：macOS 上是在 <code>sandbox-exec</code> 之下生成的 Seatbelt profile，Linux 上是去掉了网络命名空间的 bubblewrap，而 Windows 上是一个专用的 <code>srt-sandbox</code> 本地用户，加一道按该账户 SID 建键的 WFP 出站过滤器——所以一个把代理环境变量清掉的进程照样被拦，因为那个环境变量压根就不是那道边界。</p>
+  <p>它与你共用内核，这一点项目方并不掩饰，而对这个威胁模型来说它没听起来那么要紧：智能体跑的代码是你让它写的代码、不是恶意软件。换到的东西是最低的开销，以及这里唯一一个压根不需要虚拟化的选项。</p>
+  <h3>那个读取默认值，以及那两次绕过</h3>
+  <p>文件系统规则被刻意设成了相反的优先级，而这是该读两遍的那一行。写入在任何地方都默认被拒，你用 <code>allowWrite</code> 把它们打开。读取在任何地方都默认被<em>允许</em>，你用 <code>denyRead</code> 把它们关上。README 自己的例子拒的是 <code>~/.ssh</code>——这就告诉你：在你写出那份清单之前，<code>~/.aws</code>、<code>~/.kube/config</code>、你那枚 <code>gh</code> 令牌，以及你那罐浏览器 cookie，对这个被沙箱化的智能体全都是可读的。有一条地板：一组强制拒绝路径即使在一个被允许的目录里面也永远禁写，包括 <code>.bashrc</code>、<code>.gitconfig</code>、<code>.mcp.json</code>、<code>.vscode/</code> 与 <code>.git/hooks/</code>。请注意那条地板护的是什么——它挡住的是智能体去改自己的下一次启动，不是挡住它读你的密钥。</p>
+  <p>接着是失手史，而它是这整份对比里最有用的公开数据。这个网络沙箱已有两次被报告的绕过，而两次都出在主机名匹配器里。CVE-2025-66479：在 v0.0.16 之前，一份未配置的白名单压根没有被强制执行——那个空清单被读成了「全部放行」而不是「全部拒绝」，并在 2025 年 11 月 26 日的一个发布里被修掉。随后是 Aonan Guan 报告的一次空字节注入：形如 <code>attacker-host.com\x00.google.com</code> 的主机名通过了后缀检查，随后被操作系统截断，于是连接去到了攻击者的主机。公开报道把受影响范围定在「沙箱在 Claude Code 2.0.24 正式可用」到 2026 年初的 2.1.8x 系列之间，对究竟是哪个版本修掉的说法不一，并记录说没有为它发布 CVE；那次补丁加了一个 <code>isValidHost()</code> 包装，在匹配器跑起来之前先把空字节、百分号与 CRLF 拒掉。</p>
+  <div class="callout">
+    <p>这两次绕过都不是从 Seatbelt 或 bubblewrap 里逃出来。两次都是代理前面的字符串处理——而两次里攻击者拿到什么，完全是由「这个沙箱读得到什么」决定的，而那恰是这个项目默认敞着的那一项。</p>
+  </div>
+</section>
+
+<section>
+  <h2>NVIDIA OpenShell——唯一一个把凭据当成产品本体的</h2>
+  <h3>一个策略层，不是一个运行时</h3>
+  <p>Apache-2.0，约 15.8k 星标，走在 0.1.x 这条线上，而经由 WSL 2 的 Windows 支持标为实验性。它并不实现隔离；它要求底下有 Docker、Podman 或宿主虚拟化，而它管的是里面跑什么。策略覆盖文件系统路径、出站网络与进程执行，按智能体声明。值得知道的那道分界：文件系统与进程策略在沙箱创建时就被锁死，而网络策略可以在智能体运行期间改动——对一次长会话来说这个方向是对的，而且跟你猜的恰好相反。</p>
+  <p>有两项功能在另外三个那里没有对应物。一个 advisor 和一个 prover 守在策略变更前面，其中 prover 用形式化验证把「授予了危险新访问」的变更标出来——带着凭据去触达一台新主机、调用一个新的 API 方法——并把它扣住等人工评审。而它的执行粒度是按请求、而不是按主机：文档里的例子是放行对 GitHub API 的读取、同时拦掉 POST，而这是一份域名白名单表达不出来的。</p>
+  <h3>providers，以及那份重量</h3>
+  <p>providers 这项功能正是本文那个问题的架构式答案。智能体从不持有真实凭据；OpenShell 只把它们附到「策略已批准的端点」的请求上，别处一概不附。那个沙箱里的一次提示注入没法把令牌带出去，因为压根没有令牌可读；而一个糊涂了的智能体，其爆炸半径就是策略批准的那组端点——而那是一份你写下来过的东西。这与「令牌在盘上、而我拒掉了对一个目录的读取」是性质不同的姿态。</p>
+  <p>代价是重量与新。它比一个包装器多得多的活动部件，Kubernetes 部署要求一个会强制执行 <code>NetworkPolicy</code> 的 CNI，而与它一同发布的那个更大的平台——Open Agent Safety Platform，2026 年 9 月 28 日——把它与 Sentry 配成一对，而 Sentry 跑在 BlueField-4 DPU 上。Sentry 是一个数据中心部件，在笔记本上拿不到，所以请把那份公告里的硬件那一半，读作与「你今天装得上的那个东西」正交。</p>
+</section>
+
+<section>
+  <h2>Docker Sandboxes——最强的边界配上最短的配置</h2>
+  <h3>每个智能体一个 microVM</h3>
+  <p>每个沙箱是一个 microVM，有自己的内核和自己的 Docker daemon——也就是说，一个决定去 <code>docker run</code> 点什么的智能体，碰不到你的 daemon。<code>sbx</code> 是一个独立二进制，而且不需要 Docker Desktop 在跑。Claude Code、Codex、Gemini CLI、Copilot CLI、OpenCode、Kiro 与 Docker 自家的智能体都是开箱支持的。出站是经宿主侧网关的默认拒绝，<code>sbx policy log</code> 会给你看拦掉了什么——这是另外几个都做得不足的一处细节，也是调白名单时最有用的那一项便利——而规则默认按沙箱生效，想覆盖整个机群时有一个全局开关。</p>
+  <p>它的凭据故事是四者中「以最少功夫换到最好结果」的那一个，而它算不上一项功能、更像一个后果：只有你挂载的那个工作区会进到 VM 里去，而且挂在同一个绝对路径上。你的 home 目录干脆就不存在。你靠什么也不做就得到这个，而这恰与 <code>srt</code> 相反——在那里你靠什么也不做得到的是暴露。</p>
+  <h3>那次登录，以及那份许可证</h3>
+  <p>有两件事要计入价钱。CLI 与本地沙箱算力是免费的，商业用途也免费，组织治理走一份付费订阅——但这是一件产品、不是一个开源项目，而且它是这里唯一一个「没有一个你读得到的 Apache-2.0 仓库」的选项。另外，它要求用一个 Docker 账号 <code>sbx login</code> 之后才肯跑一个纯本地的沙箱，而第一次登录还会顺手设下一个默认网络策略。如果你评估这几个东西，是因为你为受监管的工作需要一道可审计的边界，那么「你读不到源码的那一个」是一种与另外三个不同性质的赌注——不管它的隔离有多好。</p>
+</section>
+
+<section>
+  <h2>microsandbox——长成库的那一个</h2>
+  <h3>不带服务器的 microVM</h3>
+  <p>Apache-2.0，约 8.6k 星标，明确是 beta，而且 README 里就这么写着。隔离是经 libkrun 的 microVM，支持 macOS（Apple Silicon）、开了 KVM 的 Linux、开了 WHP 的 Windows。那个有区分度的设计选择是：没有常驻守护进程——SDK 的 <code>create()</code> 会把一个 microVM 作为子进程启起来，而当一次会话需要活得比调用方更久时，沙箱可以被 detach。它有一个 CLI（<code>msb</code>）、TypeScript、Rust、Python、Go 与 Ruby 的 SDK，还有一个 MCP 服务器加若干 Agent Skills，好让一个智能体来驾驶它。</p>
+  <p>这个形状使它成为「沙箱是你自己的代码按任务创建出来的东西、而不是一个开发者拿它包一个 shell」时的天然之选——CI 作业、自托管的 runner、一个会执行模型写的代码的产品功能。它是这四者里你会拿来搭平台的那一个。</p>
+  <h3>绑定到主机的密钥</h3>
+  <p>网络策略是按沙箱配置的允许主机与允许端口，在 SDK 里或在 YAML 里表达。不管你最后采用什么、都值得偷走的那项功能是它的密钥模型：密钥被绑定到一台特定主机，并被描述为「从不进入 VM」。这就是 OpenShell 的 providers 那个想法的小号包装，而它是唯一一个「让一次泄漏的提示词或一个被投毒的依赖拿不走任何东西」的设计决定——因为它本想偷的那样东西，压根从未在那个地址空间里出现过。</p>
+  <p>须注意的几点是诚实的 beta 式须注意——预期会有破坏性变更——以及它的出站姿态被记录成「允许清单」、而不是一句明确的「默认拒绝」保证，所以请在你装的那个版本里去核那个默认值，而不要假定它与 <code>sbx</code> 一致。</p>
+</section>
+
+<section>
+  <h2>真正把它们分开的那条轴</h2>
+  <figure>
+    <img src="/blogs/srt-vs-openshell-vs-docker-sbx-vs-microsandbox/arch-where-the-token-lives.svg" alt="四格图，展示凭据各自坐在哪里：在 srt 下它在真实文件系统上；在 Docker Sandboxes 下它不在 microVM 里；在 OpenShell 下由沙箱之外的一个 provider 持有；在 microsandbox 下绑定到一台主机、从不进入 VM。" width="900" height="500" loading="lazy" />
+    <figcaption>三种机制，一个结果：那个密钥不在智能体运行的那个地址空间里。</figcaption>
+  </figure>
+  <p>把这四种设计并排摆在一个问题上——沙箱里面的一个进程读不读得到一份可用的凭据——它们按三比一分开，而那三个是沿不同路线到达的。Docker Sandboxes 靠拓扑到达：home 目录没有被挂载，所以压根没有东西要拒。OpenShell 靠构造到达：凭据由箱子外面的一个 provider 持有，并在代理处被附到「策略已经批准过」的那些请求上。microsandbox 按目的地到达：密钥绑定到一台主机，而且从不越进 VM。而 <code>srt</code> 只在「你写了那份清单」时才到达。</p>
+  <p>这是该据之挑选的那条轴，因为它是「在其他一切都按设计工作时仍然给损害划界」的那一条。一个在笔记本上的智能体，是被刻意交付了你的凭据的；它不需要逃出任何东西就能使用它们，而这一领域已公开的那些事件，一贯是关于「为错误的理由做出的获授权动作」、而不是关于逃逸。一个里面装着你的令牌的 microVM，是围着一个你已经授权过的动作的一道强边界。</p>
+</section>
+
+<section>
+  <h2>薄弱的那一层是白名单，不是内核</h2>
+  <figure>
+    <img src="/blogs/srt-vs-openshell-vs-docker-sbx-vs-microsandbox/compare-bypass-layer.svg" alt="三栏：隔离层零次被报告的绕过、主机名匹配器两次，而两次的损害都由凭据的可达性决定。" width="900" height="300" loading="lazy" />
+    <figcaption>记录显示失手发生在哪里。而人人都在跑的那份对比，谈的是左边那一栏。</figcaption>
+  </figure>
+  <p>这四者每一个都是靠匹配一个名字来执行网络策略的。这避不开——TLS 意味着目的地是一个主机名、而不是一个你推理得了的 IP——而它意味着这道控制的正确性住在一个解析器里、而不是住在内核里。<code>srt</code> 那两次绕过是现有的证据，而它们都是最平常的那类解析器缺陷：一个边界情形被读反了，以及一个字符上匹配器与解析器意见不一。没有理由认为另外三个在这里结构上更好；只是公开的审视更少——而 <code>srt</code> 之所以拿到了它那份审视，是因为它是跟最常用的编码智能体捆在一起的那一个。</p>
+  <p>有两个实际后果。第一，优先选那个「能表达比主机名更窄的规则」的选项，因为规则越窄、匹配器要扛的就越少——OpenShell 的方法加路径粒度与 microsandbox 的主机加端口，在这里都在干实活。第二，不论你挑哪个，把拒绝记下来。<code>sbx policy log</code> 是那个范本：一份「拦掉了什么」的记录，正是你发现「匹配器与智能体意见不一」的方式，而它也是这些遥测面里唯一一个「不用埋点就读得到」的。</p>
+</section>
+
+<section>
+  <h2>什么情形挑哪个</h2>
+  <table>
+    <thead>
+      <tr><th>情形</th><th>挑</th><th>因为</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>你在跑 Claude Code，今天就想要一道边界</td><td><code>srt</code>，并先写出一份 <code>denyRead</code> 清单</td><td>它已经装好了；而那份清单就是全部价值所在，并且它默认没开</td></tr>
+      <tr><td>一个笔记本机群，策略集中决定</td><td>NVIDIA OpenShell</td><td>providers 把凭据留在机器之外，而 prover 让一次策略变更变得可评审、而不是变成环境里默默就有的东西</td></tr>
+      <tr><td>一个开发者，几个智能体并行，配置要最少</td><td>Docker Sandboxes</td><td>每个智能体自有内核、只挂工作区，还有一份你读得到的策略日志</td></tr>
+      <tr><td>你的产品会执行模型写的代码</td><td>microsandbox</td><td>一个没有守护进程的库、五种语言的 SDK，以及绑定到主机的密钥</td></tr>
+      <tr><td>受监管的工作，需要一道可审计的边界</td><td>OpenShell 或 microsandbox</td><td>你读得到的 Apache-2.0 源码；<code>sbx</code> 的隔离很强但是闭源的，而且它要求一次厂商登录</td></tr>
+      <tr><td>面对的是恶意代码、而不只是未经评审的代码</td><td>一个 microVM，并且重新考虑这个任务</td><td>共用内核的沙箱，对一个铁了心要出来的对手不构成一道边界</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>microVM 真的比 Seatbelt 或 bubblewrap 更好吗？</h3>
+  <p>对付恶意代码，是的，而且很明显——一个独立内核就是一个独立内核。而对一个「跑着你让它写的代码」的编码智能体来说，这个差别大体是理论上的，并且它要你付出启动时间、以及「不用虚拟化就能跑」的能力。买它，是为了那个拓扑上的副作用（home 目录没被挂载）、而不是为了那个内核。</p>
+  <h3>我们已经设了域名白名单。这就算完了吗？</h3>
+  <p>你处理掉了成本与滥用那一件，以及「未获授权动作」那一件的一部分。你没处理掉外泄，因为你的白名单里装着「会接收数据」的主机；你也没处理掉一个匹配器缺陷。把白名单与「一份智能体读不到的凭据」配成一对，剩下的暴露就很小了。</p>
+  <h3>对一个已有的部署，价值最高的那一处改动是什么？</h3>
+  <p>把 <code>denyRead</code> 清单写出来。云与集群配置、SSH 密钥、包仓库令牌、git 凭据助手、浏览器配置档。它是十行 JSON，是那一行给损害划界的配置，而在默认配置里它是缺席的。</p>
+  <h3>OpenShell 需要 NVIDIA 硬件吗？</h3>
+  <p>OpenShell 本身不需要——Linux、macOS（Apple Silicon）或带 WSL 2 的 Windows，再加 Docker、Podman 或宿主虚拟化。而与它一同发布的那个硬件看门狗 Sentry 跑在 BlueField-4 DPU 上，是一个数据中心部件。把它们当成两件产品来看。</p>
+  <h3>这些能用来跑不受信的第三方 MCP 服务器吗？</h3>
+  <p><code>srt</code> 就是明确为这个情形造的，它会像包任何别的进程一样把一个 MCP 服务器包起来。但一个 MCP 服务器是被刻意交付了工具与凭据的，所以同一个结论适用：沙箱给「它够得着什么」划界，而只有一份由中介签发的凭据，才给「它拿已经被交付的东西能做什么」划界。</p>
+  <h3>这份对比里为什么没有基准测试？</h3>
+  <p>因为现有的那些数字量的是启动时间与内存，而没有哪个启动时间数字能为「眼下要做的这个决定」把它们区分开。要紧的那条轴是一个配置默认值，而那是一个你去读、而不是去量的东西。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关：</h3>
+  <ul>
+    <li><a href="/zh/playbooks/coding-and-computer-use-agents/agents-on-developer-workstations">跑在开发者工作站上的智能体</a>——这四者为之存在的那种部署，以及「用户就是 root」如何改变可用的控制集合。</li>
+    <li><a href="/zh/deep-dives/agent-security/credential-delivery-to-the-sandbox">凭据如何投递进沙箱</a>——一开始把一份密钥放进箱子里的那四条通道。</li>
+    <li><a href="/zh/deep-dives/agent-security/sandbox-and-isolation-patterns">沙箱与隔离模式</a>——这四者底下的那些层。</li>
+    <li><a href="/zh/operations/safety-and-security/egress-control-for-agents">智能体的出站控制</a>——为什么一份白名单没法同时服务外泄、未获授权动作与成本这三件事。</li>
+    <li><a href="/zh/operations/safety-and-security/agent-artifacts-on-the-endpoint">端点上的智能体残留物</a>——你正在决定是否要暴露的那个 home 目录里到底有什么。</li>
+    <li><a href="/zh/concepts/credential-lifetime">凭据有效期</a>——为什么那个目录里的令牌值的是数周、而不是一小时。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://github.com/anthropics/sandbox-runtime">anthropics/sandbox-runtime</a>——README、各平台后端、settings schema 与强制拒绝路径</li>
+    <li><a href="https://github.com/NVIDIA/openshell">NVIDIA/OpenShell</a>——策略模型、providers、advisor 与 prover</li>
+    <li><a href="https://docs.docker.com/ai/sandboxes/">Docker Sandboxes 文档</a>——microVM 模型、策略命令与定价</li>
+    <li><a href="https://github.com/microsandbox/microsandbox">microsandbox/microsandbox</a>——libkrun 隔离、各语言 SDK、绑定到主机的密钥</li>
+    <li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-66479">CVE-2025-66479</a>——未配置允许域名时网络沙箱未被强制执行</li>
+  </ul>
+</section>
