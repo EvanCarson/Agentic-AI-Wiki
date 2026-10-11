@@ -1,0 +1,165 @@
+<p class="lede">Every comparison of local agent sandboxes argues about the kernel, and the kernel has never been the thing that failed. All four of these now deny egress by default and make you name domains, so that column decides nothing. What still differs by a factor of everything is whether your GitHub token is reachable from inside the box — three of the four keep it out, by three different mechanisms, and the fourth is the one most people are already running, because it ships with Claude Code and it allows filesystem reads everywhere by default.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>All four run on a developer's own machine. They are not four implementations of one idea: one is an OS-level process wrapper, one is a policy layer that wraps a container or VM, and two are microVM runtimes.</p>
+
+  <table>
+    <thead>
+      <tr><th>Project</th><th>Isolation</th><th>Egress default</th><th>Where the credential lives</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Anthropic <code>srt</code> (sandbox-runtime)</td>
+        <td>OS-level, no container: Seatbelt on macOS, bubblewrap on Linux, a dedicated local user plus WFP on Windows (alpha)</td>
+        <td>Deny; an empty <code>allowedDomains</code> means no network at all</td>
+        <td>On the real filesystem. Reads are allowed everywhere until you write a <code>denyRead</code> list</td>
+      </tr>
+      <tr>
+        <td>NVIDIA OpenShell</td>
+        <td>Policy layer over Docker, Podman or host virtualisation; Helm for Kubernetes, where the CNI must enforce <code>NetworkPolicy</code></td>
+        <td>Every outbound connection passes a policy check before it leaves</td>
+        <td>Outside. Agents never see real credentials; a provider attaches them only to approved endpoints</td>
+      </tr>
+      <tr>
+        <td>Docker Sandboxes (<code>sbx</code>)</td>
+        <td>A microVM per agent with its own kernel and its own Docker daemon</td>
+        <td>Deny through a host-side gateway; raw TCP, UDP and ICMP including DNS are blocked</td>
+        <td>Outside, by topology — only the workspace you mount crosses in, at the same absolute path</td>
+      </tr>
+      <tr>
+        <td>microsandbox</td>
+        <td>microVM via libkrun; macOS on Apple Silicon, Linux with KVM, Windows with WHP; no long-running daemon</td>
+        <td>Allowed hosts and ports, per sandbox</td>
+        <td>Outside. Secrets are scoped to a host and, in the project's words, never enter the VM</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/srt-vs-openshell-vs-docker-sbx-vs-microsandbox/data-feature-matrix.svg" alt="Matrix of the four projects against own kernel, egress default, credential kept outside the sandbox, and licence. The egress column is strong for every row; the credential column has three different answers." width="900" height="400" loading="lazy" />
+    <figcaption>Where they lean hardest. One column is uniform, which is exactly why it has stopped being the decision.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>The egress question has the same answer four times</h2>
+  <p>Two years ago this was the whole comparison, because agent sandboxes shipped with a default route to the internet and a container was sold as a network control. That is over. <code>srt</code> removes the Linux network namespace outright and forces traffic through host-side proxies on Unix sockets, with an HTTP proxy for HTTP and HTTPS and a SOCKS5 proxy for other TCP; an empty allowlist means no network. <code>sbx</code> routes everything through a host gateway, blocks raw TCP, UDP and ICMP including DNS, and makes you run something like <code>sbx policy allow network "*.npmjs.org,*.pypi.org,files.pythonhosted.org"</code> to get a build working. OpenShell checks every outbound connection against a policy before it leaves and can change network rules at run time while filesystem and process rules stay locked at sandbox creation. microsandbox takes allowed hosts and ports per sandbox.</p>
+  <p>So if your evaluation criterion is "does it restrict the network", every option passes and you have learned nothing. The useful version of the question is narrower and it is about the matcher, not the policy: a domain allowlist is a string comparison performed on a name the agent chose. We will come back to that, because it is where both published failures of the most widely deployed option in this set were found.</p>
+</section>
+
+<section>
+  <h2>Anthropic srt — the one you are probably already running</h2>
+  <h3>What it actually is</h3>
+  <p>Apache-2.0, around 5.5k stars, and labelled a Beta Research Preview with Windows support explicitly alpha. It is a CLI and a library — <code>srt "curl example.com"</code> comes back with <em>Connection blocked by network allowlist</em> — and it restricts arbitrary processes, not just agents: MCP servers and bash commands go through the same wrapper. Configuration is one file, <code>~/.srt-settings.json</code>. The interesting engineering is the per-platform backend: generated Seatbelt profiles under <code>sandbox-exec</code> on macOS, bubblewrap with the network namespace removed on Linux, and on Windows a dedicated <code>srt-sandbox</code> local user with a WFP egress filter keyed on that account's SID — so a process that unsets the proxy environment variables is still blocked, because the environment variable was never the boundary.</p>
+  <p>It shares your kernel, which the project does not hide and which matters less than it sounds for this threat model: the code the agent runs is code you asked it to write, not malware. What it buys you for that trade is the lowest overhead and the only option here that needs no virtualisation at all.</p>
+  <h3>The read default, and the two bypasses</h3>
+  <p>The filesystem rules have deliberately opposite precedence, and this is the line to read twice. Writes are denied everywhere by default and you open them with <code>allowWrite</code>. Reads are <em>allowed</em> everywhere by default and you close them with <code>denyRead</code>. The README's own example denies <code>~/.ssh</code> — which tells you that until you write that list, <code>~/.aws</code>, <code>~/.kube/config</code>, your <code>gh</code> token and your browser cookie jar are all readable by the sandboxed agent. There is a floor: a set of mandatory deny paths is always write-blocked even inside an allowed directory, including <code>.bashrc</code>, <code>.gitconfig</code>, <code>.mcp.json</code>, <code>.vscode/</code> and <code>.git/hooks/</code>. Note what that floor protects — it stops the agent editing its own next startup, not reading your secrets.</p>
+  <p>Then the failure history, which is the most useful public data in this whole comparison. Two bypasses of the network sandbox have been reported, and both were in the hostname matcher. CVE-2025-66479: before v0.0.16, an unconfigured allowlist was not enforced at all — the empty list read as allow-everything rather than allow-nothing, fixed in a release on 26 November 2025. Then a null-byte injection reported by Aonan Guan: a hostname of the form <code>attacker-host.com\x00.google.com</code> passed the suffix check and was then truncated by the OS, so the connection went to the attacker's host. Public reporting puts the affected range from the sandbox's general availability in Claude Code 2.0.24 through the 2.1.8x series in early 2026, disagrees on the exact fixed version, and records that no CVE was published for it; the patch added an <code>isValidHost()</code> wrapper rejecting null bytes, percent signs and CRLF before the matcher runs.</p>
+  <div class="callout">
+    <p>Neither bypass was an escape from Seatbelt or bubblewrap. Both were string handling in front of the proxy — and in both cases what the attacker got was decided entirely by what the sandbox could read, which is the default this project leaves open.</p>
+  </div>
+</section>
+
+<section>
+  <h2>NVIDIA OpenShell — the only one that treats the credential as the product</h2>
+  <h3>A policy layer, not a runtime</h3>
+  <p>Apache-2.0, around 15.8k stars, on a 0.1.x line, with Windows support through WSL 2 marked experimental. It does not implement isolation; it requires Docker, Podman or host virtualisation underneath and governs what runs inside. Policy covers filesystem paths, outbound network and process execution, declared per agent. The split worth knowing: filesystem and process policy is locked when the sandbox is created, while network policy can change while the agent is running — which is the right way round for a long session, and the opposite of what you would guess.</p>
+  <p>Two features have no analogue in the other three. An advisor and a prover sit in front of policy changes, with the prover using formal verification to flag a change that grants risky new access — reaching a new host with credentials attached, calling a new API method — and holding it for human review. And the enforcement granularity is per request rather than per host: the documented example is allowing reads against the GitHub API while blocking POSTs, which a domain allowlist cannot express.</p>
+  <h3>Providers, and the weight</h3>
+  <p>The providers feature is the architectural answer to this article's question. Agents never hold real credentials; OpenShell attaches them to requests bound for approved endpoints and nothing else. A prompt injection inside that sandbox cannot exfiltrate a token because there is no token to read, and the blast radius of a confused agent is the set of endpoints the policy approves, which is a thing you wrote down. That is a categorically different posture from "the token is on disk and I denied reads to one directory".</p>
+  <p>The cost is weight and novelty. It is more moving parts than a wrapper, Kubernetes deployment requires a CNI that enforces <code>NetworkPolicy</code>, and the broader platform it was announced with — Open Agent Safety Platform, 28 September 2026 — pairs it with Sentry, a watchdog that runs on BlueField-4 DPUs. Sentry is a datacentre component and is not available on a laptop, so read the hardware half of the announcement as orthogonal to the thing you can install today.</p>
+</section>
+
+<section>
+  <h2>Docker Sandboxes — the strongest boundary and the shortest config</h2>
+  <h3>A microVM per agent</h3>
+  <p>Each sandbox is a microVM with its own kernel and its own Docker daemon, which means an agent that decides to <code>docker run</code> something is not touching your daemon. <code>sbx</code> is a separate binary and does not need Docker Desktop running. Claude Code, Codex, Gemini CLI, Copilot CLI, OpenCode, Kiro and Docker's own agent are supported out of the box. Egress is deny-by-default through a host-side gateway, <code>sbx policy log</code> shows you what was blocked — a detail the others under-serve and the single most useful affordance for tuning an allowlist — and rules scope per sandbox by default, with a global flag when you want the fleet.</p>
+  <p>The credential story is the best of the four for the least effort, and it is not a feature so much as a consequence: only the workspace you mount crosses into the VM, at the same absolute path. Your home directory is simply absent. You get that by doing nothing, which is the opposite of <code>srt</code>, where you get exposure by doing nothing.</p>
+  <h3>The sign-in and the licence</h3>
+  <p>Two things to price in. The CLI and local sandbox compute are free, including for commercial use, with organisation governance on a paid subscription — but this is a product, not an open-source project, and it is the only option here without an Apache-2.0 repository you can read. And it requires <code>sbx login</code> with a Docker account before it will run a purely local sandbox, with the first login also setting a default network policy. If you are evaluating these because you need an auditable boundary for regulated work, the one you cannot read the source of is a different kind of bet from the other three, however good the isolation is.</p>
+</section>
+
+<section>
+  <h2>microsandbox — the library-shaped one</h2>
+  <h3>microVMs without a server</h3>
+  <p>Apache-2.0, around 8.6k stars, explicitly beta and saying so in the README. Isolation is a microVM via libkrun on macOS with Apple Silicon, Linux with KVM and Windows with WHP. The distinguishing design choice is that there is no long-running daemon: the SDK's <code>create()</code> boots a microVM as a child process, and sandboxes can be detached when a session needs to outlive the caller. There is a CLI (<code>msb</code>), SDKs for TypeScript, Rust, Python, Go and Ruby, and an MCP server plus Agent Skills so an agent can drive it.</p>
+  <p>That shape makes it the natural pick when the sandbox is something your own code creates per task rather than something a developer wraps a shell in — CI jobs, self-hosted runners, a product feature that executes model-written code. It is the one of the four you would build a platform on.</p>
+  <h3>Host-scoped secrets</h3>
+  <p>Network policy is allowed hosts and allowed ports per sandbox, expressed in the SDK or in YAML. The feature worth stealing regardless of what you adopt is the secret model: keys are bound to a specific host and described as never entering the VM. That is OpenShell's providers idea in a smaller package, and it is the single design decision that makes a leaked prompt or a poisoned dependency unable to walk off with anything, because the thing it would steal was never in the address space.</p>
+  <p>The caveats are the honest beta ones — expect breaking changes — and that its egress posture is documented as allow-lists rather than as an explicit deny-by-default guarantee, so verify the default in the version you install rather than assuming it matches <code>sbx</code>.</p>
+</section>
+
+<section>
+  <h2>The axis that actually separates them</h2>
+  <figure>
+    <img src="/blogs/srt-vs-openshell-vs-docker-sbx-vs-microsandbox/arch-where-the-token-lives.svg" alt="Four panels showing where the credential sits: on the real filesystem under srt, absent from the microVM under Docker Sandboxes, held by a provider outside the sandbox under OpenShell, and scoped to a host and never entering the VM under microsandbox." width="900" height="500" loading="lazy" />
+    <figcaption>Three mechanisms, one outcome: the secret is not in the address space the agent runs in.</figcaption>
+  </figure>
+  <p>Put the four designs side by side on one question — can a process inside the sandbox read a usable credential — and they split three to one, with the three arriving by different routes. Docker Sandboxes gets there by topology: the home directory is not mounted, so there is nothing to deny. OpenShell gets there by construction: the credential is held by a provider outside the box and attached at the proxy to requests the policy already approved. microsandbox gets there per destination: the secret is bound to a host and never crosses into the VM. <code>srt</code> gets there only if you wrote the list.</p>
+  <p>This is the axis to pick on because it is the one that bounds the damage when everything else works as designed. An agent on a laptop was handed your credentials on purpose; it did not need to escape anything to use them, and the published incidents in this space are consistently about authorised actions taken for the wrong reason rather than about escapes. A microVM with your token inside it is a strong boundary around an action you already authorised.</p>
+</section>
+
+<section>
+  <h2>The allowlist is the weak layer, not the kernel</h2>
+  <figure>
+    <img src="/blogs/srt-vs-openshell-vs-docker-sbx-vs-microsandbox/compare-bypass-layer.svg" alt="Three columns: zero reported bypasses in the isolation layer, two in the hostname matcher, and credential reachability deciding the damage in both cases." width="900" height="300" loading="lazy" />
+    <figcaption>Where the record says the failures were. The comparison everyone runs is about the left column.</figcaption>
+  </figure>
+  <p>Every one of these four enforces network policy by matching a name. That is unavoidable — TLS means the destination is a hostname, not an IP you can reason about — and it means the control's correctness lives in a parser rather than in the kernel. The two <code>srt</code> bypasses are the available evidence, and they are both parser bugs of the most ordinary kind: a boundary case read the wrong way, and a character the matcher and the resolver disagreed about. There is no reason to think the other three are structurally better here; there is only less public scrutiny, and <code>srt</code> got its scrutiny by being the one bundled with the most-used coding agent.</p>
+  <p>Two practical consequences. First, prefer the option that can express a narrower rule than a hostname, because the narrower the rule the less the matcher has to carry — OpenShell's method-and-path granularity and microsandbox's host-plus-port are both doing real work here. Second, log the denials, whichever you pick. <code>sbx policy log</code> is the model: a record of what was blocked is how you find out that the matcher and the agent disagree, and it is the only one of these telemetry surfaces you can read without instrumenting anything.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>You run Claude Code and want a boundary today</td><td><code>srt</code>, with a <code>denyRead</code> list written first</td><td>It is already installed; the list is the whole value and it is not on by default</td></tr>
+      <tr><td>A fleet of laptops, policy decided centrally</td><td>NVIDIA OpenShell</td><td>Providers keep credentials off the machine, and the prover makes a policy change reviewable rather than ambient</td></tr>
+      <tr><td>One developer, several agents in parallel, minimum config</td><td>Docker Sandboxes</td><td>Own kernel per agent, workspace-only mount, and a policy log you can read</td></tr>
+      <tr><td>Your product executes model-written code</td><td>microsandbox</td><td>A library with no daemon, SDKs in five languages, and host-scoped secrets</td></tr>
+      <tr><td>Regulated work needing an auditable boundary</td><td>OpenShell or microsandbox</td><td>Apache-2.0 source you can read; <code>sbx</code>'s isolation is strong but closed, and it requires a vendor sign-in</td></tr>
+      <tr><td>Hostile code, not just unreviewed code</td><td>A microVM, and reconsider the task</td><td>Shared-kernel sandboxes are not a boundary against an adversary who wants out</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Is a microVM actually better than Seatbelt or bubblewrap?</h3>
+  <p>Against hostile code, yes, clearly — a separate kernel is a separate kernel. For a coding agent running code you asked it to write, the difference is mostly theoretical, and it costs you boot time and the ability to run with no virtualisation. Buy it for the topology side effect (the home directory is not mounted) rather than for the kernel.</p>
+  <h3>We already set a domain allowlist. Are we done?</h3>
+  <p>You have handled the cost and abuse case and part of the unsanctioned-action case. You have not handled exfiltration, because the allowlist contains hosts that accept data, and you have not handled a matcher bug. Pair the allowlist with a credential the agent cannot read and the remaining exposure is small.</p>
+  <h3>What is the single highest-value change for an existing deployment?</h3>
+  <p>Write the <code>denyRead</code> list. Cloud and cluster config, SSH keys, registry tokens, the git credential helper, browser profiles. It is ten lines of JSON, it is the one line of configuration that bounds the damage, and in the default configuration it is absent.</p>
+  <h3>Does OpenShell need NVIDIA hardware?</h3>
+  <p>OpenShell itself does not — Linux, macOS on Apple Silicon or Windows with WSL 2, plus Docker, Podman or host virtualisation. Sentry, the hardware watchdog announced alongside it, runs on BlueField-4 DPUs and is a datacentre component. Treat them as two products.</p>
+  <h3>Can I use these for untrusted third-party MCP servers?</h3>
+  <p><code>srt</code> is explicitly built for that case and will wrap an MCP server like any other process. But an MCP server is given tools and credentials on purpose, so the same conclusion applies: the sandbox bounds what it can reach, and only a brokered credential bounds what it can do with what it was given.</p>
+  <h3>Why is there no benchmark in this comparison?</h3>
+  <p>Because the numbers that exist measure boot time and memory, and no boot-time figure distinguishes these for the decision being made. The axis that matters is a configuration default, which is a thing you read rather than a thing you measure.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/playbooks/coding-and-computer-use-agents/agents-on-developer-workstations">Agents on developer workstations</a> — the deployment these four exist for, and why the user being root changes the control set.</li>
+    <li><a href="/deep-dives/agent-security/credential-delivery-to-the-sandbox">Credential delivery to the sandbox</a> — the four channels that put a secret inside the box in the first place.</li>
+    <li><a href="/deep-dives/agent-security/sandbox-and-isolation-patterns">Sandbox and isolation patterns</a> — the layers underneath all four of these.</li>
+    <li><a href="/operations/safety-and-security/egress-control-for-agents">Egress control for agents</a> — why one allowlist cannot serve exfiltration, unsanctioned action and cost at once.</li>
+    <li><a href="/operations/safety-and-security/agent-artifacts-on-the-endpoint">Agent artifacts on the endpoint</a> — what is in the home directory you are deciding whether to expose.</li>
+    <li><a href="/concepts/credential-lifetime">Credential lifetime</a> — why the token in that directory is worth weeks, not an hour.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://github.com/anthropics/sandbox-runtime">anthropics/sandbox-runtime</a> — README, platform backends, settings schema and mandatory deny paths</li>
+    <li><a href="https://github.com/NVIDIA/openshell">NVIDIA/OpenShell</a> — policy model, providers, advisor and prover</li>
+    <li><a href="https://docs.docker.com/ai/sandboxes/">Docker Sandboxes documentation</a> — microVM model, policy commands and pricing</li>
+    <li><a href="https://github.com/microsandbox/microsandbox">microsandbox/microsandbox</a> — libkrun isolation, SDKs, host-scoped secrets</li>
+    <li><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-66479">CVE-2025-66479</a> — network sandbox not enforced when no allowed domains were configured</li>
+  </ul>
+</section>
