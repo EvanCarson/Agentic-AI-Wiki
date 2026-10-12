@@ -24,8 +24,8 @@ const entry: ChangelogEntry = {
       '实战手册 · 领域——评分与考核智能体：成绩是一份可被申诉的记录，所以智能体绝不该吐出的那个数字，正是最终落到成绩单上的那个。请交付绑定到提交稿具体段落的按评分项结论，让分数仍可归因到某个人，并按分层计算对「双评并经裁定分数」的二次加权 kappa 而不是准确率——已报告的大模型一致性落在 0.6–0.8 区间，而很高的 kappa 可能只说明智能体学到了评分者的偏差——并且请拒绝那个作弊检测器：七款检测器在 ChatGPT 问世前写成的 TOEFL 作文上平均误报率 61.3%，而一句改写提示就把检测率压到约 3%。',
     ),
     L(
-      'Operations · Economics & ROI — Energy & Carbon per Run: the same median text prompt is 0.10 Wh, 0.24 Wh or 14.6 Wh depending on whose boundary you use, and every public figure was measured on a single chatbot turn that an agent multiplies by ten to forty. Report watt-hours per completed task with the boundary stated, build the estimate from tokens-per-run in your own traces divided by the success rate, show location-based and market-based carbon side by side, and note that the top four levers all attack the multiplier while choosing a smaller model comes last.',
-      '运维 · 经济性与投资回报——每次运行的能耗与碳排：同一条中位数文本提示，按不同人的边界算是 0.10 Wh、0.24 Wh 或 14.6 Wh，而所有公开数字量的都是单轮聊天，智能体会把它乘上十到四十倍。请以「每个已完成任务多少瓦时」汇报并把边界写明，用你自己追踪里的每次运行词元数除以成功率来搭这个估算，把基于地点与基于市场的碳排并排给出，并注意：排在最前面的四根杠杆打的都是那个乘数，而「换个更小的模型」排在最后。',
+      'Operations · Economics & ROI — Energy & Carbon per Run: published figures for one text prompt run from 0.10 Wh to 14.6 Wh — one paper alone puts the same median prompt at 0.10 Wh for active accelerators and 0.24 Wh for the serving stack around them — and every public figure was measured on a single chatbot turn that an agent multiplies by ten to forty. Report watt-hours per completed task with the boundary stated, build the estimate from tokens-per-run in your own traces divided by the success rate, show location-based and market-based carbon side by side, and note that the top four levers all attack the multiplier while choosing a smaller model comes last.',
+      '运维 · 经济性与投资回报——每次运行的能耗与碳排：已发布的、针对单条文本提示的能耗数字从 0.10 Wh 铺到 14.6 Wh——仅同一篇论文就把同一条中位数提示算成「只数活跃加速器 0.10 Wh、把周围服务栈数进来 0.24 Wh」——而所有公开数字量的都是单轮聊天，智能体会把它乘上十到四十倍。请以「每个已完成任务多少瓦时」汇报并把边界写明，用你自己追踪里的每次运行词元数除以成功率来搭这个估算，把基于地点与基于市场的碳排并排给出，并注意：排在最前面的四根杠杆打的都是那个乘数，而「换个更小的模型」排在最后。',
     ),
   ],
 };
