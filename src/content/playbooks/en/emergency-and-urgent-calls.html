@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">V21</div>
+  <div class="week">Playbook · Voice &amp; Realtime Agents</div>
+  <h2>When the call is an emergency: the one path the model must not own.</h2>
+  <p class="goal">Nobody is going to hand you a compliance checklist for "the agent answered a call from someone in danger" — no standard requires a voice agent to route a crisis call anywhere in particular, and that absence is exactly why teams ship without a path at all. Two obligations did arrive with your phone system the moment it went in, and they attach to the telephone system rather than to whoever answers it. Everything else is yours to design, and the design that survives puts the detector <em>below</em> the model in the audio stack, because the caller who needs a human most often says so while the agent is mid-sentence, and a model that is mid-turn cannot act.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Two obligations you already have, and who they attach to.</h3>
+
+    <p>Start here because it is the only part of this page with a rulebook, and because teams routinely assume it is somebody else's problem. In the United States, a multi-line telephone system — which is what your PBX, your cloud contact-centre tenant and the SIP trunk your agent sits on collectively are — carries two federal requirements, and neither mentions who or what answers inbound calls.</p>
+
+    <ul>
+      <li><strong>Kari's Law: direct dialing and on-site notification.</strong> A user must be able to reach 911 by dialing 911, with no prefix and no access code, and the system must notify someone on-site — a front desk, a security office, a designated contact — when that happens. The FCC adopted the implementing rules in August 2019; they apply to MLTS manufactured, imported, offered for first sale or lease, first sold or leased, or installed after 16 February 2020, which covers essentially any voice stack built since.</li>
+      <li><strong>RAY BAUM's Act section 506: dispatchable location.</strong> A 911 call must convey the caller's dispatchable location — defined as the street address plus additional information such as room number or floor number sufficient to identify where the caller is. The deadlines have long passed: on-premises fixed devices from 6 January 2021, on-premises non-fixed devices from 6 January 2022 where technically feasible.</li>
+    </ul>
+
+    <p>Read the implication rather than the text. These rules are about the <em>system</em>, so adding an agent does not create a new obligation and does not discharge an existing one — but an agent changes the failure modes dramatically. A caller who dials your main line and gets an agent is not making a 911 call, so the rules above are not directly in play; the moment your flow offers to connect anyone to emergency services, or your deployment is on-premises where a handset shares the trunk, you are inside them. And a stack that routes outbound calls through a model-driven orchestrator can silently break direct dialing, because an orchestrator that normalises dialled strings is exactly the kind of component that eats a three-digit number.</p>
+
+    <div class="callout">
+      <p>Two concrete audits worth doing this week, independent of anything else on this page: dial 911 from a device on the same system in a test window coordinated with your local PSAP or via your provider's test number, and confirm that the on-site notification actually arrived somewhere a human reads. Both fail more often than anyone expects, and both fail silently.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The detector belongs below the model, not inside it.</h3>
+
+    <p>This is the architectural decision that determines whether the rest works, and most designs get it wrong by putting emergency handling in the prompt or in a tool the model may choose to call.</p>
+
+    <p>Consider the actual timing. The agent is three seconds into reading a menu or a confirmation. The caller interrupts: "there's smoke coming from the back room". In a cascade stack the partial transcript exists in the ASR stream immediately; in a speech-to-speech stack the audio is already in the model's input. In both cases the model is mid-generation and will finish its turn before it reasons about anything, and if <a class="xref" href="/playbooks/voice-realtime-agents/turn-taking-and-barge-in">barge-in</a> is tuned conservatively to avoid false interruptions, it may not even register the utterance as a turn. Every millisecond of that is a millisecond where a deterministic matcher on the partial transcript could already have torn down the agent and dialled out.</p>
+
+    <pre class="standalone"><span class="c-cm"># two places the detector can live</span>
+
+  model-owned                  pipeline-owned
+  ------------                 --------------
+  prompt says "if emergency,   matcher runs on every partial
+  call transfer_urgent()"      ASR hypothesis, always
+
+  fires: after the turn        fires: mid-utterance, &lt;300 ms
+  depends on: model available  depends on: ASR available
+  fails when: context is full, fails when: ASR is down
+    tool list changed, model     (and then the call is dead
+    is mid-generation, the       anyway, so the dependency
+    router picked a smaller      is one you already have)
+    model, a guardrail ate it
+
+<span class="c-cm"># the right answer is BOTH, with the pipeline one load-bearing.</span></pre>
+
+    <p>So: run a deterministic classifier over every partial ASR hypothesis, in the media path, with authority to pre-empt the agent. Keep the model-side tool as well — it catches the paraphrases a matcher misses — but never let it be the only route. A tool call is a request the model makes when it is healthy and attentive; an emergency is the case where you cannot assume either. This is the same reasoning that makes a <a class="xref" href="/operations/agentops/kill-switches">kill switch</a> something outside the thing it stops.</p>
+
+    <p>A speech-to-speech deployment needs a second ASR stream for exactly this reason, and teams resist the cost. It is the cheapest insurance on the page: a small streaming recogniser whose only job is to watch for a short list of phrase patterns, never used for the conversation itself.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What "deterministic route" actually means, end to end.</h3>
+
+    <p>Deterministic does not mean keyword-only. It means every link in the chain behaves the same way on every invocation, and no link asks a model for permission.</p>
+
+    <ul>
+      <li><strong>Trigger set, versioned and reviewed like code.</strong> Explicit phrases ("call 911", "ambulance", "I'm having a heart attack"), indirect ones ("I can't breathe", "he's not waking up", "there's a fire"), and the caller's own request to stop talking to a machine. Keep it in a reviewed file with owners, not in a prompt. Expect it to be imperfect — its job is coverage of the common cases at a threshold you deliberately set too low.</li>
+      <li><strong>A DTMF escape that works before and during any prompt.</strong> One key, announced early, documented, and handled in the telephony layer so it works even if the agent process has stopped responding. This is also the only path available to a caller who cannot speak, which is a population that overlaps heavily with emergencies.</li>
+      <li><strong>Pre-empt, do not negotiate.</strong> On trigger, stop TTS immediately, stop generation, and move. Do not confirm ("just to check, is this an emergency?"), do not summarise, do not ask for an account number. Confirmation costs seconds and risks a caller who has put the phone down to deal with the thing they called about.</li>
+      <li><strong>No queue, ever.</strong> The emergency route must terminate at something that answers: a dedicated DID, an on-call group with a cascade, or the PSTN. If your only human path is a queue with a wait, the emergency route is not a route.</li>
+      <li><strong>A terminal announcement if everything else fails.</strong> If no human and no transfer is available, the agent's last act is a fixed recorded line — "please hang up and dial 911" — and then it stays on the line rather than dropping. Silence followed by a dropped call is the worst outcome available, and it is the default one when an orchestrator crashes. Make the <a class="xref" href="/concepts/fail-closed-and-fail-open">failure direction</a> an explicit choice rather than an accident of which process died.</li>
+    </ul>
+
+    <p>Write the whole chain down as a sequence with a timing budget, the way you would a <a class="xref" href="/playbooks/voice-realtime-agents/latency-budget">latency budget</a>, and then test it by triggering it rather than by reading it. A route nobody has fired is a route that does not exist.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The transfer, and the three ways it fails.</h3>
+
+    <p>Normal escalation design favours a warm transfer: the agent summarises, the human arrives briefed, the caller does not repeat themselves. That is correct for a billing dispute and wrong here, and the reason is worth stating precisely — a warm transfer adds a consult leg, a hold, and a dependency on the receiving party answering before the caller is connected to anything.</p>
+
+    <ul>
+      <li><strong>It fails slowly.</strong> A warm transfer that takes eight seconds to broker is eight seconds of a caller hearing hold treatment during an emergency. Use a blind transfer and push the context out of band — a webhook, a screen pop, an SMS to the on-call phone — so the human gets the summary without the caller waiting for it. <a class="xref" href="/playbooks/voice-realtime-agents/escalation-and-warm-transfer">Warm transfer</a> is the default for everything else and the exception here.</li>
+      <li><strong>It fails on the receiving end.</strong> Nobody picks up; the group's phones are in do-not-disturb; the shift changed. The emergency route needs a cascade with a timeout measured in a few rings, and a final fallback that is not another human.</li>
+      <li><strong>It fails by losing the caller.</strong> A transfer that drops the leg, or that hands over without media, ends the call. Instrument the transfer itself: attempted, connected, dropped — and alert on any drop in this class immediately rather than in a daily report.</li>
+    </ul>
+
+    <p>Attach whatever location and identity you already hold, and resist the urge to collect more. If the caller is an authenticated account holder, the service address you have on file is more reliable than anything you will extract from a frightened person in ten seconds, and it is already structured. If they are not authenticated, do not run <a class="xref" href="/playbooks/voice-realtime-agents/caller-authentication">caller authentication</a> first — an identity check in front of an emergency route is a gate on the one call that must not have one.</p>
+
+    <div class="callout">
+      <p>If your agent runs on behalf of a business with physical premises — a clinic, a restaurant, a utility, a building manager — the single highest-value field to attach is the premises address, not the caller's. Most urgent inbound calls to that class of business are about the premises, and you already know where it is.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Evaluate it asymmetrically, because the costs are asymmetric.</h3>
+
+    <p>Every other intent in your agent is scored on a balance of precision and recall. This one is not, and treating it like the rest is how a threshold tuned for a clean dashboard silently raises the miss rate.</p>
+
+    <p>A false positive costs one unnecessary transfer and a mildly confused human. A false negative costs an unbounded amount and is the only outcome in your whole system that cannot be retried. So fix the miss rate first and accept whatever precision falls out.</p>
+
+    <ul>
+      <li><strong>Build a labelled set from real audio, not from generated phrases.</strong> A hundred emergency and near-emergency utterances pulled from recordings, labelled by a human, plus two hundred hard negatives — the angry caller, the hypothetical ("what if there was a fire?"), the idiom ("I'm dying to get this sorted"). Generated test phrases over-represent explicit wording and will flatter your detector badly.</li>
+      <li><strong>Report recall at a fixed operating point, with the false-positive rate as the consequence.</strong> "Recall 0.97 at 4% false positives on hard negatives" is a decision. "F1 of 0.91" is a number that hides which error you chose.</li>
+      <li><strong>Include the populations that break detectors.</strong> Non-native and accented speech, code-switching, the caller who is whispering, the caller who is crying, the caller who says nothing at all. If your service is <a class="xref" href="/playbooks/voice-realtime-agents/multilingual-voice-agents">multilingual</a>, the trigger set and its evaluation are per-language work, not a translation of an English list.</li>
+      <li><strong>Test the route, not just the classifier.</strong> Once a week, fire a synthetic emergency call end to end in production and assert that a human answered within your budget. A detector with perfect recall into a broken transfer scores zero, and only an end-to-end probe catches that. This belongs with your other <a class="xref" href="/operations/agentops/fault-injection-for-agents">fault-injection</a> drills.</li>
+      <li><strong>Review every miss by hand, forever.</strong> There will be few enough of them that a human can read all of them, which is not true of any other failure class you have. Each one either extends the trigger set or exposes a route defect.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to refuse to build, and what to watch once it is live.</h3>
+
+    <p>The strongest thing on this page is a boundary. Several features that sound responsible are worse than the gap they claim to fill, and a design review is the cheapest place to kill them.</p>
+
+    <ul>
+      <li><strong>Refuse triage.</strong> An agent that assesses severity — "is this a 911 situation or can it wait?" — is doing clinical or safety judgement with a language model, on the one call where being wrong is unrecoverable. Recognise and route; do not grade. The same logic applies to anything that reads like dispatch advice.</li>
+      <li><strong>Refuse instructions.</strong> No CPR guidance, no "stay calm and check whether he is breathing", no first aid. A trained dispatcher does this with protocol cards and a recorded line; your agent has neither, and the liability is not theoretical. Say the one fixed sentence and get out of the way.</li>
+      <li><strong>Refuse to be the crisis line.</strong> If a caller discloses self-harm risk, the route is a human and, where relevant, the established crisis service — in the US, 988, which carriers are separately required to georoute by geographic area rather than by area code, nationwide wireless providers since January 2025 and the remainder by December 2026. Note what that rule is and is not: it governs how a carrier routes a call <em>to</em> 988, and says nothing about your agent's obligations. Your obligation is to not be in the middle of it.</li>
+      <li><strong>Refuse to let the agent hang up on this class of call.</strong> Whatever your normal end-of-call logic is, exclude the emergency path from it. A hangup here is indistinguishable from an abandonment and is the thing that will appear in a transcript read aloud to a regulator.</li>
+      <li><strong>Refuse to let the recording policy be an afterthought.</strong> These calls contain health and safety disclosures from people who had no time to consider a consent notice. Shorten retention for this class, restrict access, and redact aggressively — <a class="xref" href="/playbooks/voice-realtime-agents/recording-consent-and-redaction">recording, consent and redaction</a> covers the mechanics; what changes here is that the default should be the tightest setting you have, not the one that helps your eval set.</li>
+    </ul>
+
+    <p>Operationally, four numbers belong on a dashboard someone actually looks at, and they are all about the route rather than the conversation: emergency-route triggers per thousand calls, time from trigger to a human answering (p50 and p95), transfer failures in this class as an absolute count, and misses found in review. Watch the first for a step change after any prompt or model change, and treat a sustained zero as a broken detector rather than as a quiet month.</p>
+
+    <div class="callout tip">
+      <p>If you do one thing: add a pipeline-level matcher on partial ASR with authority to pre-empt the agent, wire it to a blind transfer with a fixed recorded fallback, and schedule a weekly synthetic emergency call that asserts a human answered. That is a few days of work and it converts the worst failure your voice agent can have from unbounded to measured. Everything else here — the trigger set, the labelled evaluation, the retention policy — improves a route that exists; this is what makes one exist. Related: <a class="xref" href="/playbooks/voice-realtime-agents/voice-failure-modes">voice failure modes</a> for the rest of the taxonomy, <a class="xref" href="/playbooks/voice-realtime-agents/accessible-voice-agents">accessible voice agents</a> for the callers whose only route is the DTMF escape, and <a class="xref" href="/playbooks/domain-playbooks/healthcare-agents">healthcare agents</a> for the clinical boundary this page refuses to cross.</p>
+    </div>
+  </div>
+</section>

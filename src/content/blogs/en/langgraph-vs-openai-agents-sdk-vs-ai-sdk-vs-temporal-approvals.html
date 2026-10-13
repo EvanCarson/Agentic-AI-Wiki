@@ -1,0 +1,155 @@
+<p class="lede">All four of these pause an agent before a risky tool call and wait for a human, and the APIs look close enough that teams pick on taste. They should pick on one axis: <strong>where the pending approval is stored, and what re-executes when it resumes.</strong> LangGraph's documented behaviour is to re-enter the node at its first line — so a write that happened before the pause happens twice. Temporal continues at the statement after the wait. The two SDKs sit between them and hand you the persistence problem. Choose wrong and the bug you ship is a duplicate side effect you will not see in a test, because in a test nobody takes nine minutes to click approve.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>One sentence orients the whole table: an approval is a durable wait, and a durable wait needs a place to live. These four pick four different places.</p>
+
+  <table>
+    <thead>
+      <tr><th>Framework</th><th>Where the pause lives</th><th>What resume re-executes</th><th>Who owns the clock</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>LangGraph <code>interrupt()</code></td>
+        <td>A checkpointer you run, keyed by thread ID</td>
+        <td>The whole node, from its first line</td>
+        <td>You — nothing built in</td>
+      </tr>
+      <tr>
+        <td>OpenAI Agents SDK <code>needs_approval</code></td>
+        <td>A serialisable run state you persist yourself</td>
+        <td>The paused tool call</td>
+        <td>You — nothing built in</td>
+      </tr>
+      <tr>
+        <td>Vercel AI SDK tool approval</td>
+        <td>The UI message history, in the browser</td>
+        <td>The tool call, on the next request</td>
+        <td>The user's tab</td>
+      </tr>
+      <tr>
+        <td>Temporal signal + wait condition</td>
+        <td>The cluster's workflow history</td>
+        <td>Nothing — the next statement runs</td>
+        <td>The engine, via a durable timer</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/langgraph-vs-openai-agents-sdk-vs-ai-sdk-vs-temporal-approvals/compare-where-the-pause-lives.svg" alt="Four columns showing where each framework stores a pending approval: a checkpointer you run, a serialisable run state you persist, the browser's message history, and the cluster's workflow history." width="900" height="300" loading="lazy" />
+    <figcaption>Durability rises left to right, and so does what you have to operate.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/langgraph-vs-openai-agents-sdk-vs-ai-sdk-vs-temporal-approvals/data-approval-matrix.svg" alt="Feature matrix of four frameworks against four axes: pause survives a restart, resume is exact, timeout is built in, and the approval channel is decoupled from the UI." width="900" height="400" loading="lazy" />
+    <figcaption>Where each one leans hardest. The timeout column is weak almost everywhere, and that is not an accident.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>LangGraph: durable, graph-native, and it replays the node</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-openai-agents-sdk-vs-ai-sdk-vs-temporal-approvals/arch-node-replay.svg" alt="Two lanes compared: whole-node replay re-runs a write that happened before the pause, while an exactly-resumed model continues at the statement after the wait." width="900" height="500" loading="lazy" />
+    <figcaption>The dashed arrow is the part that costs money. It is documented behaviour, not a bug.</figcaption>
+  </figure>
+  <h3>How it works</h3>
+  <p>Calling <code>interrupt()</code> inside a node stops the graph and surfaces a JSON-serialisable payload to the caller. It requires a checkpointer and a thread ID in the config — without persistence there is nothing to resume from. You resume by invoking the graph again with <code>Command(resume=value)</code>, and that value becomes the return value of the <code>interrupt()</code> call. Because the pause is a checkpoint row, the approval can arrive from anywhere that can reach your database: a Slack action, an email link, a back-office queue, a different process entirely.</p>
+  <h3>The replay semantics, which are the thing to internalise</h3>
+  <p>The documentation is explicit that execution starts at the <em>beginning of the node</em> on resume. It does not jump back into the middle of the function at the line after <code>interrupt()</code> — it re-runs the node from its first statement, with the interrupt call now returning the human's value instead of pausing. Everything above that line therefore executes a second time. A node that logs an audit row, charges a card, posts a message or increments a counter before pausing does all of it twice.</p>
+  <p>The guidance that follows from this is to put irreversible actions <em>after</em> the interrupt, or make them idempotent — upserts rather than inserts — or to wrap externally visible operations in a persisted task so the stored result is returned on resume instead of the operation re-running. All three are correct and all three are conventions rather than guarantees, which means the rule lives in code review. There is also a reported sharp edge for multi-interrupt nodes: a node containing two interrupts can re-run after only one of them is resumed. Time-travel replay has the same property by design — rewinding to a checkpoint re-executes the nodes after it, model calls and API requests included.</p>
+  <h3>Where it is the right answer</h3>
+  <p>When the agent is already a graph, the approval is one node among many, and you want the decision to be deliverable from outside the request that started the run. That last property is genuinely valuable and the two SDKs below make it harder.</p>
+</section>
+
+<section>
+  <h2>OpenAI Agents SDK: the cleanest model, and you own the storage</h2>
+  <h3>How it works</h3>
+  <p>A tool declares <code>needs_approval</code> — a boolean, or a function that receives the run context, the arguments and the call ID, so the gate can depend on the amount being transferred rather than on the tool's identity. When it fires, the run stops and the pending calls appear as approval items in the result's interruptions. You call approve or reject on the run state and hand the state back to the runner. Partial approval works: resolve one item, leave another pending, and the run continues as far as it can.</p>
+  <p>The argument-aware gate is the best thing in this comparison. "Approve <code>transfer</code> when the amount exceeds a threshold" is a policy; "approve <code>transfer</code>" is a tool name. The others can reach the same place, but only this one puts the predicate where the tool is defined.</p>
+  <h3>The catch</h3>
+  <p>Persistence is yours. The run state is serialisable — it converts to JSON and back — and nothing stores it for you. That is a defensible design, and it means every production deployment writes the same three things: a table of pending approvals, a writer that saves state at the pause, and a reaper that decides what happens to a row nobody touched. If you skip the third, your answer to silence is "the row sits there forever", which is a policy you chose by not choosing.</p>
+  <p>Treat the serialised state as a resumable capability and store it accordingly. A blob that will re-issue a tool call when replayed is not a log line; anyone who can write to that table can change what gets executed on resume.</p>
+</section>
+
+<section>
+  <h2>Vercel AI SDK: the pause is a message, and the tab is the database</h2>
+  <h3>How it works</h3>
+  <p>Mark the tool; when the model calls it, the call surfaces in the UI message stream as a tool part in an approval-requested state, and the client renders approve and deny buttons and responds through the chat hook's approval function. In AI SDK 6 the flag is <code>needsApproval</code> on the tool. In AI SDK 7 it moved to a <code>toolApproval</code> setting on <code>generateText</code>, <code>streamText</code> and <code>ToolLoopAgent</code>, taking <code>'approved'</code>, <code>'denied'</code> or <code>'user-approval'</code>; the old per-tool flag is deprecated but still honoured, and the migration guide maps a boolean <code>needsApproval: true</code> onto <code>toolApproval: { myTool: 'user-approval' }</code>.</p>
+  <p>This is by far the fastest of the four to ship, and for a chat product where a human is already watching the stream, it is the right shape. The approval round trip is just the next request.</p>
+  <h3>Three sharp edges</h3>
+  <p>First, the pause is not durable in any useful sense: it lives in the message history the client holds. Close the tab and the pending approval is gone, which is fine for "shall I send this email?" and not fine for anything a reviewer was supposed to look at tomorrow.</p>
+  <p>Second, the resume has to be wired. The documented pattern pairs the approval response with an automatic send condition so the conversation continues once every approval is resolved; without it there are reports of a parallel auto-executing tool leaving an orphaned tool-use block and the provider rejecting the next message outright. That is the sort of bug that appears only when one tool needs approval and another does not.</p>
+  <p>Third, and this is the one worth a design-review veto: with a function-form <code>toolApproval</code>, returning <code>undefined</code> for a tool the function does not recognise runs that tool <em>without</em> approval. A function written as a switch over known tools therefore fails open the moment someone adds a tool and forgets the case. If you use the function form, return an explicit <code>'user-approval'</code> for anything you do not recognise — the general version of this rule is <a href="/concepts/fail-closed-and-fail-open">that a gate must fail closed</a>, and a per-tool opt-in is a gate whose default is "no gate".</p>
+</section>
+
+<section>
+  <h2>Temporal: the only one where waiting is the native operation</h2>
+  <h3>How it works</h3>
+  <p>The approval pattern is a blocking wait with a timeout — <code>workflow.wait_condition()</code> in Python, <code>condition()</code> in TypeScript, <code>Workflow.await()</code> in Java, <code>AwaitWithTimeout()</code> in Go — and the human's decision arrives as a signal that sets the flag the condition is waiting on. If the timer expires first, the workflow unblocks on the timeout branch. The durable timer is persisted in the server's database and survives worker restarts, deployments and infrastructure moves, so a nine-day approval is not architecturally different from a nine-second one.</p>
+  <p>Because the event history is deterministic and single-threaded, a signal and a timer cannot actually race: a late signal arrives after the timeout has already returned, and the ordering is reproducible rather than lucky. Use an update instead of a signal when the decision can be rejected by business rules and the person should learn that in the same click; use the updatable-timer pattern when the deadline itself moves.</p>
+  <h3>The cost, stated honestly</h3>
+  <p>You are running a cluster and writing workflow code under determinism constraints — no clock reads, no random values, no direct I/O outside activities. For a team that already runs Temporal this is free; for a team that does not, adopting it to get human approvals is a large bill for one feature, and the honest comparison is against a checkpointer plus a reaper, not against nothing.</p>
+  <p>What you buy is the one property the other three cannot give you cheaply: resume is exact. No node replays, no idempotency convention to maintain, no second audit row. If your approvals gate operations that are expensive or irreversible — and that is usually why they exist — that property is the feature.</p>
+</section>
+
+<section>
+  <h2>Cross-cutting: three things none of them solve</h2>
+  <h3>Silence has no default anywhere</h3>
+  <p>Not one of the four decides what happens when nobody answers. Temporal gives you a durable timer and makes you write the branch; the other three do not even give you the timer. This matters more than the API ergonomics, because an unanswered approval is the common case in production, not the edge case: reviewers go on holiday, Slack channels get archived, the on-call rotation changes. Decide explicitly whether silence means reject, escalate, or proceed-with-reduced-scope, and write that branch before you ship the happy path. An approval queue with no expiry policy becomes a list nobody reads, and then <a href="/playbooks/agent-ux-and-human-interaction/review-queues-for-agent-output">the review queue is the bottleneck</a> rather than the control.</p>
+  <h3>The approval binds to arguments rendered at pause time</h3>
+  <p>All four show the human the tool call as it stood when the agent proposed it, and all four then execute a call on resume. Nothing in the default path re-verifies that the arguments are still the ones that were shown, and nothing re-checks that the state the human reasoned about still holds. For a transfer of a fixed amount this is unremarkable; for "delete the resources matching this filter" it is <a href="/deep-dives/agent-security/time-of-check-to-time-of-use">a time-of-check-to-time-of-use gap</a> with a human as the check. If the gap can matter, include a precondition in the approved payload and verify it inside the tool.</p>
+  <p>Related: only the Vercel ecosystem has an open request for editing the input at approval time; everywhere else, approve-or-deny with an optional reason is the whole vocabulary. A reviewer who wants to change one field has to deny and wait for the agent to propose again, which is why <a href="/playbooks/agent-ux-and-human-interaction/plan-review-and-editing">plan editing</a> keeps getting rebuilt above these primitives.</p>
+  <h3>Idempotency is the tax you pay for cheap resume</h3>
+  <p>Rank the four by how much idempotency discipline they demand and you get exactly the inverse of their infrastructure cost. Temporal demands almost none. The SDKs demand some, at the boundary of whatever loop you drive. LangGraph demands the most: every node that can interrupt is a function that may run its prefix twice, forever, and the enforcement mechanism is a human reading a diff. If you choose it, make the convention mechanical — a lint rule, a wrapper, or a hard rule that nodes containing <code>interrupt()</code> do nothing above that line — because <a href="/operations/agentops/idempotency-and-retries">idempotency by good intentions</a> does not survive a team growing.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Chat product, human watching the stream, reversible actions</td><td>AI SDK tool approval</td><td>The pause only has to outlive a few seconds, and the UI is already there</td></tr>
+      <tr><td>Agent is already a LangGraph graph, approvals arrive from Slack</td><td>LangGraph <code>interrupt()</code></td><td>Durable, decoupled channel — pay for it with a node-replay rule</td></tr>
+      <tr><td>Policy depends on the arguments, not the tool</td><td>Agents SDK <code>needs_approval</code></td><td>The predicate belongs next to the tool definition</td></tr>
+      <tr><td>Irreversible or expensive actions, approvals measured in days</td><td>Temporal</td><td>Exact resume and a durable timer are the actual requirements</td></tr>
+      <tr><td>You already run a durable-execution engine</td><td>That engine</td><td>A second pause mechanism is a second place state can be lost</td></tr>
+    </tbody>
+  </table>
+  <p>The one combination to avoid is a durable backend with an ephemeral approval. If the pending decision lives in a browser tab while the work it gates is a multi-day pipeline, you have built a system whose control plane is less reliable than the thing it controls — and that asymmetry is where <a href="/concepts/blast-radius">blast radius</a> stops being theoretical.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Does LangGraph really run my code twice around an interrupt?</h3>
+  <p>It re-enters the node at its first line on resume, so everything above the <code>interrupt()</code> call executes again, with the interrupt now returning the human's value. The fix is to keep side effects below that line, make them idempotent, or wrap them so a stored result is returned instead of re-running.</p>
+  <h3>Can I use the OpenAI Agents SDK for approvals that take days?</h3>
+  <p>Yes, but you are building the persistence. Serialise the run state at the pause, store it with the pending approval, and write the expiry job yourself — the SDK gives you a resumable state object and no opinion about where it goes.</p>
+  <h3>Is the Vercel AI SDK's approval safe to rely on for destructive tools?</h3>
+  <p>Only with the function form returning an explicit approval requirement for unrecognised tools, since returning nothing runs the tool ungated. Even then the pause is held in the browser's message history, so a destructive action whose review may outlive the session needs a server-side queue instead.</p>
+  <h3>Why does Temporal keep coming up for human-in-the-loop?</h3>
+  <p>Because a human approval is a durable wait, and a durable wait is the primitive a workflow engine already implements. The timer is persisted server-side and the resume continues at the next statement, so you get no replay and no idempotency homework.</p>
+  <h3>What should happen when nobody approves?</h3>
+  <p>Whatever you decide — none of the four has a default. Write the timeout branch explicitly as reject, escalate, or proceed with reduced scope, and treat an approval queue with no expiry as an outage waiting for a holiday.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/human-in-the-loop">Human in the loop</a> — the concept these four are all implementing.</li>
+    <li><a href="/playbooks/agent-ux-and-human-interaction/approval-and-confirmation-ux">Approval &amp; confirmation UX</a> — what to put in front of the reviewer once the plumbing works.</li>
+    <li><a href="/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal">Durable execution: LangGraph plus Temporal</a> — running both, and which owns what.</li>
+    <li><a href="/operations/agentops/durable-state-and-resumability">Durable state &amp; resumability</a> — the general version of the replay problem.</li>
+    <li><a href="/deep-dives/agent-security/time-of-check-to-time-of-use">Time-of-check to time-of-use</a> — why an approved payload needs a precondition.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://docs.langchain.com/oss/python/langgraph/interrupts">LangGraph: interrupts</a></li>
+    <li><a href="https://openai.github.io/openai-agents-python/ref/tool/">OpenAI Agents SDK: tool reference</a></li>
+    <li><a href="https://ai-sdk.dev/docs/migration-guides/migration-guide-7-0">AI SDK: migrating 6.x to 7.0</a></li>
+    <li><a href="https://docs.temporal.io/design-patterns/approval">Temporal: the approval pattern</a></li>
+  </ul>
+</section>

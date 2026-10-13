@@ -1,0 +1,123 @@
+<section class="phase">
+  <div class="phase-num">R13</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>向量压缩与内存层级。</h2>
+  <p class="goal">「二值量化能把索引缩小 32 倍」这句话是真的，却几乎总被读错，因为全精度向量并没有消失——单靠二值检索，召回会塌到相对精确检索约 0.6，而唯一能把它救回来的是重打分，而重打分要把那些全精度向量读回来。所以量化根本不是一个压缩决定。它是一个关于「你的向量的每一份副本住在哪一层」的决定，而那笔账是从内存挪到磁盘 I/O，而不是凭空消失。分层分对了，1 比特向量只让你损失大约一个点的召回；分错了，你就是把一个内存问题换成了一个要排查一周的延迟问题。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>从算术开始，因为这是唯一没人争论的部分。</h3>
+
+    <p>一个向量索引有两个内存消费者：向量本身，以及用来在它们之间导航的那张图。向量占主导，而它的大小恰好等于维数 × 每个分量的字节数。</p>
+
+    <pre class="standalone"><span class="c-cm"># bytes per vector, 1536 dimensions</span>
+
+float32    1536 x 4 = 6144 B      10M vectors -> ~61 GB
+float16    1536 x 2 = 3072 B      10M vectors -> ~31 GB
+int8       1536 x 1 = 1536 B      10M vectors -> ~15 GB
+1-bit      1536 / 8 =  192 B      10M vectors -> ~1.9 GB
+
+<span class="c-cm"># plus the HNSW graph: roughly 2 x m x 4 B per node at the</span>
+<span class="c-cm"># base layer, so ~128 B/vector at m=16 — small next to</span>
+<span class="c-cm"># float32, and the DOMINANT term once you go 1-bit.</span></pre>
+
+    <p>这张表立刻推出两件事。第一，有意思的那个阈值不是某个压缩比，而是工作集有没有从「装得进你愿意付钱的那点内存」越界到「装不进」——而在 1000 万条当代 1536 维嵌入的规模上，float32 在一台普通机器上装不下，1 比特却装得下且还有余地。第二，一旦到了 1 比特，图的连边就比向量更费内存，于是继续压缩向量什么也买不到。这才是真正的天花板，而它比人们预期的来得更早。</p>
+
+    <p>哪些数字适用于你，取决于你选的嵌入，而<a class="xref" href="/zh/concepts/embeddings">各模型的维数能相差一个数量级</a>。请在读任何厂商基准之前先做这道算术——已发布结果之间的分歧，大多是一次维数差异披着某种技术的外衣。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>没有重打分，二值量化就不工作。这就是整篇文章。</h3>
+
+    <p>每维一个比特保留符号、丢掉幅值，而它算出来的距离是比特串上的汉明距离——这也正是速度那套说法为真的原因，因为那是一次 popcount 而不是一次点积。可它一并丢掉的，是足以把 top-k 排对的那部分信息。</p>
+
+    <p>Qdrant 自己发布的测量把不带重打分的 1 比特检索放在相对精确检索 <strong>recall@10 为 0.605</strong>。这不是调参问题，这就是这门技术本身。把重打分打开——先用便宜的二值距离取回更多候选，再用原始向量对这些候选重新排序——同一配置报告的是 <strong>2 倍过采样下 recall@10 为 0.977、4 倍下为 0.988</strong>，这在向量体积只有 1/32 的情况下，距 float32 基线不足一个点。在 1536 维的 OpenAI 嵌入上，报告值是 4 倍过采样下约 0.98 的 recall@100；在一个 4096 维的 Cohere 模型上，是 2 倍下约 0.98 的 recall@50。</p>
+
+    <pre class="standalone"><span class="c-cm"># what rescoring actually does, per query, for k=10</span>
+
+1. search the 1-bit index for k * oversampling candidates
+2. read the ORIGINAL vectors for those candidates
+3. compute exact distances, sort, return k
+
+<span class="c-cm"># step 2 is the part the "32x smaller" headline omits.</span>
+<span class="c-cm"># at 4x oversampling, k=10: 40 full-precision vector reads.</span></pre>
+
+    <p>所以这套架构要安置的是三份副本，不是一份：1 比特向量（热、随机访问、每次查询都用）、那张图（热），以及全精度向量（每次查询要读过采样倍数 × k 个候选）。厂商把过采样默认设得低、把重打分默认打开，是有充分理由的；而 Qdrant 的文档把规则讲得很直白：只在启用重打分的前提下使用二值量化。</p>
+
+    <div class="callout">
+      <p>如果你以「这样才隔离出压缩本身」为由关掉重打分来做二值量化的基准测试，你会量到 0.6 的召回、得出这门技术不可用的结论，然后错掉。那次过采样重打分不是事后拧上去的一项优化——它就是算法的后半截。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>全精度向量住在哪里，才是你真正在做的那个决定。</h3>
+
+    <p>现在分层这个问题才有了牙齿，因为重打分的第 2 步总得从某个地方把原始向量读出来，而「某个地方」只有两处。</p>
+
+    <ul>
+      <li><strong>全精度向量在内存里。</strong>那你并没有省下内存——你省下的是<em>索引</em>内存，而你买到的是速度：候选扫描变成了在 192 字节串上做 popcount，而不是在 6 KB 上做点积。那些惊人的吞吐数字正是从这种配置里来的；当你的问题是 QPS 或 p99 延迟、而不是实例多大时，它是对的那一种。</li>
+      <li><strong>全精度向量在磁盘上。</strong>那内存节省是真实而可观的，而你把成本挪到了存储层：现在每次查询都要发出过采样倍数 × k 次随机读。Qdrant 的文档明确写了，对磁盘上的原始向量做重打分可能显著降低检索速度。在 NVMe 上、页缓存是热的，这通常没问题；在网络存储上，或者工作集缓存不住时，这就是你的尾延迟搬去住的地方。</li>
+    </ul>
+
+    <p>这就是为什么同一门技术在一篇文章里被写成「快 40 倍」、在另一篇里被写成「便宜 32 倍」。那是两套不同的部署，而你没法同时两样都要：速度那套说法假定原始向量已经在内存里，内存那套说法假定它们不在。在打开这个开关之前先决定你买的是哪个数字，并按这个选择、而不是按某张召回表来定过采样——Qdrant 的测量显示，过采样超过 4 倍之后对召回几乎毫无加成，而读放大仍在继续增加。</p>
+
+    <p>同一套框架也顺手解决了「要不要把图放到磁盘上」这个相关问题。在每维 1 比特下连边才是更大的那一项，所以一个激进量化、然后把 HNSW 图留在内存里的内存受限设计，顺序是对的；而把图推到磁盘上的那个设计，换掉的恰恰是访问模式为纯随机跳转的那个结构。<a class="xref" href="/zh/deep-dives/retrieval-and-rag/choosing-a-vector-database">挑一个向量数据库</a>在很大程度上就是在挑「谁的默认值已经把这件事编码进去了」。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>维数是两门技术共同花掉的那份预算。</h3>
+
+    <p>Matryoshka 表示学习训练出的嵌入，其前导维度各自独立可用，于是你可以把一个 1536 维向量截断到 512 或 256 维而保住大部分质量。当代嵌入 API 上的 <code class="inline">dimensions</code> 参数就是这个，而它在一个量化做不到的意义上是真的免费——你存更少的数、读更少的数，没有第二份副本，也没有重打分。</p>
+
+    <p>不那么显然的是：截断与二值化动用的是同一份储备。两者之所以奏效，都是因为高维嵌入是冗余的；截断花掉那份冗余，而丢掉每个分量的幅值也在花它。花两遍，第二门技术可用的就更少了。已发布的数字恰好显示了这一点：在 512 维下，不带重打分的 1 比特准确率落在 53–55% 附近，带重打分后回到 71–91%——远低于同一方法在 1536 维与 4096 维上达到的近基线召回。Qdrant 自己的指引用谨慎的措辞说了同一件事：维数更低、或向量分量分布不同的模型，可能需要自己单独做一轮参数搜索。</p>
+
+    <pre class="standalone"><span class="c-cm"># ordering that works, cheapest decision first</span>
+
+1. pick dimensions      <span class="c-cm"># MRL truncation; measure recall@k</span>
+2. pick precision       <span class="c-cm"># int8 is the low-risk 4x</span>
+3. consider 1-bit       <span class="c-cm"># only if dims are high AND you</span>
+                        <span class="c-cm"># have decided where originals live</span>
+4. tune oversampling    <span class="c-cm"># 2x, then 4x; stop there</span>
+
+<span class="c-cm"># never change two of these between measurements.</span></pre>
+
+    <p>那些被广泛转述的说法——截断到 256 维仍保留 95–98% 的完整质量，或者截断加 int8 的召回代价不到两个点——请当作关于别人语料的假设来对待。它们出自未设对照的文章，被保留的那个比例强烈依赖数据集，而 MRL 的全部要点就在于：在你自己的语料上测它很便宜。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>把召回量成相对精确检索的，而不是相对上周那个索引的。</h3>
+
+    <p>几乎每一次量化回退上线，都是因为团队量错了基线。要紧的那个数字是相对<em>穷举</em>检索（在同一批向量上）的召回，因为只有这样才能把「近似让你损失了什么」与「你的检索本来也找不到什么」分开。</p>
+
+    <ul>
+      <li><strong>用蛮力把真值建一次。</strong>从日志里取 500–1000 条真实查询，离线在全精度向量上算出精确 top-k 并存下来。这是几分钟的算力，而且它在你之后要试的每一种配置上都能复用。</li>
+      <li><strong>在你真正会消费的那个 k 上报 recall@k。</strong>recall@100 会严重美化量化：近似候选集几乎总在某条长尾里含着对的文档。如果模型只看五个切片，就量 recall@5——并请注意，这正是<a class="xref" href="/zh/concepts/rerankers">重排序器的增益被你的召回曲线封顶</a>的同一个原因。</li>
+      <li><strong>也在一个子集上量终端指标。</strong>检索召回是一个代理量。一个 0.98 召回的索引，若对某一类查询恰好漏掉那一份权威文档，对答案准确率的影响会大于这个数字所暗示的——而这正是<a class="xref" href="/zh/deep-dives/retrieval-and-rag/evaluating-rag">RAG 评测</a>存在的用途。</li>
+      <li><strong>在同一轮里记下 p95 延迟与读取量。</strong>如果原始向量在磁盘上，那张召回表只是结果的一半；另一半是每次查询的读次数，而它是在压力下、而不是在测试下回退的那一半。</li>
+    </ul>
+
+    <p>有一个值得点名的运维陷阱：量化参数是你索引身份的一部分。改过采样是一个查询期旋钮，但改维数或改精度意味着重建，而在数千万条向量上重建就是一次带双写窗口的迁移——与<a class="xref" href="/zh/operations/agentops/reindexing-and-embedding-migrations">一次嵌入迁移</a>是同一种形状的问题，值得当作迁移来规划，而不是当作迁移来发现。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>什么时候该上哪一种，以及什么时候一种都不该上。</h3>
+
+    <p>对大多数系统来说，诚实的答案是：它们离需要这个还很远。一百万个切片、768 维、float32，大约 3 GB；那是一台笔记本的量，而花一周做量化去省下它，就是一周没花在<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">你真正有的那个检索质量问题</a>上。</p>
+
+    <ul>
+      <li><strong>500 万向量以下，除了维数什么都别改。</strong>如果你的提供方给了 <code class="inline">dimensions</code> 参数就用它，保持 float32，然后往下做别的。没有第二份副本、没有重打分、没有新的失效模式。</li>
+      <li><strong>500 万到 5000 万，或者内存账单已经看得见了：int8。</strong>标量量化是那个无聊的 4 倍，召回风险最小，也不硬依赖重打分。它是大多数团队应该落到的默认选项，也是最不容易制造事故的那一个。</li>
+      <li><strong>再往上，或者当约束是 QPS 时：带重打分的 1 比特。</strong>只在高维嵌入上用，只把过采样设在 2–4 倍，并且只在你已经写下「全精度向量住在哪里、在那里做一次重打分要花多少」之后再用。</li>
+      <li><strong>端侧或单二进制部署：先维数，再 int8。</strong>重打分那些随机读恰恰是受限设备最不擅长的东西，这也是<a class="xref" href="/zh/deep-dives/retrieval-and-rag/local-first-retrieval">本地优先检索</a>更倚重更小的嵌入、而不是激进量化的部分原因。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>在启用任何量化之前，先在设计文档里写一行：<em>全精度向量住在 ___，在那里对 k=10 做一次 4 倍过采样重打分要花 ___</em>。如果这两个空你填不上，那你不是在选一个压缩档位，你是在把延迟预算挪到一个你没测过的地方。然后给 500 条真实查询建那份蛮力真值——它只要几分钟、永久可复用，而且它正是「我们上了 1 比特向量」与「我们上了 1 比特向量且 recall@5 为 0.98」之间的区别。延伸：<a class="xref" href="/zh/deep-dives/retrieval-and-rag/choosing-a-vector-database">挑一个向量数据库</a>看谁的默认值配哪种分层，<a class="xref" href="/zh/deep-dives/retrieval-and-rag/late-interaction-retrieval">晚交互检索</a>看同一套存储论证在「每个 token 一个向量」下的样子，以及<a class="xref" href="/zh/concepts/distillation-and-quantization">蒸馏与量化</a>看这笔精度权衡在模型侧的版本。</p>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,155 @@
+<p class="lede">这四者都能在一次有风险的工具调用之前暂停智能体、等一个人，而它们的 API 看着足够像，于是团队按口味来选。他们应该按一个轴来选：<strong>待批的那次审批存在哪里，以及恢复时什么会被重新执行。</strong>LangGraph 有文档记载的行为是从节点的第一行重新进入——于是一次发生在暂停之前的写入会发生两遍。Temporal 则从等待之后的那条语句继续。两个 SDK 落在它们中间，并把持久化这个问题交还给你。选错了，你上线的那个 bug 就是一次重复的副作用，而你在测试里看不到它——因为在测试里没人会花九分钟才去点「批准」。</p>
+
+<section>
+  <h2>一眼看完</h2>
+  <p>一句话就能把整张表定位：一次审批是一次持久的等待，而一次持久的等待需要一个地方住。这四者挑了四个不同的地方。</p>
+
+  <table>
+    <thead>
+      <tr><th>框架</th><th>那次暂停住在哪里</th><th>恢复时什么会被重新执行</th><th>谁掌着那口钟</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>LangGraph <code>interrupt()</code></td>
+        <td>一个由你运行的检查点存储，按 thread ID 索引</td>
+        <td>整个节点，从它的第一行起</td>
+        <td>你——内置的没有</td>
+      </tr>
+      <tr>
+        <td>OpenAI Agents SDK <code>needs_approval</code></td>
+        <td>一份可序列化的运行状态，由你自己持久化</td>
+        <td>被暂停的那次工具调用</td>
+        <td>你——内置的没有</td>
+      </tr>
+      <tr>
+        <td>Vercel AI SDK 工具审批</td>
+        <td>UI 消息历史，在浏览器里</td>
+        <td>那次工具调用，在下一个请求上</td>
+        <td>用户那个标签页</td>
+      </tr>
+      <tr>
+        <td>Temporal signal + 条件等待</td>
+        <td>集群的工作流历史</td>
+        <td>什么都不重跑——下一条语句接着执行</td>
+        <td>引擎，靠一个持久定时器</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/langgraph-vs-openai-agents-sdk-vs-ai-sdk-vs-temporal-approvals/compare-where-the-pause-lives.svg" alt="四列展示每个框架把待批审批存在哪里：一个由你运行的检查点存储、一份由你持久化的可序列化运行状态、浏览器的消息历史，以及集群的工作流历史。" width="900" height="300" loading="lazy" />
+    <figcaption>耐久性从左到右上升，而你要运维的东西也一样。</figcaption>
+  </figure>
+
+  <figure>
+    <img src="/blogs/langgraph-vs-openai-agents-sdk-vs-ai-sdk-vs-temporal-approvals/data-approval-matrix.svg" alt="四个框架对四个轴的特性矩阵：暂停能否扛过一次重启、恢复是否精确、超时是否内置，以及审批通道是否与 UI 解耦。" width="900" height="400" loading="lazy" />
+    <figcaption>各自最吃劲的地方。超时那一列几乎处处偏弱，而这并非偶然。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>LangGraph：持久、图原生，而它会重跑节点</h2>
+  <figure>
+    <img src="/blogs/langgraph-vs-openai-agents-sdk-vs-ai-sdk-vs-temporal-approvals/arch-node-replay.svg" alt="两条泳道对比：整节点重跑会把发生在暂停之前的一次写入再跑一遍，而精确恢复的模型则从等待之后的那条语句继续。" width="900" height="500" loading="lazy" />
+    <figcaption>那条虚线箭头就是要花钱的部分。它是有文档记载的行为，不是 bug。</figcaption>
+  </figure>
+  <h3>它怎么工作</h3>
+  <p>在一个节点里调 <code>interrupt()</code> 会停住整张图，并把一份 JSON 可序列化的载荷呈给调用方。它要求配置里有一个检查点存储和一个 thread ID——没有持久化就没有可恢复的东西。你通过带着 <code>Command(resume=value)</code> 再次调用这张图来恢复，而那个值会成为 <code>interrupt()</code> 调用的返回值。因为那次暂停就是一行检查点记录，所以审批可以从任何能触达你数据库的地方到来：一次 Slack 操作、一条邮件链接、一个后台队列，甚至一个完全不同的进程。</p>
+  <h3>重跑语义，也就是你必须吃透的那件事</h3>
+  <p>文档明确写了，恢复时执行从<em>节点的开头</em>开始。它并不会跳回函数中间、落到 <code>interrupt()</code> 之后的那一行——它会从节点的第一条语句重跑，只是这一次那个 interrupt 调用返回人给的值、而不是再暂停一次。因此那一行之上的一切都会执行第二遍。一个在暂停之前记审计行、扣款、发消息或给计数器加一的节点，会把这些全做两遍。</p>
+  <p>由此而来的指引是：把不可逆的动作放在 interrupt <em>之后</em>，或者让它们幂等——用 upsert 而不是 insert——或者把对外可见的操作包进一个会被持久化的任务里，这样恢复时返回的是存下来的结果、而不是把操作再跑一遍。三条都对，而三条都是约定、不是保证，这意味着这条规则活在代码评审里。还有一处被报告过的锋利边缘涉及多 interrupt 的节点：一个含两个 interrupt 的节点，在只恢复了其中一个之后就可能重跑。时间旅行式重放按设计也有同一性质——回退到某个检查点会把它之后的节点重新执行，模型调用与 API 请求一并在内。</p>
+  <h3>它在什么时候是对的答案</h3>
+  <p>当智能体本来就是一张图、审批只是众多节点中的一个，而你希望那个决定可以从「发起这次运行的那个请求」之外送进来。最后那项性质是真有价值的，而下面两个 SDK 把它变难了。</p>
+</section>
+
+<section>
+  <h2>OpenAI Agents SDK：模型最干净，而存储归你</h2>
+  <h3>它怎么工作</h3>
+  <p>一个工具声明 <code>needs_approval</code>——可以是一个布尔值，也可以是一个接收运行上下文、参数与调用 ID 的函数，于是这道关卡可以取决于转账金额、而不是取决于工具的身份。它触发时，这次运行会停住，而待批的调用会作为审批条目出现在结果的 interruptions 里。你在运行状态上调批准或拒绝，然后把这个状态交回给 runner。部分批准是可行的：解决一个条目、把另一个留着待批，这次运行就会尽其所能往前走。</p>
+  <p>那个「看参数」的关卡是本次比较里最好的东西。「当金额超过某个阈值时才审批 <code>transfer</code>」是一条策略；「审批 <code>transfer</code>」只是一个工具名。其余几者也能走到同一个地方，但只有这一个把那个谓词放在工具定义的旁边。</p>
+  <h3>代价在哪</h3>
+  <p>持久化归你。运行状态是可序列化的——它能转成 JSON 再转回来——而没有谁替你存它。这是个站得住的设计，而它意味着每一个生产部署都要写同样的三样东西：一张待批审批表、一个在暂停处保存状态的写入器，以及一个决定「一行没人动过的记录会怎样」的清理器。如果你跳过第三样，那你对沉默的回答就是「那行记录永远躺在那儿」——而这是一条你靠「不选」选出来的策略。</p>
+  <p>请把序列化后的状态当作一项可恢复的能力来对待，并照此存放。一个被回放时会重新发出一次工具调用的二进制块不是一行日志；任何能写那张表的人，都能改掉恢复时会被执行的东西。</p>
+</section>
+
+<section>
+  <h2>Vercel AI SDK：那次暂停是一条消息，而标签页就是数据库</h2>
+  <h3>它怎么工作</h3>
+  <p>把工具标上；当模型调它时，这次调用会在 UI 消息流里以一个处于「待审批」状态的工具片段浮现出来；客户端渲染批准与拒绝按钮，并通过聊天 hook 的审批函数作答。在 AI SDK 6 里，这个标记是工具上的 <code>needsApproval</code>。在 AI SDK 7 里，它搬到了 <code>generateText</code>、<code>streamText</code> 与 <code>ToolLoopAgent</code> 上的一个 <code>toolApproval</code> 设置，取值为 <code>'approved'</code>、<code>'denied'</code> 或 <code>'user-approval'</code>；旧的按工具标记已弃用但仍被接受，而迁移指南把布尔的 <code>needsApproval: true</code> 映射成 <code>toolApproval: { myTool: 'user-approval' }</code>。</p>
+  <p>这是四者中上线最快的那一个；而对于一个人本来就在盯着流的聊天产品来说，它是对的形状。那次审批往返就是下一个请求。</p>
+  <h3>三处锋利的边缘</h3>
+  <p>第一，这次暂停在任何有用的意义上都不耐久：它活在客户端持有的那份消息历史里。关掉标签页，待批的审批就没了——这对「要我把这封邮件发出去吗？」没问题，而对任何「本该由某位复核人明天来看」的事情都不行。</p>
+  <p>第二，恢复得你自己接起来。有文档的那套做法会把审批回应与一个自动发送条件配在一起，使得每个审批都解决后对话继续；不配它的话，已有报告显示：一个并行自动执行的工具会留下一个孤立的 tool-use 块，而提供方会直接拒掉下一条消息。这正是那种「只在一个工具需要审批、另一个不需要时」才会现身的 bug。</p>
+  <p>第三，而这一条值得在设计评审上投反对票：在函数形式的 <code>toolApproval</code> 下，对一个函数不认识的工具返回 <code>undefined</code>，会让那个工具<em>不经</em>审批就跑起来。一个写成「在已知工具上做 switch」的函数，因此在有人加了个工具却忘了加分支的那一刻就会失效时放行。如果你用函数形式，请对任何你不认识的东西显式返回 <code>'user-approval'</code>——这条规则的一般版本是<a href="/zh/concepts/fail-closed-and-fail-open">一道关卡必须失效时关闭</a>，而一个按工具逐个选入的关卡，就是一个默认值为「没有关卡」的关卡。</p>
+</section>
+
+<section>
+  <h2>Temporal：唯一一个「等待」本身就是原生操作的</h2>
+  <h3>它怎么工作</h3>
+  <p>审批模式就是一次带超时的阻塞等待——Python 里的 <code>workflow.wait_condition()</code>、TypeScript 里的 <code>condition()</code>、Java 里的 <code>Workflow.await()</code>、Go 里的 <code>AwaitWithTimeout()</code>——而人的决定作为一个 signal 到来，把那个条件正等着的标志置上。如果定时器先到期，工作流就在超时那条分支上解除阻塞。那个持久定时器被持久化在服务端的数据库里，能扛过 worker 重启、发布与基础设施迁移，所以一次九天的审批在架构上和一次九秒的并无不同。</p>
+  <p>因为事件历史是确定性的、单线程排序的，所以一个 signal 和一个定时器根本不会真的竞态：一个迟到的 signal 是在超时已经返回之后到达的，而这个顺序是可复现的、不是靠运气的。当那个决定可能被业务规则驳回、而那个人该在同一次点击里就知道这件事时，请用 update 而不是 signal；当截止时间本身会挪动时，请用可更新定时器那套模式。</p>
+  <h3>代价，说实话</h3>
+  <p>你要运行一个集群，并在确定性约束下写工作流代码——不读时钟、不取随机值、activity 之外不直接做 I/O。对一个本来就在跑 Temporal 的团队，这是免费的；对一个没在跑的团队，为了拿到人工审批而引入它，是为一个功能付的一笔大账，而诚实的对比对象是「一个检查点存储加一个清理器」，不是「什么都没有」。</p>
+  <p>你买到的是其余三者都没法便宜给你的那一项性质：恢复是精确的。没有节点重跑、没有要维护的幂等约定、没有第二行审计记录。如果你的审批把关的是昂贵或不可逆的操作——而那通常正是它们存在的原因——那么这项性质就是那个功能本身。</p>
+</section>
+
+<section>
+  <h2>横向看：三件四者都没解决的事</h2>
+  <h3>沉默在任何一处都没有默认值</h3>
+  <p>四者里没有一个决定「没人作答时会怎样」。Temporal 给你一个持久定时器、让你自己写那条分支；另外三个连定时器都不给你。这比 API 的顺手程度更要紧，因为一次没人应答的审批在生产里是常见情形、不是边缘情形：复核人去休假了、Slack 频道被归档了、值班轮转换了。请明确决定沉默意味着拒绝、升级，还是「以缩减的范围继续」，并在上线快乐路径之前就把那条分支写好。一个没有过期策略的审批队列会变成一张没人读的清单，然后<a href="/zh/playbooks/agent-ux-and-human-interaction/review-queues-for-agent-output">那条复核队列就成了瓶颈</a>、而不是那道控制。</p>
+  <h3>审批绑定的是暂停那一刻渲染出来的参数</h3>
+  <p>四者都把工具调用按智能体提议时的样子摆给人看，然后四者都在恢复时执行一次调用。默认路径里没有什么会重新校验那些参数仍是当初被展示的那些，也没有什么会重新检查那个人据以推理的状态仍然成立。对一笔固定金额的转账，这不值一提；而对「删掉匹配这个过滤器的资源」，这就是<a href="/zh/deep-dives/agent-security/time-of-check-to-time-of-use">一道检查时到使用时的缺口</a>，而那个检查是一个人。如果这道缺口可能要紧，就把一个前置条件放进被批准的载荷里，并在工具内部校验它。</p>
+  <p>相关的一点：只有 Vercel 那套生态里有一个「在审批时编辑输入」的待办请求；在别处，批准或拒绝加一条可选理由就是全部的词汇。一位想改一个字段的复核人只能拒绝、然后等智能体再提一遍——这正是<a href="/zh/playbooks/agent-ux-and-human-interaction/plan-review-and-editing">方案复核与编辑</a>总是在这些原语之上被重新造一遍的原因。</p>
+  <h3>幂等是你为便宜的恢复所付的税</h3>
+  <p>按它们各自要求多少幂等纪律来排序，你得到的恰好是它们基础设施成本的倒序。Temporal 几乎什么都不要求。两个 SDK 要求一些，在你驱动的那个循环的边界上。LangGraph 要求最多：每一个可能中断的节点都是一个「其前缀可能跑两遍」的函数，永远如此，而执行机制是一个人在读 diff。如果你选它，就把这条约定做成机械的——一条 lint 规则、一层包装，或者一条硬规定：含 <code>interrupt()</code> 的节点在那一行之上什么都不做——因为<a href="/zh/operations/agentops/idempotency-and-retries">靠良好意愿维持的幂等</a>扛不过团队变大。</p>
+</section>
+
+<section>
+  <h2>什么时候该选哪一个</h2>
+  <table>
+    <thead>
+      <tr><th>情形</th><th>选</th><th>因为</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>聊天产品，有人正盯着流，动作可逆</td><td>AI SDK 工具审批</td><td>那次暂停只需要活过几秒，而 UI 本来就在那儿</td></tr>
+      <tr><td>智能体本来就是一张 LangGraph 图，审批从 Slack 来</td><td>LangGraph <code>interrupt()</code></td><td>持久、通道解耦——代价是一条节点重跑的规则</td></tr>
+      <tr><td>策略取决于参数，而不是取决于工具</td><td>Agents SDK <code>needs_approval</code></td><td>那个谓词属于工具定义的旁边</td></tr>
+      <tr><td>不可逆或昂贵的动作，审批以天计</td><td>Temporal</td><td>精确恢复与持久定时器才是真正的需求</td></tr>
+      <tr><td>你本来就在跑一个持久执行引擎</td><td>那个引擎</td><td>第二套暂停机制就是第二个状态可能丢失的地方</td></tr>
+    </tbody>
+  </table>
+  <p>唯一要避开的组合是「持久的后端配一次易失的审批」。如果那个待批的决定住在一个浏览器标签页里，而它把关的工作是一条跨天的流水线，那你就造出了一个控制面比它所控制之物更不可靠的系统——而正是这种不对称，让<a href="/zh/concepts/blast-radius">爆炸半径</a>不再只是理论。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>LangGraph 真的会把我 interrupt 周围的代码跑两遍吗？</h3>
+  <p>恢复时它会从节点的第一行重新进入，所以 <code>interrupt()</code> 调用之上的一切都会再执行一遍，只是这次那个 interrupt 返回人给的值。办法是把副作用留在那一行之下、让它们幂等，或者把它们包起来，使恢复时返回存下来的结果而不是重跑。</p>
+  <h3>OpenAI Agents SDK 能用在要花好几天的审批上吗？</h3>
+  <p>能，但持久化是你在建。请在暂停处序列化运行状态、把它和那条待批审批一起存好，并自己写过期任务——SDK 给你的是一个可恢复的状态对象，以及对「它该放哪儿」毫无意见。</p>
+  <h3>Vercel AI SDK 的审批能放心用在破坏性工具上吗？</h3>
+  <p>只有在用函数形式、并对不认识的工具显式返回「需要审批」时才行，因为什么都不返回会让工具不设关就跑。即便如此，那次暂停仍握在浏览器的消息历史里，所以一个其复核可能比会话活得更久的破坏性动作，需要的是一个服务端队列。</p>
+  <h3>为什么谈人在环里总会谈到 Temporal？</h3>
+  <p>因为一次人工审批就是一次持久的等待，而一次持久的等待正是工作流引擎早已实现的那个原语。定时器在服务端被持久化，而恢复从下一条语句继续，于是你既没有重放、也没有幂等作业。</p>
+  <h3>没人批准时该发生什么？</h3>
+  <p>由你决定——四者都没有默认值。请把超时那条分支明确写成拒绝、升级，或以缩减的范围继续；并把一个没有过期策略的审批队列当作一次正等着某个假期发生的故障。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站：</h3>
+  <ul>
+    <li><a href="/zh/concepts/human-in-the-loop">人在环中</a>——这四者都在实现的那个概念。</li>
+    <li><a href="/zh/playbooks/agent-ux-and-human-interaction/approval-and-confirmation-ux">审批与确认的交互设计</a>——管道通了之后，该往复核人面前摆什么。</li>
+    <li><a href="/zh/deep-dives/architectures-and-patterns/durable-execution-langgraph-plus-temporal">持久执行：LangGraph 加 Temporal</a>——两个都跑时，谁该拥有什么。</li>
+    <li><a href="/zh/operations/agentops/durable-state-and-resumability">持久状态与可恢复性</a>——重放问题的一般版本。</li>
+    <li><a href="/zh/deep-dives/agent-security/time-of-check-to-time-of-use">检查时到使用时</a>——为什么一份被批准的载荷需要一个前置条件。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://docs.langchain.com/oss/python/langgraph/interrupts">LangGraph: interrupts</a></li>
+    <li><a href="https://openai.github.io/openai-agents-python/ref/tool/">OpenAI Agents SDK: tool reference</a></li>
+    <li><a href="https://ai-sdk.dev/docs/migration-guides/migration-guide-7-0">AI SDK: migrating 6.x to 7.0</a></li>
+    <li><a href="https://docs.temporal.io/design-patterns/approval">Temporal: the approval pattern</a></li>
+  </ul>
+</section>
