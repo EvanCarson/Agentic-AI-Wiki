@@ -1,0 +1,33 @@
+import { L, type ChangelogEntry } from '../types.ts';
+
+const entry: ChangelogEntry = {
+  date: '2026-10-13',
+  title: L(
+    'Two AI Blog posts — one on the agent that re-graded three quarters of 9,967 HIGH cloud findings, where the 16.6% it raised matters more than the 58.5% it lowered and the same team’s benchmark puts verdicts at 94% against 78% for the answer behind them, one on where a pending human approval actually lives across four frameworks and what each of them re-executes on resume — plus three pages on the two marking schemes that fail in exactly complementary ways, the 1-bit vectors whose 32× saving is a tiering decision rather than a compression one, and the one call a voice agent must recognise and then get out of the way of',
+    '两篇 AI 博客——一篇讲那个把 9,967 条 HIGH 级云端发现重新定级了四分之三的智能体：它升级的那 16.6% 比它降级的那 58.5% 更要紧，而同一团队的基准把裁决放在 94%、把裁决背后的答案放在 78%；一篇讲待批的人工审批在四个框架里究竟住在哪里，以及各自在恢复时会重新执行什么——外加三个页面：以恰好互补的方式失效的那两种标记方案、那种「32 倍节省其实是一次分层决定而非压缩决定」的 1 比特向量，以及语音智能体必须识别出来、然后立刻让开的那一通电话',
+  ),
+  items: [
+    L(
+      'AI Blog — “The re-grade was a verdict, not a record”: an agent changed the grade of 75.1% of 9,967 HIGH-severity cloud findings across eight production environments — 58.5% down, 16.6% up — and the upgrades are what make it a result about measurement rather than about backlog volume, because a tool that only ever lowered findings would be indistinguishable from one that had learned to say “probably fine”. The largest downgrade pattern, 32.3%, was inert or orphaned resources, which reframes a third of the queue as an asset-lifecycle problem; and the same group’s arXiv benchmark reports 94% verdicts against 78% answer correctness at full context, so a re-grade licenses ordering a queue and not closing a finding. Store the evidence as a first-class artefact, re-grade in a second field rather than suppressing, give every verdict an expiry, and measure your own inter-engineer agreement before adopting anyone’s headline.',
+      'AI 博客——《那次重新定级给的是裁决，不是记录》：一个智能体在八套生产环境里改掉了 9,967 条 HIGH 级云端发现中 75.1% 的定级——58.5% 降、16.6% 升——而正是那些升级让它成为一项关于「测量」而非关于「积压数量」的结果，因为一个只会把发现往下挪的工具，与一个学会了说「大概没事」的工具无从分辨。最大的降级模式（32.3%）是惰性或孤儿资源，这把三分之一的队列重新框成了资产生命周期问题；而同一团队的 arXiv 基准报告的是 94% 的裁决对全上下文下 78% 的答案正确率，所以一次重新定级许可的是给队列排序，而不是关闭一条发现。请把证据当作一等物件来存、在第二个字段里重新定级而不是去抑制、给每份裁决一个有效期，并在采用任何人的标题数字之前先量一量你自己工程师之间的一致性。',
+    ),
+    L(
+      'AI Blog — “LangGraph vs OpenAI Agents SDK vs AI SDK vs Temporal: where the pause lives”: all four pause before a tool call and wait for a human, and the axis that decides everything is where the pending approval is stored and what re-executes on resume. LangGraph’s documented behaviour re-enters the node at its first line, so a write above the interrupt runs twice; the Agents SDK hands you a serialisable run state and an argument-aware gate but no persistence; the Vercel AI SDK keeps the pause in the browser’s message history and, in its function form, runs any tool it does not recognise without approval; Temporal continues at the next statement behind a server-persisted durable timer. None of the four decides what silence means, and all four bind the approval to arguments rendered at pause time.',
+      'AI 博客——《LangGraph、OpenAI Agents SDK、AI SDK 与 Temporal：那次暂停住在哪里》：四者都能在工具调用前暂停并等一个人，而决定其后一切的那个轴是「待批审批存在哪里」与「恢复时什么会被重新执行」。LangGraph 有文档记载的行为是从节点第一行重新进入，所以 interrupt 之上的一次写入会跑两遍；Agents SDK 给你一份可序列化的运行状态和一道「看参数」的关卡，但不给持久化；Vercel AI SDK 把暂停留在浏览器的消息历史里，而在其函数形式下，任何它不认识的工具都会不经审批就跑；Temporal 在一个服务端持久化的定时器之后、从下一条语句继续。四者都没有决定沉默意味着什么，而四者都把审批绑定在暂停那一刻渲染出来的参数上。',
+    ),
+    L(
+      'Concepts — Watermarking & Content Credentials: signed C2PA manifests and in-content watermarks fail in exactly complementary ways — a credential survives paraphrase and dies to a screenshot, a text watermark survives a screenshot and has been assessed dropping from a 0.998 true-positive rate to about 0.498 under moderate paraphrasing — and neither answers whether the content is true. The EU marking duty applies to producers with no matching right to verify, so a marking regime arrived without a verification regime and no public detector reads the major text marks. Build provenance over what you create, store it as a joined field rather than embedded metadata, and never let an ingestion path read “unmarked” as “human”.',
+      '概念——水印与内容凭据：签名的 C2PA 清单与内容内水印以恰好互补的方式失效——凭据扛得住改写却死于一次截图，文本水印扛得住截图，却在评估中从 0.998 的真阳性率掉到中等改写下的约 0.498——而两者都回答不了内容是否为真。欧盟的标记义务落在生产方头上，却没有相应的核验权利，于是标记制度到了而核验制度没到，且没有任何公开检测器读得出主要的文本标记。请为你所创作的东西建溯源、把它存成一个关联字段而不是内嵌元数据，并且绝不要让某条接入路径把「未标记」读成「人写的」。',
+    ),
+    L(
+      'Deep-Dives · Retrieval & RAG — Vector compression and the memory tier: binary quantization alone drops recall@10 to about 0.605 against exact search, and rescoring restores it to 0.977 at 2× oversampling and 0.988 at 4× — but rescoring reads the full-precision vectors back, so “32× smaller” is a decision about which tier each copy lives in, not a compression win. Keep the originals in RAM and you bought throughput; put them on disk and you bought memory at the price of oversampling × k random reads per query. Truncation and binarisation spend the same redundancy, which is why 1-bit accuracy collapses at 512 dimensions, and the ordering that works is dimensions first, then int8, then 1-bit only with somewhere decided for the originals.',
+      '深入解析 · 检索与 RAG——向量压缩与内存层级：单靠二值量化，recall@10 相对精确检索会掉到约 0.605，而重打分在 2 倍过采样下把它恢复到 0.977、4 倍下到 0.988——但重打分要把全精度向量读回来，所以「缩小 32 倍」是一个关于「每份副本住在哪一层」的决定，而不是一次压缩上的胜利。把原始向量留在内存里，你买到的是吞吐；把它们放到磁盘上，你买到的是内存，代价是每次查询过采样倍数 × k 次随机读。截断与二值化花的是同一份冗余，这正是 1 比特准确率在 512 维下崩塌的原因；而行得通的顺序是先定维数、再上 int8，最后才在「原始向量住哪里」已有定论时考虑 1 比特。',
+    ),
+    L(
+      'Playbooks · Voice & Realtime — Emergency & Urgent Calls: no standard tells a voice agent where to route a crisis call, but Kari’s Law (direct 911 dialing plus on-site notification) and RAY BAUM’s Act dispatchable location already attach to your phone system rather than to whoever answers it. Put a deterministic matcher on every partial ASR hypothesis below the model, because the caller who needs a human says so while the agent is mid-sentence and a model mid-generation cannot act; blind-transfer with context pushed out of band and a fixed recorded fallback; fix the miss rate first and let precision fall out; and refuse triage, first-aid instructions, and being the crisis line.',
+      '实战手册 · 语音与实时——紧急与危急来电：没有任何标准规定语音智能体该把一通危机来电转去哪里，但 Kari’s Law（直接拨 911 加现场通知）与 RAY BAUM’s Act 的可派遣位置，早已绑在你的电话系统上、而不是绑在由谁来接听上。请把一个确定性匹配器放在模型下面、跑在每一个部分 ASR 假设上，因为需要人的那位来电者是在智能体说到一句话中间时才说出口的，而一个正在生成中途的模型没法行动；请用盲转、把上下文从带外推出去、并备一句固定录音兜底；请先钉住漏检率、精确率落到多少就接受多少；并请拒绝分诊、拒绝急救指导、拒绝去当危机热线。',
+    ),
+  ],
+};
+
+export default entry;

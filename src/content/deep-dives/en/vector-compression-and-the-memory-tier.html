@@ -1,0 +1,123 @@
+<section class="phase">
+  <div class="phase-num">R13</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Vector compression and the memory tier.</h2>
+  <p class="goal">"Binary quantization makes your index 32× smaller" is true and almost always misread, because the full-precision vectors do not go away — binary search alone collapses recall to roughly 0.6 against exact, and the only thing that fixes it is rescoring, which reads those full vectors back. So quantization is not a compression decision at all. It is a decision about which tier each copy of your vectors lives in, and the bill moves from RAM to disk I/O rather than disappearing. Get the tiering right and 1-bit vectors cost you about a point of recall; get it wrong and you have traded a memory problem for a latency problem you will diagnose for a week.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Start with the arithmetic, because it is the only part nobody disputes.</h3>
+
+    <p>A vector index has two memory consumers: the vectors themselves and the graph that navigates them. The vectors dominate, and their size is exactly dimensions × bytes-per-component.</p>
+
+    <pre class="standalone"><span class="c-cm"># bytes per vector, 1536 dimensions</span>
+
+float32    1536 x 4 = 6144 B      10M vectors -> ~61 GB
+float16    1536 x 2 = 3072 B      10M vectors -> ~31 GB
+int8       1536 x 1 = 1536 B      10M vectors -> ~15 GB
+1-bit      1536 / 8 =  192 B      10M vectors -> ~1.9 GB
+
+<span class="c-cm"># plus the HNSW graph: roughly 2 x m x 4 B per node at the</span>
+<span class="c-cm"># base layer, so ~128 B/vector at m=16 — small next to</span>
+<span class="c-cm"># float32, and the DOMINANT term once you go 1-bit.</span></pre>
+
+    <p>Two things fall out of that table immediately. First, the interesting threshold is not a compression ratio, it is whether the working set crosses from "fits in the RAM you are willing to pay for" to "does not" — and at 10M vectors of a modern 1536-dimension embedding, float32 does not fit on a commodity box while 1-bit fits with room to spare. Second, once you are at 1 bit the graph links cost more than the vectors, so further compression of the vectors buys nothing. That is the real ceiling, and it arrives sooner than people expect.</p>
+
+    <p>Which numbers apply to you depends on the embedding you chose, and <a class="xref" href="/concepts/embeddings">dimension counts vary by an order of magnitude across models</a>. Do this calculation before reading any vendor benchmark — most of the disagreement between published results is a dimension difference wearing a technique's clothes.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Binary quantization does not work without rescoring. That is the whole article.</h3>
+
+    <p>One bit per dimension keeps the sign and throws away the magnitude, and the distance it computes is a Hamming distance over bit strings — which is why the speed claims are real, since that is a popcount instead of a dot product. What it also throws away is enough information to rank the top-k correctly.</p>
+
+    <p>Qdrant's own published measurements put 1-bit search without rescoring at <strong>0.605 recall@10</strong> against exact search. That is not a tuning problem; it is the technique. Turn rescoring on — retrieve more candidates by the cheap binary distance, then re-rank those candidates using the original vectors — and the same configuration reports <strong>0.977 recall@10 at 2× oversampling and 0.988 at 4×</strong>, which is within a point of the float32 baseline at 1/32 the vector size. On 1536-dimension OpenAI embeddings the reported figure is about 0.98 recall@100 at 4× oversampling; on a 4096-dimension Cohere model, about 0.98 recall@50 at 2×.</p>
+
+    <pre class="standalone"><span class="c-cm"># what rescoring actually does, per query, for k=10</span>
+
+1. search the 1-bit index for k * oversampling candidates
+2. read the ORIGINAL vectors for those candidates
+3. compute exact distances, sort, return k
+
+<span class="c-cm"># step 2 is the part the "32x smaller" headline omits.</span>
+<span class="c-cm"># at 4x oversampling, k=10: 40 full-precision vector reads.</span></pre>
+
+    <p>So the architecture has three copies to place, not one: the 1-bit vectors (hot, random access, every query), the graph (hot), and the full-precision vectors (read for oversampling × k candidates per query). Vendors default oversampling low and rescoring on for good reason, and Qdrant's documentation states the rule plainly: use binary quantization only with rescoring enabled.</p>
+
+    <div class="callout">
+      <p>If you benchmark binary quantization with rescoring off because "that isolates the compression", you will measure 0.6 recall, conclude the technique is unusable, and be wrong. The oversampled rescore is not an optimisation bolted on afterwards — it is the second half of the algorithm.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Where the full vectors live is the decision you are actually making.</h3>
+
+    <p>Now the tiering question has teeth, because step 2 of the rescore has to read the originals from somewhere, and there are only two somewheres.</p>
+
+    <ul>
+      <li><strong>Full vectors in RAM.</strong> Then you did not save memory — you saved <em>index</em> memory, and what you bought is speed: the candidate scan is a popcount over 192-byte strings instead of a dot product over 6 KB. This is the configuration the dramatic throughput numbers come from, and it is the right one when your problem is QPS or p99 latency rather than the size of your instance.</li>
+      <li><strong>Full vectors on disk.</strong> Then the memory saving is real and large, and you have moved the cost to the storage layer: every query now issues oversampling × k random reads. Qdrant's documentation is explicit that rescoring against on-disk originals can significantly decrease search speed. On NVMe with a warm page cache this is often fine; on network storage, or with a working set that does not cache, it is where your tail latency goes to live.</li>
+    </ul>
+
+    <p>This is why the same technique gets written up as "40× faster" in one post and "32× cheaper" in another. Those are two different deployments and you cannot have both at once: the speed claim assumes the originals are already in memory, and the memory claim assumes they are not. Decide which number you are buying before you turn the feature on, and size oversampling against that choice rather than against a recall table — Qdrant's measurements show oversampling past 4× adds almost nothing to recall while continuing to add reads.</p>
+
+    <p>The same framing settles the related question of whether to keep the graph on disk. At 1 bit per dimension the links are the larger term, so a memory-constrained design that quantizes aggressively and then leaves the HNSW graph in RAM is correctly ordered; one that pushes the graph to disk is trading the one structure whose access pattern is pure random hops. <a class="xref" href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">Choosing a vector database</a> is in large part choosing whose defaults already encode this.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Dimensionality is the budget both techniques spend.</h3>
+
+    <p>Matryoshka representation learning trains an embedding so that its leading dimensions are independently useful, which lets you truncate a 1536-dimension vector to 512 or 256 and keep most of the quality. The <code class="inline">dimensions</code> parameter on current embedding APIs is this, and it is genuinely free in a way quantization is not — you store fewer numbers and read fewer numbers, with no second copy and no rescore.</p>
+
+    <p>What is not obvious is that truncation and binarisation draw on the same reserve. Both work because a high-dimensional embedding is redundant; truncation spends that redundancy, and so does throwing away every component's magnitude. Spend it twice and the second technique has less to work with. The published figures show exactly this: at 512 dimensions, 1-bit accuracy without rescoring sits around 53–55%, recovering to 71–91% with rescoring — far below the near-baseline recall the same method reaches at 1536 and 4096 dimensions. Qdrant's own guidance says as much in careful language: models with lower dimensionality, or a different distribution of vector components, may need their own parameter search.</p>
+
+    <pre class="standalone"><span class="c-cm"># ordering that works, cheapest decision first</span>
+
+1. pick dimensions      <span class="c-cm"># MRL truncation; measure recall@k</span>
+2. pick precision       <span class="c-cm"># int8 is the low-risk 4x</span>
+3. consider 1-bit       <span class="c-cm"># only if dims are high AND you</span>
+                        <span class="c-cm"># have decided where originals live</span>
+4. tune oversampling    <span class="c-cm"># 2x, then 4x; stop there</span>
+
+<span class="c-cm"># never change two of these between measurements.</span></pre>
+
+    <p>Treat the widely-repeated claims that 256-dimension truncation retains 95–98% of full quality, or that truncation plus int8 costs under two points of recall, as hypotheses about someone else's corpus. They come from uncontrolled write-ups, the retained fraction is strongly dataset-dependent, and the whole point of MRL is that it is cheap to test on yours.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Measure recall against exact search, not against last week's index.</h3>
+
+    <p>Almost every quantization regression ships because the team measured the wrong baseline. The number that matters is recall relative to <em>exhaustive</em> search over the same vectors, because that isolates what the approximation cost you from what your retrieval was never going to find anyway.</p>
+
+    <ul>
+      <li><strong>Build the ground truth once, by brute force.</strong> Take 500–1000 real queries from your logs, compute exact top-k over the full-precision vectors offline, and store it. This is a few minutes of compute and it is reusable across every configuration you will try.</li>
+      <li><strong>Report recall@k at the k you actually consume.</strong> Recall@100 flatters quantization badly: the approximate candidate set almost always contains the right documents somewhere in a long tail. If the model sees five chunks, measure recall@5 — and note that this is the same reason <a class="xref" href="/concepts/rerankers">a reranker's gain is bounded by your recall curve</a>.</li>
+      <li><strong>Measure the end metric too, on a subset.</strong> Retrieval recall is a proxy. A 0.98-recall index that drops the one authoritative document for a class of queries can move answer accuracy more than the number suggests, which is what <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">RAG evaluation</a> exists to catch.</li>
+      <li><strong>Record p95 latency and read volume in the same run.</strong> If the originals are on disk, the recall table is only half the result; the other half is reads per query, and it is the half that regresses under load rather than under test.</li>
+    </ul>
+
+    <p>One operational trap worth naming: quantization parameters are part of your index's identity. Changing oversampling is a query-time knob, but changing dimensions or precision means a rebuild, and a rebuild over tens of millions of vectors is a migration with a dual-write window — the same shape of problem as <a class="xref" href="/operations/agentops/reindexing-and-embedding-migrations">an embedding migration</a>, and worth planning as one rather than discovering as one.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When to reach for which, and when to reach for none.</h3>
+
+    <p>The honest answer for most systems is that they are nowhere near needing this. A million chunks at 768 dimensions in float32 is about 3 GB; that is a laptop, and spending a week on quantization to save it is a week not spent on <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">the retrieval quality problem you actually have</a>.</p>
+
+    <ul>
+      <li><strong>Under ~5M vectors, change nothing but dimensions.</strong> Use the <code class="inline">dimensions</code> parameter if your provider offers it, keep float32, and move on. No second copy, no rescore, no new failure mode.</li>
+      <li><strong>5M–50M vectors, or a memory bill you can see: int8.</strong> Scalar quantization is the boring 4× with the smallest recall risk and no hard dependency on rescoring. It is the default most teams should land on and the one least likely to produce an incident.</li>
+      <li><strong>Above that, or when QPS is the constraint: 1-bit with rescoring.</strong> Only with high-dimensional embeddings, only with oversampling at 2–4×, and only after you have written down where the full-precision vectors live and what a rescore costs there.</li>
+      <li><strong>On-device or single-binary deployments: dimensions first, then int8.</strong> The rescore's random reads are exactly what a constrained device handles worst, which is part of why <a class="xref" href="/deep-dives/retrieval-and-rag/local-first-retrieval">local-first retrieval</a> leans on smaller embeddings rather than aggressive quantization.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Before you enable any quantization, write one line in your design doc: <em>the full-precision vectors live in ___, and a 4× oversampled rescore of k=10 costs ___ there</em>. If you cannot fill both blanks, you are not choosing a compression setting, you are moving your latency budget somewhere you have not measured. Then build the brute-force ground truth for 500 real queries — it costs minutes, it is reusable forever, and it is the difference between "we shipped 1-bit vectors" and "we shipped 1-bit vectors at 0.98 recall@5". Related: <a class="xref" href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">choosing a vector database</a> for whose defaults match which tiering, <a class="xref" href="/deep-dives/retrieval-and-rag/late-interaction-retrieval">late-interaction retrieval</a> for the same storage argument at one vector per token, and <a class="xref" href="/concepts/distillation-and-quantization">distillation and quantization</a> for the model-side version of the precision trade.</p>
+    </div>
+  </div>
+</section>
