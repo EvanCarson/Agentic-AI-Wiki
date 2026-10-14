@@ -1,0 +1,113 @@
+<section class="phase">
+  <div class="phase-num">C12</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>Tasks reads like an async convenience bolted onto MCP. It is not — it is where durability went when the session was deleted, and the server, not you, decides when you get one.</h2>
+  <p class="goal">Every mechanism that used to carry work across a broken connection — the session id, SSE resumability, <code class="inline">Last-Event-ID</code>, server-initiated requests — was removed in 2026-07-28, and a task handle is the only thing left that survives a reconnect. So a client that treats the <code class="inline">io.modelcontextprotocol/tasks</code> extension as optional has not declined a feature; it has declared that every call it makes must finish inside one HTTP response. And because task creation is <em>server-directed</em>, the server sets the three numbers that decide whether your long job completes at all: how long the handle lives, how often you may ask, and what happens to the work when nobody asks again.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Tasks did not get demoted to an extension. It got promoted out of a core that could no longer hold it.</h3>
+
+    <p>Tasks shipped as an experimental core feature in 2025-11-25 and left core in 2026-07-28, moving to the standalone extension <code class="inline">io.modelcontextprotocol/tasks</code> under SEP-2663. Read in isolation that looks like a downgrade: a feature that was in the spec is now in an add-on. Read against the rest of the revision it is the opposite, because of what else left at the same time.</p>
+
+    <p>The <a href="/deep-dives/mcp/mcp-revision-2026-07-28" class="xref">2026-07-28 revision</a> deleted the <code class="inline">initialize</code> handshake, the <code class="inline">Mcp-Session-Id</code> header, <code class="inline">GET</code> on the MCP endpoint and with it the standalone SSE stream, <code class="inline">Last-Event-ID</code> and therefore stream resumability, and the three server-initiated requests. Count what that removes from a long-running tool call. Under 2025-11-25 a forty-minute build could hold an SSE stream open and emit progress notifications; if the stream broke, the client reconnected with <code class="inline">Last-Event-ID</code> and the server replayed. All three of those mechanisms are gone, and the spec's replacement rule for a broken stream is explicit: re-issue the work as a <em>new request with a new request ID</em>.</p>
+
+    <p>That rule is only survivable if the work has an identity independent of the request that started it. A task id is that identity. Which means Tasks is not the asynchronous option alongside a synchronous one — for anything that outlives a single response, it is the only option the protocol still offers, and the extension boundary is a packaging decision rather than a statement about how central it is.</p>
+
+    <div class="callout">
+      <p>The useful mental test: ask what happens to your longest tool call when the load balancer moves the next request to a different replica. Under 2025-11-25 the answer was "sticky routing prevents that". Under 2026-07-28 there is no stickiness to buy, so the answer has to be "the work is addressable by id from any replica" — which is a statement about your storage, not about your transport.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The wire shape: one new <code class="inline">resultType</code>, five statuses, three methods, and one ordering rule that catches everyone.</h3>
+
+    <p>Support is negotiated per request, like everything else in this revision: the client lists <code class="inline">io.modelcontextprotocol/tasks</code> in the capabilities it restates inside <code class="inline">params._meta</code> on every call, and the server advertises it in its <code class="inline">server/discover</code> capabilities. There is no handshake in which this is agreed once.</p>
+
+    <p>When the server decides a call will be long-running, it answers the original request immediately with <code class="inline">resultType: "task"</code> and a task object — a unique <code class="inline">taskId</code>, an initial <code class="inline">status</code>, a <code class="inline">ttlMs</code> and a <code class="inline">pollIntervalMs</code>. The client then drives everything through three methods: <code class="inline">tasks/get</code> to poll, <code class="inline">tasks/update</code>, and <code class="inline">tasks/cancel</code>. The status is one of five values — <code class="inline">working</code>, <code class="inline">input_required</code>, <code class="inline">completed</code>, <code class="inline">cancelled</code>, <code class="inline">failed</code> — and the transitions are the obvious ones, with <code class="inline">working</code> and <code class="inline">input_required</code> able to alternate any number of times before one of the three terminal states.</p>
+
+<pre class="standalone"><span class="c-cm">// 1. An ordinary tools/call. The client has declared it can take a task.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 11, <span class="c-kw">"method"</span>: <span class="c-st">"tools/call"</span>,
+ <span class="c-kw">"params"</span>: {<span class="c-kw">"name"</span>: <span class="c-st">"reindex_corpus"</span>,
+            <span class="c-kw">"arguments"</span>: {<span class="c-kw">"collection"</span>: <span class="c-st">"support-tickets"</span>},
+            <span class="c-kw">"_meta"</span>: {<span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>: <span class="c-st">"2026-07-28"</span>,
+                      <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>: {
+                        <span class="c-kw">"io.modelcontextprotocol/tasks"</span>: {}}}}}
+
+<span class="c-cm">// 2. The server declines to answer now. This IS the success case.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 11, <span class="c-kw">"result"</span>: {
+  <span class="c-kw">"resultType"</span>: <span class="c-st">"task"</span>,
+  <span class="c-kw">"task"</span>: {<span class="c-kw">"taskId"</span>: <span class="c-st">"tsk_01JA7Q2X"</span>,
+           <span class="c-kw">"status"</span>: <span class="c-st">"working"</span>,
+           <span class="c-cm">// Milliseconds. Not seconds. See STEP 4.</span>
+           <span class="c-kw">"ttlMs"</span>: 3600000,
+           <span class="c-kw">"pollIntervalMs"</span>: 5000}}}
+
+<span class="c-cm">// 3. Poll. Any replica can answer this; that is the whole point.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 12, <span class="c-kw">"method"</span>: <span class="c-st">"tasks/get"</span>,
+ <span class="c-kw">"params"</span>: {<span class="c-kw">"taskId"</span>: <span class="c-st">"tsk_01JA7Q2X"</span>, <span class="c-kw">"_meta"</span>: {<span class="c-st">"..."</span>: <span class="c-st">"..."</span>}}}</pre>
+
+    <p>The ordering rule is the one that bites implementers, and it is worth stating precisely: a server <strong>MUST NOT</strong> return the creation result until a <code class="inline">tasks/get</code> for that id would resolve. Obvious when written down, routinely violated in practice, because the natural implementation is to generate an id, return it, and then enqueue the job — at which point a fast client polls and gets "unknown task" for a job that exists. Persist first, answer second. The symptom when you get this backwards is a flaky client that works locally and fails under load, which is the most expensive class of bug to find.</p>
+
+    <p>Note also what <em>did</em> go away. The 2025-11-25 shape had a blocking <code class="inline">tasks/result</code> that let a client wait for completion in one call; it is removed. Polling is the model now, which is a deliberate trade — a blocking call reintroduces exactly the long-held connection the revision was trying to delete.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Server-directed creation is the real design change, and it reverses who owns the decision.</h3>
+
+    <p>A client cannot ask for a task. It can only declare that it is able to receive one; the server decides, per call, whether this particular invocation becomes a task or returns inline. That single asymmetry is responsible for most of the work the extension creates on both sides.</p>
+
+    <p>For a client author it means there is no such thing as a tool call you know is synchronous. Any <code class="inline">tools/call</code>, <code class="inline">resources/read</code> or <code class="inline">prompts/get</code> against a task-capable server may come back as a handle, including one that returned inline a thousand times before — the server is entitled to change its mind when its queue is deep. So the result-handling branch is not an optional code path for the few tools you know are slow; it is the shape of every call site. The anti-pattern is a client that advertises the capability because a library turned it on and then treats <code class="inline">resultType: "task"</code> as an unexpected response, which surfaces as a tool that silently returns nothing useful to the model.</p>
+
+    <p>For a server author it means the promotion decision is yours and it is a capacity decision, not a semantic one. The honest default is a deadline: if the work will not finish inside the response budget you are willing to hold a connection open for — a few seconds, not a few minutes — promote it. Promoting on tool identity instead ("<code class="inline">reindex_corpus</code> is always a task") is tempting and wrong, because the same tool is sub-second on a small collection and an hour on a large one, and you have just forced a round trip onto the common case.</p>
+
+    <div class="callout warn">
+      <p>Promotion changes what the model sees. An inline result is content the model reasons over on the next turn; a task handle is a promise with no content in it at all. If your harness does not explicitly give the model something to do while a task is working — wait, do other work, tell the user — the usual failure is that the model treats the empty handle as a completed call and proceeds to summarise work that has not happened. That is the <a href="/concepts/failure-concealment" class="xref">failure-concealment</a> pattern arriving through the protocol rather than through the model.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3><code class="inline">ttlMs</code> and <code class="inline">pollIntervalMs</code> are a retention contract and a load contract, and the units changed under you.</h3>
+
+    <p>These two fields look like hints. They are the operational bar the extension actually sets, and they are set by the server, which means the client's retry strategy is no longer the client's to choose.</p>
+
+    <p><code class="inline">ttlMs</code> is how long the server retains the task, measured from creation. It is a retention policy with a sharp edge: a job whose work takes longer than its own TTL, or a client that goes away for longer than the TTL and comes back, finds the handle gone. Worse, "gone" is indistinguishable from "never existed" unless you design for it. A client that resumes after a crash and gets "unknown task" cannot tell whether the reindex it started finished, failed, or is still running under a handle it can no longer address — and the <em>work</em> may well still be running, because expiring the record does not cancel the job unless you make it. Set the TTL from the worst-case duration of the work plus the worst-case client outage, not from how long you want to keep rows.</p>
+
+    <p><code class="inline">pollIntervalMs</code> is the server telling clients how often it is willing to be asked. Honour it. A client that polls a 5-second interval every 200ms is running a small denial-of-service against a server that is, by construction, already busy — and because every request now restates the full handshake in <code class="inline">params._meta</code>, a poll is not a cheap request. On the server side, set the interval from the actual granularity of your progress, not from impatience: an interval shorter than the time between real status changes buys the client nothing and costs you the whole poll volume.</p>
+
+    <div class="callout warn">
+      <p><strong>The 1000× bug.</strong> The 2025-11-25 core shape used <code class="inline">ttl</code> and <code class="inline">pollInterval</code> in <em>seconds</em>. The extension uses <code class="inline">ttlMs</code> and <code class="inline">pollIntervalMs</code> in <em>milliseconds</em>. A migration that maps the old field onto the new name without converting produces a TTL a thousand times too short — a one-hour retention becomes 3.6 seconds — and the failure presents as "tasks randomly disappear", not as a type error. Implementations have also been reported advertising the extension while still speaking the 2025-11-25 shape, so a server that advertises it is not a server that implements it; test the wire format rather than the capability list, which is the argument the <a href="/deep-dives/mcp/mcp-testing" class="xref">MCP testing essay</a> makes about every part of this protocol.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3><code class="inline">input_required</code> is where Tasks meets MRTR, and it is the only reason a long job can ask a question.</h3>
+
+    <p>Because server-initiated requests were deleted, a task that needs a human decision halfway through — approve this migration, pick between two merge candidates, supply a credential — has no way to interrupt the client. The <code class="inline">input_required</code> status is the replacement: the task parks itself, the next <code class="inline">tasks/get</code> reports the status along with the pending input requests, and the client answers through the Multi Round-Trip Request pattern the revision introduced for <a href="/deep-dives/mcp/mcp-sampling-and-elicitation" class="xref">sampling and elicitation</a>. The job does not resume until someone asks and answers.</p>
+
+    <p>Two consequences follow and neither is obvious from the state diagram. First, a parked task is burning TTL while it waits for a human, and humans are slower than every other actor in this system — a TTL tuned to the compute time of the job will expire a task that is merely waiting for someone to come back from lunch. Second, a client that polls on a timer but only surfaces terminal states to the user will sit in a loop forever, politely asking a task that is politely waiting for it. <code class="inline">input_required</code> must be routed to a human surface the moment it is observed, which makes this a UX obligation rather than a protocol one; the <a href="/playbooks/agent-ux-and-human-interaction/async-agent-ux" class="xref">async agent UX</a> playbook is where that queue lives.</p>
+
+    <p>The symmetrical mistake on the server is to park on a question nobody can answer. If the task was started by a scheduled run with no human attached, <code class="inline">input_required</code> is a deadlock dressed as a status. Servers exposing tools that can need input should take the deadline with them: park, and fail the task when the input does not arrive inside a bound you set, so the caller gets <code class="inline">failed</code> with a reason instead of a handle that is working forever.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Operating it: idempotent creation, cooperative cancellation, and the fact that nobody is watching.</h3>
+
+    <p>Three operational properties finish the picture, and each is a direct consequence of something the revision removed.</p>
+
+    <ul>
+      <li><strong>Creation must be idempotent, because the transport no longer protects it.</strong> With stream resumability gone, the client's prescribed response to a broken connection is to re-issue the work as a new request with a new id. A server without an idempotency key therefore starts the forty-minute reindex twice for one network blip, and the second one is invisible to the client, which only ever learned about the second handle. Thread a caller-supplied idempotency key through tool arguments and return the <em>existing</em> task for a repeat — this is the <a href="/operations/agentops/idempotency-and-retries" class="xref">idempotency</a> discipline the rest of your stack already has, newly mandatory here.</li>
+      <li><strong>Cancellation is cooperative and should be treated as a request, not a stop.</strong> <code class="inline">tasks/cancel</code> moves the record to <code class="inline">cancelled</code>; whether the work actually stops depends entirely on whether your job checks. A server that marks cancelled and leaves the job running has built the worst version of this: the client believes it stopped, the invoice says otherwise, and any side effects land after the user was told they would not. Check a cancellation flag at every point where the job is about to do something externally visible.</li>
+      <li><strong>Assume nobody comes back.</strong> Polling means the completion of a task is only observed if a client chooses to look, and clients crash, get closed, and change conversations. Every task must therefore have a terminal disposition that does not depend on being read: results durable to the TTL, side effects either completed or compensated, and alerting that fires on tasks that reached <code class="inline">failed</code> and were never fetched. The reliability of the job cannot be contingent on the attentiveness of the poller.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Implement the extension server-side before you need it, and set your promotion deadline at the point where you would otherwise be holding a connection open — for most servers that is three to ten seconds. Then spend your design effort on the two numbers rather than the state machine: a <code class="inline">ttlMs</code> covering worst-case work plus worst-case client absence, and a <code class="inline">pollIntervalMs</code> matching the real granularity of progress. The state machine is five values and will take an afternoon. A TTL that expires under a human approval, or a creation path that is not idempotent, will cost you a production incident each, and both of them present as "tasks are flaky" rather than as the specific bugs they are. For the surrounding operational posture — health, versioning, and what to page on — see <a href="/deep-dives/mcp/mcp-ops-in-production" class="xref">MCP ops in production</a>.</p>
+    </div>
+  </div>
+</section>
