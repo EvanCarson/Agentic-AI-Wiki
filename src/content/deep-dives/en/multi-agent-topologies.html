@@ -1,52 +1,91 @@
 <section class="phase">
   <div class="phase-num">G2</div>
   <div class="week">Deep Dive · Multi-Agent Systems</div>
-  <h2>Multi-agent topologies: the wiring diagram is the design decision.</h2>
-  <p class="goal">Once you have decided to use more than one agent, the next decision dominates everything else: how the agents are <em>connected</em>. Star, pipeline, hierarchy, and mesh are not interchangeable styles — each has a different communication cost, a different failure profile, and a narrow regime where it is the right answer. This essay maps the four canonical topologies, their O(·) message costs, and how to pick one without defaulting to "everyone talks to everyone."</p>
+  <h2>Multi-agent topologies: the wiring diagram decides where context breaks.</h2>
+  <p class="goal">In the largest controlled comparison so far, the same multi-agent wirings scored up to 81% better than a single agent on one task and up to 70% worse on another, so the topology you draw can decide whether adding agents helps at all. Every edge in the graph is a place where context is cut. Drawing the graph therefore decides which decisions each agent can see, who pays the tokens, and whether anything checks a result before it moves on. The evidence from 2025–2026 supports a blunt rule. Fan out when the work splits into independent reads, and keep coupled work, especially writes, inside one agent. When you do fan out, the hub's job is to verify, not only to merge. This essay tests star, pipeline, hierarchy and mesh against that evidence and ends with a decision procedure.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>Topology is the variable that most strongly predicts cost and reliability.</h3>
-    <p>The agents' prompts get the attention; the <em>graph</em> determines the outcome. Communication cost scales with the number of edges, not the number of agents: a star with <em>n</em> workers has <em>n</em> edges, a full mesh has <em>n(n−1)/2</em>. Every edge is a token-bearing channel and a potential point of error propagation or deadlock. Choosing a topology is choosing how much your system will spend and how it will fail — decide it explicitly, draw it, and defend it.</p>
+    <h3>A topology is a decision about where context is split and who pays for it.</h3>
+    <p>The textbook cost model counts edges. A star with <em>n</em> workers has <em>n</em> edges and a full mesh has <em>n(n−1)/2</em>, and every edge carries tokens. That still holds, but it misses the more important property: an edge is a <em>lossy handoff</em>. Whatever crosses it is a brief or a summary, not the sender's full working state. A multi-agent system therefore buys two things with one design choice. It gets more total context, because each agent has its own window, and it accepts less shared context, because no agent sees everything.</p>
+    <p>Anthropic's write-up of its multi-agent Research feature (June 13, 2025) shows the first half of that trade clearly. Agents typically used about 4× the tokens of a chat interaction, and multi-agent systems about 15×. On BrowseComp, three factors explained 95% of the performance variance, and token usage alone explained 80%. The other two were the number of tool calls and the model choice. Read plainly, a large part of what a fan-out topology buys on search-style tasks is the ability to spend more tokens in parallel.</p>
+    <p>The second half shows up once you hold that spend fixed. A Stanford preprint by Tran and Kiela (April 2026) gave single-agent and multi-agent systems the same <em>thinking-token</em> budget on multi-hop reasoning, across three model families. The single agent consistently matched or beat the multi-agent systems. The authors also report that API-based budget control and standard benchmarks contain artifacts that can inflate apparent multi-agent gains. So the first question about any topology is not "how many messages?" It is "what does splitting the context buy that a single window, given the same tokens, could not?"</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>Star: one coordinator, n leaves, O(n) edges.</h3>
-    <p>A central agent dispatches to workers that never talk to each other and report only upward. This is the workhorse of production multi-agent systems through 2025 (the supervisor/worker pattern, see <code class="inline">supervisor-worker-pattern</code>). Communication is <strong>O(n)</strong>, the coordinator is the single place to enforce budget and aggregation, and a failed worker is contained. The price: the coordinator is a bottleneck and a single point of failure, and leaves cannot share discoveries except through it.</p>
+    <h3>The best controlled evidence: same tasks, five wirings.</h3>
+    <p>The most direct test of topology so far is Google Research's <em>Towards a Science of Scaling Agent Systems</em> (Kim et al., arXiv:2512.08296, first posted December 2025, revised April 2026). It compares a single agent with four multi-agent architectures across agentic benchmarks and three LLM families, with tools, prompts and compute standardized. The architectures map onto the classic shapes. <em>Independent</em> means parallel workers whose results are combined only at the end, with no communication. <em>Centralized</em> is a hub-and-spoke orchestrator, which is a star. <em>Decentralized</em> is a peer-to-peer mesh. <em>Hybrid</em> is hierarchical oversight plus peer links. The figures below are from the April 2026 revision (v3, Table 5 and Section 4).</p>
 
-<pre class="standalone"><span class="c-cm"># star: coordinator fans out, workers stay isolated</span>
-<span class="c-kw">def</span> <span class="c-fn">star</span>(task):
-    subs = coordinator.<span class="c-fn">decompose</span>(task)
-    results = [worker.<span class="c-fn">run</span>(s) <span class="c-kw">for</span> s <span class="c-kw">in</span> subs]   <span class="c-cm"># no leaf-to-leaf edge</span>
-    <span class="c-kw">return</span> coordinator.<span class="c-fn">aggregate</span>(results)</pre>
+<pre class="standalone"><span class="c-cm"># Kim et al. 2026 (v3). Error amp.: single agent = 1.0; single-agent row shows raw scores</span>
+architecture    turns        overhead   error amp.   PlanCraft vs SAS   Finance-Agent vs SAS
+single agent     7.2           0%         1.0          (0.568)            (0.349)
+independent     11.4          58%        17.2         −70.0%             +57%
+centralized     27.7         285%         4.4         −50.3%             +80.8%
+decentralized   26.1         263%         7.8         −41.5%             +74.5%
+hybrid          44.3         515%         5.1         −39.1%             +73.1%</pre>
 
-    <div class="callout tip"><p>Default to star. Most "we need a mesh so agents can collaborate" intuitions are solved by a star plus a shared read-only artifact (see <code class="inline">shared-memory-and-blackboard</code>) — you get cross-worker information without the quadratic message cost or the mesh's tangled failure modes.</p></div>
+    <p>Three findings matter for topology. First, <strong>the task decides the sign</strong>. On decomposable financial reasoning every multi-agent wiring beat the single agent. On PlanCraft, a sequential planning task, every one of them lost, by 39–70%. Second, <strong>the sparsest graph had the worst errors</strong>. The independent fan-out had the least overhead and the highest error amplification. Adding a hub that sees every worker's output cut amplification from 17.2 to 4.4, and the authors attribute the gap to the absence or presence of centralized verification. Third, <strong>coordination stops paying off as the base model improves</strong>. Once a single agent already scores above roughly 45% on a task, coordination returns diminish or turn negative, and tool-heavy tasks pay a larger coordination tax. The paper's fitted model picks the best architecture for 87% of held-out configurations. Its predictors are task properties such as sequential dependency and tool density. Agent count and graph aesthetics are not among them.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>Pipeline: a linear chain, O(n) edges, fully serial.</h3>
-    <p>Agent A's output is agent B's input, and so on. Each stage specializes; latency is the <em>sum</em> of stages, never overlapped. Pipelines suit work with a true sequential dependency and clean, narrow interfaces between stages (extract → transform → validate). The structural weakness is <strong>error propagation with no recovery path</strong>: a subtly wrong stage-two output is treated as ground truth by stages three through n, and the lossy handoff at each boundary compounds. A pipeline with five hops has five places to silently corrupt the result and zero places to catch it unless you add explicit validation edges.</p>
+    <h3>Star: fan out the reads, and make the hub a checker.</h3>
+    <p>A central agent dispatches workers that never talk to each other and report only upward. This is the production default, and the <a class="xref" href="/deep-dives/multi-agent-systems/supervisor-worker-pattern">supervisor/worker pattern</a> covers its mechanics in detail. Its best-documented success is Anthropic's Research system. It uses an orchestrator-worker design with a Claude Opus 4 lead and Claude Sonnet 4 subagents, and it outperformed single-agent Claude Opus 4 by 90.2% on Anthropic's internal research eval. Running subagents in parallel, and tools in parallel inside each subagent, cut research time by up to 90% on complex queries. The workload is breadth-first search: many independent reads whose findings only need to meet at the end.</p>
+    <p>The same report is candid about the star's limits. Lead agents ran subagents <em>synchronously</em>, waiting for each batch before continuing, so the lead could not steer subagents and subagents could not coordinate with one another. The Google numbers explain why the hub is still worth having. A star whose hub only concatenates outputs is functionally the "independent" row, with low overhead and maximal error amplification. A star whose hub reads, cross-checks and rejects is the "centralized" row. Most of the hub's 285% overhead is the cost of that checking, and it is the part worth paying for.</p>
+
+<pre class="standalone"><span class="c-cm"># star: fan out reads, verify at the hub, never merge blindly</span>
+<span class="c-kw">def</span> <span class="c-fn">star</span>(task, budget):
+    subs = hub.<span class="c-fn">decompose</span>(task)                     <span class="c-cm"># subtasks must not share decisions</span>
+    results = <span class="c-fn">parallel</span>(worker.<span class="c-fn">run</span>(s, budget / len(subs)) <span class="c-kw">for</span> s <span class="c-kw">in</span> subs)
+    checked = [r <span class="c-kw">for</span> r <span class="c-kw">in</span> results <span class="c-kw">if</span> hub.<span class="c-fn">verify</span>(r, task)]   <span class="c-cm"># the edge that contains errors</span>
+    <span class="c-kw">return</span> hub.<span class="c-fn">synthesize</span>(checked)</pre>
+
+    <div class="callout tip"><p>Default to a star, and budget it as a star. Expect it to cost more than ten times the tokens of a chat turn, and compare it with a single agent given the same spend before claiming that the topology, rather than the extra tokens, did the work. Where workers need each other's findings, a shared read-only artifact (see <a class="xref" href="/deep-dives/multi-agent-systems/shared-memory-and-blackboard">shared memory and the blackboard</a>) usually beats adding leaf-to-leaf edges.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>Hierarchy: a tree of coordinators, O(n) edges, bounded depth.</h3>
-    <p>A star whose leaves are themselves coordinators. This is how you scale beyond one coordinator's context limit: a top planner delegates to mid-level leads that fan out to workers. Communication stays <strong>O(n)</strong> on a tree, and each subtree is an isolation and budget boundary. The new failure mode is <em>multi-level lossy summarization</em>: a worker's nuance is compressed at its lead, then again at the planner, so the top sees a summary of summaries. Keep the tree shallow (two, rarely three levels) and pass structured artifacts, not prose, up the tree to limit compression loss.</p>
-
-    <div class="callout warn"><p>Every extra level of hierarchy is another lossy summarization hop and another coordinator that can become a bottleneck. Depth is not free organization — it is compounding information loss. If you are reaching for a fourth level, the task decomposition is wrong, not the tree too short.</p></div>
+    <h3>Pipeline: serial by definition, so it needs a verifier on the path.</h3>
+    <p>Agent A's output becomes agent B's input. Each stage specializes, latency is the sum of the stages, and nothing overlaps. A pipeline suits work with a genuine sequential dependency and narrow, checkable interfaces such as extract → transform → validate. Its structural weakness is that a subtly wrong stage-two output becomes ground truth for every later stage, and each boundary is another lossy handoff.</p>
+    <p>The failure data points at the fix. The MAST taxonomy (Cemri et al., <em>Why Do Multi-Agent LLM Systems Fail?</em>, arXiv:2503.13657, revised October 2025) annotated more than 1,600 traces from seven multi-agent frameworks. It sorts 14 failure modes into three categories: system design issues, inter-agent misalignment and task verification. Inter-annotator agreement was κ = 0.88. ChatDev, which the paper lists as a hierarchical workflow, is a role-to-role pipeline in practice. Adding one high-level check of the result against the task objective raised its success on ProgramDev by 15.6%, the largest single intervention gain the paper reports. Better role specifications added 9.4%. In a pipeline, the cheapest reliability you can buy is an edge from the end of the chain back to the original task.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>Mesh: any-to-any, O(n²) edges — powerful and rarely worth it.</h3>
-    <p>Every agent can message every other agent. Mesh enables emergent collaboration and debate-style cross-talk (see <code class="inline">agent-debate-and-ensembles</code>), but it pays the full <strong>O(n²)</strong> communication cost and inherits every system-level failure at once: groupthink (agents converge by echoing each other), deadlock and livelock (circular waits and message storms with no progress), and an observability nightmare (no central trace; you must reconstruct order from a distributed log). Mesh is justified for small <em>n</em> where the cross-talk <em>is</em> the algorithm — structured debate among three to five agents — not as a general collaboration substrate.</p>
+    <h3>Hierarchy: buys context capacity, pays in turns and summaries.</h3>
+    <p>A hierarchy is a star whose leaves are themselves coordinators. It is how you scale past one hub's context window: a top planner delegates to leads, and the leads fan out to workers. Each subtree is a budget and isolation boundary. The cost shows up in the Google table. The hybrid architecture, with hierarchical oversight plus peer links, had the highest overhead (515%) and the most turns (44.3 per trial, against 7.2 for the single agent). On Finance-Agent it did not beat the plain star (+73.1% against +80.8%).</p>
+    <p>The qualitative failure is <em>multi-level lossy summarization</em>. A worker's nuance is compressed once at its lead and again at the planner, so the top sees a summary of summaries. Every level is another place where context is split, which is the property this whole essay is about. Keep trees shallow, pass structured artifacts rather than prose up the tree, and add a level only when one hub provably cannot hold the plan.</p>
+
+    <div class="callout warn"><p>Depth is not free organization. Each level adds a lossy summarization hop and another coordinator that can become a bottleneck, and in the controlled comparison the extra structure bought turns, not accuracy. If you are reaching for a fourth level, the task decomposition is wrong; the tree is not too short.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>When NOT to pick the richer topology.</h3>
-    <p>The instinct to "let agents talk freely" almost always over-buys: mesh's quadratic cost and tangled failure modes are real, while its benefit only materializes when interaction itself is the computation. Use a <em>pipeline</em> only for genuinely serial work with narrow interfaces, a <em>star</em> as the default for parallel fan-out, a <em>hierarchy</em> only when one coordinator's context cannot hold the plan, and a <em>mesh</em> only for small-n structured debate. <strong>Pick the sparsest topology that still expresses the dependencies — edges are not collaboration, they are cost and failure surface.</strong></p>
+    <h3>Mesh: maximum shared context, maximum cost, and no single checker.</h3>
+    <p>In a mesh every agent can message every other. It is the only topology where workers see each other's intermediate state directly, which is why it is attractive. In the Google comparison the decentralized mesh did well on the decomposable finance task (+74.5%). It still came in below the star while carrying comparable overhead (263%) and nearly double the star's error amplification (7.8 against 4.4). Peer messages spread context, but no single node is responsible for rejecting a wrong claim, so a confident error moves as easily as a correct one.</p>
+    <p>That leaves a narrow regime: a small number of agents where the cross-talk <em>is</em> the algorithm, such as structured debate among three to five agents. Even there, most of the measured gain tends to come from ensembling rather than from the conversation itself. See <a class="xref" href="/deep-dives/multi-agent-systems/agent-debate-and-ensembles">debate, voting and ensembles</a>. As a general collaboration substrate, a mesh pays quadratic communication to fix a context-sharing problem that a shared artifact or a single agent fixes more cheaply.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>Reads fan out; writes stay in one thread.</h3>
+    <p>The sharpest version of the argument comes from practitioners who disagree on everything except this. Cognition's <em>Don't Build Multi-Agents</em> (Walden Yan, June 2025) states two principles. Share context, meaning full agent traces rather than individual messages. And remember that actions carry implicit decisions, so conflicting decisions produce bad results. Its example is a Flappy Bird clone split between two subagents. One builds a Super Mario-style background and the other builds a bird that does not fit it, because neither could see the stylistic choices the other was making. The post also describes how Claude Code used subagents at the time: they never worked in parallel with the main agent, and they mostly answered well-defined questions rather than writing code. Their value was keeping an investigation's clutter out of the main agent's history.</p>
+    <p>Anthropic, writing the same week in favour of multi-agent research, draws the same boundary from the other side. Domains that require all agents to share the same context, or that involve many dependencies between agents, are not a good fit today. Most coding tasks also involve fewer truly parallelizable pieces than research does. Put together, a read such as a search, a lookup or an investigation returns information and commits nothing, so it can run in an isolated window and be summarized safely. A write commits a decision that every later write depends on, so splitting writes across windows splits the decisions. That is the mechanism behind the PlanCraft collapse and behind most of MAST's inter-agent misalignment category.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 8</div>
+    <h3>The decision rule, and when NOT to pick the richer topology.</h3>
+    <p>Work through the questions in order and stop at the first one that decides.</p>
+    <ol>
+      <li><strong>Do the subtasks share decisions?</strong> If they are coupled writes or sequential plans, use one agent, and if its window overflows use compaction or a read-only subagent rather than peers. In the controlled comparison, sequential planning lost 39–70% under every multi-agent wiring.</li>
+      <li><strong>Is the single agent already good at this?</strong> Above roughly 45% baseline success, expect coordination to return little or less than nothing. Measure the single agent first.</li>
+      <li><strong>Is the work wide, read-heavy and worth roughly 15× the tokens?</strong> If yes, use a star whose hub verifies as well as merges. If the value does not justify the spend, give one agent the extra budget instead, and compare the two at equal tokens.</li>
+      <li><strong>Is it serial, with narrow interfaces?</strong> Use a pipeline, and add a final check against the original objective.</li>
+      <li><strong>Does one hub's context truly fail to hold the plan?</strong> Only then add one level of hierarchy, and pass structured artifacts upward.</li>
+      <li><strong>Is the interaction itself the computation?</strong> Only then use a small mesh, typically a structured debate among three to five agents.</li>
+    </ol>
+    <p>The common error is assuming that more edges mean more collaboration. The evidence says edges mean more tokens and more places where context is lost, and that the one edge reliably worth adding is a verification path from the hub to every output. <strong>Pick the sparsest topology that keeps coupled decisions in one context and puts a checker between every worker and the answer.</strong> For the case against splitting at all, see <a class="xref" href="/deep-dives/multi-agent-systems/multi-agent-when-and-why">when (and when not) to go multi-agent</a>. For what goes wrong once you have split, see <a class="xref" href="/deep-dives/multi-agent-systems/multi-agent-failure-modes">multi-agent failure modes</a>.</p>
   </div>
 </section>
