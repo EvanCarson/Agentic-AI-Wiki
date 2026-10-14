@@ -1,0 +1,113 @@
+<section class="phase">
+  <div class="phase-num">C12</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>Tasks 读起来像是给 MCP 外挂上去的一个异步便利功能。它不是——它是会话被删掉之后，「持久性」搬去的那个地方，而且决定你什么时候拿到一个任务的是服务端，不是你。</h2>
+  <p class="goal">凡是能把工作带过一次断连的机制——会话 id、SSE 可恢复、<code class="inline">Last-Event-ID</code>、服务器发起的请求——在 2026-07-28 里全被删了，而任务句柄是唯一还能熬过重连的东西。所以一个把 <code class="inline">io.modelcontextprotocol/tasks</code> 扩展当成可选项的客户端，并不是婉拒了一项功能；它是宣布了自己发出的每一次调用都必须在一个 HTTP 响应之内结束。而由于任务的创建是<em>由服务端决定</em>的，服务端也就定下了那三个决定你的长任务能否跑完的数字：句柄活多久、你多久可以问一次，以及当没有人再来问时，那份工作会怎么样。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Tasks 不是被降级成了扩展。它是从一个再也装不下它的核心里被挪了出来。</h3>
+
+    <p>Tasks 在 2025-11-25 里作为实验性核心特性发布，又在 2026-07-28 离开核心，依据 SEP-2663 迁入独立扩展 <code class="inline">io.modelcontextprotocol/tasks</code>。孤立地看，这像是降级：原本写在规范里的特性，如今成了一个附加件。但放在这一版修订的其余部分里看，结论恰好相反——因为同时离开的还有别的东西。</p>
+
+    <p><a href="/zh/deep-dives/mcp/mcp-revision-2026-07-28" class="xref">2026-07-28 修订版</a>删掉了 <code class="inline">initialize</code> 握手、<code class="inline">Mcp-Session-Id</code> header、MCP 端点上的 <code class="inline">GET</code>（连带那条独立 SSE 流）、<code class="inline">Last-Event-ID</code>（因而连带流的可恢复性），以及三种服务器发起的请求。数一数这从一次长时工具调用里拿走了什么。在 2025-11-25 下，一次四十分钟的构建可以把一条 SSE 流挂着并发出进度通知；流断了，客户端带上 <code class="inline">Last-Event-ID</code> 重连，服务器重放。这三套机制如今全没了，而规范对「流断了怎么办」给出的替代规则写得很直白：<em>用一个新的请求 ID，作为一个新请求重新发起这份工作</em>。</p>
+
+    <p>这条规则只有在「工作拥有一个独立于发起它的那次请求的身份」时才活得下去。任务 id 就是那个身份。这意味着 Tasks 并不是与同步选项并列的那个异步选项——对任何活得比一次响应更久的工作而言，它是协议还留下的唯一选项，而扩展这条边界是一个打包方式的决定，并不是在说它有多核心。</p>
+
+    <div class="callout">
+      <p>一个好用的自检：问问当负载均衡器把下一个请求投到另一个副本上时，你那条最长的工具调用会发生什么。在 2025-11-25 下，答案是「黏性路由会避免这种情况」。在 2026-07-28 下没有黏性可买，所以答案必须是「这份工作可以从任何副本按 id 寻址」——这是一句关于你的存储的话，不是关于你的传输层的话。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>线上的形状：一个新的 <code class="inline">resultType</code>、五种状态、三个方法，以及一条所有人都会栽的顺序规则。</h3>
+
+    <p>支持与否是逐请求协商的，和这一版的其他一切一样：客户端把 <code class="inline">io.modelcontextprotocol/tasks</code> 列进它在每次调用的 <code class="inline">params._meta</code> 里重新声明的能力集，服务端则在自己的 <code class="inline">server/discover</code> 能力里公布它。不存在「一次谈妥」的握手。</p>
+
+    <p>当服务端判定一次调用会长时间运行，它会立刻用 <code class="inline">resultType: "task"</code> 和一个任务对象来回答原请求——一个唯一的 <code class="inline">taskId</code>、一个初始 <code class="inline">status</code>、一个 <code class="inline">ttlMs</code> 和一个 <code class="inline">pollIntervalMs</code>。此后客户端通过三个方法驱动一切：<code class="inline">tasks/get</code> 轮询、<code class="inline">tasks/update</code>、<code class="inline">tasks/cancel</code>。状态是五个值之一——<code class="inline">working</code>、<code class="inline">input_required</code>、<code class="inline">completed</code>、<code class="inline">cancelled</code>、<code class="inline">failed</code>——转移关系就是显而易见的那些，其中 <code class="inline">working</code> 与 <code class="inline">input_required</code> 可以在进入三个终态之一之前来回切换任意多次。</p>
+
+<pre class="standalone"><span class="c-cm">// 1. An ordinary tools/call. The client has declared it can take a task.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 11, <span class="c-kw">"method"</span>: <span class="c-st">"tools/call"</span>,
+ <span class="c-kw">"params"</span>: {<span class="c-kw">"name"</span>: <span class="c-st">"reindex_corpus"</span>,
+            <span class="c-kw">"arguments"</span>: {<span class="c-kw">"collection"</span>: <span class="c-st">"support-tickets"</span>},
+            <span class="c-kw">"_meta"</span>: {<span class="c-kw">"io.modelcontextprotocol/protocolVersion"</span>: <span class="c-st">"2026-07-28"</span>,
+                      <span class="c-kw">"io.modelcontextprotocol/clientCapabilities"</span>: {
+                        <span class="c-kw">"io.modelcontextprotocol/tasks"</span>: {}}}}}
+
+<span class="c-cm">// 2. The server declines to answer now. This IS the success case.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 11, <span class="c-kw">"result"</span>: {
+  <span class="c-kw">"resultType"</span>: <span class="c-st">"task"</span>,
+  <span class="c-kw">"task"</span>: {<span class="c-kw">"taskId"</span>: <span class="c-st">"tsk_01JA7Q2X"</span>,
+           <span class="c-kw">"status"</span>: <span class="c-st">"working"</span>,
+           <span class="c-cm">// Milliseconds. Not seconds. See STEP 4.</span>
+           <span class="c-kw">"ttlMs"</span>: 3600000,
+           <span class="c-kw">"pollIntervalMs"</span>: 5000}}}
+
+<span class="c-cm">// 3. Poll. Any replica can answer this; that is the whole point.</span>
+{<span class="c-kw">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-kw">"id"</span>: 12, <span class="c-kw">"method"</span>: <span class="c-st">"tasks/get"</span>,
+ <span class="c-kw">"params"</span>: {<span class="c-kw">"taskId"</span>: <span class="c-st">"tsk_01JA7Q2X"</span>, <span class="c-kw">"_meta"</span>: {<span class="c-st">"..."</span>: <span class="c-st">"..."</span>}}}</pre>
+
+    <p>会咬人的是那条顺序规则，值得精确写下来：服务端<strong>绝不可</strong>在「针对该 id 的一次 <code class="inline">tasks/get</code> 已经能被解析到」之前返回创建结果。写下来显而易见，实践中却经常被违反——因为最自然的实现是先生成一个 id、返回、再把任务入队，于是一个手快的客户端轮询过来，对一个确实存在的任务得到了「未知任务」。先持久化，再应答。搞反了的症状是一个本地跑得好好的客户端在压力下开始抖，而这是最费钱的那一类 bug。</p>
+
+    <p>也要注意<em>走掉</em>了什么。2025-11-25 那套形状里有一个阻塞式的 <code class="inline">tasks/result</code>，让客户端用一次调用等到完成；它被移除了。如今的模型是轮询，这是一笔有意为之的交易——一个阻塞调用会把这一版努力想删掉的那种长挂连接原样请回来。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>「由服务端决定创建」才是真正的设计变更，它把决定权调了个头。</h3>
+
+    <p>客户端无法索要一个任务。它只能声明自己有能力接住一个；究竟这一次调用是变成任务还是内联返回，由服务端逐次决定。这一条不对称，造成了这个扩展在两边带来的大部分工作量。</p>
+
+    <p>对客户端作者而言，这意味着不存在「你知道它是同步的」那种工具调用。对一台支持任务的服务器发出的任何 <code class="inline">tools/call</code>、<code class="inline">resources/read</code> 或 <code class="inline">prompts/get</code> 都可能回来一个句柄，包括此前内联返回过一千次的那一个——队列深了，服务端有权改主意。所以处理结果的那个分支不是「为少数你知道很慢的工具」准备的可选代码路径；它就是每一处调用点的形状。反模式是：一个客户端因为某个库默认打开而声明了这项能力，却把 <code class="inline">resultType: "task"</code> 当成意料之外的响应——其表征是一个工具安静地什么有用东西都没返回给模型。</p>
+
+    <p>对服务端作者而言，这意味着「提升为任务」的决定在你手上，而它是一个容量决定，不是一个语义决定。诚实的默认做法是用一个期限：如果这份工作无法在「你愿意为之挂着一条连接」的响应预算内完成——是几秒，不是几分钟——就提升它。改按工具身份来提升（「<code class="inline">reindex_corpus</code> 永远是任务」）很诱人，也是错的，因为同一个工具在小集合上是亚秒级、在大集合上是一小时，而你刚刚给常见情形硬塞了一次往返。</p>
+
+    <div class="callout warn">
+      <p>提升会改变模型看到的东西。内联结果是模型下一轮要据以推理的内容；任务句柄则是一个里头什么内容都没有的承诺。如果你的 harness 没有明确告诉模型在任务 <code class="inline">working</code> 期间该做什么——等待、去干别的、告诉用户——常见的失效就是：模型把这个空句柄当成一次已完成的调用，然后开始总结一份根本还没发生的工作。这就是<a href="/zh/concepts/failure-concealment" class="xref">失败隐瞒</a>这一模式经由协议、而非经由模型送上门来。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3><code class="inline">ttlMs</code> 与 <code class="inline">pollIntervalMs</code> 是一份保留契约和一份负载契约，而单位在你脚下换过了。</h3>
+
+    <p>这两个字段看起来像提示。它们才是这个扩展真正立下的运维门槛，而且由服务端设定——也就是说，客户端的重试策略已经不再由客户端来选。</p>
+
+    <p><code class="inline">ttlMs</code> 是服务端保留这个任务的时长，自创建起算。这是一条带着锋利边缘的保留策略：一份耗时长过自身 TTL 的工作，或者一个离开超过 TTL 之后才回来的客户端，会发现句柄没了。更糟的是，除非你为此做了设计，否则「没了」和「从来没存在过」是分不出来的。一个崩溃后恢复、拿到「未知任务」的客户端，无从判断它启动的那次重建索引是完成了、失败了，还是仍在一个它再也寻址不到的句柄底下跑着——而那份<em>工作</em>很可能确实还在跑，因为让记录过期并不会取消作业，除非你让它取消。TTL 要按「工作的最坏耗时 + 客户端的最坏失联时长」来定，而不是按「你想留多久的行」来定。</p>
+
+    <p><code class="inline">pollIntervalMs</code> 是服务端在告诉客户端：我愿意被问得多勤。请尊重它。一个对着 5 秒间隔每 200 毫秒轮询一次的客户端，是在对一台按定义已经很忙的服务器发动一场小型拒绝服务——而且由于如今每个请求都要在 <code class="inline">params._meta</code> 里重述完整握手，一次轮询并不是一个便宜的请求。在服务端这边，按你进度的真实粒度来设这个间隔，而不是按急性子来设：短于「真实状态变化之间的时间」的间隔，什么都不会多给客户端，却要你付掉全部的轮询量。</p>
+
+    <div class="callout warn">
+      <p><strong>那个 1000 倍的 bug。</strong>2025-11-25 的核心形状用的是以<em>秒</em>为单位的 <code class="inline">ttl</code> 和 <code class="inline">pollInterval</code>。这个扩展用的是以<em>毫秒</em>为单位的 <code class="inline">ttlMs</code> 和 <code class="inline">pollIntervalMs</code>。一次把旧字段直接映到新名字、却没做换算的迁移，会产出一个短了一千倍的 TTL——一小时的保留变成 3.6 秒——而失效的表征是「任务会随机消失」，不是一个类型错误。也已有实现被报告「声明了该扩展，却仍然在说 2025-11-25 的那套形状」，所以一台声明了它的服务器并不等于一台实现了它的服务器；请测线上的实际格式，而不是能力列表——这正是<a href="/zh/deep-dives/mcp/mcp-testing" class="xref">MCP 测试那篇</a>对这个协议的每一部分都在讲的道理。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3><code class="inline">input_required</code> 是 Tasks 与 MRTR 相交的地方，也是一个长任务还能提问的唯一理由。</h3>
+
+    <p>由于服务器发起的请求被删掉了，一个跑到一半需要人来拿主意的任务——批准这次迁移、在两个合并候选里挑一个、补一份凭据——已经没有办法去打断客户端。<code class="inline">input_required</code> 状态就是那个替代品：任务把自己停住，下一次 <code class="inline">tasks/get</code> 会连同待处理的输入请求一起报出这个状态，客户端则通过这一版为<a href="/zh/deep-dives/mcp/mcp-sampling-and-elicitation" class="xref">采样与征询</a>引入的多轮往返请求（MRTR）模式来作答。没有人来问、来答，作业就不会继续。</p>
+
+    <p>由此引出两个后果，从状态图上都看不出来。其一，一个停住的任务是在<em>一边等人、一边烧 TTL</em>，而人比这个系统里的任何其他角色都慢——一个按作业计算时间调出来的 TTL，会把一个只是在等某人午饭回来的任务给过期掉。其二，一个按定时器轮询、却只把终态呈现给用户的客户端，会永远停在一个循环里：它礼貌地问着一个正礼貌地等着它的任务。<code class="inline">input_required</code> 必须在被观察到的那一刻就路由到一个人类界面上，这让它成了一项交互设计义务而非协议义务；那个队列住在<a href="/zh/playbooks/agent-ux-and-human-interaction/async-agent-ux" class="xref">异步智能体体验</a>这篇手册里。</p>
+
+    <p>服务端这边对称的错误，是停在一个没人能回答的问题上。如果这个任务是由一次没有人类在场的定时运行发起的，那么 <code class="inline">input_required</code> 就是一场披着状态外衣的死锁。凡是暴露了「可能需要输入」的工具的服务端，都应该把期限一并带上：停住，并在输入没有在你设定的界限内到达时把任务判 <code class="inline">failed</code>，这样调用方拿到的是一个带原因的 <code class="inline">failed</code>，而不是一个永远 working 的句柄。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>把它运起来：幂等的创建、协作式的取消，以及「没有人在看」这件事。</h3>
+
+    <p>三项运维性质补完了这幅图，而每一项都是这一版删掉了某样东西的直接后果。</p>
+
+    <ul>
+      <li><strong>创建必须幂等，因为传输层不再替它兜底。</strong>流的可恢复性没了，客户端面对断连时被规定的反应是「用一个新 id 作为新请求重新发起这份工作」。于是一台没有幂等键的服务器，会为一次网络抖动把那个四十分钟的重建索引启动两遍，而第二遍对客户端是不可见的——它只知道第二个句柄。把一个调用方提供的幂等键穿过工具参数传下去，并对重复请求返回<em>已存在</em>的那个任务——这就是你技术栈其余部分早就有的<a href="/zh/operations/agentops/idempotency-and-retries" class="xref">幂等</a>纪律，只是在这里新变成了强制项。</li>
+      <li><strong>取消是协作式的，应当被当成一个请求而不是一次急停。</strong><code class="inline">tasks/cancel</code> 把记录挪到 <code class="inline">cancelled</code>；工作是否真的停下来，完全取决于你的作业有没有去检查。一台把状态标成 cancelled 却任由作业继续跑的服务器，造出了这件事最糟的版本：客户端相信它停了，账单却不这么说，而任何副作用都会落在「用户已经被告知不会发生」之后。在作业每一个即将做出对外可见动作的点上，检查一次取消标志。</li>
+      <li><strong>假设没有人会回来。</strong>轮询意味着一个任务的完成只有在某个客户端选择去看时才会被观察到，而客户端会崩溃、会被关掉、会换去别的对话。因此每个任务都必须有一个不依赖于「被读到」的终态归宿：结果持久到 TTL、副作用要么完成要么被补偿、并对那些进入了 <code class="inline">failed</code> 却从未被取走的任务发出告警。作业的可靠性不能取决于轮询方够不够上心。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>在你需要之前就把这个扩展在服务端实现掉，并把提升门槛设在「否则你就得挂着一条连接」的那个点上——对多数服务器而言是三到十秒。然后把设计精力花在那两个数字上，而不是花在状态机上：一个覆盖「最坏工作耗时 + 最坏客户端失联」的 <code class="inline">ttlMs</code>，以及一个匹配进度真实粒度的 <code class="inline">pollIntervalMs</code>。状态机只有五个值，一个下午就写完了。而一个会在人工审批中途到期的 TTL，或者一条不幂等的创建路径，各自会让你付掉一场生产事故——并且两者的表征都是「任务时好时坏」，而不是它们各自真正的那个 bug。关于周边的运维姿态——健康检查、版本化，以及该为什么告警——见 <a href="/zh/deep-dives/mcp/mcp-ops-in-production" class="xref">MCP 的生产运维</a>。</p>
+    </div>
+  </div>
+</section>

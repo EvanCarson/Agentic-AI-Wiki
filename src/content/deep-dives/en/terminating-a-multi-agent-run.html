@@ -1,0 +1,123 @@
+<section class="phase">
+  <div class="phase-num">G11</div>
+  <div class="week">Deep Dive · Multi-Agent Systems</div>
+  <h2>Every framework ships a step cap as its only termination condition — which means your system cannot tell a finished task from a truncated one, and neither can you.</h2>
+  <p class="goal">LangGraph stops at 25 steps by default, roughly twelve tool calls in a ReAct loop, and raises <code class="inline">GraphRecursionError</code>; the other frameworks differ only in the number and the exception name. That cap measures how much effort the system spent, not whether the task is complete, so it fires identically on a run that was nearly done and a run that was looping — and a cap is a dial between two opposite failure modes rather than a safety net, because every notch you raise it to reduce premature stops increases the runs that never stop. The fix is not a better number. It is a termination contract with three distinguishable exits, a shared budget ledger instead of per-agent caps, and a completion decision taken by something other than the agent claiming to be finished.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The default cap is lower than teams think, and it answers a question nobody asked.</h3>
+
+    <p>LangGraph's <code class="inline">recursion_limit</code> defaults to 25, where a step is one node execution. A standard ReAct cycle burns two steps per tool call — the model node, then the tool node — so the default budget is about twelve tool iterations before <code class="inline">GraphRecursionError</code>. For a chat agent that is generous. For a supervisor dispatching four workers that each read three files, it is exhausted before the first aggregation. The limit also has a configuration trap that has bitten enough people to show up in the forums: nest it inside <code class="inline">configurable</code> and the key is ignored, you silently get 25, and the error you see reports the default you thought you had overridden.</p>
+
+    <p>Set that aside, though, because the number is the less interesting problem. The structural problem is what the cap is a function of. It counts the system's own activity. Completion is a property of the task. Those two things are correlated only through the thing you were trying to measure, which means the cap fires at the same moment whether the run was one tool call from done or had been re-reading the same file for nine iterations.</p>
+
+    <p>What arrives downstream is the giveaway. An exhausted cap surfaces as an exception at the graph level, not as a result — no partial output, no statement of what was completed, no indication of which of the four workers finished. Compare that to the signal you would want: <em>three of four subtasks complete, the fourth blocked on an API returning 503, here is what we have</em>. Almost every production system has to reconstruct that from traces after the fact, because the framework's termination path threw it away.</p>
+
+    <div class="callout">
+      <p>A useful check on your own system: force a cap exhaustion deliberately and look at what the caller receives. If the answer is "an exception and whatever happens to be in the state object", your termination path is a crash with a configurable trigger. Everything else in this essay is about making it a decision instead.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>There are three ways a run ends, and collapsing them is what makes the failures silent.</h3>
+
+    <p>A run can finish because the task is done, because the task cannot be done, or because you ran out of what you were willing to spend. These are not variations on an outcome — they demand different downstream actions, and a system that cannot distinguish them will take the wrong one.</p>
+
+    <ul>
+      <li><strong>Complete.</strong> A completion predicate was evaluated and held. The result is usable and the work should not be retried.</li>
+      <li><strong>Abandoned.</strong> Someone established the task cannot be completed as specified: a required system is down, the request is contradictory, the information does not exist. Retrying is pure waste; the right response is to surface the blocker. This is the exit <a href="/concepts/unsatisfiable-tasks" class="xref">unsatisfiable tasks</a> argues most agents are never given, which is why they loop instead of declining.</li>
+      <li><strong>Exhausted.</strong> Steps, tokens, wall clock or money ran out while the task was still live. Retrying with a larger budget is rational; retrying with the same budget is not.</li>
+    </ul>
+
+    <p>Collapse abandoned into exhausted and you retry a run that will never succeed, which is <a href="/concepts/retry-amplification" class="xref">retry amplification</a> with a supervisor paying for it. Collapse exhausted into complete — the common direction, because a truncated run still emits a plausible final message — and you ship a partial answer as a finished one. That second collapse is the one that reaches users, and it reaches them with full confidence, because nothing in the final message knows it was cut off.</p>
+
+    <p>The remedy is mechanical and cheap: every run returns a structured outcome carrying the exit reason, the completion predicate's verdict, the budget consumed against the budget allowed, and whatever partial results exist. Make the exit reason a required field rather than something inferred from an exception type, and the three cases stay distinct all the way to the caller.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>MAST names both termination failures, and they are opposites — so tuning the cap trades one for the other.</h3>
+
+    <p>The Berkeley MAST taxonomy (Cemri et al., arXiv 2503.13657) derived fourteen failure modes from 200 traces across seven open-source multi-agent frameworks, with inter-annotator agreement at Cohen's κ = 0.88. Two of its modes are about stopping, and they point in opposite directions. <strong>FM-1.5, "unaware of termination conditions"</strong>, sits in the system-design category: the agents do not know what finished looks like, so they do not stop. <strong>FM-3.1, "premature termination"</strong>, sits in the task-verification-and-termination category: they stop before the work is done.</p>
+
+    <p>Holding both in view is what makes the step cap's role clear. The cap is the only instrument most systems have, and it acts on exactly one of these: it bounds FM-1.5 by force. It does nothing about FM-3.1, and worse, it <em>causes</em> FM-3.1 — a run cut off at twelve tool calls has terminated prematurely by definition. So the cap is a dial with a failure mode at each end. Lower it to control runaway cost and you convert long-but-healthy runs into truncated ones. Raise it to let legitimate work finish and you let the pathological runs burn to the new ceiling. There is no setting that is correct, because the dial is not measuring the thing that distinguishes the two cases.</p>
+
+    <p>That distinction has a name and it is progress. A run that is advancing — new information per iteration, state changing, subgoals closing — should be allowed to continue; a run that is not should be stopped immediately, well before any cap. Cheap progress signals exist and almost nobody wires them in: repeated identical tool calls with identical arguments, a trajectory whose state hash has not changed in three iterations, a worker that has produced no new artifact in its last five steps. Any of these is a better stopping trigger than a step count, because each of them is evidence about the run rather than about the budget. Wire them as explicit transitions to the <em>abandoned</em> exit, with the loop recorded — the loop is what <a href="/deep-dives/evaluating-agents/trajectory-and-process-evaluation" class="xref">trajectory evaluation</a> needs and what a cap exhaustion destroys.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The agent that did the work is the wrong one to decide it is finished.</h3>
+
+    <p>This is the single highest-leverage structural rule in the essay, and there is field evidence for it. An IBM and UC Berkeley study applying MAST to 310 ITBench SRE traces found that the strongest predictor of overall failure was <strong>FM-3.3, incorrect verification</strong> — agents consistently "declaring victory" without checking against ground truth. Not stopping too early, not failing to stop: stopping while asserting a success that was never checked. The same analysis saw one model spike premature termination by 46 percentage points relative to its comparison, which is the companion result: when the self-assessment is the gate, the gate moves with the model.</p>
+
+    <p>Why this is structural rather than a prompting failure: the agent's judgement of completion is produced by the same process, with the same context and the same incentive, as the work it is judging. A worker that misread the task will consider the misread task complete. A worker that silently dropped a subgoal has no record of the subgoal to check against. This is the <a href="/concepts/generator-verifier-gap" class="xref">generator-verifier gap</a> applied to the stopping decision, and it is also why the honest version of a supervisor is a <em>checker</em> rather than a merger — a point the <a href="/deep-dives/multi-agent-systems/multi-agent-topologies" class="xref">topologies</a> essay reaches from the other direction.</p>
+
+    <p>What to do instead, in descending order of strength:</p>
+
+    <ul>
+      <li><strong>Machine-checkable predicates.</strong> Tests pass, the row exists, the file parses, the invoice totals match. Where the task admits one, nothing else competes: it is cheap, deterministic, and immune to the worker's narrative.</li>
+      <li><strong>A separate verifier with its own view of the world.</strong> Not the worker's summary — the worker's <em>artifacts</em>, re-read from the system of record. A verifier handed a report is grading prose.</li>
+      <li><strong>A human gate, for the irreversible and the unverifiable.</strong> Expensive per decision and therefore reserved, but the only honest answer where no predicate exists.</li>
+    </ul>
+
+    <p>And one that reads like a solution and is not: asking the worker to rate its own confidence. It produces a number that correlates with fluency rather than correctness, and it hardens <a href="/concepts/failure-concealment" class="xref">failure concealment</a> by giving the concealment a numeric endorsement.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Per-agent caps do not compose into a system bound, and fan-out is where the arithmetic breaks.</h3>
+
+    <p>Every framework's cap is scoped to one agent or one graph: a recursion limit here, a max-iterations there, a max-turns on the other. Each is a local bound. None of them is a bound on the run, and in a dynamic topology the relationship between them is multiplicative rather than additive.</p>
+
+    <p>Work the shape through. A supervisor with a limit of 25 dispatches workers, each with their own limit of 25. If a worker dispatch costs the supervisor one step, the ceiling is not 25 or 50 — it is on the order of 25 × 25 before anything the framework knows about trips. Allow a worker to spawn a worker and the exponent moves. Nothing in that path is misconfigured; every component is inside its documented limit, and the system has no limit at all. This is the mechanism behind the cost explosions catalogued in <a href="/deep-dives/multi-agent-systems/multi-agent-failure-modes" class="xref">multi-agent failure modes</a>: not a bug in any agent, an absence at the level between them.</p>
+
+    <p>The construct that fixes it is a shared budget ledger, and it is a small piece of code:</p>
+
+    <ul>
+      <li><strong>One ledger per run,</strong> created at the entry point, carrying tokens, wall clock, money and tool calls. Not per agent, not per graph — per <em>user-visible task</em>, which is the only unit a budget is meaningful in.</li>
+      <li><strong>Debited with actual spend</strong> as each call returns, so the ledger reflects what happened rather than what was planned.</li>
+      <li><strong>Checked before dispatch, not after.</strong> A supervisor about to fan out to four workers asks whether the remaining budget covers four workers, and fans out to two if it does not. Checking afterwards tells you about an overrun you have already paid for.</li>
+      <li><strong>Reserved, not merely checked,</strong> under concurrency. Four parallel workers that each read the same remaining balance will each believe they can afford it.</li>
+      <li><strong>Visible to the agents.</strong> A worker told it has 20% of the run's budget left behaves differently from one that discovers its budget by being killed — it summarises, narrows, or takes the abandoned exit, all of which are better outcomes than truncation.</li>
+    </ul>
+
+    <p>Keep per-agent caps as well; they remain a useful backstop against a single runaway component. Just stop treating them as the system's budget, and keep the ledger's accounting aligned with the <a href="/operations/economics-roi/cost-attribution" class="xref">cost attribution</a> you already do, so the budget that bounds a run and the budget that appears on the invoice are the same number.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The termination contract, written down.</h3>
+
+    <p>Everything above is one artifact, specified per task type and enforced by the orchestrator rather than by prompt. It is short enough to review and specific enough to test.</p>
+
+<pre class="standalone">TERMINATION CONTRACT  ::  task_type = "resolve_support_ticket"
+
+completion    predicate  : ticket.status in {resolved, escalated}
+                           AND reply_sent == true
+              checked_by : orchestrator, re-reading the CRM
+                           (NEVER the worker's own report)
+
+abandon       triggers   : required system unavailable after 2 attempts
+                           | state hash unchanged for 3 iterations
+                           | identical tool call + args seen 3x
+                           | worker invokes give_up(reason)
+              result     : exit=abandoned, blocker recorded, NO retry
+
+budget        ledger     : shared, per run. tokens | usd | wall | calls
+              checked    : before every dispatch, reserved not peeked
+              at 20% left: workers notified; fan-out degrades to serial
+              at 0%      : exit=exhausted, partial results RETURNED
+
+exits         complete | abandoned | exhausted        <span class="c-cm"># required field</span>
+              every exit returns: partials, budget_used, trace_id</pre>
+
+    <p>Three details in that sketch do most of the work. The completion predicate is checked by the orchestrator re-reading the system of record, which is STEP 4 made concrete. <code class="inline">give_up(reason)</code> is an explicit tool, because a worker with no way to decline will invent a way to appear finished. And every exit returns partial results — the single change that most improves a multi-agent system's behaviour under pressure, because it turns a budget overrun from a lost run into a shorter one.</p>
+
+    <div class="callout tip">
+      <p>If you do one thing from this essay, make the exit reason a required field on every run result and stop inferring it from an exception. It costs an afternoon, it is purely additive, and it immediately reveals the distribution you have been flying blind on — most teams who measure this for the first time find that between a fifth and a third of their "successful" runs actually hit a cap, and that the proportion is much higher on exactly the long-horizon tasks the multi-agent topology was adopted for. Then add <code class="inline">give_up</code>, then the shared ledger, then the loop detectors. Raising the step limit, which is where everyone starts, is the one intervention on the list that changes nothing except the size of the bill. For the single-agent version of the stopping question, see <a href="/concepts/planning-and-termination" class="xref">planning and termination</a>.</p>
+    </div>
+  </div>
+</section>
