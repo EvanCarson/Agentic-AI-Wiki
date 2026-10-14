@@ -1,60 +1,150 @@
 <section class="phase">
   <div class="phase-num">K4</div>
   <div class="week">深入解析 · 工具与能力设计</div>
-  <h2>错误消息是一段提示词：它是你教会模型下一次尝试的唯一机会。</h2>
-  <p class="goal">当一次工具调用失败时，错误字符串会直接回到模型的上下文，并成为它紧接着那个决策最具影响力的单一输入。堆栈跟踪什么也教不了它；<code class="inline">"error: 400"</code> 教它去瞎猜；而一句说清「哪里错了、该改成什么」的话，常常一回合就修好了循环。本文把错误消息当作工具设计中头等重要的一部分——为一个会读它、并立刻再试一次的模型而写。</p>
+  <h2>错误消息是一段提示词：它的读者是模型的下一步，所以它必须说清下一步该做什么——而且它得先真正抵达模型才算数。</h2>
+  <p class="goal">当一次工具调用失败时，错误字符串会回到模型的上下文里，并成为它紧接着那个决策最具影响力的输入。这让每一条工具错误的受众变得非常具体：不是明天翻日志的工程师，而是一秒钟后就要选择下一次调用的模型。由此推出两个结论，本文就建立在这两点之上。第一，只说「哪里错了」的错误，把修法留给模型去猜；有用的错误要说「下一步做什么」。第二，一条走在模型根本读不到的通道上的错误——被客户端吞掉的协议层错误——写得再好，也什么都教不会它。</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
     <h3>模型的下一次调用，几乎完全取决于上一个错误。</h3>
 
-    <p>撞上错误的人会翻文档、读源码、问同事。模型只有一份可供学习的东西：你返回的那段文本。它不会再去找一遍模式；它会对着你的错误字符串去做模式匹配地重试。这让错误消息成为整个工具里杠杆最高的一句话——它在功能上，就是在模型决定该怎样换个做法的那一刻注入的一段即时提示词。就照这个去写。</p>
+    <p>撞上错误的人会翻文档、读源码、问同事。模型只有一份可供学习的东西：你返回的那段文本。它不会回头重读模式定义；它会对着你的错误字符串去做模式匹配地重试。这让错误消息成为整个工具里杠杆最高的一句话——在功能上，它就是在模型决定该怎样换个做法的那一刻注入的一段即时提示词。</p>
+
+    <p>而这段提示词的预算很小。Anthropic 的工具使用文档写明：如果一次工具请求无效或缺少参数，Claude「会带着修正重试 2–3 次，然后向用户道歉」。两三次机会，就是全部的恢复窗口。一条把其中一次浪费在「输入无效」上的错误，已经烧掉了这次运行三分之一的成功机会。</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>好的错误点出原因，并开出修复药方。</h3>
+    <h3>模型看不见的错误什么也教不会它：先把它放到对的通道上。</h3>
 
-    <p>有用错误的最低限度有三部分：<em>什么</em>被拒绝、<em>为什么</em>被拒绝、<em>正确的调用长什么样</em>。缺任何一个，模型就在瞎猜。「输入无效」三个都不占。「<code class="inline">amount</code> 必须是以分计的正整数；你传的是 <code class="inline">39.99</code>；请传 <code class="inline">3999</code>」三个都占，于是重试立刻成功，因为修正就在消息里，而不是模型得去重新推导的东西。</p>
+    <p>先谈路由，再谈措辞。每一种主流工具接口都有一条会落进模型上下文的通道，和一条不会的通道；一条为模型而写、却走了第二条通道的错误，等于白写。</p>
 
-<pre class="standalone"><span class="c-cm"># Useless: the model guesses, retries, fails the same way</span>
-<span class="c-err">Error</span>: <span class="c-st">400 Bad Request</span>
-<span class="c-err">ValidationError</span>: <span class="c-st">field 'amount' invalid</span>
+    <ul>
+      <li><strong>Anthropic Messages API。</strong>失败的客户端工具以一个普通的 <code class="inline">tool_result</code> 块返回，带 <code class="inline">"is_error": true</code>，消息放在 <code class="inline">content</code> 里。模型像读任何其他结果一样读它。文档还补了一句正是本文主题的指示：不要用 <code class="inline">"failed"</code> 这类笼统错误，而要「写明出了什么问题，以及 Claude 接下来该尝试什么」。</li>
+      <li><strong>OpenAI 函数调用。</strong>没有错误标志。<code class="inline">function_call_output</code> 条目携带一个 <code class="inline">output</code> 字符串，其「格式由你决定（JSON、错误码、纯文本等）」，而「模型会按需解读这个字符串」。错误<em>就是</em>这个字符串——所以它必须承载一切，包括要不要重试。</li>
+      <li><strong>MCP。</strong>规范定义了两种机制，只有一种是面向模型的。<em>协议错误</em>是 JSON-RPC 的 <code class="inline">error</code> 对象，用于未知工具、格式错误的请求和服务器错误；客户端「MAY（可以）」把它们交给模型，「但这些不太可能带来成功的恢复」。<em>工具执行错误</em>——API 失败、输入校验错误、业务逻辑错误——在一个普通的 <code class="inline">result</code> 里以 <code class="inline">isError: true</code> 返回，并且客户端「SHOULD（应当）把工具执行错误提供给语言模型，以便其自我纠正」。当前修订版 <a class="xref" href="/deep-dives/mcp/mcp-revision-2026-07-28">2026-07-28</a> 原样保留了这一划分。</li>
+    </ul>
 
-<span class="c-cm"># Useful: cause + value + the corrected call, in words</span>
-<span class="c-err">Error</span>: <span class="c-st">'amount' must be a positive integer in cents.</span>
-<span class="c-st">You sent 39.99 (dollars). Retry with amount=3999.</span></pre>
+<pre class="standalone"><span class="c-cm"># Protocol error: caught by the client; the model may never see it</span>
+{ <span class="c-st">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-st">"id"</span>: 3,
+  <span class="c-st">"error"</span>: { <span class="c-st">"code"</span>: -32602, <span class="c-st">"message"</span>: <span class="c-err">"Invalid params"</span> } }
 
-    <div class="callout tip"><p>把出错的值在错误里回显回去。「你传的是 <code class="inline">39.99</code>」让模型看见自己的错误，而不必去重新推理它可能哪里做错了——这是错误设计里收益最高的单一习惯。</p></div>
+<span class="c-cm"># Tool execution error: an ordinary result, delivered into context</span>
+{ <span class="c-st">"jsonrpc"</span>: <span class="c-st">"2.0"</span>, <span class="c-st">"id"</span>: 4,
+  <span class="c-st">"result"</span>: {
+    <span class="c-st">"content"</span>: [{ <span class="c-st">"type"</span>: <span class="c-st">"text"</span>,
+      <span class="c-st">"text"</span>: <span class="c-out">"Dates must be in the future. Current date is 08/08/2025"</span> }],
+    <span class="c-st">"isError"</span>: <span class="c-kw">true</span> } }</pre>
+
+    <p>协议是吃过亏才学会这一点的。MCP 的 2025-06-18 规范含糊不清——「无效参数（invalid arguments）」被列为协议错误，「无效输入数据（invalid input data）」却被列为工具执行错误——于是许多服务器把校验失败当作 JSON-RPC <code class="inline">-32602</code> 返回。SEP-1303（「把输入校验错误作为工具执行错误」）直截了当地写出了后果：「协议错误在应用层被 MCP 客户端拦截。只有工具执行错误会被转发回模型」，因此「模型看不到这些错误消息，也就无法自我纠正」。它的实例是一个订机票工具，其「日期必须在未来」这条规则无法用 JSON Schema 表达：SEP 报告说，Cursor「通常会一贯地发送 2024 年的日期」，并且「把同一个 tools/call 请求重复 3 次，却得不到任何关于调用为何失败的信息」。修复方案把所有输入校验都挪进了工具执行错误，而 2025-11-25 与 2026-07-28 两版规范都把输入校验错误列在 <code class="inline">isError: true</code> 之下。</p>
+
+    <div class="callout warn"><p>陷阱在于，框架默认就会做错的事。一个抛异常的校验器、一个把异常映射成 JSON-RPC 错误的 SDK、一个把 4xx 变成传输失败的网关——每一个都可能悄无声息地把一条精心措辞的消息挪到模型读不到的那条通道上。要端到端地测这条路径：故意让工具失败，看看实际落进对话记录里的是什么，做法见 <a class="xref" href="/deep-dives/mcp/mcp-testing">MCP 测试</a>。</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>用文字明确区分「可重试」与「终态」。</h3>
+    <h3>形状：什么失败了、你传了什么、为什么、下一步做什么、要不要再试。</h3>
 
-    <p>模型需要知道再试一次有没有可能成功。一个暂时性失败（「被限流，2 秒后重试」）邀请退避；一个终态失败（「订单 42 已退款；不要重试」）必须关停循环，否则你会得到一个无限相同重试在烧预算。别让模型从一个它一知半解的 HTTP 码里去推断这点——直接说出来。「重试不会成功；该订单不存在」会终结一个「404」本会无限空转的循环。</p>
+    <p>「点出原因」是必要的，但不充分。一条诊断得完美却就此打住的错误，把补救办法留给模型去推导，而那 2–3 次重试就耗在推导上。有用错误的最低限度有五个部分，其中第四个最常被遗漏。</p>
 
-    <div class="callout warn"><p>有副作用的工具上一个含糊的错误，正是失控循环的诞生方式：模型分不清「已完成，停」和「暂时性，再试」，选了再试，然后无限重发。可重试/终态信号是一个遏制控制，不只是个锦上添花。</p></div>
+<pre class="standalone"><span class="c-cm"># Minimal tool-error template (plain text; the same fields work as JSON)</span>
+<span class="c-err">&lt;tool&gt; failed</span>: <span class="c-st">&lt;what was rejected, in one clause&gt;</span>
+<span class="c-kw">You sent</span>: <span class="c-st">&lt;the offending value, echoed back&gt;</span>
+<span class="c-kw">Because</span>: <span class="c-st">&lt;the rule it broke, or the state that blocked it&gt;</span>
+<span class="c-kw">Next</span>: <span class="c-st">&lt;the corrected call, or the tool to call first&gt;</span>
+<span class="c-kw">Retry</span>: <span class="c-st">&lt;yes, as corrected | yes, after N s | no — stop and tell the user&gt;</span></pre>
+
+    <ul>
+      <li><strong>回显出错的值。</strong>「你传的是 <code class="inline">39.99</code>」让模型看见自己的错误，而不必重新推测自己可能做错了什么。</li>
+      <li><strong>开药方，而不只是下诊断。</strong><code class="inline">Next</code> 这一行是一个具体的调用，或一个点名的工具。Anthropic 的《Writing effective tools for agents》说的是同一件事：对错误响应做提示工程，「清楚地传达具体、可执行的改进，而不是不透明的错误码或回溯」。</li>
+      <li><strong>用文字说明能否重试。</strong>别让模型从一个它一知半解的 HTTP 状态码去推断。有副作用的工具上一条含糊的错误，正是失控循环的起点：模型分不清「已经做完了，停」和「暂时性的，再试」，选了再试，然后反复重发——正是 <a class="xref" href="/concepts/retry-amplification">重试放大</a> 所描述的模式。</li>
+      <li><strong>补上缺失的上下文。</strong>MCP 规范自己的示例里写着「Current date is 08/08/2025」——这是模型原本没有、却修正调用必需的事实。如果规则依赖于状态，就把状态一并给出。</li>
+    </ul>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>错误应把模型引向正确的工具，而不只是引离错误的调用。</h3>
+    <h3>改写前后：五类失败，每一类都改写成说清下一步做什么。</h3>
 
-    <p>最好的错误会做正向路由。如果模型用名字而非 ID 调用了 <code class="inline">delete_user</code>，错误应当说「需要一个用户 ID；请先调用 <code class="inline">search_users</code> 取得一个」——点名那个能产出缺失输入的工具。这把死胡同变成了一份计划。一个只说「不行」的错误，把工作流留给模型去重新发现；一个说「不行，改做这个」的错误，就是一次恢复的运行与一次被放弃的运行之间的区别。</p>
+    <p>模板很容易认同，也很容易跳过。下面这些改写，才是实践中真正起作用的。</p>
+
+    <p><strong>校验。</strong>模型传了一个类型正确的值，但违反了一条模式无法表达的规则。</p>
+
+<pre class="standalone"><span class="c-cm"># Before: the model guesses, retries, fails the same way</span>
+<span class="c-err">ValidationError</span>: <span class="c-st">field 'amount' invalid</span>
+
+<span class="c-cm"># After</span>
+<span class="c-err">create_refund failed</span>: <span class="c-st">'amount' must be a positive integer in cents.</span>
+<span class="c-st">You sent 39.99 (dollars). Retry with amount=3999.</span></pre>
+
+    <p><strong>找不到 / 有歧义。</strong>模型在需要 ID 的地方传了名字，或者传了一个能匹配到多个对象的引用。好的错误会把它引向能产出缺失输入的那个工具——把死胡同变成一个计划。</p>
+
+<pre class="standalone"><span class="c-cm"># Before</span>
+<span class="c-err">404</span>: <span class="c-st">user not found</span>
+
+<span class="c-cm"># After</span>
+<span class="c-err">delete_user failed</span>: <span class="c-st">'user_id' expects an ID like usr_8f3a; you sent "Dana Lee".</span>
+<span class="c-st">Two users match that name: usr_8f3a (dana@acme.com), usr_c901 (dana.lee@acme.com).</span>
+<span class="c-st">Ask the user which one, then retry with that user_id. Do not guess.</span></pre>
+
+    <p><strong>权限。</strong>下一次调用怎么改都修不好这个问题，而模型需要被明确告知这一点——否则它会去试相邻的工具或参数变体，想办法绕过这次拒绝。</p>
+
+<pre class="standalone"><span class="c-cm"># Before</span>
+<span class="c-err">403 Forbidden</span>
+
+<span class="c-cm"># After</span>
+<span class="c-err">merge_pr failed</span>: <span class="c-st">this agent's token has read-only access to repo acme/billing.</span>
+<span class="c-st">Not retryable, and no other tool can merge here. Stop, tell the user the PR</span>
+<span class="c-st">is ready for review, and include its URL.</span></pre>
+
+    <p><strong>限流 / 暂时性故障。</strong>可以重试——但要说清什么时候，以及还剩几次，好让模型既不狂轰也不放弃。</p>
+
+<pre class="standalone"><span class="c-cm"># Before</span>
+<span class="c-err">Error</span>: <span class="c-st">429</span>
+
+<span class="c-cm"># After</span>
+<span class="c-err">search_tickets failed</span>: <span class="c-st">rate limit exceeded (upstream allows 10 requests/min).</span>
+<span class="c-st">Retry after 60 seconds. Meanwhile, narrow the query: one call with</span>
+<span class="c-st">status="open" and since="2026-10-01" replaces the per-day calls you were making.</span></pre>
+
+    <p><strong>结果过大。</strong>调用成功了，但结果会淹没上下文窗口。把它当作一个带收窄药方的错误来处理，而不是悄悄截断。Anthropic 的工具编写指南说，如果要截断，「务必用有帮助的指示去引导智能体」；同一篇文章还提到，Claude Code 默认把工具响应限制在 25,000 个 token。预算的机制见 <a class="xref" href="/deep-dives/tool-capability-design/shaping-tool-results">塑形工具返回值</a>；错误的职责是那句「下一步」。</p>
+
+<pre class="standalone"><span class="c-cm"># Before: 40,000 tokens of JSON, cut mid-object</span>
+[{<span class="c-st">"id"</span>: <span class="c-st">"LOG-1"</span>, ... <span class="c-out">&lt;truncated&gt;</span>
+
+<span class="c-cm"># After</span>
+<span class="c-err">read_logs</span>: <span class="c-st">14,212 lines match; returning none (limit 500).</span>
+<span class="c-st">Add level="error" (312 lines) or a time window via since/until,</span>
+<span class="c-st">or call read_logs with page=1 to page through 500 at a time.</span></pre>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>绝不让工具静默失败，或对成功撒谎。</h3>
+    <h3>哪些错误交给模型，哪些交给框架或人。</h3>
 
-    <p>最糟的错误，是那个没被返回的错误。一个吞掉失败、返回空结果，或在什么都没发生时返回 <code class="inline">200</code> 的工具，会让模型在一个虚假前提上自信地继续——而那个错误会在三步之后浮现为无从定位、任何追踪都无法锁定的诡异行为。部分成功是同一个陷阱：「已退款但通知失败」必须如实报告，而不是报为成功，否则智能体会向用户报告一个谎言。诚实的失败，每一次都胜过省事的沉默。</p>
+    <p>第 2 步里的通道划分是一个协议事实；它底下是一条设计规则。<strong>当模型能改变自己下一步动作中的某样东西时，把错误返回给模型。当只有代码能处理时，交给框架处理；当只有人能处理时，升级给人。</strong></p>
+
+    <ul>
+      <li><strong>交给模型（作为 <code class="inline">is_error</code> / <code class="inline">isError</code>）：</strong>校验失败、找不到与歧义、业务规则拒绝（「订单已退款」）、过大的结果，以及模型可以通过收窄或等待来绕开的限流。每一种都有一个更好的下一次调用。</li>
+      <li><strong>交给框架：</strong>一次带退避的普通重试就能修好的暂时性抖动——一次断连、一个 503。花一个模型回合去决定「再试一次」纯属浪费；框架应静默重试，只有在自己的预算耗尽后才把错误抛出来，并且此时标记为终态。分层做法见 <a class="xref" href="/deep-dives/architectures-and-patterns/tool-error-recovery">工具使用循环与错误恢复</a>。</li>
+      <li><strong>交给人：</strong>需要重新授权的过期凭据、只有所有者才能解除的拒绝、已经耗尽的花费上限。模型仍会拿到一条简短的终态结果——「不可重试；请让用户重新连接 GitHub」——好让它干净地停下而不是打转，但决定权属于人（<a class="xref" href="/concepts/human-in-the-loop">人在回路</a>）。</li>
+      <li><strong>不进入模型上下文的：</strong>堆栈跟踪、内部主机名、SQL、密钥。它们消耗 token，对下一步毫无帮助，还会把你的内部细节泄漏进一份可能被记录、甚至展示给用户的对话记录里。把它们写进日志；给模型那一句它能据以行动的话。</li>
+    </ul>
+
+    <div class="callout tip"><p>检验任何一条错误字符串的快速方法：把 <code class="inline">Next</code> 和 <code class="inline">Retry</code> 两行之外的内容全部遮住。如果剩下的部分不能告诉一个能干的陌生人该做什么，模型也不会知道。</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>何时简短的错误才是对的选择。</h3>
+    <h3>永远别让工具静默失败，或谎报成功。</h3>
 
-    <p>啰嗦、富有教益的错误要花上下文 token，而一个每次失败都倾倒 500 行堆栈跟踪、或整个有效模式的错误，比一个生硬的错误更毒害窗口。<strong>让错误有教益，而非百科全书式——一句原因加上修正后的调用，胜过一墙诊断信息，免得模型为了找到它需要的那一条事实而在里面跋涉。</strong></p>
+    <p>最糟糕的错误，是那条没有被返回的错误。一个吞掉失败、返回空结果的工具，或者什么都没发生却返回成功的工具，会让模型在错误前提下自信地继续——而这个失败会在三步之后，以任何追踪都定位不了的行为浮现出来（即 <a class="xref" href="/deep-dives/tool-capability-design/tool-design-antipatterns">静默失败反模式</a>）。部分成功是同一个陷阱：「退款已发出，但确认邮件发送失败——不要再次退款；告诉用户不会收到邮件」必须如实这样报告，否则智能体会向用户报告一个谎言，或者退两次款。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>什么时候简短的错误才是对的。</h3>
+
+    <p>有指导性不等于冗长。错误和任何其他结果一样，会在之后的每一轮被重发；一条把整个合法模式或 500 行堆栈倒出来的错误，比一条简短的错误更能毒化上下文窗口。当严格的模式约束已经让某一类错误不可能发生时——Anthropic 的 <code class="inline">strict: true</code> 保证工具输入与模式完全一致——就别在它上面花任何字。Anthropic 的指南也指向另一面：「大量因无效参数产生的工具错误，可能意味着工具需要更清晰的描述或更好的示例。」反复出现的错误是描述的 bug，而不是措辞问题。<strong>让错误有指导性，而不是百科全书式：一句原因、回显的值、下一次调用、重试与否的结论——并以模型读得到的结果形式送达，因为一条从未进入其上下文的错误，是它无法据以行动的错误。</strong></p>
   </div>
 </section>
