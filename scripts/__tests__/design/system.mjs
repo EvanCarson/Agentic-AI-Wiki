@@ -34,6 +34,7 @@ const CURATED = [
   '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
   '/changelog/',
   '/books/', '/books/ai-driven-sdlc/', '/zh/books/ai-driven-sdlc/',
+  '/books/ai-driven-sdlc/the-maturity-model/', '/zh/books/ai-driven-sdlc/case-studies/',
   '/zh/concepts/prompt-caching/',
 ];
 
