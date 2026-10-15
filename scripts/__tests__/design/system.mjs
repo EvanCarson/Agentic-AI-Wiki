@@ -33,6 +33,7 @@ const CURATED = [
   '/playbooks/coding-and-computer-use-agents/coding-agent-architecture/',
   '/blogs/nemo-guardrails-vs-guardrails-ai-vs-llama-guard-vs-llm-guard/',
   '/changelog/',
+  '/books/', '/books/ai-driven-sdlc/', '/zh/books/ai-driven-sdlc/',
   '/zh/concepts/prompt-caching/',
 ];
 
