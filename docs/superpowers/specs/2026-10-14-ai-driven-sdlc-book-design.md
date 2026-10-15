@@ -163,8 +163,8 @@ not hedged.
 
 | PR | Contents |
 |---|---|
-| 1 | Books section, book landing page, layout, tests, nav change, spec. No chapters. Research runs in parallel. |
-| 2 | Part I (Preface + Ch 1–4), after owner review |
+| 1 | Books section: shelf, book landing page with planned TOC, manifest + test, nav change, spec. No chapters. Research runs in parallel. |
+| 2 | Part I (Preface + Ch 1–4), after owner review — plus `BookChapterLayout`, "Referenced in" backlinks, and the RSS and `llms.txt` entries, which need published chapters to exist and to be tested |
 | 3 | Part II (Ch 5–12) |
 | 4 | Part III + appendices |
 
