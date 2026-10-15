@@ -42,6 +42,7 @@ export function expectedOgFor(pathname) {
     playbooks: 'playbooks',
     operations: 'operations',
     blogs: 'blog',
+    books: 'books',
     changelog: 'changelog',
   };
   const slug = MAP[section] ?? 'default';

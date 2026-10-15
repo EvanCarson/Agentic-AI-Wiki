@@ -8,6 +8,7 @@ export type OgSectionKey =
   | 'playbooks'
   | 'operations'
   | 'blog'
+  | 'books'
   | 'changelog';
 
 export interface OgSection {
@@ -27,5 +28,6 @@ export const OG_SECTIONS: readonly OgSection[] = [
   { key: 'playbooks' },
   { key: 'operations' },
   { key: 'blog' },
+  { key: 'books' },
   { key: 'changelog' },
 ] as const;
