@@ -3,7 +3,7 @@ import type { Locale } from './index';
 export interface UIStrings {
   brand: string;
   tagline: string;
-  nav: { fieldGuide: string; concepts: string; deepDives: string; playbooks: string; operations: string; blog: string; changelog: string; about: string;
+  nav: { fieldGuide: string; concepts: string; deepDives: string; playbooks: string; operations: string; blog: string; books: string; changelog: string; about: string;
          menu: string; menuOpen: string; menuClose: string };
   switcher: { en: string; zh: string; aria: string };
   footer: { sections: string; project: string; language: string; privacy: string; nav: string; follow: string };
@@ -40,6 +40,13 @@ export interface UIStrings {
           seeAllChapters: string; browseAll: string;
           fromTheBlog: string; readPost: string; morePosts: string };
   fg: { metaTitle: string; metaDesc: string };
+  books: {
+    metaTitle: string; metaDesc: string;
+    shelfKicker: string; shelfHeading: string; shelfLede: string;
+    howToRead: string; contents: string; comingSoon: string;
+    chaptersPublished: (published: number, total: number) => string;
+    startReading: string; backToShelf: string;
+  };
   concepts: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
               readingPath: { badge: string; intro: string; escapePrefix: string; escapeLinkLabel: string } };
   deepDives: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
@@ -84,7 +91,7 @@ export const ui: Record<Locale, UIStrings> = {
   en: {
     brand: 'Agentic AI Wiki',
     tagline: 'Agentic AI Wiki — knowledge, written to last.',
-    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', blog: 'AI Blog', changelog: 'Changelog', about: 'About',
+    nav: { fieldGuide: 'Field Guide', concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', blog: 'AI Blog', books: 'Books', changelog: 'Changelog', about: 'About',
            menu: 'Menu', menuOpen: 'Open navigation menu', menuClose: 'Close navigation menu' },
     switcher: { en: 'EN', zh: '中文', aria: 'Language' },
     footer: { sections: 'Sections', project: 'Project', language: 'Language', privacy: 'Privacy', nav: 'Site', follow: 'Follow' },
@@ -126,6 +133,19 @@ export const ui: Record<Locale, UIStrings> = {
     },
     fg: { metaTitle: 'The Agentic AI Field Guide',
           metaDesc: "A working engineer's guide to building agentic systems, end to end." },
+    books: {
+      metaTitle: 'Books — Agentic AI Wiki',
+      metaDesc: 'Long-form, book-length guides on adopting agentic AI, in English and Chinese.',
+      shelfKicker: 'Books',
+      shelfHeading: 'Long-form guides, read in order.',
+      shelfLede: 'The rest of this wiki is built to be dipped into. A book is built to be read through: each one argues a single case across many chapters, every claim sourced, published part by part as it is written.',
+      howToRead: 'How to read this book',
+      contents: 'Contents',
+      comingSoon: 'Coming soon',
+      chaptersPublished: (p, t) => (p === 0 ? `${t} chapters planned · first part in progress` : `${p} of ${t} chapters published`),
+      startReading: 'Start reading',
+      backToShelf: 'All books',
+    },
     concepts: {
       metaTitle: 'Concepts — Agentic AI Wiki',
       metaDesc: 'AI and agentic AI explained: a plain-language encyclopedia from foundations to the agent loop.',
@@ -221,7 +241,7 @@ export const ui: Record<Locale, UIStrings> = {
   zh: {
     brand: 'Agentic AI 维基',
     tagline: 'Agentic AI 维基 — 沉淀长期有效的知识。',
-    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', blog: 'AI 博客', changelog: '更新日志', about: '关于',
+    nav: { fieldGuide: '实战指南', concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', blog: 'AI 博客', books: '书籍', changelog: '更新日志', about: '关于',
            menu: '菜单', menuOpen: '打开导航菜单', menuClose: '关闭导航菜单' },
     switcher: { en: 'EN', zh: '中文', aria: '语言' },
     footer: { sections: '内容板块', project: '关于本站', language: '语言', privacy: '隐私政策', nav: '站点导航', follow: '订阅与关注' },
@@ -263,6 +283,19 @@ export const ui: Record<Locale, UIStrings> = {
     },
     fg: { metaTitle: 'Agentic AI 实战指南',
           metaDesc: '一线工程师的智能体系统构建全程指南。' },
+    books: {
+      metaTitle: '书籍 — Agentic AI 维基',
+      metaDesc: '关于落地智能体 AI 的长篇、成书规模的指南，中英双语。',
+      shelfKicker: '书籍',
+      shelfHeading: '长篇指南，按顺序读。',
+      shelfLede: '这个维基的其他部分是供你随手翻查的；一本书则是供你从头读到尾的：每一本都用许多章节论证同一件事，每个论断都有出处，并随写作进度一部分一部分地发布。',
+      howToRead: '如何阅读本书',
+      contents: '目录',
+      comingSoon: '即将推出',
+      chaptersPublished: (p, t) => (p === 0 ? `共规划 ${t} 章 · 第一部分撰写中` : `已发布 ${p} / ${t} 章`),
+      startReading: '开始阅读',
+      backToShelf: '全部书籍',
+    },
     concepts: {
       metaTitle: '概念 — Agentic AI 维基',
       metaDesc: 'AI 与 Agentic AI 通俗解读：从基础到智能体主循环的白话百科。',

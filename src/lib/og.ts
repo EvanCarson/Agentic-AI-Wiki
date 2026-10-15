@@ -10,6 +10,7 @@ const SLUG: Record<OgSectionKey, string> = {
   playbooks: 'playbooks',
   operations: 'operations',
   blog: 'blog',
+  books: 'books',
   changelog: 'changelog',
 };
 

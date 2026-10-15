@@ -1,5 +1,5 @@
 // scripts/build-og.mjs
-// Renders the 14 social-share OG cards (7 sections × en/zh) to public/og/.
+// Renders the 16 social-share OG cards (8 sections × en/zh) to public/og/.
 // Run via `npm run og:build`. Idempotent: writes only when bytes change.
 //
 // Layout: Direction A — dark editorial card (see the spec).
