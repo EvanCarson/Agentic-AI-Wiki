@@ -186,7 +186,26 @@ test('the section names equal the nav strings in src/i18n/ui.ts', () => {
     const locale = nav.fieldGuide === 'Field Guide' ? 'en' : 'zh';
     assert.deepEqual(SECTION_NAMES[locale], {
       concepts: nav.concepts, deepDives: nav.deepDives, playbooks: nav.playbooks,
-      operations: nav.operations, fieldGuide: nav.fieldGuide, blog: nav.blog,
+      operations: nav.operations, fieldGuide: nav.fieldGuide, blog: nav.blog, books: nav.books,
     });
   }
+});
+
+test('a book lists its landing page and published chapters only, under a Books heading, after the Field Guide', () => {
+  const book = {
+    slug: 'b', title: L('Book', '书'), subtitle: L('Sub', '副'), pitch: L('Pitch.', '简介。'),
+    parts: [{ chapters: [
+      { slug: 'one', num: '1', title: L('One', '一'), summary: L('S1.', '摘一。'), status: 'published' },
+      { slug: 'two', num: '2', title: L('Two', '二'), summary: L('S2.', '摘二。'), status: 'planned' },
+    ] }],
+  };
+  const out = buildLlmsTxt('en', SITE, { ...SOURCES, books: [book] });
+  const hs = headings(out);
+  assert.ok(hs.includes('## Books: Book'), hs.join(' | '));
+  assert.ok(hs.indexOf('## Books: Book') < hs.indexOf('## AI Blog'), 'Books precedes the blog');
+  assert.ok(out.includes('- [Book: Sub](https://menuagentic.com/books/b/): Pitch.'));
+  assert.ok(out.includes('- [1 · One](https://menuagentic.com/books/b/one/): S1.'));
+  assert.ok(!out.includes('/books/b/two/'), 'planned chapters are not listed');
+  const zhOut = buildLlmsTxt('zh', SITE, { ...SOURCES, books: [book] });
+  assert.ok(zhOut.includes('## 书籍：书') && zhOut.includes('https://menuagentic.com/zh/books/b/one/'));
 });

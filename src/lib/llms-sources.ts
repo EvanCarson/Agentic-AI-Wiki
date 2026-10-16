@@ -8,6 +8,7 @@ import { GROUPS as playbooks } from '../content/playbooks/manifest';
 import { GROUPS as operations } from '../content/operations/manifest';
 import { PARTS as fieldGuide } from '../content/field-guide/manifest';
 import { POSTS as posts } from '../content/blogs/manifest';
+import { BOOKS as books } from '../content/books/index';
 import type { Sources } from './llms-txt';
 
-export const SOURCES: Sources = { concepts, deepDives, playbooks, operations, fieldGuide, posts };
+export const SOURCES: Sources = { concepts, deepDives, playbooks, operations, fieldGuide, posts, books };

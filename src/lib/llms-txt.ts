@@ -35,6 +35,9 @@ export interface CatalogGroup { key: string; name: Localized; entries: CatalogEn
 /** A Field Guide part and its numbered chapters. */
 export interface CatalogPart { name: Localized; chapters: { slug: string; num: string; title: Localized }[] }
 
+/** A book: its landing page plus its chapters; only `published` ones are listed. */
+export interface CatalogBook { slug: string; title: Localized; subtitle: Localized; pitch: Localized; parts: { chapters: { slug: string; num: string; title: Localized; summary: Localized; status: string }[] }[] }
+
 /** Everything the file is built from. `posts` must be newest-first. */
 export interface Sources {
   concepts: CatalogEntry[];
@@ -43,6 +46,8 @@ export interface Sources {
   operations: CatalogGroup[];
   fieldGuide: CatalogPart[];
   posts: BlogPost[];
+  /** Optional so fixtures written before Books existed still type-check. */
+  books?: CatalogBook[];
 }
 
 /** One `- [title](url): note` line. `path` is site-relative or an absolute URL. */
@@ -60,7 +65,7 @@ const REPO_URL = 'https://github.com/EvanCarson/Agentic-AI-Wiki';
 
 interface Strings {
   title: string;
-  sections: { concepts: string; deepDives: string; playbooks: string; operations: string; fieldGuide: string; blog: string };
+  sections: { concepts: string; deepDives: string; playbooks: string; operations: string; fieldGuide: string; blog: string; books: string };
   /** Between a section name and its group name in a heading. */
   sep: string;
   summary: (pages: number) => string;
@@ -79,7 +84,7 @@ interface Strings {
 const STRINGS: Record<Locale, Strings> = {
   en: {
     title: 'Agentic AI Wiki',
-    sections: { concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', fieldGuide: 'Field Guide', blog: 'AI Blog' },
+    sections: { concepts: 'Concepts', deepDives: 'Deep-Dives', playbooks: 'Playbooks', operations: 'Operations', fieldGuide: 'Field Guide', blog: 'AI Blog', books: 'Books' },
     sep: ': ',
     summary: n => `An open, bilingual (English / 简体中文) knowledge base on building agentic AI: a plain-language Concepts encyclopedia, engineering Deep-Dives, applied Playbooks, production Operations, a numbered Field Guide, and a long-form AI Blog. ${n} pages in each language, updated daily.`,
     details: [
@@ -97,7 +102,7 @@ const STRINGS: Record<Locale, Strings> = {
   },
   zh: {
     title: 'Agentic AI Wiki',
-    sections: { concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', fieldGuide: '实战指南', blog: 'AI 博客' },
+    sections: { concepts: '概念', deepDives: '深度剖析', playbooks: '实战手册', operations: '运维', fieldGuide: '实战指南', blog: 'AI 博客', books: '书籍' },
     sep: '：',
     summary: n => `一个开放的双语（English / 简体中文）知识库，专注于如何把智能体 AI 构建好：白话的概念百科、工程向的深度剖析、应用向的实战手册、面向生产环境的运维、按序编排的实战指南，以及长文形式的 AI 博客。每种语言各 ${n} 个页面，每日更新。`,
     details: [
@@ -156,6 +161,19 @@ export function catalogFor(locale: Locale, s: Sources): LlmsDoc {
     sections.push({
       heading: heading(t.sections.fieldGuide, p.name[locale]),
       links: p.chapters.map(c => ({ title: `${c.num} · ${c.title[locale]}`, path: href(`/field-guide/${c.slug}/`) })),
+    });
+  }
+
+  // Books: one section per book — the landing page (which carries the full
+  // table of contents) and each published chapter in reading order.
+  for (const b of s.books ?? []) {
+    const chapters = b.parts.flatMap(p => p.chapters).filter(c => c.status === 'published');
+    sections.push({
+      heading: heading(t.sections.books, b.title[locale]),
+      links: [
+        { title: `${b.title[locale]}: ${b.subtitle[locale]}`, path: href(`/books/${b.slug}/`), note: b.pitch[locale] },
+        ...chapters.map(c => ({ title: `${c.num ? `${c.num} · ` : ''}${c.title[locale]}`, path: href(`/books/${b.slug}/${c.slug}/`), note: c.summary[locale] })),
+      ],
     });
   }
 

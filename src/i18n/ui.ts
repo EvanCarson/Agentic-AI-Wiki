@@ -46,6 +46,7 @@ export interface UIStrings {
     howToRead: string; contents: string; comingSoon: string;
     chaptersPublished: (published: number, total: number) => string;
     startReading: string; backToShelf: string;
+    referencedIn: string; partLabel: (roman: string) => string; chapterLabel: (num: string) => string; sidebarAria: string;
   };
   concepts: { metaTitle: string; metaDesc: string; h1: string; tagline: string; emptyHtml: string;
               readingPath: { badge: string; intro: string; escapePrefix: string; escapeLinkLabel: string } };
@@ -145,6 +146,10 @@ export const ui: Record<Locale, UIStrings> = {
       chaptersPublished: (p, t) => (p === 0 ? `${t} chapters planned · first part in progress` : `${p} of ${t} chapters published`),
       startReading: 'Start reading',
       backToShelf: 'All books',
+      referencedIn: 'Chapters that build on this one',
+      partLabel: (r) => `Part ${r}`,
+      chapterLabel: (n) => (/^\d+$/.test(n) ? `Chapter ${n}` : n ? `Appendix ${n}` : ''),
+      sidebarAria: 'Book contents',
     },
     concepts: {
       metaTitle: 'Concepts — Agentic AI Wiki',
@@ -295,6 +300,10 @@ export const ui: Record<Locale, UIStrings> = {
       chaptersPublished: (p, t) => (p === 0 ? `共规划 ${t} 章 · 第一部分撰写中` : `已发布 ${p} / ${t} 章`),
       startReading: '开始阅读',
       backToShelf: '全部书籍',
+      referencedIn: '在此基础上展开的章节',
+      partLabel: (r) => `第 ${r} 部分`,
+      chapterLabel: (n) => (/^\d+$/.test(n) ? `第 ${n} 章` : n ? `附录 ${n}` : ''),
+      sidebarAria: '本书目录',
     },
     concepts: {
       metaTitle: '概念 — Agentic AI 维基',
