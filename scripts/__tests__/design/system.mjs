@@ -35,6 +35,7 @@ const CURATED = [
   '/changelog/',
   '/books/', '/books/ai-driven-sdlc/', '/zh/books/ai-driven-sdlc/',
   '/books/ai-driven-sdlc/the-maturity-model/', '/zh/books/ai-driven-sdlc/case-studies/',
+  '/books/ai-driven-sdlc/code-review/', '/zh/books/ai-driven-sdlc/security-permissions-and-blast-radius/',
   '/zh/concepts/prompt-caching/',
 ];
 
