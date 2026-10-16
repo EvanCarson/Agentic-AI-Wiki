@@ -1,0 +1,121 @@
+<section class="phase">
+  <div class="phase-num">N11</div>
+  <div class="week">深入解析 · 推理与测试时计算</div>
+  <h2>为推理 token 记账：账单上唯一没有物件的那一项。</h2>
+  <p class="goal">推理 token 是你账单上唯一一项在日志里找不到对应物件的费用，而三家主要提供方报告它的形状互不兼容——于是每个跨厂商成本看板都会照抄的那一步算术，会根据它指向哪家厂商而往相反的方向出错。把 OpenAI 的推理计数加到它的输出计数上，你会高报这次调用；不把 Gemini 的加上去，你会低报它。解决办法不是更好的公式，而是在边缘做一次归一化——按模型、按接口分别处理，并拿账单而不是拿对话记录去对平。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>三家厂商，三个总数，一张表。</h3>
+
+    <p>每家提供方都按输出价计费推理 token。这一点乏味地一致，也正是人人都知道的那一半。真正有差别、并且会悄悄弄坏看板的，是推理计数究竟在输出计数<em>之内</em>、还是在它<em>之旁</em>。</p>
+
+    <ul>
+      <li><strong>OpenAI。</strong>推理 token 报在 <code class="inline">output_tokens_details.reasoning_tokens</code> 下，并且已经包含在 <code class="inline">output_tokens</code> 里。那个细分字段是一次拆解，不是一个加数。把两者相加会把推理重复计一遍。</li>
+      <li><strong>Anthropic。</strong>思考 token 计入 <code class="inline">usage.output_tokens</code>，而这就是计费数字。这里没有一个会被忘记相加的独立加数，这使它成为最不容易弄错的形状，也成为最容易让你以为问题不存在的形状。</li>
+      <li><strong>Gemini。</strong><code class="inline">usageMetadata.thoughtsTokenCount</code> 与 <code class="inline">candidatesTokenCount</code> <em>并列</em>，而不在其内。Google 自家的用量文档把总数定义为 prompt 加 candidates 再加 thoughts（当存在时），这已经是你能拿到的最明确的声明：在这里 thoughts 是一个加数。</li>
+    </ul>
+
+    <p>这个误差不是舍入问题。在一次推理调用里，推理内容往往主导了输出，所以一个符号搞错的加数会把数字挪动好几倍，而不是挪动几个百分点。</p>
+
+    <pre class="standalone"><span class="c-cm"># One call, 240 visible output tokens, 1,760 reasoning tokens.</span>
+<span class="c-cm"># Same underlying work. Three correct totals, three wrong ones.</span>
+
+OpenAI      output_tokens = 2000   reasoning_tokens = 1760   <span class="c-cm"># nested</span>
+            <span class="c-out">correct: 2000</span>
+            <span class="c-err">naive sum: 3760   → +88% overstated</span>
+
+Anthropic   usage.output_tokens = 2000                       <span class="c-cm"># nested, no detail field</span>
+            <span class="c-out">correct: 2000</span>
+            <span class="c-err">reading the visible text: 240   → −88% understated</span>
+
+Gemini      candidatesTokenCount = 240  thoughtsTokenCount = 1760   <span class="c-cm"># sibling</span>
+            <span class="c-out">correct: 2000</span>
+            <span class="c-err">candidates only: 240   → −88% understated</span></pre>
+
+    <div class="callout warn">
+      <p>这个 bug 最危险的版本是会相互抵消的那一版。一支横跨两家提供方的车队，把一家高报 88%、把另一家低报 88%，完全可以产出一个看起来合理的汇总值，而每一个「按模型」的单位经济都是错的——而「按模型」恰好就是做路由决策的那个粒度。汇总值能跟账单对上，并不构成拆解正确的证据；参见<a class="xref" href="/zh/operations/economics-roi/cost-attribution">成本归因</a>。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>字段可能缺失，而缺失不等于零。</h3>
+
+    <p>一个只针对一个模型、一个接口写过一次的归一化层，会因为一个没人预留预算的理由而出错：推理字段并不可靠地存在。有开发者报告过 Gemini 批量推理的结果在内容上带着 <code class="inline">thoughtSignature</code>——证明思考发生过——而 <code class="inline">thoughtsTokenCount</code> 在 <code class="inline">usageMetadata</code> 里完全缺席。也有报告称某个模型返回的输出计数与账单实际扣费严重背离，还有报告称同一个字段在 Google 两个接口中的一个里是嵌套的、在另一个里是并列的。把这些都当作它们本来的样子：一个强先验，说明这个形状是「模型与接口」这一对的属性，而不是厂商的属性。</p>
+
+    <p>于是防御性规则毫不炫目，而它就是本页全部的操作性内容。缺失的推理字段默认为 <code class="inline">null</code>，绝不默认为 <code class="inline">0</code>，并且让这两者一路可区分地进到你的数仓里。null 说的是「这次调用的推理开销未被测量」；0 说的是「这次调用没有思考」。其中一个是数据质量告警，另一个是关于模型的发现，而把它们塌缩成一个，就是一次沉默的 8 倍低计能活过一个季度的原因。</p>
+
+    <pre class="standalone"><span class="c-cm"># Normalise once, at the edge, keyed on (vendor, model, surface).</span>
+
+<span class="c-kw">def</span> <span class="c-fn">normalise_usage</span>(raw, vendor, model, surface):
+    shape = REASONING_SHAPE[(vendor, model, surface)]   <span class="c-cm"># "nested" | "sibling"</span>
+
+    reasoning = <span class="c-fn">extract_reasoning</span>(raw)            <span class="c-cm"># None if the field is absent</span>
+    visible   = <span class="c-fn">extract_output</span>(raw)
+
+    <span class="c-kw">if</span> reasoning <span class="c-kw">is</span> None:
+        <span class="c-cm"># Unmeasured, NOT zero. Alert; do not silently bill it as free.</span>
+        <span class="c-kw">return</span> Usage(billed_output=visible, reasoning=None, measured=<span class="c-kw">False</span>)
+
+    billed = visible <span class="c-kw">if</span> shape == <span class="c-st">"nested"</span> <span class="c-kw">else</span> visible + reasoning
+    <span class="c-kw">return</span> Usage(billed_output=billed, reasoning=reasoning, measured=<span class="c-kw">True</span>)</pre>
+
+    <p>把这一对映射到形状的那张表才是这里的资产，而它是个版本锁定问题、不是个编码问题：模型版本变化时、你在直连 API 与云上转售方之间迁移时、以及你从同步切到批量时，这个条目都必须重新核验。这与<a class="xref" href="/zh/operations/agentops/unpinned-vendor-defaults">未锁定的厂商默认值</a>是同一套纪律，只不过作用在一个你去读的字段、而不是一个你去传的参数上。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>你被收费的东西和你被展示的东西，是两个不同的物件。</h3>
+
+    <p>推理开销抵抗常规记账的更深层原因是：被计费的那个量没有物件。你为模型生成的那些推理 token 付费；而回来的东西，取决于厂商与设置，是它们的一份摘要、一个空白块、或者什么都没有。Anthropic 把立场说得很直白：你为该请求生成的全部思考 token 付费，而不是为摘要 token 付费，并且被计费的输出计数不会与你能看到的 token 数吻合。display 设置改变的是物件，不是账单。</p>
+
+    <p>由此有三个后果，而且三个都属于会很晚才浮现的那类。</p>
+
+    <ul>
+      <li><strong>你无法从对话记录推出开销。</strong>任何对已存响应做分词来算成本的工具——一个看起来挺合理的设计，也是人们在 usage 对象没被持久化时会搭的东西——读到的只有可见的那条尾巴。在一次重推理调用上，那是你能看见的那 12% 的输出。</li>
+      <li><strong>你也无法从开销推出对话记录。</strong>用量数字告诉你发生了大量思考，却完全不告诉你那是什么，这正是为什么推理占比是一个成本信号、而永远不是一个调试信号。当你需要内容时，诚实的答案只有两个：一个会把它返回的厂商功能，或者一个会把它返回的模型——而不是从计数器做的推断。</li>
+      <li><strong>连续性是有价钱的。</strong>当推理作为一团不透明或加密的数据跨轮次交还回去、以便模型接上自己的思路时，那团数据会在它随行的每一轮里占据你付费的上下文——机理在<a class="xref" href="/zh/deep-dives/reasoning-and-test-time-compute/carrying-reasoning-across-tool-calls">把推理一路带过工具调用</a>。因此一个多步智能体为同一段推理先按输出价付一次，再按输入价反复付——这是智能体单位经济里被低估得最彻底的一项。</li>
+    </ul>
+
+    <div class="callout">
+      <p>这也是对审计那个问题的诚实回答。一个推理被摘要或被扣留的智能体，无论你的 token 记账多么完备，都无法产出一份可复核的「它如何得出该决策」的记录——这个权衡在<a class="xref" href="/zh/deep-dives/reasoning-and-test-time-compute/latent-reasoning">潜在推理与你从此拿不到的那份轨迹</a>与<a class="xref" href="/zh/concepts/chain-of-thought-faithfulness">思维链忠实性</a>里都论证过。记账告诉你思考花了多少钱，它永远不会告诉你那思考好不好。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>每次调用记三个数字，不是一个。</h3>
+
+    <p>多数智能体遥测每次调用只记一个成本数字，而这恰恰是唯一一种无法回答推理真正引出的任何问题的形状。改为记录那份拆解，记在每一个 span 上，并把提供方的 usage 对象原样存在它旁边，这样日后对形状表的修正可以重放、而不必重跑。</p>
+
+    <ul>
+      <li><strong>输入、可见输出、推理</strong>作为三个独立计数器，外加提供方会报告的缓存输入 token。把缓存行为单独归因——推理与缓存会相互作用，经济账在<a class="xref" href="/zh/deep-dives/architectures-and-patterns/context-caching-economics">上下文缓存经济学</a>。</li>
+      <li><strong>推理占比</strong>——推理除以总输出——作为一个一等指标，按模型、按任务类别、按 effort 档位分别统计。当厂商在一个不变的版本串下重调模型时，动的就是这个数字，而且它比你的质量指标先动。</li>
+      <li><strong>原始 usage 对象</strong>，不作解析。它很小，它是唯一能活过你自己解析 bug 的证据，也是「重新推导一个季度的历史」与「丢掉它」之间的差别。</li>
+    </ul>
+
+    <p>把这些放在 span 上、而不是放在一个计费旁路里，这样推理开销就落在引发它的那些工具调用所在的同一条轨迹上——这正是<a class="xref" href="/zh/operations/evaluation-and-observability/tracing-and-observability">追踪与可观测性</a>存在要给你的那个连接，也是<a class="xref" href="/zh/operations/evaluation-and-observability/otel-genai-semantic-conventions">OTel GenAI 语义约定</a>给了命名的东西。没有它，唯一能问的问题是「上个月为什么更贵」，而这个问题没有答案；有了它，问题变成「哪个任务类别抬高了自己的推理占比」，而这个问题恰好只有一个答案。</p>
+
+    <p>然后去对平。挑一个模型、一个接口，跑一份已知负载，把你算出的总数与账单上该模型那一行做比较——不是与提供方层面的总额比，那正是符号相反的误差藏身之处。对每一组「模型与接口」重复一遍。这是半天的练习，而在某次路由变更把流量挪到一组你假设过形状的配对上时，它第一次就能把成本赚回来。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>这个数字究竟是用来干什么的。</h3>
+
+    <p>准确的推理记账本身不是目的；它的存在是为了让三个否则只能靠猜的决策变得可做。</p>
+
+    <ul>
+      <li><strong>按任务类别设定 effort。</strong>effort 旋钮是一个推理部署里杠杆最高的成本控制手段，而它几乎总是被写客户端的那个人一次性全局设定好。推理占比按任务类别告诉你预算流向了哪里，而<a class="xref" href="/zh/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">自适应思考与努力度预算</a>讲的是怎么挪它。请把它与<a class="xref" href="/zh/deep-dives/reasoning-and-test-time-compute/inverse-scaling-in-test-time-compute">测试时计算的逆向扩展</a>里的警告配在一起看：更多推理并非单调更好，所以最便宜的档位和最好的档位有时是同一个档位。</li>
+      <li><strong>路由。</strong>一个包含推理在内的按任务类别成本，是<a class="xref" href="/zh/concepts/model-routing">模型路由</a>的输入。若不算推理，那么每当便宜模型靠思考更久来补偿更弱的权重时，它看起来就比实际更便宜——这是一个真实且常见的模式，而一个只看输出的成本模型完全看不见它。</li>
+      <li><strong>预测。</strong>推理占比是让智能体开销对请求量呈非线性的那一项，因为一个智能体的推理随步数增长、而不随用户轮数增长。<a class="xref" href="/zh/operations/economics-roi/forecasting-agent-spend">预测智能体开销</a>与<a class="xref" href="/zh/operations/agentops/cost-control-in-the-loop">循环内的成本控制</a>都把它当输入，也都会在它出错时悄悄退化。</li>
+    </ul>
+
+    <p>对以上一切有一个诚实的限制：推理开销是被测量的，不是被控制的。一个被请求的预算是模型可以超出或忽略的提示，而真正扛得住的上限是你自己强制的那个——在你的循环里检查的每次运行 token 硬上限，这是本页上唯一一个不依赖厂商说真话的控制。</p>
+
+    <div class="callout tip">
+      <p>今天就做，一小时内：找到你代码里从 usage 对象算成本的那一处，按提供方检查它的符号。如果它为 OpenAI 或 Anthropic 把一个推理字段加到一个输出字段上，你在高报；如果它为 Gemini 只读 <code class="inline">candidatesTokenCount</code>，你在低报。然后让缺失的推理字段触发告警、而不是默认为零，并开始存原始 usage 对象。这里其他的一切——形状表、按配对对平、推理占比指标——都值得去建，但那两处修改才是让你不会拿一个错了好几倍的数字去做路由决策的那两处。</p>
+    </div>
+  </div>
+</section>

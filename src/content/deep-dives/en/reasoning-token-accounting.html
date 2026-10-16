@@ -1,0 +1,121 @@
+<section class="phase">
+  <div class="phase-num">N11</div>
+  <div class="week">Deep Dive · Reasoning &amp; Test-Time Compute</div>
+  <h2>Accounting for reasoning tokens: the line item with no artifact.</h2>
+  <p class="goal">Reasoning tokens are the only thing on your invoice with no matching object in your logs, and the three major providers report them in three incompatible shapes — so the single piece of arithmetic every cross-vendor cost dashboard copies is wrong in opposite directions depending on which vendor it is pointed at. Add OpenAI's reasoning count to its output count and you overstate that call; fail to add Gemini's and you understate it. The fix is not a better formula. It is one normalisation step at the edge, per model and per surface, reconciled against the invoice rather than against the transcript.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three vendors, three totals, one spreadsheet.</h3>
+
+    <p>Every provider bills reasoning at the output rate. That part is boringly consistent and it is the part everyone knows. What differs — and what quietly breaks the dashboard — is whether the reasoning count is <em>inside</em> the output count or <em>beside</em> it.</p>
+
+    <ul>
+      <li><strong>OpenAI.</strong> Reasoning tokens are reported under <code class="inline">output_tokens_details.reasoning_tokens</code> and are already included in <code class="inline">output_tokens</code>. The detail field is a breakdown, not an addend. Summing the two double-counts the reasoning.</li>
+      <li><strong>Anthropic.</strong> Thinking tokens are counted in <code class="inline">usage.output_tokens</code>, which is the billing figure. There is no separate addend to forget, which makes this the shape least likely to be got wrong and the shape most likely to make you think the problem does not exist.</li>
+      <li><strong>Gemini.</strong> <code class="inline">usageMetadata.thoughtsTokenCount</code> sits <em>alongside</em> <code class="inline">candidatesTokenCount</code>, not inside it. Google's own usage documentation defines the total as prompt plus candidates plus thoughts when present, which is as clear a statement as you will get that the thoughts are an addend here.</li>
+    </ul>
+
+    <p>The error is not a rounding problem. Reasoning routinely dominates the output of a reasoning call, so a mis-signed addend moves the number by multiples rather than percents.</p>
+
+    <pre class="standalone"><span class="c-cm"># One call, 240 visible output tokens, 1,760 reasoning tokens.</span>
+<span class="c-cm"># Same underlying work. Three correct totals, three wrong ones.</span>
+
+OpenAI      output_tokens = 2000   reasoning_tokens = 1760   <span class="c-cm"># nested</span>
+            <span class="c-out">correct: 2000</span>
+            <span class="c-err">naive sum: 3760   → +88% overstated</span>
+
+Anthropic   usage.output_tokens = 2000                       <span class="c-cm"># nested, no detail field</span>
+            <span class="c-out">correct: 2000</span>
+            <span class="c-err">reading the visible text: 240   → −88% understated</span>
+
+Gemini      candidatesTokenCount = 240  thoughtsTokenCount = 1760   <span class="c-cm"># sibling</span>
+            <span class="c-out">correct: 2000</span>
+            <span class="c-err">candidates only: 240   → −88% understated</span></pre>
+
+    <div class="callout warn">
+      <p>The dangerous version of this bug is the one that cancels out. A fleet split across two providers, overstating one by 88% and understating the other by 88%, can produce a plausible aggregate while every per-model unit economic is wrong — and per-model is exactly the granularity at which routing decisions get made. The aggregate reconciling against the invoice is not evidence the breakdown is right; see <a class="xref" href="/operations/economics-roi/cost-attribution">cost attribution</a>.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The field can be missing, and missing is not zero.</h3>
+
+    <p>A normalisation layer written once against one model on one surface will be wrong for a reason nobody budgets for: the reasoning field is not reliably present. Developers have reported Gemini batch-prediction results that carry a <code class="inline">thoughtSignature</code> on the content — proof that thinking happened — while <code class="inline">thoughtsTokenCount</code> is absent from <code class="inline">usageMetadata</code> entirely. There are also reported cases of a model's returned output count diverging sharply from what billing charged, and reports that the same field is nested on one of Google's two surfaces and a sibling on the other. Treat all of those as what they are: a strong prior that the shape is a property of the model-and-surface pair, not of the vendor.</p>
+
+    <p>So the defensive rule is unglamorous and it is the whole of this page's operational content. Default a missing reasoning field to <code class="inline">null</code>, never to <code class="inline">0</code>, and keep the two distinguishable all the way into your warehouse. A null says "this call's reasoning spend is unmeasured"; a zero says "this call did no thinking". One of those is a data-quality alert and the other is a finding about the model, and collapsing them is how a silent 8× undercount survives a quarter.</p>
+
+    <pre class="standalone"><span class="c-cm"># Normalise once, at the edge, keyed on (vendor, model, surface).</span>
+
+<span class="c-kw">def</span> <span class="c-fn">normalise_usage</span>(raw, vendor, model, surface):
+    shape = REASONING_SHAPE[(vendor, model, surface)]   <span class="c-cm"># "nested" | "sibling"</span>
+
+    reasoning = <span class="c-fn">extract_reasoning</span>(raw)            <span class="c-cm"># None if the field is absent</span>
+    visible   = <span class="c-fn">extract_output</span>(raw)
+
+    <span class="c-kw">if</span> reasoning <span class="c-kw">is</span> None:
+        <span class="c-cm"># Unmeasured, NOT zero. Alert; do not silently bill it as free.</span>
+        <span class="c-kw">return</span> Usage(billed_output=visible, reasoning=None, measured=<span class="c-kw">False</span>)
+
+    billed = visible <span class="c-kw">if</span> shape == <span class="c-st">"nested"</span> <span class="c-kw">else</span> visible + reasoning
+    <span class="c-kw">return</span> Usage(billed_output=billed, reasoning=reasoning, measured=<span class="c-kw">True</span>)</pre>
+
+    <p>The table that maps the pair to the shape is the asset here, and it is a pinning problem rather than a coding one: the entry must be re-verified when the model version changes, when you move between a direct API and a cloud reseller, and when you switch from synchronous to batch. That is the same discipline as <a class="xref" href="/operations/agentops/unpinned-vendor-defaults">unpinned vendor defaults</a>, applied to a field you read rather than a parameter you send.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What you are billed for and what you are shown are different objects.</h3>
+
+    <p>The deeper reason reasoning spend resists ordinary accounting is that the billed quantity has no artifact. You are charged for the reasoning tokens the model generated; what comes back is, depending on the vendor and the setting, a summary of them, an empty block, or nothing. Anthropic states the position plainly: you pay for the full thinking tokens generated by the request, not the summary tokens, and the billed output count will not match the tokens you can see. The display setting changes the artifact and not the bill.</p>
+
+    <p>Three consequences follow, and all three are the kind that surface late.</p>
+
+    <ul>
+      <li><strong>You cannot derive spend from the transcript.</strong> Any cost tooling that tokenises the stored response — a reasonable-looking design, and one people build when the usage object was not persisted — reads only the visible tail. On a heavy reasoning call that is the 12% of the output you can see.</li>
+      <li><strong>You cannot derive the transcript from spend.</strong> The usage number tells you a lot of thinking happened and nothing about what it was, which is why reasoning share is a cost signal and never a debugging one. When you need the content, the only honest answers are a vendor feature that returns it or a model that does — not an inference from the counter.</li>
+      <li><strong>Continuity has a price.</strong> Where reasoning is handed back across turns as an opaque or encrypted blob so the model can resume its own train of thought, that blob occupies the context you pay for on every turn it rides along in — the mechanics are in <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/carrying-reasoning-across-tool-calls">carrying reasoning across tool calls</a>. A multi-step agent therefore pays for one span of reasoning once at the output rate and then repeatedly at the input rate, which is the single most under-modelled term in agent unit economics.</li>
+    </ul>
+
+    <div class="callout">
+      <p>This is also the honest answer to the audit question. An agent whose reasoning is summarised or withheld cannot produce a reviewable record of how it reached a decision, however complete your token accounting is — the trade-off argued in <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/latent-reasoning">latent reasoning and the trace you stop getting</a> and in <a class="xref" href="/concepts/chain-of-thought-faithfulness">chain-of-thought faithfulness</a>. Accounting tells you what the thinking cost. It will never tell you whether it was any good.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Instrument three numbers per call, not one.</h3>
+
+    <p>Most agent telemetry logs a single cost figure per call, which is the one shape that cannot answer any of the questions reasoning actually raises. Log the decomposition instead, on every span, and store the provider's usage object verbatim beside it so a later correction to your shape table can be replayed rather than re-run.</p>
+
+    <ul>
+      <li><strong>Input, visible output, reasoning</strong> as three separate counters, plus cached-input tokens where the provider reports them. Attribute cache behaviour separately — reasoning and caching interact, and the economics are in <a class="xref" href="/deep-dives/architectures-and-patterns/context-caching-economics">context-caching economics</a>.</li>
+      <li><strong>The reasoning share</strong> — reasoning over total output — as a first-class metric per model, per task class, and per effort setting. This is the number that moves when a vendor retunes a model under a stable version string, and it moves before your quality metrics do.</li>
+      <li><strong>The raw usage object</strong>, unparsed. It is tiny, it is the only evidence that survives your own parsing bug, and it is the difference between re-deriving a quarter of history and losing it.</li>
+    </ul>
+
+    <p>Put these on the span rather than in a billing sidecar, so reasoning spend lands on the same trajectory as the tool calls that provoked it — the join that <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a> exists to give you, and that <a class="xref" href="/operations/evaluation-and-observability/otel-genai-semantic-conventions">the OTel GenAI semantic conventions</a> give you names for. Without it the only available question is "why did last month cost more", which has no answer; with it the question becomes "which task class raised its reasoning share", which has exactly one.</p>
+
+    <p>Then reconcile. Pick one model and one surface, run a known workload, and compare your computed total against the invoice line for that model — not against the provider-level total, which is where opposite-signed errors hide. Repeat per model-and-surface pair. This is a half-day exercise that pays for itself the first time a routing change moves traffic onto a pair whose shape you assumed.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>What the number is actually for.</h3>
+
+    <p>Accurate reasoning accounting is not an end in itself; it exists to make three decisions that are otherwise guesses.</p>
+
+    <ul>
+      <li><strong>Setting effort per task class.</strong> The effort knob is the highest-leverage cost control in a reasoning deployment and it is nearly always set once, globally, by whoever wrote the client. Reasoning share per task class tells you where the budget is going, and <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">adaptive thinking and effort budgets</a> covers the mechanics of moving it. Pair it with the warning in <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/inverse-scaling-in-test-time-compute">inverse scaling in test-time compute</a>: more reasoning is not monotonically better, so the cheapest setting and the best setting are sometimes the same setting.</li>
+      <li><strong>Routing.</strong> A per-task-class cost that includes reasoning is the input to <a class="xref" href="/concepts/model-routing">model routing</a>. Computed without reasoning, the cheap model looks cheaper than it is whenever it compensates for weaker weights by thinking longer — a real and common pattern that an output-only cost model cannot see at all.</li>
+      <li><strong>Forecasting.</strong> Reasoning share is the term that makes agent spend non-linear in request volume, because an agent's reasoning grows with the number of steps and not with the number of user turns. <a class="xref" href="/operations/economics-roi/forecasting-agent-spend">Forecasting agent spend</a> and <a class="xref" href="/operations/agentops/cost-control-in-the-loop">cost control in the loop</a> both take this as an input, and both degrade quietly when it is wrong.</li>
+    </ul>
+
+    <p>One honest limit on all of it: reasoning spend is measured, not controlled. A requested budget is a hint the model may exceed or ignore, and the ceiling that actually holds is the one you enforce yourself — a hard cap on tokens per run, checked in your loop, which is the only control on this page that does not depend on the vendor telling you the truth.</p>
+
+    <div class="callout tip">
+      <p>Do this today, in an hour: find the one place your code computes cost from a usage object, and check its sign per provider. If it adds a reasoning field to an output field for OpenAI or Anthropic, you are overstating; if it reads <code class="inline">candidatesTokenCount</code> alone for Gemini, you are understating. Then make a missing reasoning field raise an alert instead of defaulting to zero, and start storing the raw usage object. Everything else here — the shape table, the per-pair reconciliation, the reasoning-share metric — is worth building, but those two edits are the ones that stop you making a routing decision on a number that is wrong by a multiple.</p>
+    </div>
+  </div>
+</section>
