@@ -2,8 +2,9 @@
 // listing it here; order here is shelf order.
 import type { Book, BookChapter, BookPart } from './types';
 import aiDrivenSdlc from './ai-driven-sdlc/manifest';
+import lastMile from './last-mile/manifest';
 
-export const BOOKS: Book[] = [aiDrivenSdlc];
+export const BOOKS: Book[] = [aiDrivenSdlc, lastMile];
 
 export function bookBySlug(slug: string): Book | undefined {
   return BOOKS.find(b => b.slug === slug);
