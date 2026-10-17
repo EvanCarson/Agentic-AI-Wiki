@@ -3,8 +3,8 @@ import { L, type ChangelogEntry } from '../types.ts';
 const entry: ChangelogEntry = {
   date: '2026-10-16',
   title: L(
-    'Books — “From SDLC to AI-Driven SDLC” is complete: Part III turns the book into a migration plan, and four appendices add copy-ready templates, a dated regulatory status, a glossary and a full bibliography',
-    '书籍——《从 SDLC 到 AI 驱动的 SDLC》全书完成：第三部分把全书变成一份迁移计划，四个附录补上可直接复制的模板、注明日期的监管现状、术语表与完整的参考文献',
+    'Book complete: Part III, the migration plan, and four appendices',
+    '全书完成：第三部分迁移计划与四个附录',
   ),
   items: [
     L(

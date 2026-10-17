@@ -3,8 +3,8 @@ import { L, type ChangelogEntry } from '../types.ts';
 const entry: ChangelogEntry = {
   date: '2026-10-13',
   title: L(
-    'Five of the thinnest original pages rebuilt around verified evidence — benchmarks, agent pricing, multi-agent topologies, tool error messages and coding-agent evals',
-    '把五个最单薄的初版页面围绕经过核实的证据重写——基准、智能体定价、多智能体拓扑、工具错误消息与编码智能体评测',
+    'Five thin original pages rebuilt around verified evidence',
+    '五个单薄的初版页面围绕核实过的证据重写',
   ),
   items: [
     L(

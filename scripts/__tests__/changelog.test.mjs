@@ -41,3 +41,19 @@ test('changelog: every entry has bilingual, well-shaped content', async () => {
     seenKeys.add(key);
   }
 });
+
+// A title is the scan line on a collapsed entry; the bullets are the detail.
+// Before this cap, half the titles ran past 120 characters (max 728), so one
+// collapsed entry filled a phone screen. Entries from CAP_FROM on must fit a
+// headline; older ones are left as written and clamped by the stylesheet.
+const CAP_FROM = '2026-10-17';
+const MAX_EN = 110;   // characters
+const MAX_ZH = 60;    // characters (CJK text is roughly half as long)
+test(`changelog: titles from ${CAP_FROM} are headline length (en ≤ ${MAX_EN}, zh ≤ ${MAX_ZH} chars)`, async () => {
+  for (const f of files) {
+    if (f.slice(0, 10) < CAP_FROM) continue;
+    const e = (await import(pathToFileURL(entriesDir + f).href)).default;
+    assert.ok([...e.title.en].length <= MAX_EN, `${f}: en title is ${[...e.title.en].length} chars (max ${MAX_EN}) — move the detail into items`);
+    assert.ok([...e.title.zh].length <= MAX_ZH, `${f}: zh title is ${[...e.title.zh].length} chars (max ${MAX_ZH}) — move the detail into items`);
+  }
+});

@@ -58,6 +58,9 @@ notable accessibility/SEO/design changes — all get an entry file.
   defect, fix it like any other.
 - Every `title` and every `items[]` bullet must be **bilingual** (`L(en, zh)`),
   with a faithful, fluent Chinese translation — never machine-literal.
+- The `title` is a **headline**: at most 110 characters (en) / 60 (zh), enforced
+  by `changelog.test.mjs` from 2026-10-17. On a phone the collapsed title is all
+  a reader sees; arguments and numbers go in the `items` bullets.
 - Group related work into one entry file; keep bullets concrete and user-facing.
 - If you forget and only notice later, add the file as a follow-up before merge.
 
