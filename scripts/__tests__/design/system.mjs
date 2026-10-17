@@ -37,6 +37,9 @@ const CURATED = [
   '/books/ai-driven-sdlc/the-maturity-model/', '/zh/books/ai-driven-sdlc/case-studies/',
   '/books/ai-driven-sdlc/code-review/', '/zh/books/ai-driven-sdlc/security-permissions-and-blast-radius/',
   '/books/ai-driven-sdlc/templates/', '/zh/books/ai-driven-sdlc/measuring-success-and-rolling-back/',
+  '/books/last-mile/', '/zh/books/last-mile/',
+  '/books/last-mile/how-to-use/', '/zh/books/last-mile/discovery/',
+  '/books/last-mile/scoping-and-the-first-win/',
   '/zh/concepts/prompt-caching/',
 ];
 
