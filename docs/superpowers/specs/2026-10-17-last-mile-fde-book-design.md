@@ -220,7 +220,7 @@ The book infrastructure already supports several books (`src/content/books/index
   - `.callout.composite`: a shaded box labelled "Composite" / "合成案例".
   - `.callout.verified`: a dated box labelled "Verified YYYY-MM" / "核实于 YYYY-MM".
 
-  The label comes from a `data-label` attribute so it is translated in the fragment.
+  The label comes from a `data-badge` attribute (the existing `.callout.start` convention) so it is translated in the fragment.
   Both variants must pass `test:design` contrast checks in light and dark mode. A
   chapter page from this book is added to the design suite's CURATED list.
 - **Test.** `books-manifest.test.mjs` already iterates `BOOKS`. Confirm it covers the
