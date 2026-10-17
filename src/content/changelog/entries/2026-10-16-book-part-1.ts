@@ -3,8 +3,8 @@ import { L, type ChangelogEntry } from '../types.ts';
 const entry: ChangelogEntry = {
   date: '2026-10-16',
   title: L(
-    'Books — Part I of “From SDLC to AI-Driven SDLC” is published: the case for changing the process, a maturity model you can audit, ten graded case studies, and how to read the evidence',
-    '书籍——《从 SDLC 到 AI 驱动的 SDLC》第一部分发布：为什么要改流程、一套可审计的成熟度模型、十个分级的案例研究，以及如何解读证据',
+    'Book: Part I of “From SDLC to AI-Driven SDLC” — the case, the maturity model, ten cases',
+    '书籍：《从 SDLC 到 AI 驱动的 SDLC》第一部分——理由、成熟度模型、十个案例',
   ),
   items: [
     L(

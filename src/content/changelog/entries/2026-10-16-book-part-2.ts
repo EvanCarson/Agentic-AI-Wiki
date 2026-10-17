@@ -3,8 +3,8 @@ import { L, type ChangelogEntry } from '../types.ts';
 const entry: ChangelogEntry = {
   date: '2026-10-16',
   title: L(
-    'Books — Part II of “From SDLC to AI-Driven SDLC” is published: eight phase-by-phase chapters, from requirements to security, each with its own maturity ladder, a graded case, migration steps, guardrails and metrics',
-    '书籍——《从 SDLC 到 AI 驱动的 SDLC》第二部分发布：从需求到安全的八个逐阶段章节，每章都有自己的成熟度阶梯、一个分级案例、迁移步骤、护栏与指标',
+    'Book: Part II of “From SDLC to AI-Driven SDLC” — eight phase-by-phase chapters',
+    '书籍：《从 SDLC 到 AI 驱动的 SDLC》第二部分——八个逐阶段章节',
   ),
   items: [
     L(

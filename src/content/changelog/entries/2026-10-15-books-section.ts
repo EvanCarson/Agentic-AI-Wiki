@@ -3,8 +3,8 @@ import { L, type ChangelogEntry } from '../types.ts';
 const entry: ChangelogEntry = {
   date: '2026-10-15',
   title: L(
-    'A new Books section, opening with the plan for “From SDLC to AI-Driven SDLC” — and Books replaces Changelog in the top navigation',
-    '新增「书籍」板块，首本是《从 SDLC 到 AI 驱动的 SDLC》的写作计划——顶部导航中「书籍」取代了「更新日志」',
+    'Books section launched, with the plan for “From SDLC to AI-Driven SDLC”',
+    '新增「书籍」板块，首本《从 SDLC 到 AI 驱动的 SDLC》写作计划上线',
   ),
   items: [
     L(
