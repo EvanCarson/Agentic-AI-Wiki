@@ -2,8 +2,8 @@ import { L, type ChangelogEntry } from '../types.ts';
 
 const entry: ChangelogEntry = {
   date: '2026-10-17',
-  title: L('A second book: Last Mile, the Forward Deployed Engineer\'s handbook, opens with Part II',
-           '第二本书《最后一公里：FDE 落地手册》上线，先发第 II 部分'),
+  title: L('A second book: Last Mile, the Forward Deployed Engineer\'s handbook, opens with its guide and Chapters 4–6',
+           '第二本书《最后一公里：FDE 落地手册》上线，先发导读与第 II 部分前三章'),
   items: [
     L('How to Use This Book: three reading paths, the T1–T4 evidence grades, how echoed numbers and composites are marked, and a 28-row index from the situation you are in to the page that helps.',
       '如何使用本书：三条阅读路径、T1–T4 证据分级、回声数字与合成案例的标注方式，以及一份 28 行、从你所处处境直达对应页面的索引。'),

@@ -139,7 +139,7 @@ const book: Book = {
           summary: L('Every case in the book, graded by how well it is evidenced.', '书中全部案例，按证据强弱分级。') },
         { slug: 'templates', num: 'B', status: 'planned',
           title: L('Templates', '模板'),
-          summary: L('Every template from Part II, blank and filled in.', '第二部分的全部模板，空白版与填写示例。') },
+          summary: L('Every template from Part II, blank and filled in.', '第 II 部分的全部模板，空白版与填写示例。') },
         { slug: 'failure-modes', num: 'C', status: 'planned',
           title: L('Failure Modes', '失败模式'),
           summary: L('Symptom, cause and fix for the ways engagements go wrong.', '交付出错的各种方式：症状、成因与对策。') },
