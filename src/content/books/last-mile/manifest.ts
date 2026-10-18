@@ -37,7 +37,7 @@ const book: Book = {
         { slug: 'what-an-fde-is', num: '1', status: 'published',
           title: L('What an FDE Is, and Isn\'t', 'FDE 是什么，不是什么'),
           summary: L('One test sorts the jobs that share the title: does the role own the customer\'s outcome from discovery through handoff, writing the code itself? Includes a checklist to run on any job post.',
-                     '同一个头衔下其实是好几种工作，一个检验就能分清：这个角色是否从需求挖掘一直到交接都对客户的结果负责，并亲手写代码？附一份可用于任何职位描述的检查清单。') },
+                     '同一个头衔下其实是好几种工作，一个检验就能分清：这个角色是否从需求挖掘一直到交接都对客户的结果负责，并亲手写代码？附一份可用于任何招聘启事的检查清单。') },
         { slug: 'origins-and-economics', num: '2', status: 'published',
           title: L('Origins and Economics', '起源与经济账'),
           summary: L('Palantir showed that losing money on pilots can buy a high-margin customer; the AI labs copied the pattern because models need the same last mile, and the new deployment companies show the services trap is still live.',
@@ -45,7 +45,7 @@ const book: Book = {
         { slug: 'the-skill-map', num: '3', status: 'published',
           title: L('The Skill Map', '技能地图'),
           summary: L('Job posts measure the skills that fit on a CV; engagements reward four kinds of behaviour. A rubric of four domains by four levels, and a self-assessment scored on what you have done, not what you know.',
-                     '职位描述衡量的是能写进简历的技能，交付奖励的却是四类行为。一份四个领域乘四个级别的评估标准，以及一份按“做过什么”而非“知道什么”打分的自我评估。') },
+                     '招聘启事衡量的是能写进简历的技能，交付奖励的却是四类行为。一份四个领域乘四个级别的评估标准，以及一份按“做过什么”而非“知道什么”打分的自我评估。') },
       ],
     },
     {
@@ -103,7 +103,7 @@ const book: Book = {
         { slug: 'judgment-under-pressure', num: '14', status: 'published',
           title: L('Judgment Under Pressure', '压力下的判断'),
           summary: L('Judgment is knowing which four commitments are load-bearing (the threshold, the data path, the sponsor and the exit), trading everything else readily, and writing each refusal down so it holds.',
-                     '判断力，就是知道哪四项承诺是承重的——阈值、数据通路、发起人与退出——其余一切都可以痛快让步，而每一次拒绝都要落在纸面上，才能站得住。') },
+                     '判断力，就是知道哪四项承诺是承重的——阈值、数据通路、发起人与退出机制——其余一切都可以痛快让步，而每一次拒绝都要落在纸面上，才能站得住。') },
       ],
     },
     {
