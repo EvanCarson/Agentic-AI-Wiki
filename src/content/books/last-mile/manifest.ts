@@ -68,7 +68,7 @@ const book: Book = {
         { slug: 'data-access-and-integration', num: '7', status: 'published',
           title: L('Data Access and Integration', '数据接入与集成'),
           summary: L('Integration, not the model, is where the weeks go: file the access request on day one, build on fixtures while it moves, read before you write, and give every connector an owner.',
-                     '时间都花在集成上，而不是模型上：第一天就提交数据访问申请，等待期间用脱敏样例先搭起来，先读后写，并给每个连接器指定负责人。') },
+                     '时间都花在集成上，而不是模型上：第一天就提交数据接入申请，等待期间用测试样本先搭起来，先读后写，并给每个连接器指定负责人。') },
         { slug: 'security-governance-and-model-risk', num: '8', status: 'published',
           title: L('Security, Governance and Model Risk', '安全、治理与模型风险'),
           summary: L('Treat the customer\'s review as a design input: answer the data questions with contract terms, and answer prompt injection with an agent that has nothing dangerous to do.',
