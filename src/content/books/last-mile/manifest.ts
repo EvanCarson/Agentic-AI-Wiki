@@ -109,12 +109,12 @@ const book: Book = {
     {
       key: 'the-career', roman: 'IV',
       name: L('The Career', '职业'),
-      audience: L('For aspiring and growing FDEs', '写给想入行与正在成长的 FDE'),
+      audience: L('For aspiring and growing FDEs, and the people who lead them', '写给想入行与正在成长的 FDE，以及带领他们的人'),
       chapters: [
         { slug: 'where-fdes-work', num: '15', status: 'published',
           title: L('Where FDEs Work', 'FDE 在哪里工作'),
-          summary: L('The employer type changes the job more than the title does: lab, application startup, platform or deployment company each buy something different with your time. Place the employer first, then compare pay, including the China spread.',
-                     '雇主类型比头衔更能改变这份工作：AI 实验室、应用创业公司、平台型公司与部署公司，各自用你的时间买的东西不同。先给雇主定位，再比较薪资，包括国内的薪资差距。') },
+          summary: L('The employer type changes the job more than the title does: lab, application startup, platform or deployment company each buy something different with your time. Place the employer first, then compare pay, in the US and in China.',
+                     '雇主类型比头衔更能改变这份工作：AI 实验室、应用创业公司、平台型公司与部署公司，各自用你的时间买的东西不同。先给雇主定位，再比较美国和国内的薪资。') },
         { slug: 'getting-hired', num: '16', status: 'published',
           title: L('Getting Hired', '拿到录用'),
           summary: L('Coding is only the floor in FDE loops; the hire turns on whether you can turn a vague problem into an agreed number. Prepare with one portfolio project shaped like an engagement, and interview the employer back.',
@@ -125,8 +125,8 @@ const book: Book = {
                      'FDE 团队会因为一个个看似合理的人员安排，逐步滑向一家服务公司。要把它当作一个组合来经营：按能学到什么来挑客户，每周用一页纸审视每个客户，衡量的是跨过的阈值和交给产品的信号。') },
         { slug: 'levels-burnout-and-what-comes-next', num: '18', status: 'published',
           title: L('Levels, Burnout and What Comes Next', '职级、倦怠与下一步'),
-          summary: L('Climbing by volume repeats the same evidence and piles up the load that burns people out; the one ladder that spells out seniority rewards leverage. Nobody has published attrition data, so plan level, load and exits as one decision.',
-                     '靠堆量往上爬，只会重复同样的证据，并累积让人倦怠的负荷；唯一把资深程度写清楚的职级阶梯，奖励的是杠杆。目前没有人公布过流失数据，所以要把职级、负荷与退路当作同一个决定来规划。') },
+          summary: L('Climbing by volume repeats the same evidence and piles up the load that burns people out; the one employer whose posts spell out seniority asks for leverage. Nobody has published attrition data, so plan level, load and exits as one decision.',
+                     '靠堆量往上爬，只会重复同样的证据，并累积让人倦怠的负担；唯一在启事里写清资深程度的那家雇主，要求的是杠杆。目前没有人公布过流失数据，所以要把职级、负担与出路当作同一个决定来规划。') },
       ],
     },
     {
