@@ -44,7 +44,7 @@ Sources: five briefs. Brief codes: **RM** role-and-market, **CA** cases, **EP** 
   - Scale: $565.7M at 55%, with the top 25% of Scale customers at 87%.
 
   Pilots run "at no or low cost… at a loss". The sales cycle is "six to nine months but can extend to a year". Source: same S-1 (2020-08-25). (RM)
-- [T4] Qureshi (Palantir FDE 2015–2023):
+- [T4] Qureshi (joined Palantir as an FDE in 2015 and left in 2023):
   - The FDE/PD split was a key "secret". FDE field work became Magritte, Contour and Workshop, because "PD's job was to take whatever you'd built and generalize it".
   - Palantir's 2023 gross margin was about 80% against 32% for Accenture. He gives no source; these may echo company figures.
 
