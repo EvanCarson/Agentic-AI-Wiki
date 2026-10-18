@@ -1,8 +1,8 @@
 // Last Mile: The Forward Deployed Engineer's Handbook for Shipping AI.
 // Design: docs/superpowers/specs/2026-10-17-last-mile-fde-book-design.md
 // Research + bible: docs/books/last-mile/
-// Ships Part II first (PR 1 = how-to-use + Ch 4–6). A chapter is `planned`
-// until its PR adds both fragments and flips it to `published`.
+// Shipped in five PRs, Part II first (#247 how-to-use + Ch 4–6, #248 Ch 7–13,
+// #249 Ch 1–3 + 14, #250 Ch 15–18, then the appendices). Every entry is published.
 import type { Localized } from '../../../i18n/index';
 import type { Book } from '../types';
 
@@ -134,23 +134,23 @@ const book: Book = {
       name: L('Appendices', '附录'),
       audience: L('Reference', '参考资料'),
       chapters: [
-        { slug: 'case-file', num: 'A', status: 'planned',
+        { slug: 'case-file', num: 'A', status: 'published',
           title: L('Case File', '案例档案'),
           summary: L('Every case in the book, graded by how well it is evidenced.', '书中全部案例，按证据强弱分级。') },
-        { slug: 'templates', num: 'B', status: 'planned',
+        { slug: 'templates', num: 'B', status: 'published',
           title: L('Templates', '模板'),
           summary: L('Every template from Part II, blank and filled in.', '第 II 部分的全部模板，空白版与填写示例。') },
-        { slug: 'failure-modes', num: 'C', status: 'planned',
+        { slug: 'failure-modes', num: 'C', status: 'published',
           title: L('Failure Modes', '失败模式'),
           summary: L('Symptom, cause and fix for the ways engagements go wrong.', '交付出错的各种方式：症状、成因与对策。') },
-        { slug: 'state-of-the-role', num: 'D', status: 'planned',
+        { slug: 'state-of-the-role', num: 'D', status: 'published',
           title: L('State of the Role', '这个角色的现状'),
           summary: L('A dated snapshot of who hires FDEs, what they pay and how the role is changing.',
                      '一份注明日期的快照：谁在招 FDE、薪酬多少、这个角色正如何变化。') },
-        { slug: 'glossary', num: 'E', status: 'planned',
+        { slug: 'glossary', num: 'E', status: 'published',
           title: L('Glossary', '术语表'),
           summary: L('The terms the book uses, defined once.', '书中用到的术语，统一定义一次。') },
-        { slug: 'sources', num: 'F', status: 'planned',
+        { slug: 'sources', num: 'F', status: 'published',
           title: L('Sources', '参考来源'),
           summary: L('Every source cited, with its evidence tier.', '全部引用来源及其证据等级。') },
       ],

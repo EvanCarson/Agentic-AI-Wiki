@@ -43,6 +43,7 @@ const CURATED = [
   '/books/last-mile/evals/', '/zh/books/last-mile/when-engagements-fail/',
   '/books/last-mile/the-skill-map/', '/zh/books/last-mile/judgment-under-pressure/',
   '/books/last-mile/where-fdes-work/', '/zh/books/last-mile/leading-fdes/',
+  '/books/last-mile/failure-modes/', '/zh/books/last-mile/glossary/',
   '/zh/concepts/prompt-caching/',
 ];
 
