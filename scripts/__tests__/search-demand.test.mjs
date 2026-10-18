@@ -1,16 +1,20 @@
 // The search-demand harvester's pure half (scripts/search-demand/lib.mjs):
 // matching and status, ranking, GSC row classification and the queue shape.
-// No network. The last test reads the real repo to build the coverage index —
-// a filesystem read, no build needed.
+// No network. The coverage-index test reads the real repo — a filesystem read,
+// no build needed — and the run-level tests below drive main() against a stubbed
+// fetch to prove that no source failure can fail the run.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   tokenize, stem, isAgentTopic, isHnAnnouncement, fragmentParts, parseBlogPost, makeDoc,
   buildIdf, scoreDoc, statusFor, matchQuestion, THRESHOLDS,
   normalizeGscRows, classifyWeakPages, classifyLowClickPages, aggregateQueries,
   demandScore, rank, dedupeById, buildNewQuestions, buildQueue, CAPS, pathOf, enPath,
 } from '../search-demand/lib.mjs';
-import { loadCoverageIndex } from '../search-demand/harvest.mjs';
+import { loadCoverageIndex, main } from '../search-demand/harvest.mjs';
 
 const DOCS = [
   makeDoc({ path: '/concepts/what-is-mcp/', section: 'concepts', title: 'What Is the Model Context Protocol?', summary: 'MCP is a standard way for agents to reach tools and data.' }),
@@ -219,4 +223,87 @@ test('coverage index: every section is present, paths are public URL shapes', as
   const m = matchQuestion('How do I build an MCP server?', docs, buildIdf(docs));
   assert.equal(m.status, 'covered');
   assert.match(m.bestMatch.path, /mcp/);
+});
+
+// --- whole runs: no source failure fails the run ------------------------------
+
+const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+
+/**
+ * Run main() with fetch answered by `route(url)` (Stack Exchange answers 502 by
+ * default, which stops it after one request), writing into a directory that
+ * does not exist yet. Returns the queue main() wrote, read back from disk.
+ */
+async function runWith(env, route = () => null) {
+  const realFetch = globalThis.fetch;
+  const realErr = console.error, realLog = console.log;
+  const dir = mkdtempSync(join(tmpdir(), 'sdq-'));
+  const out = join(dir, 'nested', 'deeper', 'sq.json');
+  globalThis.fetch = async url => {
+    const u = new URL(url);
+    return route(u) ?? (u.host === 'api.stackexchange.com' ? json({ error_id: 502 }, 502) : json({ hits: [] }));
+  };
+  console.error = () => {}; console.log = () => {};
+  try {
+    await main(['--out', out], env);
+    return JSON.parse(readFileSync(out, 'utf8'));
+  } finally {
+    globalThis.fetch = realFetch; console.error = realErr; console.log = realLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('run: --out creates its parent directories', async () => {
+  const q = await runWith({});
+  assert.equal(q.sources.gsc.status, 'skipped');
+  assert.equal(q.sources.hn.status, 'ok');
+});
+
+test('run: a malformed PEM records GSC as failed, without the key, and the run completes', async () => {
+  const q = await runWith({ GSC_SA_KEY: JSON.stringify({ client_email: 'x', private_key: 'not a pem SECRET' }), GSC_SITE: 'sc-domain:x' });
+  assert.equal(q.sources.gsc.status, 'error');
+  assert.match(q.sources.gsc.error, /private_key/);
+  assert.doesNotMatch(q.sources.gsc.error, /SECRET|not a pem/);
+  assert.equal(q.sources.hn.status, 'ok', 'later sources still ran');
+});
+
+test('run: a source throwing a TypeError is recorded as failed and the run completes', async () => {
+  // `hits` of the wrong type makes the HN loop throw "is not iterable".
+  const q = await runWith({}, u => (u.host === 'hn.algolia.com' ? json({ hits: 5 }) : null));
+  assert.equal(q.sources.hn.status, 'error');
+  assert.match(q.sources.hn.error, /^unexpected TypeError: /);
+  assert.equal(q.sources.coverage.status, 'ok');
+});
+
+test('run: HTTP errors carry status and host, never the response body or the API key', async () => {
+  const q = await runWith({ BING_API_KEY: 'KEY123', BING_SITE: 'https://example.com/' },
+    u => (u.host === 'ssl.bing.com' ? new Response('<html>BODY-LEAK</html>', { status: 500 }) : null));
+  assert.equal(q.sources.bing.status, 'error');
+  assert.equal(q.sources.bing.error, 'ssl.bing.com: HTTP 500');
+  assert.doesNotMatch(JSON.stringify(q), /BODY-LEAK|KEY123/);
+});
+
+test('run: Bing passes siteUrl and page the same way, and one failed page keeps the rest', async () => {
+  const day = `/Date(${Date.now() - 86_400_000}-0000)/`;
+  const seen = [];
+  const q = await runWith({ BING_API_KEY: 'k', BING_SITE: 'https://example.com/' }, u => {
+    if (u.host !== 'ssl.bing.com') return null;
+    const method = u.pathname.split('/').pop();
+    if (method === 'GetQueryStats') return json({ d: [{ Query: 'mcp server', Impressions: 50, Clicks: 1, AvgImpressionPosition: 9, Date: day }] });
+    if (method === 'GetPageStats') return json({ d: [
+      { Query: 'https://example.com/concepts/a/', Impressions: 90, Clicks: 1, Date: day },
+      { Query: 'https://example.com/concepts/b/', Impressions: 80, Clicks: 1, Date: day },
+    ] });
+    seen.push({ siteUrl: u.searchParams.get('siteUrl'), page: u.searchParams.get('page') });
+    if (u.searchParams.get('page').endsWith('/a/')) return json({}, 503);
+    return json({ d: [{ Query: 'mcp server', Impressions: 40, Clicks: 1, AvgImpressionPosition: 12, Date: day }] });
+  });
+  assert.deepEqual(seen, [
+    { siteUrl: 'https://example.com/', page: 'https://example.com/concepts/a/' },
+    { siteUrl: 'https://example.com/', page: 'https://example.com/concepts/b/' },
+  ]);
+  assert.equal(q.sources.bing.status, 'ok');
+  assert.equal(q.sources.bing.pageQueryRows, 1, 'page b survives page a failing');
+  assert.equal(q.sources.bing.pagesFailed, 1);
+  assert.deepEqual(q.sources.bing.errors, ['/concepts/a/: ssl.bing.com: HTTP 503']);
 });

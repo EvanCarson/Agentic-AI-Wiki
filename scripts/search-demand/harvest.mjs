@@ -16,8 +16,8 @@
 // output shape are in ./lib.mjs. Design:
 //   docs/superpowers/specs/2026-10-18-search-demand-queue-design.md
 import { createSign } from 'node:crypto';
-import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   SE_TAGS, SE_WINDOW_DAYS, SE_MIN_SCORE, HN_QUERIES, HN_WINDOW_DAYS, HN_MIN_POINTS,
@@ -88,19 +88,26 @@ export async function loadCoverageIndex(root = REPO) {
 // HTTP
 // ---------------------------------------------------------------------------
 
-/** A source's own failure (network, HTTP status, bad JSON) — logged, never fatal. */
+/**
+ * A source's own failure (network, HTTP status, bad body, bad credentials) —
+ * logged, never fatal. Its message lands in the published artifact, so it
+ * carries a host and a status at most: never a response body, a URL (Bing's
+ * carries the API key) or key material.
+ */
 class SourceError extends Error {}
 
 async function getJson(url, init = {}) {
+  const host = new URL(url).host;
   let res;
   try {
     res = await fetch(url, { ...init, signal: AbortSignal.timeout(30_000) });
   } catch (err) {
-    throw new SourceError(`${new URL(url).host}: ${err.cause?.message ?? err.message}`);
+    throw new SourceError(`${host}: request failed (${err.name === 'TimeoutError' ? 'timeout' : err.cause?.code ?? err.name})`);
   }
-  const text = await res.text();
-  if (!res.ok) throw new SourceError(`${new URL(url).host}: HTTP ${res.status} ${text.slice(0, 200)}`);
-  try { return JSON.parse(text); } catch { throw new SourceError(`${new URL(url).host}: response is not JSON`); }
+  if (!res.ok) throw new SourceError(`${host}: HTTP ${res.status}`);
+  let text;
+  try { text = await res.text(); } catch { throw new SourceError(`${host}: HTTP ${res.status}, body could not be read`); }
+  try { return JSON.parse(text); } catch { throw new SourceError(`${host}: HTTP ${res.status}, response is not JSON`); }
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -123,7 +130,11 @@ async function gscToken(key) {
     scope: 'https://www.googleapis.com/auth/webmasters.readonly',
     aud, iat: now, exp: now + 3600,
   }))}`;
-  const sig = createSign('RSA-SHA256').update(unsigned).sign(key.private_key);
+  let sig;
+  // Never echo the crypto error: it can quote the key it failed to parse.
+  try { sig = createSign('RSA-SHA256').update(unsigned).sign(key.private_key); } catch {
+    throw new SourceError('GSC_SA_KEY private_key could not sign the token (not a valid PEM key)');
+  }
   const tok = await getJson(aud, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -157,6 +168,14 @@ async function harvestGsc(env) {
 // GetQueryStats / GetPageStats / GetPageQueryStats, documented at
 // learn.microsoft.com/dotnet/api/microsoft.bing.webmaster.api.interfaces.iwebmasterapi
 // Rows are weekly buckets with a WCF date ("/Date(1316156400000-0700)/").
+//
+// String arguments (siteUrl, page) all go as plain URL-encoded strings. The
+// docs disagree with themselves here: every JSON sample passes siteUrl plain,
+// the POX sample passes page plain, but the JSON GetPageQueryStats sample
+// alone wraps page as a JSON string literal ("http:\/\/…"). The endpoint is
+// WCF, whose JSON query-string converter JSON-decodes a value only when it
+// starts with a quote and takes it verbatim otherwise, so the plain form is
+// the one documented shape that is valid for both arguments.
 // ---------------------------------------------------------------------------
 
 const BING = 'https://ssl.bing.com/webmaster/api.svc/json';
@@ -179,9 +198,10 @@ function bingTotals(rows, keyOf, since) {
 }
 
 async function harvestBing(env) {
-  const q = (method, extra = '') =>
-    getJson(`${BING}/${method}?siteUrl=${encodeURIComponent(env.BING_SITE)}${extra}&apikey=${encodeURIComponent(env.BING_API_KEY)}`)
-      .then(d => d.d ?? []);
+  const q = (method, args = {}) => {
+    const qs = new URLSearchParams({ siteUrl: env.BING_SITE, ...args, apikey: env.BING_API_KEY });
+    return getJson(`${BING}/${method}?${qs}`).then(d => d.d ?? []);
+  };
   const since = Date.now() - SEARCH_WINDOW_DAYS * DAY;
   const queries = bingTotals(await q('GetQueryStats'), r => r.Query, since)
     .map(a => ({ query: a.key, impressions: a.impressions, clicks: a.clicks, position: a.position }));
@@ -189,14 +209,20 @@ async function harvestBing(env) {
   const pages = bingTotals(await q('GetPageStats'), r => r.Query, since)
     .sort((a, b) => b.impressions - a.impressions).slice(0, BING_TOP_PAGES);
   const rows = [];
+  const errors = [];
   for (const p of pages) {
-    // The API wants the page as a JSON string literal with escaped slashes.
-    const pageArg = encodeURIComponent(JSON.stringify(p.key).replace(/\//g, '\\/'));
-    for (const a of bingTotals(await q('GetPageQueryStats', `&page=${pageArg}`), r => r.Query, since)) {
+    // One page failing costs that page only; the rows already fetched stay.
+    let stats;
+    try { stats = await q('GetPageQueryStats', { page: p.key }); } catch (err) {
+      if (!(err instanceof SourceError)) throw err;
+      errors.push(`${pathOf(p.key)}: ${err.message}`);
+      continue;
+    }
+    for (const a of bingTotals(stats, r => r.Query, since)) {
       rows.push({ query: a.key, page: pathOf(p.key), clicks: a.clicks, impressions: a.impressions, position: a.position });
     }
   }
-  return { rows, queries };
+  return { rows, queries, pages: pages.length, errors };
 }
 
 // ---------------------------------------------------------------------------
@@ -283,14 +309,22 @@ async function harvestHn() {
 // Main
 // ---------------------------------------------------------------------------
 
-/** Run one source; a SourceError becomes a recorded failure, anything else is a bug and propagates. */
+/**
+ * Run one source. Any throw inside it — a SourceError, or an unexpected one
+ * such as a TypeError from a response of the wrong shape — becomes a recorded
+ * failure; only code outside the sources can fail the run. An unexpected
+ * error is recorded by type and message alone (no stack, no payload).
+ */
 async function runSource(name, sources, fn) {
   try {
     return await fn();
   } catch (err) {
-    if (!(err instanceof SourceError)) throw err;
-    console.error(`search-demand: ${name} failed — ${err.message}`);
-    sources[name] = { status: 'error', error: err.message };
+    const message = err instanceof SourceError
+      ? err.message
+      : `unexpected ${err?.name ?? 'error'}: ${String(err?.message ?? err).slice(0, 160)}`;
+    console.error(`search-demand: ${name} failed — ${message}`);
+    if (!(err instanceof SourceError)) console.error(err?.stack ?? err);
+    sources[name] = { status: 'error', error: message };
     return null;
   }
 }
@@ -324,7 +358,10 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     if (r) {
       searchRows.push(...r.rows);
       questions.push(...searchQueryItems('bing', r.queries.filter(q => q.impressions >= 5)));
-      sources.bing = { status: 'ok', queries: r.queries.length, pageQueryRows: r.rows.length };
+      sources.bing = {
+        status: 'ok', queries: r.queries.length, pageQueryRows: r.rows.length,
+        ...(r.errors.length && { pagesFailed: r.errors.length, pagesTried: r.pages, errors: r.errors.slice(0, 10) }),
+      };
     }
   } else sources.bing = { status: 'skipped', reason: 'BING_API_KEY / BING_SITE not set' };
 
@@ -364,6 +401,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     siteMedianCtr: searchRows.length ? low.siteMedianCtr : null,
     hasSearchData: searchRows.length > 0,
   });
+  mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, JSON.stringify(queue, null, 2) + '\n');
 
   for (const [name, s] of Object.entries(sources)) console.log(`  ${name.padEnd(14)} ${s.status}${s.reason ? ` (${s.reason})` : ''}${s.error ? ` (${s.error})` : ''}`);
