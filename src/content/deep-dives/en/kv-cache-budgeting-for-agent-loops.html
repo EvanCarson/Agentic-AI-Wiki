@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">M13</div>
+  <div class="week">Deep Dive · Memory &amp; Context Engineering</div>
+  <h2>The weight file tells you whether the model loads; the KV cache tells you whether the agent runs — and on a long loop the cache is routinely the larger number.</h2>
+  <p class="goal">A 70B model quantized to 4 bits is a 42 GB file, and on an 80 GB card that looks like a comfortable fit until you notice that its attention cache costs about 0.31 MB per token — 10 GB at 32K context, 40 GB at 128K, 80 GB at 256K. The context length you advertise is a memory commitment, it is paid per concurrent run, and an agent loop grows into it monotonically, so the run that OOMs is step 40 of the first session that went long. This essay is the arithmetic, the four architectural levers that change it, how to work backwards from a vendor's "fits in 24 GB" claim, and the capacity division that tells you how many agents one GPU actually serves.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The formula, and why it is the number that decides.</h3>
+
+    <p>During <a class="xref" href="/concepts/prefill-and-decode">prefill and decode</a>, a transformer stores one key and one value vector per token per attention layer, so that generating token <em>n</em> + 1 does not require recomputing attention over tokens 1…<em>n</em>. That store is the KV cache, and its size is fully determined by geometry you can read off a config file:</p>
+
+<pre class="standalone"><span class="c-cm"># Bytes of KV cache for one sequence.</span>
+bytes = 2 * layers * kv_heads * head_dim * bytes_per_element * tokens
+<span class="c-cm">#        ^ one K and one V                 ^ 2 for fp16/bf16, 1 for int8</span>
+
+<span class="c-cm"># Per-token cost is everything except `tokens`, so quote that:</span>
+bytes_per_token = 2 * layers * kv_heads * head_dim * bytes_per_element</pre>
+
+    <p>Three properties of that expression are what make it the binding constraint for agents rather than for chat. It is <strong>linear in context length</strong>, and an agent loop appends tool results every step, so its cache grows with the step index and never shrinks unless you make it. It is <strong>multiplied by concurrency</strong>, because every in-flight sequence holds its own cache. And it is <strong>independent of how many parameters are active</strong> — a mixture-of-experts model that activates 9B of 74B parameters per token still pays full cache price on every attention layer it has, which is why <a class="xref" href="/concepts/mixture-of-experts">MoE sparsity</a> buys compute and not memory. The weight file is a fixed cost paid once; the cache is a variable cost paid per token per run, and only one of those two scales with the thing your agent does more of.</p>
+
+    <div class="callout">
+      <p>This is the mechanism behind a complaint that sounds mysterious: the model loaded fine, short prompts worked, and then the service started failing under real traffic. Nothing degraded. You simply crossed the point where (weights + Σ caches) exceeded the card, and the sum on the left has a term that grows with both of the things production adds.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>A worked budget on one 80 GB card.</h3>
+
+    <p>Take a 70B-class dense transformer with the geometry that has become conventional for models in that range — 80 layers, grouped-query attention with 8 key-value heads, head dimension 128 — served at bf16 cache precision. These are assumptions, named so you can substitute your own model's config; the point is the shape, not the specific model.</p>
+
+<pre class="trace">bytes_per_token = 2 * 80 * 8 * 128 * 2 = 327,680 B = 0.3125 MB
+
+Context    KV cache, one sequence
+--------   ----------------------
+   8,192                   2.5 GB
+  32,768                  10.0 GB
+ 131,072                  40.0 GB
+ 262,144                  80.0 GB
+
+Weights, 70B at 4-bit (~0.6 GB per billion)        42 GB
+Runtime, activations, fragmentation (allow)         4 GB
+--------------------------------------------------------
+Headroom for KV cache on an 80 GB card             34 GB
+  → one sequence at 32K context      10 GB     fits
+  → one sequence at 128K context     40 GB     does not fit
+  → three sequences at 32K context   30 GB     fits
+  → four  sequences at 32K context   40 GB     does not fit
+</pre>
+
+    <p>Read the last four lines as the actual deployment statement: this is a 32K-context, three-concurrent-agent server, not a "128K context" server, and no amount of advertised window changes that. The same card with the same model serves either one long agent or three short ones, and which of those you sell is a product decision you are making whether or not you notice you are making it. The <a class="xref" href="/deep-dives/memory-and-context/context-budgeting">context-budgeting</a> discipline normally arrives as a cost and accuracy argument; on self-hosted hardware it arrives as a hard allocation.</p>
+
+    <p>Note also how badly the two halves of the budget respond to the obvious lever. Quantizing weights harder — 4-bit to 2-bit — saves 21 GB once. Doubling the context cap costs 10 GB per concurrent run, every run. Past a fairly early point, weight quantization is not where the memory is.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Four levers that change the per-token cost, and what each one charges you.</h3>
+
+    <p>Every term in the formula except <code class="inline">tokens</code> is set by the model you picked, which makes the per-token figure a model-selection criterion rather than a tuning knob. These are the four things that move it.</p>
+
+    <ul>
+      <li><strong>Fewer KV heads (GQA, MQA, MLA).</strong> The largest lever by far, because <code class="inline">kv_heads</code> enters linearly and multi-head attention sets it equal to the query-head count. NVIDIA's published config for Nemotron 3 Super is instructive: 32 query heads against <strong>2 key-value heads</strong>, head dimension 128, 88 layers. Sixteen query heads share each KV head, which costs 16× less cache than full multi-head attention over the same geometry. The charge is a modest capability cost that model authors have judged worth paying for several generations; you are not choosing this at serving time, you are choosing it when you choose the model.</li>
+      <li><strong>Fewer attention layers (hybrid backbones).</strong> Only attention layers hold a cache that grows with length. State-space blocks — Mamba-2 and its relatives — carry a <em>fixed-size</em> recurrent state instead, so a hybrid backbone that interleaves Mamba, attention and MoE blocks pays length-dependent cache on only the attention minority. NVIDIA describes Nemotron 3 Super's language backbone as exactly that interleave. The charge is real and under-discussed: a fixed-size state is lossy by construction, so what you buy with the memory is a different forgetting profile, not free capacity. Read it alongside <a class="xref" href="/deep-dives/memory-and-context/long-context-effective-vs-advertised">effective versus advertised context</a> — a hybrid's advertised window and its usable recall can diverge for a structural reason, not a benchmark one.</li>
+      <li><strong>Lower cache precision.</strong> <code class="inline">bytes_per_element</code> is the one term you genuinely control at serving time: int8 KV halves the cache, int4 quarters it, and most serving stacks expose it as a flag. The charge shows up first on long-context retrieval, which is the workload that depends most on fine distinctions between cached keys — so measure it on your own long-context evals rather than on a short-prompt benchmark that cannot see the damage. Unlike weight quantization, which is covered in <a class="xref" href="/concepts/distillation-and-quantization">distillation and quantization</a>, this one is cheap to try and cheap to revert.</li>
+      <li><strong>Paging and offload.</strong> Paged attention stops fragmentation from wasting the headroom you measured, and CPU or disk offload trades cache residency for bandwidth. Offload is the lever of last resort: it converts an out-of-memory error into a latency regression, which is sometimes the right trade and is never free. Prefix sharing is the honourable exception — many agent sessions sharing one system prompt and tool catalogue can share its cache blocks, which is the single best reason to keep that prefix byte-stable.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Working backwards from "fits in 24 GB".</h3>
+
+    <p>Vendors increasingly ship a memory budget as the headline. NVIDIA's Nemotron 3.5 Bolt 74B-A9B-24GB, released on 15 October 2026, is compressed from the Super VL parent checkpoint with native 2-bit quantization to fit a 24 GB budget, and its model card states support for context up to 256K tokens. Those two numbers are the interesting part, because taken naively they do not fit together — and the way they are reconciled is exactly what a self-hoster needs to be able to check.</p>
+
+    <p>Do the division. 74B parameters at 2 bits is roughly 18.5 GB of weights. On a 24 GB card that leaves something under 4 GB for everything else, and a 256K cache has to live inside it:</p>
+
+<pre class="trace">Budget available for KV cache at 256K tokens:  &lt; 4 GB
+Implied per-token cost: 4 GB / 262,144 tokens  ≈ 16 KB/token
+
+With kv_heads = 2 and head_dim = 128 at int8:
+  bytes_per_token = 2 * L * 2 * 128 * 1 = 512 * L
+  16,384 / 512  →  L ≈ 32 attention layers
+
+At bf16 cache precision the same budget implies L ≈ 16.
+Published backbone: 88 layers, interleaved Mamba-2 / attention / MoE.
+</pre>
+
+    <p>So the claim is self-consistent only if a minority of those 88 layers are attention layers and the cache is held at reduced precision — which is precisely what a hybrid backbone with two KV heads is for. The arithmetic above is a reconstruction from the published budget, not a quote from a config file; read the real config before you plan capacity on it. But the method is the durable part: when a vendor publishes a memory number and a context number together, divide one by the other and ask what geometry the quotient implies. If the implied per-token cost is far below what a dense transformer of that size would charge, you are looking at a hybrid or an aggressive attention variant, and you should go and find out which, because the answer predicts how the model forgets — and whether its 256K is a window you can use or a window you can merely fill.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Capacity is a division, and the divisor is the step your agent has not reached yet.</h3>
+
+    <p>Once the per-token cost is known, the serving question becomes arithmetic with no judgement left in it:</p>
+
+<pre class="standalone"><span class="c-cm"># How many concurrent agent sessions one accelerator serves.</span>
+sessions = (vram_total - weights - runtime_overhead)
+         / (bytes_per_token * context_cap)</pre>
+
+    <p>Two things about that denominator are easy to get wrong, and both of them are agent-specific. First, the right value for <code class="inline">context_cap</code> is not the average session length — it is the length you will allow, because memory must be reserved against the worst case or the twelfth session evicts the eleventh mid-run. An agent whose sessions average 20K tokens but are permitted to reach 200K is a 200K-token tenant for capacity purposes. Second, sessions are long-lived and overlapping in a way chat turns are not: an agent holds its cache across tool calls that may block on a network round trip, so utilisation and residency come apart, and a card that looks idle on a compute graph can be entirely full. <a class="xref" href="/operations/agentops/concurrency-and-scaling">Concurrency and scaling</a> covers the queueing consequences, and <a class="xref" href="/operations/agentops/multi-tenancy-for-agents">multi-tenancy for agents</a> the isolation ones.</p>
+
+    <p>The reserved-worst-case rule is what makes a context cap the load-bearing capacity control. Raising the cap from 32K to 64K on the worked example above does not cost a little more memory — it halves the number of agents the card serves. Conversely, <a class="xref" href="/deep-dives/memory-and-context/context-compaction">compaction</a> that keeps sessions under a cap is not only a cost and accuracy measure on self-hosted hardware; it is the mechanism that doubles your fleet's capacity without buying a card.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The five numbers to write down before you commit to hardware.</h3>
+
+    <p>You can do this in an afternoon, and it is the difference between a capacity plan and a hope.</p>
+
+    <ul>
+      <li><strong>Per-token cache cost, from the config.</strong> Read <code class="inline">num_hidden_layers</code>, <code class="inline">num_key_value_heads</code> and <code class="inline">head_dim</code>, count how many layers are actually attention layers if the backbone is hybrid, and compute the product. Quote it in KB per token and put it in your runbook.</li>
+      <li><strong>Weight footprint at your serving precision</strong>, measured from the loaded process rather than inferred from the parameter count.</li>
+      <li><strong>The context cap you will enforce</strong>, as a configured limit with a defined behaviour when a session hits it — compaction, summarisation, or a clean refusal. "We did not set one" means your cap is the context window, and your capacity plan is sized for it.</li>
+      <li><strong>The p99 session length you actually see</strong>, from traces. If p99 is near the cap, the cap is doing work; if it is a tenth of the cap, you are reserving memory for sessions that never happen and should lower the cap and raise concurrency.</li>
+      <li><strong>Measured sessions per card under load</strong>, not the computed number. Fragmentation, prefix sharing and offload all make reality differ from the division, usually in both directions. <a class="xref" href="/operations/agentops/load-testing-agents">Load testing</a> at the cap is how you find out which.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Quote your model's KV cost in <strong>KB per token</strong> and put it next to the per-million-token price you pay a hosted provider. Those two numbers are the same decision seen from two sides: hosted inference converts context length into money, self-hosting converts it into memory, and the conversion rate is the one you just computed. If a context cap you can live with fits three agents on a card you already own, self-host; if holding the cap costs you the quality you were buying, pay for the tokens and keep the engineering. What you must not do is plan from the weight file — it is the one number in this essay that does not grow with the work.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/deep-dives/architectures-and-patterns/on-device-agent-architecture">on-device agent architecture</a> for the rest of the local stack including cache warmth across restarts, <a class="xref" href="/operations/agentops/self-hosted-inference-for-agents">self-hosted inference for agents</a> for the operational commitment, <a class="xref" href="/concepts/small-and-local-models">small and local models</a> for which jobs never needed the big model, and <a class="xref" href="/concepts/cost-quality-latency">cost, quality and latency</a> for the hosted side of the same trade.</p>
+  </div>
+</section>

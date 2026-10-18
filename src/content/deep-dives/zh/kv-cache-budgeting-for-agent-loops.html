@@ -1,0 +1,128 @@
+<section class="phase">
+  <div class="phase-num">M13</div>
+  <div class="week">深入解析 · 记忆与上下文工程</div>
+  <h2>权重文件告诉你模型能不能装得下；KV 缓存告诉你智能体能不能跑起来——而在一个长循环上，缓存常常是更大的那个数。</h2>
+  <p class="goal">一个量化到 4 bit 的 70B 模型是个 42 GB 的文件，放在 80 GB 的卡上看起来宽裕得很——直到你注意到它的注意力缓存每个 token 大约要花 0.31 MB：32K 上下文 10 GB，128K 40 GB，256K 80 GB。你对外宣称的上下文长度是一份内存承诺，它按并发运行逐份付账，而智能体循环会单调地长进去，所以真正 OOM 的那一次，是第一个跑长了的会话的第 40 步。本文讲的是这套算术、能改变它的四个架构杠杆、如何从厂商「24 GB 装得下」的说法里反推回去，以及那道告诉你一张 GPU 实际能服务多少个智能体的除法。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>公式，以及为什么它才是拍板的那个数。</h3>
+
+    <p>在 <a class="xref" href="/zh/concepts/prefill-and-decode">prefill 与 decode</a> 过程中，transformer 会为每个 token、每个注意力层各存一份 key 与 value 向量，这样生成第 <em>n</em> + 1 个 token 时就不必对第 1 到第 <em>n</em> 个 token 重算注意力。这份存储就是 KV 缓存，它的大小完全由你能从配置文件里读到的几何参数决定：</p>
+
+<pre class="standalone"><span class="c-cm"># Bytes of KV cache for one sequence.</span>
+bytes = 2 * layers * kv_heads * head_dim * bytes_per_element * tokens
+<span class="c-cm">#        ^ one K and one V                 ^ 2 for fp16/bf16, 1 for int8</span>
+
+<span class="c-cm"># Per-token cost is everything except `tokens`, so quote that:</span>
+bytes_per_token = 2 * layers * kv_heads * head_dim * bytes_per_element</pre>
+
+    <p>让这个表达式成为智能体（而不是聊天）的约束瓶颈的，是它的三条性质。它对上下文长度是<strong>线性</strong>的，而智能体循环每一步都在追加工具结果，于是它的缓存随步数增长，除非你动手，它永不收缩。它要<strong>乘上并发数</strong>，因为每一条在飞的序列各自持有一份缓存。而它<strong>与多少参数被激活无关</strong>——一个每 token 只激活 74B 中 9B 参数的混合专家模型，在它拥有的每一个注意力层上仍然付全价缓存，这正是<a class="xref" href="/zh/concepts/mixture-of-experts">MoE 稀疏性</a>买到的是算力而不是内存的原因。权重文件是一次付清的固定成本；缓存是按 token、按运行逐份付的变动成本——而这两者里，只有一个会随着你的智能体做得更多而增长。</p>
+
+    <div class="callout">
+      <p>这就是那条听起来很玄的抱怨背后的机制：模型加载正常，短提示也好用，然后在真实流量下服务开始崩。其实什么都没有退化。你只是越过了（权重 + Σ 各份缓存）超出显卡容量的那个点，而左边这个和里，有一项会随着生产环境增加的两样东西一起增长。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>在一张 80 GB 卡上算一遍预算。</h3>
+
+    <p>取一个 70B 量级的稠密 transformer，用这个区间里已成惯例的几何参数——80 层、分组查询注意力带 8 个 key-value 头、头维度 128——缓存精度按 bf16 提供服务。这些都是假设，之所以写明是为了让你能换成自己模型的配置；这里要看的是形状，不是某个具体模型。</p>
+
+<pre class="trace">bytes_per_token = 2 * 80 * 8 * 128 * 2 = 327,680 B = 0.3125 MB
+
+Context    KV cache, one sequence
+--------   ----------------------
+   8,192                   2.5 GB
+  32,768                  10.0 GB
+ 131,072                  40.0 GB
+ 262,144                  80.0 GB
+
+Weights, 70B at 4-bit (~0.6 GB per billion)        42 GB
+Runtime, activations, fragmentation (allow)         4 GB
+--------------------------------------------------------
+Headroom for KV cache on an 80 GB card             34 GB
+  → one sequence at 32K context      10 GB     fits
+  → one sequence at 128K context     40 GB     does not fit
+  → three sequences at 32K context   30 GB     fits
+  → four  sequences at 32K context   40 GB     does not fit
+</pre>
+
+    <p>把最后四行当成真正的部署结论来读：这是一台 32K 上下文、三并发智能体的服务器，不是一台「128K 上下文」的服务器，宣传的窗口再大也改不了这件事。同一张卡、同一个模型，要么服务一个长智能体，要么服务三个短的，而你卖的是哪一种，是一个你无论有没有意识到都在做的产品决策。<a class="xref" href="/zh/deep-dives/memory-and-context/context-budgeting">上下文预算</a>这套纪律通常是以成本与准确率的论证登场的；在自托管硬件上，它登场的方式是一次硬性分配。</p>
+
+    <p>还要注意这份预算的两半对那个最显然的杠杆反应有多不同。把权重量化得更狠——4 bit 到 2 bit——一次性省下 21 GB。把上下文上限翻倍，则是每一个并发运行多花 10 GB，次次都花。过了相当早的一个点之后，权重量化就不是内存所在之处了。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>四个能改变每 token 开销的杠杆，以及各自向你收取的代价。</h3>
+
+    <p>公式里除 <code class="inline">tokens</code> 以外的每一项，都由你挑的那个模型定下，这让「每 token 多少字节」成了一条模型选型标准，而不是一个调参旋钮。能移动它的只有这四样。</p>
+
+    <ul>
+      <li><strong>更少的 KV 头（GQA、MQA、MLA）。</strong>迄今最大的杠杆，因为 <code class="inline">kv_heads</code> 是线性进入公式的，而多头注意力把它直接等于查询头数。NVIDIA 为 Nemotron 3 Super 公布的配置很有教益：32 个查询头对<strong>2 个 key-value 头</strong>，头维度 128，88 层。十六个查询头共享一个 KV 头，在相同几何下比完整多头注意力少花 16 倍缓存。代价是一份不大的能力损失，而模型作者们已经判断它值得付了好几代；这件事不是你在上线时选的，是你在选模型时就选了的。</li>
+      <li><strong>更少的注意力层（混合骨干）。</strong>只有注意力层持有会随长度增长的缓存。状态空间模块——Mamba-2 及其亲属——持有的是一份<em>固定大小</em>的递归状态，因此一个把 Mamba、注意力与 MoE 模块交错起来的混合骨干，只在注意力那少数层上付随长度增长的缓存。NVIDIA 对 Nemotron 3 Super 语言骨干的描述正是这样的交错。代价真实存在，而且少有人谈：固定大小的状态在构造上就是有损的，所以你用内存换来的是一份不同的遗忘特征，而不是免费的容量。请与<a class="xref" href="/zh/deep-dives/memory-and-context/long-context-effective-vs-advertised">有效上下文与宣称上下文</a>一起读——一个混合模型宣称的窗口与它可用的召回之间会发生背离，而原因是结构性的，不是基准测试造成的。</li>
+      <li><strong>更低的缓存精度。</strong><code class="inline">bytes_per_element</code> 是你在上线时真正控制得了的那一项：int8 KV 把缓存砍半，int4 砍到四分之一，而多数服务栈都把它做成了一个开关。代价最先出现在长上下文检索上，而这恰是最依赖「缓存键之间细微区别」的工作负载——所以请在你自己的长上下文评测上测它，而不要在一个看不见这种损伤的短提示基准上测。与<a class="xref" href="/zh/concepts/distillation-and-quantization">蒸馏与量化</a>里讲的权重量化不同，这一项试起来便宜，撤回来也便宜。</li>
+      <li><strong>分页与卸载。</strong>分页注意力让碎片不再浪费掉你刚量出来的余量，而卸载到 CPU 或磁盘，是用缓存的驻留换带宽。卸载是最后手段的杠杆：它把一次显存耗尽的报错换成一次延迟回退，这有时是对的交易，但从不免费。前缀共享是其中值得尊敬的例外——许多共用同一段系统提示与工具清单的智能体会话可以共享它的缓存块，而这正是把那段前缀保持为逐字节稳定的最好理由。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>从「24 GB 装得下」反推回去。</h3>
+
+    <p>厂商越来越多地把一份内存预算当成头条来发。NVIDIA 于 2026 年 10 月 15 日发布的 Nemotron 3.5 Bolt 74B-A9B-24GB，是从 Super VL 母检查点经原生 2 bit 量化压缩而来以塞进 24 GB 预算的，而它的模型卡声明支持最长 256K token 的上下文。这两个数字才是有意思的部分——因为直接看它们并不相容，而它们被调和的方式，恰恰是一个自托管者需要有能力去核对的东西。</p>
+
+    <p>做那道除法。74B 参数按 2 bit 算，权重大约 18.5 GB。在一张 24 GB 的卡上，这留给其余一切的不到 4 GB，而一份 256K 的缓存必须住在里面：</p>
+
+<pre class="trace">Budget available for KV cache at 256K tokens:  &lt; 4 GB
+Implied per-token cost: 4 GB / 262,144 tokens  ≈ 16 KB/token
+
+With kv_heads = 2 and head_dim = 128 at int8:
+  bytes_per_token = 2 * L * 2 * 128 * 1 = 512 * L
+  16,384 / 512  →  L ≈ 32 attention layers
+
+At bf16 cache precision the same budget implies L ≈ 16.
+Published backbone: 88 layers, interleaved Mamba-2 / attention / MoE.
+</pre>
+
+    <p>所以这个说法只有在那 88 层中只有少数是注意力层、且缓存以降低的精度持有时，才是自洽的——而这正是一个带两个 KV 头的混合骨干所要做的事。上面这套算术是从公开预算反推出来的重建，不是从某个配置文件里引用的；在用它规划容量之前，请去读真正的配置。但方法才是那个耐久的部分：当一家厂商把一个内存数字和一个上下文数字一起发布时，拿一个除另一个，然后问这个商意味着什么样的几何。如果推出来的每 token 开销远低于同等规模的稠密 transformer 该收的，那你面对的就是一个混合架构或一种激进的注意力变体，而你应该去查清是哪一种——因为答案预示着这个模型如何遗忘，以及它的 256K 是一个你能用的窗口，还是一个你只能填满的窗口。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>容量是一道除法，而除数是你的智能体还没走到的那一步。</h3>
+
+    <p>一旦每 token 的开销已知，服务容量这个问题就变成了不留任何判断余地的算术：</p>
+
+<pre class="standalone"><span class="c-cm"># How many concurrent agent sessions one accelerator serves.</span>
+sessions = (vram_total - weights - runtime_overhead)
+         / (bytes_per_token * context_cap)</pre>
+
+    <p>关于那个分母，有两件事很容易弄错，而两件都是智能体特有的。第一，<code class="inline">context_cap</code> 的正确取值不是会话的平均长度——而是你<em>允许</em>的长度，因为内存必须按最坏情况预留，否则第十二个会话会把第十一个在跑到一半时挤掉。一个会话平均 20K token、但被允许长到 200K 的智能体，在容量上就是一个 200K token 的租户。第二，会话是长命且相互重叠的，这一点与聊天轮次不同：智能体在可能阻塞于一次网络往返的工具调用之间一直持有它的缓存，于是利用率与驻留率就分开了，一张在算力图上看起来空闲的卡可能已经满了。排队方面的后果见<a class="xref" href="/zh/operations/agentops/concurrency-and-scaling">并发与扩容</a>，隔离方面的见<a class="xref" href="/zh/operations/agentops/multi-tenancy-for-agents">智能体的多租户</a>。</p>
+
+    <p>「按最坏情况预留」这条规则，正是让上下文上限成为承重容量控制的原因。在上面那个算例里，把上限从 32K 提到 64K，并不是多花一点内存——它把这张卡能服务的智能体数量砍半。反过来说，把会话压在上限之内的<a class="xref" href="/zh/deep-dives/memory-and-context/context-compaction">压缩</a>，在自托管硬件上不只是一项成本与准确率措施；它是那个能让你不买卡就把机群容量翻倍的机制。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>在为硬件下单之前要写下来的五个数。</h3>
+
+    <p>这件事你一个下午就能做完，而它是一份容量规划与一个指望之间的差别。</p>
+
+    <ul>
+      <li><strong>每 token 的缓存开销，从配置里读。</strong>读 <code class="inline">num_hidden_layers</code>、<code class="inline">num_key_value_heads</code> 与 <code class="inline">head_dim</code>，如果骨干是混合的就数清到底有多少层真是注意力层，然后把乘积算出来。用「每 token 多少 KB」来报它，并写进你的运行手册。</li>
+      <li><strong>你所用服务精度下的权重占用</strong>，从加载后的进程里实测，而不要从参数量推。</li>
+      <li><strong>你会强制执行的那个上下文上限</strong>，要作为一条配置好的限制存在，并定义会话撞上它时的行为——压缩、摘要，或者干脆明确拒绝。「我们没设」意味着你的上限就是上下文窗口，而你的容量规划是按它来定尺寸的。</li>
+      <li><strong>你实际看到的 p99 会话长度</strong>，从轨迹里取。如果 p99 接近上限，那这个上限是在干活的；如果它只有上限的十分之一，那你是在为永不发生的会话预留内存，应该把上限降下来、把并发提上去。</li>
+      <li><strong>压测下每张卡实测的会话数</strong>，不是算出来的那个数。碎片、前缀共享与卸载都会让现实偏离那道除法，而且通常是两个方向都偏。在上限处做<a class="xref" href="/zh/operations/agentops/load-testing-agents">压力测试</a>，是你弄清偏哪边的办法。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>把你模型的 KV 开销用<strong>每 token 多少 KB</strong>报出来，并把它摆在你付给托管厂商的每百万 token 价格旁边。这两个数字是同一个决策的两面：托管推理把上下文长度换成钱，自托管把它换成内存，而兑换率就是你刚刚算出来的那个。如果一个你能接受的上下文上限，能在你已经拥有的卡上塞进三个智能体，那就自托管；如果守住这个上限的代价是你本来要买的那份质量，那就付 token 的钱，把工程省下来。唯一不该做的，是从权重文件开始做规划——它是本文里唯一一个不随工作量增长的数字。</p>
+    </div>
+
+    <p>延伸阅读：<a class="xref" href="/zh/deep-dives/architectures-and-patterns/on-device-agent-architecture">端侧智能体架构</a>讲本地栈的其余部分，包括重启后的缓存预热；<a class="xref" href="/zh/operations/agentops/self-hosted-inference-for-agents">面向智能体的自托管推理</a>讲运维上的承诺；<a class="xref" href="/zh/concepts/small-and-local-models">小模型与本地模型</a>讲哪些工作从来就不需要大模型；<a class="xref" href="/zh/concepts/cost-quality-latency">成本、质量与延迟</a>讲同一笔交易在托管那一侧的样子。</p>
+  </div>
+</section>
