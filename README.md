@@ -27,7 +27,7 @@ Every page exists in both languages; switch with the language toggle or the
 - `npm run build` — production build to `dist/` (runs `og:build` then `astro build`)
 - `npm run verify` — assert bilingual completeness, no broken internal links, OG meta on every page
 - `npm test` — unit tests (extraction, manifests, i18n, OG catalog, search index shape)
-- `npm run test:design` — build, then check the design system (tokens, layout, typography) against `dist/`
+- `npm run test:design` — build, then check the design system (tokens, layout, typography) against `dist/` (needs `npx playwright install chromium` once)
 - `npm run search:index` — rebuild the Pagefind search index against `dist/`
 - `npm run test:search` — assert the search index covers the built pages
 - `npm run indexnow` — submit changed URLs to IndexNow (CI runs this on pushes to `main`)
