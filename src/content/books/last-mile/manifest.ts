@@ -136,10 +136,10 @@ const book: Book = {
       chapters: [
         { slug: 'case-file', num: 'A', status: 'published',
           title: L('Case File', '案例档案'),
-          summary: L('Every case in the book, graded by how well it is evidenced.', '书中全部案例，按证据强弱分级。') },
+          summary: L('The book\'s public cases, graded by how well each is evidenced.', '书中的公开案例，按证据强弱分级。') },
         { slug: 'templates', num: 'B', status: 'published',
           title: L('Templates', '模板'),
-          summary: L('Every template from Part II, blank and filled in.', '第 II 部分的全部模板，空白版与填写示例。') },
+          summary: L('All seventeen templates in the book, blank, each linked to its filled example.', '全书十七份模板的空白版，每份都链接到章节里的填写示例。') },
         { slug: 'failure-modes', num: 'C', status: 'published',
           title: L('Failure Modes', '失败模式'),
           summary: L('Symptom, cause and fix for the ways engagements go wrong.', '交付出错的各种方式：症状、成因与对策。') },

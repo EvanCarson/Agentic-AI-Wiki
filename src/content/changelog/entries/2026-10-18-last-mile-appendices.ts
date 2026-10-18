@@ -3,7 +3,7 @@ import { L, type ChangelogEntry } from '../types.ts';
 const entry: ChangelogEntry = {
   date: '2026-10-18',
   title: L('Last Mile is complete: six appendices add a case file, every template, a failure catalogue and sources',
-           '《最后一公里》全书完成：六个附录补上案例档案、全部模板与失败目录'),
+           '《最后一公里》全书完成：六个附录补上案例档案、全部模板、失败目录与参考来源'),
   items: [
     L('A, Case File: the ten strongest public cases, each with its evidence tier, what it proves and what it does not, plus the runners-up and what no public source covers.',
       '附录 A《案例档案》：十个最有力的公开案例，逐一标明证据等级、能证明什么、不能证明什么，另附次一级案例，以及公开资料尚未覆盖的空白。'),
