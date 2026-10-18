@@ -48,7 +48,9 @@ Every chapter serves this thesis. Each one names a stretch of the distance, says
   - **T1:** measured, primary and independent.
   - **T2:** measured and primary, but vendor- or self-reported.
   - **T3:** secondary reporting.
-  - **T4:** anecdote, opinion or job post.
+  - **T4:** anecdote, opinion, advice, doctrine, a stated target, or a job post.
+
+  **The T2/T4 line is measurement.** T2 = measured, primary, vendor- or self-reported (e.g. CORE-Bench 42%→95%, Klarna 20→400 policies, Morgan Stanley's 6–8 weeks + 4 months, LinkedIn 80%→95%). T4 = vendor advice, doctrine, stated targets or opinion, even from the same vendor or speaker (e.g. Anthropic's eval guidance, Jarvis's 20%→50% reuse target). Independent guidance (OWASP) and analyst forecasts (Gartner) are T4 too. State this rule once in how-to-use; every chapter follows it.
 
   Job posts are T4 for how the job is *done*, but primary evidence for what employers *ask for*. Say which use you are making.
 - **The book is honest about what is weak.** T1 evidence on how engagements run barely exists (EP). Of the ten best cases, the only T1-measured outcome is a failure (NYC MyCity). Say so where it matters.
@@ -217,7 +219,7 @@ Communication tactics live inside the playbooks: demos in Ch 6, bad news in Ch 9
 **data-access-and-integration** (7)
 - **Argument:** Integration, not modelling, is where FDE time goes. Write-back is harder than read. An integration nobody maintains decays faster than a model.
 - **Cases:**
-  - Jarvis "translation layer" (T2);
+  - Jarvis "translation layer" (T4, self-description);
   - Qureshi "data integration… negotiating with data owners" (T4);
   - NHS FDP write-back (T3);
   - MD Anderson never updated after the Epic move (T3);
@@ -250,10 +252,10 @@ Communication tactics live inside the playbooks: demos in Ch 6, bad news in Ch 9
 **evals** (9)
 - **Argument:** The eval set is the contract. Build it with the customer's experts before the agent, and expect the climb from 80% to the threshold to take longer than everything before it.
 - **Cases:**
-  - Jarvis "five with the experts" and "not done until you have a set of evals" (T2);
+  - Jarvis "five with the experts" and "not done until you have a set of evals" (T4, doctrine);
   - Klarna eval-per-intent, 20 → 400 policies (T2);
   - Morgan Stanley "start with evals" (T2);
-  - Anthropic's 20–50 tasks, pass^k and broken graders (T2);
+  - Anthropic's 20–50 tasks, pass^k and broken graders (T4, vendor advice);
   - LinkedIn's 80% → 95% over four months (T2);
   - Husain and Yan (T4);
   - McDonald's low-80s vs a 95%+ target (T3).
@@ -289,7 +291,7 @@ Communication tactics live inside the playbooks: demos in Ch 6, bad news in Ch 9
   - Alpine Edge handoff drill (T4);
   - NHS FDP adoption framed as 45/72/120+ (T3);
   - Walgreens (T2);
-  - Sierra immutable releases (T2).
+  - Sierra immutable releases (T4, platform description).
 - **Executives:** communicating with them is taught here.
 - **Template:** a runbook and handoff document.
 - **Links:**
@@ -302,7 +304,7 @@ Communication tactics live inside the playbooks: demos in Ch 6, bad news in Ch 9
 - **Argument:** The loop back to product is what separates an FDE from a contractor. Without it the role is services revenue, and every lab job post says so.
 - **Cases:**
   - Klarna → Swarm → Agents SDK, flagging the attribution blur (#7) (T2);
-  - reuse rising from 20% to 50% (T2, CA);
+  - reuse rising from 20% to 50% (T4, a stated target; CA);
   - the Realtime API (T3);
   - Palantir FDE→PD (T4);
   - "gravel roads / superhighways" (T3);
