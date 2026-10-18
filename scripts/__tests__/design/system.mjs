@@ -41,6 +41,7 @@ const CURATED = [
   '/books/last-mile/how-to-use/', '/zh/books/last-mile/discovery/',
   '/books/last-mile/scoping-and-the-first-win/',
   '/books/last-mile/evals/', '/zh/books/last-mile/when-engagements-fail/',
+  '/books/last-mile/the-skill-map/', '/zh/books/last-mile/judgment-under-pressure/',
   '/zh/concepts/prompt-caching/',
 ];
 
