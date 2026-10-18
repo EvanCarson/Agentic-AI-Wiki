@@ -49,3 +49,18 @@ figures; never name the insurer or the vendor.** Refer to "the insurer", "the FD
 | 13 failure | months 6–9 | The expansion to **property claims** (the "not now" trigger fired once auto met the threshold) **stalls when the COO's priorities shift**. The lead and the FDE run a post-mortem and decide to **reset the scope or walk**. Show the decision rule; whichever way it goes, the auto triage stays in production, owned by the insurer. Template: engagement post-mortem. |
 
 Each beat's last sentence cites the verified pattern it dramatises (bible §6, right column).
+
+## Locked for Part IV (Ch 15–18)
+
+The Part IV beats follow the FDE past the insurer. Read in book order (15 → 18) they run
+backwards in time, so each later beat must stay consistent with the earlier calendar below.
+
+| Ch | When | Facts every chapter must agree with |
+|---|---|---|
+| 17 leading FDEs | month 8 | The lead's month-eight review pencils in **two to three weeks on the template** before the next engagement. The second insurer reused part of the template (ranges only). |
+| 3 / 18 skill map and growth plan | month 9, after the wind-down | The FDE is **mid-level**. Self-assessment (Ch 3): technical L2, customer L3, product L1, judgment L2; the lead struck two draft scores; the shape check reads "services". Growth plan (Ch 18): the FDE **plans the next year at the vendor** and keeps exits open (staff FDE, product role); the gap is agreed at the shorter end; next review at the end of the next engagement. On site through discovery, scoping and the handoff drill, and a day or two a week in between, mostly for the model-risk review. |
+| — | months 9 to about 18 after the pilot | The FDE **does the next engagement at the vendor** and fills in the self-assessment again after it. Product is still the weakest domain, one level up at best. |
+| 16 getting hired | about eighteen months after the pilot | The FDE **interviews elsewhere for a senior FDE role** and tells the insurer engagement in a deep dive, on ranges and roles only. |
+| 15 where FDEs work | about eighteen months after the pilot | The FDE **weighs two senior offers**: a founding role at a deployment company (trap check three of five) and a deployment role at an insurance-claims startup (trap check one of five). Base pay within a few tens of thousands of each other. The FDE cites the month-nine self-assessment and the one after the next engagement, and takes the startup offer for the product domain. |
+
+Wording: "about eighteen months after the pilot" (ZH: 试点结束约十八个月后). Never "a year on".
