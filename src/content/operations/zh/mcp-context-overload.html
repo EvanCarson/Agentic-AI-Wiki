@@ -1,0 +1,134 @@
+<section class="phase">
+  <div class="phase-num">O34</div>
+  <div class="week">运维 · 智能体运维：部署与运营</div>
+  <h2>当 MCP 结果撑爆上下文时。</h2>
+  <p class="goal">MCP 规范对工具目录做了分页，却对一次工具调用结果的大小只字未提。所以当某个服务器塞给你的智能体 100,000 个 token 时，会发生什么，取决于你跑的是哪个宿主、以及你留在默认值上的那些设置。那些服务器不归你管，而且会在你脚下悄悄变化。因此上限、溢出行为和驱逐策略都必须由你自己来定：按工具逐个设置，用你最大的客户而不是演示租户来测试，并在生产中持续度量。而且现有的每一种补救手段（落盘、代码执行、清除、压缩）都只是把成本挪到了别处，而不是把它消除。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>在任何东西加工结果之前先度量它，按 token 也按字符。</h3>
+
+    <p>大多数团队第一次见识到自己的结果大小，都是通过某个症状（一个 429、一轮卡住的对话、一个「忘了」任务的智能体），而到那时，日志里只剩下宿主截断或落盘之后的样子。在原始 MCP 响应到达、任何宿主或中间件碰它之前的那个位置埋点，每次调用记一行：</p>
+
+    <ul>
+      <li><strong>服务器、工具，以及决定大小的那些参数</strong>：页大小、字段选择、日期范围。</li>
+      <li><strong>字符数和估算 token 数，两个都要。</strong>各个宿主用的单位并不一致。Claude Code 会把超过 50,000 <em>字符</em>的文本结果存到文件里，不管它的 token 设置写的是多少。<a class="xref" href="https://github.com/anthropics/claude-code/issues/97622" rel="noopener">claude-code issue #97622</a> 的报告者测得：一个 50,000 字符的结果，拉丁字母文本约为 34k token，希腊文约为 48k token。一个按英文调好的阈值，对其他所有人都会在不同的位置触发。</li>
+      <li><strong>宿主对它做了什么</strong>：原样传递、截断、存成文件，还是报错。</li>
+    </ul>
+
+    <p>然后按 p99 大小给工具排序，而不是按均值：过载是一个长尾问题，而长尾会随着账户一起长大。在 <a class="xref" href="https://github.com/github/github-mcp-server/issues/1934" rel="noopener">github-mcp-server issue #1934</a> 中，一位报告者列出 30 个 pull request，拿回了 508KB。Issue #2383 报告 50 个项目条目约为 100K token，「大约是一个典型 LLM 上下文窗口的一半」。Figma 自己的客户端故障排查页面引用了一个 <code class="inline">get_design_context</code> 响应：351,378 个 token，而上限是 25,000 个 token。参考实现 Memory 服务器的 <code class="inline">read_graph</code>，据 issue #3953 报告，在使用六周之后会返回 50k–80k+ token。工具从未改变；是存储长大了。</p>
+
+    <p>这就是为什么测试数据比阈值更重要。一个只有 11 个项目的测试租户能通过每一项检查；而那个有 1,400 个项目的客户，才是半夜把你叫醒的人。在设定任何一个数字之前，先用你被允许复制的最大账户构建测试数据，或者按那个规模合成一份。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>按工具设置上限，并弄清楚哪些旋钮归你。</h3>
+
+    <p>单一的全局上限总会对某个人是错的：高到足以容纳日志搜索，就会让列表类工具淹没窗口；低到能管住列表类工具，日志搜索就没法用了。各种按工具的机制，在归谁所有、按什么单位计数上都各不相同。截至 2026 年 10 月：</p>
+
+    <ul>
+      <li><strong>Claude Code。</strong>它在 10,000 token 时发出警告，这是一个固定阈值。默认上限是 25,000 token，可以用 <code class="inline">MAX_MCP_OUTPUT_TOKENS</code> 调高。这个变量只管那些没有声明自身限制的工具。一个<em>服务器</em>可以在它的 <code class="inline">tools/list</code> 条目里声明 <code class="inline">_meta["anthropic/maxResultSizeChars"]</code>，把某个工具的阈值调高，最高到 500,000 字符的硬上限。那是服务器作者的旋钮，不是你的，所以要审计哪些已连接的工具声明了它：它们已经退出了你以为自己设下的那个上限。</li>
+      <li><strong>Codex。</strong><code class="inline">tool_output_token_limit</code> 设定存入历史的工具输出的预算。按工具的 <code class="inline">mcp_servers.&lt;id&gt;.tools.&lt;tool&gt;.output_token_limit</code>（于 2026-08-28 在 PR #41421 中合并）会针对单个 MCP 工具覆盖它，之后再加上标准的 20% 序列化余量。当插件策略与用户策略重叠时，最严格的限制胜出。默认值没有文档说明，所以要显式设置。</li>
+      <li><strong>Gemini CLI。</strong><code class="inline">tools.truncateToolOutputThreshold</code> 默认在 40,000 字符处截断；设为 0 或负值则关闭截断。</li>
+      <li><strong>claude.ai 和 Claude Desktop。</strong>连接器的工具结果上限约为 150,000 字符。它不可配置，文档也没说超过之后会发生什么。</li>
+    </ul>
+
+    <p>速率限制也是一种上限，而且比窗口更早咬人。GitHub 服务器中的 <a class="xref" href="https://github.com/github/github-mcp-server/issues/142" rel="noopener">Issue #142</a> 并不是上下文溢出：三十个 commit 在后续调用中产生了超过 64k token，报告者是 OpenAI 的 tier-1 用户，拿到了一个 429：请求了 68,490 token，而 TPM 限制是 30,000。像<a class="xref" href="/zh/operations/agentops/cost-control-in-the-loop">循环中的成本控制</a>里那样的按任务 token 预算，应当把<em>流入</em>的工具结果也算进去，而不只是流出的模型输出。在服务器白名单里，把每个上限和它实测的 p99 放在一起；旁边没有度量数据的上限，只是一个猜测。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>选定溢出行为，然后测试往返流程，而不是顺利路径。</h3>
+
+    <p>当一个结果越过上限时，宿主会做三件事之一，而每一种都有自己的失败方式。</p>
+
+    <ul>
+      <li><strong>落盘。</strong>Claude Code 会把超出上限的、成功的非图像结果存到会话的 <code class="inline">tool-results</code> 目录，并用一条写明路径的消息替换它。Cursor 会把较长的 MCP 输出写入一个智能体可以读取的文件。什么都没丢，但模型现在得通过一个指针来工作。</li>
+      <li><strong>截断。</strong>Gemini CLI 在它的字符阈值处切断。Claude Code 会截断<em>错误</em>结果：一个超过约 11,000 字符的 <code class="inline">isError</code> 文本只保留前 5,000 和后 5,000 个字符。对堆栈跟踪来说没问题；如果原因恰好在中间，就会误导人。</li>
+      <li><strong>报错。</strong>调用失败，智能体必须用更窄的参数重试。如果错误文本写明了补救方法，这是最诚实的选项。</li>
+    </ul>
+
+    <p>落盘的失败案例早已公开。把它们当作你的测试套件：</p>
+
+    <ul>
+      <li><strong>智能体能只读其中一部分吗？</strong>在 <a class="xref" href="https://github.com/makenotion/notion-mcp-server/issues/206" rel="noopener">notion-mcp-server issue #206</a> 中，一个 41,207 token 的页面以挤在大约五行里的 JSON 返回。这个落盘文件无法部分读取，因为读取工具按行偏移分页，而直接读取则以「exceeds maximum allowed tokens (25000)」失败。只有当文件是按行组织、可 grep 的，落盘才有用。</li>
+      <li><strong>它能编辑并写回吗？</strong>在 <a class="xref" href="https://github.com/atlassian/atlassian-mcp-server/issues/106" rel="noopener">atlassian-mcp-server issue #106</a> 中，一个 50–70KB 的 Confluence 页面正文被存到了磁盘上，于是模型从未看到它，也就无法重建它来调用更新工具。它本得内联输出约 15K token。任何「读取—修改—写回」的工作流，在读取落盘的那一刻就断了。</li>
+      <li><strong>补救提示真的管用吗？</strong>在 <a class="xref" href="https://github.com/microsoft/vscode/issues/311068" rel="noopener">vscode issue #311068</a> 中，VS Code 截断了一个 50KB–999KB 的文件结果，并让智能体去读一个 <code class="inline">vscode-chat-response-resource://</code> URI 获取其余部分。读取以「outside the workspace」失败，智能体就此卡住。</li>
+      <li><strong>宿主告诉模型的话对吗？</strong>2.1.105 版本加入了按格式区分的处理方法（JSON 用 jq）。2.1.287 版本修复了 Claude 被告知用 Read 的 offset 和 limit 来分页读取大型 JSON 结果的问题。溢出提示文本是你系统的一部分，而宿主一升级它就会变。</li>
+    </ul>
+
+    <p>为每个重型工具写一个测试：越过上限，然后让智能体去做下一件真实的事情：找到一个字段、修改一个值、把对象写回去。通过的标准是任务完成，而不是调用返回。服务端的那一半在 <a class="xref" href="/zh/deep-dives/mcp/mcp-large-results-and-pagination">MCP 中的大型结果与分页</a>；GitHub 的服务器是怎么学会这一课的，在<a class="xref" href="/zh/blogs/the-page-was-counted-in-records">那一页是按记录数计算的</a>。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>把大批量数据挡在循环之外，并为它的去处标好价格。</h3>
+
+    <p>最便宜的 token 是从未进入主上下文的那个。有两种安排方式，各有各的账单。</p>
+
+    <ul>
+      <li><strong>用子智能体做大型读取。</strong>Anthropic 的上下文工程指南描述了这样的子智能体：它们「可能会大量探索，使用数万甚至更多 token」，然后只返回「一份浓缩、提炼过的摘要」。成本转移到了子智能体的 token 和摘要的保真度上：编排者无从知道摘要漏掉了什么。记录子智能体的原始输入；当答案出错时，证据就在那里。</li>
+      <li><strong>程序化工具调用，或代码执行。</strong>模型写一个脚本，脚本在沙箱中调用工具并在那里过滤数据，只有结果才会到达模型。Anthropic 对这个问题举的例子是：一份两小时会议的转录从一个工具复制到另一个工具，会两次穿过模型，大约多出 50,000 token。被广泛引用的 150,000 → 2,000 token（98.7%）是 Anthropic 的示意性演算示例，不是基准测试。它在复杂研究任务上对程序化工具调用的实测数字，是平均从 43,588 降到 27,297 token，即 −37%。按实测数字做规划。</li>
+    </ul>
+
+    <p>代码执行是真正的架构变更，不是一个设置项。在 Claude API 上，它需要代码执行工具（<code class="inline">code_execution_20260120</code> 或更新版本），Claude Haiku 4.5 不可用，也不符合零数据保留的条件。文档警告 <code class="inline">allowed_callers</code> 不是安全边界。Anthropic 列出的成本是沙箱、资源限制和监控，即「直接工具调用所没有的运维开销和安全考量」。你还会失去廉价的审计轨迹：原先的对话记录是一串工具调用，现在它是一个程序，其效果需要你去重建。<a class="xref" href="/zh/deep-dives/tool-capability-design/code-as-action">代码即行动</a>讲的是行动日志必须记录什么，才能让这一切保持可审查。</p>
+
+    <div class="callout">
+      <p>别让一个定义侧的数字为一个结果侧的项目背书。工具搜索的「超过 85%」削减、Cloudflare 的 1.17 million → 约 1,000 token，以及 Cursor 的 −46.9%，度量的都是预先加载的工具<em>定义</em>。它们对一次返回 100K token 的单次调用毫无作用。一份把两者混在一起的汇报材料，会让钱花在错误的修复上。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>驱逐陈旧内容，并清楚驱逐做不到什么。</h3>
+
+    <p>在一个长会话里，窗口的大部分是智能体早已据此行动过的旧工具结果，而清除它们，用 Anthropic 的话说，是「最安全、最轻量的压缩形式之一」。截至 2026 年 10 月：</p>
+
+    <ul>
+      <li><strong>Anthropic 上下文编辑</strong>（beta，header <code class="inline">context-management-2025-06-27</code>）。<code class="inline">clear_tool_uses_20250919</code> 策略会在输入越过触发点（默认 100,000 输入 token）后，从最旧的工具结果开始移除。默认保留最近 3 次工具使用。<code class="inline">clear_at_least</code> 会在无法至少释放这么多 token 时完全跳过这次编辑，这样微不足道的节省就不会让你付出一次重写提示的代价。<code class="inline">exclude_tools</code> 列出那些结果绝不能被清除的工具。</li>
+      <li><strong>Anthropic 压缩</strong>（beta，header <code class="inline">compact-2026-01-12</code>，编辑类型 <code class="inline">compact_20260112</code>）。在触发点对历史做摘要：默认 150,000 输入 token，最低 50,000。</li>
+      <li><strong>OpenAI Responses</strong>：<code class="inline">context_management: [{ type: "compaction", compact_threshold: … }]</code> 会在渲染后的 token 数越过你的阈值时运行服务端压缩。结果是一个加密条目，「不透明，且并非供人类解读」。另外，<code class="inline">truncation: "auto"</code> 会在输入超出窗口时，从对话开头丢弃条目。这是粗暴的从最旧开始丢弃；默认值 <code class="inline">disabled</code> 则会让请求以 400 失败。</li>
+    </ul>
+
+    <pre class="standalone"><span class="c-cm"># POST /v1/messages, with the header  anthropic-beta: context-management-2025-06-27</span>
+{
+  <span class="c-kw">"model"</span>: <span class="c-st">"&lt;your-model&gt;"</span>,
+  <span class="c-kw">"max_tokens"</span>: <span class="c-st">4096</span>,
+  <span class="c-kw">"tools"</span>: [ <span class="c-cm">/* ...MCP-backed tools... */</span> ],
+  <span class="c-kw">"messages"</span>: [ <span class="c-cm">/* ... */</span> ],
+  <span class="c-kw">"context_management"</span>: {
+    <span class="c-kw">"edits"</span>: [{
+      <span class="c-kw">"type"</span>: <span class="c-st">"clear_tool_uses_20250919"</span>,
+      <span class="c-kw">"trigger"</span>:        { <span class="c-kw">"type"</span>: <span class="c-st">"input_tokens"</span>, <span class="c-kw">"value"</span>: <span class="c-st">60000</span> },
+      <span class="c-kw">"keep"</span>:           { <span class="c-kw">"type"</span>: <span class="c-st">"tool_uses"</span>,    <span class="c-kw">"value"</span>: <span class="c-st">3</span> },
+      <span class="c-kw">"clear_at_least"</span>: { <span class="c-kw">"type"</span>: <span class="c-st">"input_tokens"</span>, <span class="c-kw">"value"</span>: <span class="c-st">10000</span> },
+      <span class="c-kw">"exclude_tools"</span>:  [<span class="c-st">"getConfluencePage"</span>]   <span class="c-cm">// the read a later write depends on</span>
+    }]
+  }
+}</pre>
+
+    <p>触发点故意设在默认值之下：根据你 Step 1 的数据来设定它，设在质量开始下降的地方，而不是窗口到头的地方。<code class="inline">exclude_tools</code> 运用的是 Step 3 的往返教训：绝不清除一个待执行写入所依赖的读取。</p>
+
+    <p>有两条限制让这一切保持诚实。第一，驱逐并不是白来的质量。<a class="xref" href="https://arxiv.org/abs/2606.00408" rel="noopener">arXiv 2606.00408</a> 发现，在 4B–284B 的骨干模型上，屏蔽陈旧观察带来的收益呈倒 U 形，而当屏蔽移除了模型本会用到的证据时，它可能会起反作用。根据你的评测而不是 token 曲线来调 <code class="inline">keep</code> 和触发点。第二，无论清除还是压缩，对<em>单个</em>超大结果都无能为力。两者作用的都是历史，而一个 100K token 的负载在它到达的那一轮就已造成了破坏。那是 Step 2 的职责。摘要化的取舍在<a class="xref" href="/zh/deep-dives/memory-and-context/context-compaction">上下文压缩</a>中。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>对漂移报警，并对溢出路径做回归测试。</h3>
+
+    <p>你的上限是对着今天的服务器设定的，而服务器会变。GitHub 的服务器展示了这种模式：一个又一个端点家族撞上这个问题，然后得到了一个 <code class="inline">minimal_*</code> 响应类型。一个尚未合并的 PR（#2675）让 <code class="inline">search_pull_requests</code> 默认返回紧凑输出，用 <code class="inline">minimal_output: false</code> 取回原始形式。PR #2563 把每个项目条目的输出削减了 93%；这样一个版本发布会让某个工具的 p99 一夜之间改变，而厂商加上的下一个字段又会把它推回去。这就是<a class="xref" href="/zh/operations/agentops/third-party-tool-drift">第三方工具漂移</a>，而结果大小是它最容易度量的症状之一。</p>
+
+    <ul>
+      <li><strong>对按工具的 p99 大小漂移报警</strong>，在服务器报告版本时以服务器版本为键。任一方向的阶跃都意味着契约变了；缩小可能意味着你依赖的字段现在需要显式开启。</li>
+      <li><strong>以比率的形式对溢出事件报警</strong>：每个工具每千次调用中的落盘、截断和大小错误次数。某个工具的比率上升，意味着某个客户的数据越过了你的测试数据从未达到的阈值。</li>
+      <li><strong>断言截断标记能到达模型。</strong>构建良好的服务器会在带内说明这一点：MotherDuck 的服务器会设置 <code class="inline">truncated: true</code> 并附带警告，Grafana 的 Loki 工具会返回 <code class="inline">resultsTruncated</code>。中间件、宿主升级或你自己的摘要化都可能把它剥掉。测试模型的输入中是否仍然包含它；一个不知道自己数据不完整的智能体，会自信地报出一个错误的计数。</li>
+      <li><strong>锁定版本，并在宿主升级时重新测试。</strong>溢出行为是宿主代码，会在版本之间变化。每次宿主版本升级都运行 Step 3 的往返测试，就像你对待模型变更那样。</li>
+      <li><strong>保留一个金丝雀式的大账户评测。</strong>按计划对大账户测试数据运行一小组固定的真实任务，并按结果打分。这是唯一一个能同时抓住数据增长、服务器漂移和宿主变化的测试。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>如果这些都还没有到位，这周先做两件事。第一，为每次工具调用记录原始结果大小和宿主采取的动作，这样你才有一个 p99 可以据理力争。第二，挑出你最重的三个工具，用大账户测试数据把每一个都推过它的上限，再让智能体完成一个真实任务的下一步。在那里失败的地方，才是你真正的上限和真正的溢出行为，不管设置文件里写的是什么。</p>
+    </div>
+  </div>
+</section>

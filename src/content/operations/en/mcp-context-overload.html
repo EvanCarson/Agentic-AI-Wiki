@@ -1,0 +1,134 @@
+<section class="phase">
+  <div class="phase-num">O34</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>When MCP results overload the context.</h2>
+  <p class="goal">The MCP specification paginates the tool catalog and says nothing about the size of a tool call's result, so when a server hands your agent 100,000 tokens, the host you run and the settings you left at default decide what happens. You do not control those servers, and they change under you. The ceiling, the overflow behaviour and the eviction policy therefore have to be yours: set per tool, tested against your largest customer rather than your demo tenant, and measured in production. And every remedy on offer (spill to file, code execution, clearing, compaction) moves the cost somewhere else rather than removing it.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Measure the result before anything shapes it, in tokens and in characters.</h3>
+
+    <p>Most teams first meet their result sizes as a symptom (a 429, a stalled turn, an agent that "forgets" the task), and by then the log shows only what the host truncated or spilled. Instrument the point where the raw MCP response arrives, before any host or middleware touches it, and record one row per call:</p>
+
+    <ul>
+      <li><strong>Server, tool, and the arguments that drive size</strong>: page size, field selection, date range.</li>
+      <li><strong>Characters and estimated tokens, both.</strong> Hosts do not agree on the unit. Claude Code saves text results over 50,000 <em>characters</em> to a file whatever its token setting says. The reporter of <a class="xref" href="https://github.com/anthropics/claude-code/issues/97622" rel="noopener">claude-code issue #97622</a> measured a 50,000-character result at about 34k tokens of Latin-script text and about 48k tokens of Greek. A threshold tuned on English fires at a different point for everyone else.</li>
+      <li><strong>What the host did with it</strong>: passed through, truncated, saved to a file, or errored.</li>
+    </ul>
+
+    <p>Then rank tools by p99 size, not by the mean: overload is a tail problem, and the tail grows with the account. In <a class="xref" href="https://github.com/github/github-mcp-server/issues/1934" rel="noopener">github-mcp-server issue #1934</a>, a reporter listed 30 pull requests and got 508KB back. Issue #2383 reports 50 project items at about 100K tokens, "roughly half of a typical LLM context window". Figma's own client-troubleshooting page quotes a <code class="inline">get_design_context</code> response of 351,378 tokens against a 25,000-token cap. The reference Memory server's <code class="inline">read_graph</code> is reported in issue #3953 to return 50k–80k+ tokens after six weeks of use. The tool never changed; the store grew.</p>
+
+    <p>That is why fixtures matter more than thresholds. A test tenant with 11 projects passes every check; the customer with 1,400 is the one who pages you. Build fixtures from the largest account you are allowed to copy, or synthesise one at that scale, before you set a single number.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Set ceilings per tool, and know which knobs belong to you.</h3>
+
+    <p>A single global cap is always wrong for somebody: high enough for log search lets the list tools flood the window, low enough for the list tools makes log search useless. The per-tool mechanisms differ in who owns them and what unit they count. As of October 2026:</p>
+
+    <ul>
+      <li><strong>Claude Code.</strong> It warns at 10,000 tokens, a fixed threshold. The default cap is 25,000 tokens, which you can raise with <code class="inline">MAX_MCP_OUTPUT_TOKENS</code>. That variable only governs tools that have not declared their own limit. A <em>server</em> can declare <code class="inline">_meta["anthropic/maxResultSizeChars"]</code> in its <code class="inline">tools/list</code> entry and raise one tool's threshold up to a hard ceiling of 500,000 characters. That is the server author's knob, not yours, so audit which connected tools declare it: they have opted out of the ceiling you think you set.</li>
+      <li><strong>Codex.</strong> <code class="inline">tool_output_token_limit</code> sets the budget for tool outputs stored in history. The per-tool <code class="inline">mcp_servers.&lt;id&gt;.tools.&lt;tool&gt;.output_token_limit</code> (merged in PR #41421 on 2026-08-28) overrides it for one MCP tool, before a standard 20% serialization allowance. When plugin and user policies overlap, the most restrictive limit wins. The default is not documented, so set it explicitly.</li>
+      <li><strong>Gemini CLI.</strong> <code class="inline">tools.truncateToolOutputThreshold</code> truncates at 40,000 characters by default; 0 or a negative value disables truncation.</li>
+      <li><strong>claude.ai and Claude Desktop.</strong> Connectors have a maximum tool result of about 150,000 characters. It is not configurable, and the docs do not say what happens above it.</li>
+    </ul>
+
+    <p>Rate limits are a ceiling too, and bite earlier than the window. <a class="xref" href="https://github.com/github/github-mcp-server/issues/142" rel="noopener">Issue #142</a> in GitHub's server was not a context overflow: thirty commits produced more than 64k tokens on the follow-up call, and the reporter, a tier-1 OpenAI user, got a 429: 68,490 tokens requested against a 30,000 TPM limit. A per-task token budget like the one in <a class="xref" href="/operations/agentops/cost-control-in-the-loop">cost control in the loop</a> should count tool results on the way <em>in</em>, not only model output on the way out. Keep each ceiling next to its measured p99 in the server allow-list; a ceiling with no measurement beside it is a guess.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Choose the overflow behaviour, then test the round trip, not the happy path.</h3>
+
+    <p>When a result crosses the ceiling, the host does one of three things, and each fails in its own way.</p>
+
+    <ul>
+      <li><strong>Spill to a file.</strong> Claude Code saves an over-cap successful, non-image result to the session's <code class="inline">tool-results</code> directory and replaces it with a message naming the path. Cursor writes long MCP output to a file the agent can read. Nothing is lost, but the model now works through a pointer.</li>
+      <li><strong>Truncate.</strong> Gemini CLI cuts at its character threshold. Claude Code truncates <em>error</em> results: an <code class="inline">isError</code> text over about 11,000 characters keeps only its first 5,000 and last 5,000 characters. Fine for a stack trace; misleading if the cause sits in the middle.</li>
+      <li><strong>Error.</strong> The call fails and the agent has to retry with narrower arguments. The most honest option, if the error text names the remedy.</li>
+    </ul>
+
+    <p>Spill-to-file's failure cases are already public. Use them as your test suite:</p>
+
+    <ul>
+      <li><strong>Can the agent read part of it?</strong> In <a class="xref" href="https://github.com/makenotion/notion-mcp-server/issues/206" rel="noopener">notion-mcp-server issue #206</a>, a 41,207-token page came back as JSON packed onto about five lines. The spill file could not be read partially, because the read tool pages by line offset, and a plain read failed with "exceeds maximum allowed tokens (25000)". A spill only helps if the file is line-structured and greppable.</li>
+      <li><strong>Can it edit and write back?</strong> In <a class="xref" href="https://github.com/atlassian/atlassian-mcp-server/issues/106" rel="noopener">atlassian-mcp-server issue #106</a>, a Confluence page body of 50–70KB was saved to disk, so the model never saw it and could not rebuild it to call the update tool. It would have had to emit about 15K tokens inline. Any read-modify-write workflow breaks the moment the read spills.</li>
+      <li><strong>Does the remedy hint actually work?</strong> In <a class="xref" href="https://github.com/microsoft/vscode/issues/311068" rel="noopener">vscode issue #311068</a>, VS Code truncated a 50KB–999KB file result and pointed the agent at a <code class="inline">vscode-chat-response-resource://</code> URI to read the rest. Reading it failed as "outside the workspace", which left the agent stuck.</li>
+      <li><strong>Does the host tell the model the right thing?</strong> Version 2.1.105 added format-specific recipes (jq for JSON). Version 2.1.287 fixed Claude being told to page large JSON results with Read's offset and limit. The overflow text is part of your system, and a host upgrade changes it.</li>
+    </ul>
+
+    <p>For each heavy tool, write one test that crosses the ceiling and then asks the agent to do the next real thing: find a field, change a value, write the object back. Pass means the task completes, not that the call returned. The server-side half is in <a class="xref" href="/deep-dives/mcp/mcp-large-results-and-pagination">large results &amp; pagination in MCP</a>; how GitHub's server learned it is in <a class="xref" href="/blogs/the-page-was-counted-in-records">the page was counted in records</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Keep bulk data out of the loop, and price where it goes instead.</h3>
+
+    <p>The cheapest token never enters the main context. There are two ways to arrange that, and each has its own bill.</p>
+
+    <ul>
+      <li><strong>A subagent for big reads.</strong> Anthropic's context-engineering guidance describes subagents that "might explore extensively, using tens of thousands of tokens or more" and return "only a condensed, distilled summary". The cost moves to the subagent's tokens and the summary's fidelity: the orchestrator cannot know what the summary left out. Log the subagent's raw inputs; when the answer is wrong, that is where the evidence lives.</li>
+      <li><strong>Programmatic tool calling, or code execution.</strong> The model writes a script, the script calls the tools in a sandbox and filters the data there, and only the result reaches the model. Anthropic's example of the problem: a two-hour meeting transcript copied from one tool to another passes through the model twice, roughly 50,000 extra tokens. The widely quoted 150,000 → 2,000 tokens (98.7%) is Anthropic's illustrative worked example, not a benchmark. Its measured figure for programmatic tool calling on complex research tasks is an average drop from 43,588 to 27,297 tokens, or −37%. Plan on the measured number.</li>
+    </ul>
+
+    <p>Code execution is a real change of architecture, not a setting. On the Claude API it requires the code execution tool (<code class="inline">code_execution_20260120</code> or later), it is not available for Claude Haiku 4.5, and it is not eligible for zero data retention. The docs warn that <code class="inline">allowed_callers</code> is not a security boundary. Anthropic lists the cost as sandboxing, resource limits and monitoring, "operational overhead and security considerations that direct tool calls avoid". You also lose the cheap audit trail: the transcript was a list of tool calls, and now it is a program whose effects you must reconstruct. <a class="xref" href="/deep-dives/tool-capability-design/code-as-action">Code as action</a> covers what the action log has to capture to keep that reviewable.</p>
+
+    <div class="callout">
+      <p>Do not let a definition-side number justify a result-side project. Tool search's "over 85 percent" reduction, Cloudflare's 1.17 million → about 1,000 tokens and Cursor's −46.9% all measure tool <em>definitions</em> loaded up front. They do nothing for a single call that returns 100K tokens. A deck that blends the two will fund the wrong fix.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Evict what is stale, and know what eviction cannot do.</h3>
+
+    <p>In a long session, most of the window is old tool results the agent has already acted on, and clearing them is, in Anthropic's words, "one of the safest lightest touch forms of compaction". As of October 2026:</p>
+
+    <ul>
+      <li><strong>Anthropic context editing</strong> (beta, header <code class="inline">context-management-2025-06-27</code>). The <code class="inline">clear_tool_uses_20250919</code> strategy removes the oldest tool results first once input crosses a trigger, 100,000 input tokens by default. By default it keeps the last 3 tool uses. <code class="inline">clear_at_least</code> skips the edit entirely unless it can free at least that many tokens, so a trivial saving does not cost you a rewritten prompt. <code class="inline">exclude_tools</code> names the tools whose results must never be cleared.</li>
+      <li><strong>Anthropic compaction</strong> (beta, header <code class="inline">compact-2026-01-12</code>, edit type <code class="inline">compact_20260112</code>). Summarises history at a trigger: default 150,000 input tokens, minimum 50,000.</li>
+      <li><strong>OpenAI Responses</strong>: <code class="inline">context_management: [{ type: "compaction", compact_threshold: … }]</code> runs server-side compaction once the rendered token count crosses your threshold. The result is an encrypted item that is "opaque and not intended to be human-interpretable". Separately, <code class="inline">truncation: "auto"</code> drops items from the beginning of the conversation when input exceeds the window. It is blunt oldest-first dropping; the default, <code class="inline">disabled</code>, fails the request with a 400.</li>
+    </ul>
+
+    <pre class="standalone"><span class="c-cm"># POST /v1/messages, with the header  anthropic-beta: context-management-2025-06-27</span>
+{
+  <span class="c-kw">"model"</span>: <span class="c-st">"&lt;your-model&gt;"</span>,
+  <span class="c-kw">"max_tokens"</span>: <span class="c-st">4096</span>,
+  <span class="c-kw">"tools"</span>: [ <span class="c-cm">/* ...MCP-backed tools... */</span> ],
+  <span class="c-kw">"messages"</span>: [ <span class="c-cm">/* ... */</span> ],
+  <span class="c-kw">"context_management"</span>: {
+    <span class="c-kw">"edits"</span>: [{
+      <span class="c-kw">"type"</span>: <span class="c-st">"clear_tool_uses_20250919"</span>,
+      <span class="c-kw">"trigger"</span>:        { <span class="c-kw">"type"</span>: <span class="c-st">"input_tokens"</span>, <span class="c-kw">"value"</span>: <span class="c-st">60000</span> },
+      <span class="c-kw">"keep"</span>:           { <span class="c-kw">"type"</span>: <span class="c-st">"tool_uses"</span>,    <span class="c-kw">"value"</span>: <span class="c-st">3</span> },
+      <span class="c-kw">"clear_at_least"</span>: { <span class="c-kw">"type"</span>: <span class="c-st">"input_tokens"</span>, <span class="c-kw">"value"</span>: <span class="c-st">10000</span> },
+      <span class="c-kw">"exclude_tools"</span>:  [<span class="c-st">"getConfluencePage"</span>]   <span class="c-cm">// the read a later write depends on</span>
+    }]
+  }
+}</pre>
+
+    <p>The trigger sits below the default on purpose: set it from your Step 1 data, where quality starts to fall, not where the window ends. <code class="inline">exclude_tools</code> applies Step 3's round-trip lesson: never clear the read a pending write depends on.</p>
+
+    <p>Two limits keep this honest. First, eviction is not free quality. <a class="xref" href="https://arxiv.org/abs/2606.00408" rel="noopener">arXiv 2606.00408</a> finds the gains from masking stale observations follow an inverted U across 4B–284B backbones, and masking can hurt when it removes evidence the model would have used. Tune <code class="inline">keep</code> and the trigger against your eval, not the token graph. Second, neither clearing nor compaction does anything for <em>one</em> oversized result. Both act on history, and a single 100K-token payload does its damage on the turn it arrives. That is Step 2's job. The summarisation trade-offs are in <a class="xref" href="/deep-dives/memory-and-context/context-compaction">context compaction</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Alarm on drift and regression-test the overflow path.</h3>
+
+    <p>Your ceilings were set against today's servers, and the servers will change. GitHub's server shows the pattern: one endpoint family after another hit the problem and got a <code class="inline">minimal_*</code> response type. One open PR (#2675) makes <code class="inline">search_pull_requests</code> return compact output by default, with <code class="inline">minimal_output: false</code> to get the raw form back. PR #2563 cut per-item project output by 93%; a release like that changes a tool's p99 overnight, and the next field a vendor adds moves it back. This is <a class="xref" href="/operations/agentops/third-party-tool-drift">third-party tool drift</a>, and result size is one of its most measurable symptoms.</p>
+
+    <ul>
+      <li><strong>Alert on per-tool p99 size drift</strong>, keyed by server version where the server reports one. A step in either direction means the contract moved; shrinkage can mean fields you relied on are now opt-in.</li>
+      <li><strong>Alert on overflow events as a rate</strong>: spills, truncations and size errors per thousand calls, per tool. A rising rate on one tool means a customer's data has crossed a threshold your fixtures never reached.</li>
+      <li><strong>Assert that the truncation marker reaches the model.</strong> Well-built servers say so in-band: MotherDuck's server sets <code class="inline">truncated: true</code> with a warning, and Grafana's Loki tool returns <code class="inline">resultsTruncated</code>. Middleware, a host upgrade or your own summarisation can strip it. Test that the model's input still contains it; an agent that does not know its data is partial reports a confident wrong count.</li>
+      <li><strong>Pin and re-test on host upgrades.</strong> Overflow behaviour is host code and changes between releases. Run the Step 3 round-trip tests on every host version bump, as you would for a model change.</li>
+      <li><strong>Keep a canary large-account eval.</strong> Run a small, fixed set of real tasks against the large-account fixture on a schedule, and score them on outcome. It is the one test that catches data growth, server drift and host changes together.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>If none of this is in place, do two things this week. First, log raw result size and host action per tool call, so you have a p99 to argue from. Second, take your three heaviest tools, push each one past its ceiling against a large-account fixture, and ask the agent to complete the next step of a real task. Whatever fails there is your real ceiling and your real overflow behaviour, whatever the settings file says.</p>
+    </div>
+  </div>
+</section>

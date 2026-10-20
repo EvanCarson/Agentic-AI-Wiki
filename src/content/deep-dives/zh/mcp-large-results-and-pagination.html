@@ -1,0 +1,153 @@
+<section class="phase">
+  <div class="phase-num">C13</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>MCP 分页的是目录，不是调用。一个可能返回大量数据的工具，必须自带分页契约，而且要按最小的那个宿主来写。</h2>
+  <p class="goal">协议里的分页规定得很清楚：不透明游标、由服务端决定的页大小、游标无效时返回 <code class="inline">-32602</code>。但它恰好只覆盖四个方法，<code class="inline">tools/call</code> 不在其中。无论在 2025-11-25 还是 2026-07-28 里，工具结果都没有游标、没有大小上限、也没有分块。规范里唯一能表达「数据在别处」的原语，是 <code class="inline">resource_link</code> 加上 <code class="inline">resources/read</code>，而后者不支持按范围读取，许多宿主也根本没给模型留出跟进这个链接的途径。于是，一个大结果最终会怎样，取决于用户用的是哪个宿主，而各家宿主的做法并不一致。想要行为可预期的服务端作者，只能在工具自己的参数里定义一份结果契约，并按最不宽容的那个客户端来定尺寸。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>规范分页的是什么，以及值得照搬的游标规则。</h3>
+
+    <p>分页这一节开头写的是「Model Context Protocol（MCP）支持对可能返回大量结果的列表操作进行分页」，关键词是<em>列表操作</em>。它点名了四个：<code class="inline">tools/list</code>、<code class="inline">resources/list</code>、<code class="inline">resources/templates/list</code> 和 <code class="inline">prompts/list</code>。这份清单在 2025-11-25 和 2026-07-28 里完全一样。<a href="/zh/deep-dives/mcp/mcp-revision-2026-07-28" class="xref">2026-07-28 修订版</a>重写了协议的大部分其余内容，这里却一项没加、一项没减。</p>
+
+    <p>在这四个方法之内，规则很短，拿来做你自己工具的模板正合适：</p>
+
+    <ul>
+      <li><strong>游标是不透明的。</strong>它是「一个不透明的字符串令牌，代表结果集中的某个位置」。客户端「MUST 把游标当作不透明令牌」：不得解析或修改它，除了「有没有给」之外，也不得从中推断任何东西。2026-07-28 补充了一句「空字符串是合法的游标」，不能把它理解为结果已到末尾。</li>
+      <li><strong>页大小由服务端决定。</strong>「页大小由服务端决定，客户端 MUST NOT 假定页大小固定。」规范里没有页大小参数，也没有上限。</li>
+      <li><strong>结束靠「缺席」来表示。</strong>「如果还有更多结果」，就会带上 <code class="inline">nextCursor</code>；客户端 SHOULD 把它的缺失视为结束。</li>
+      <li><strong>坏游标要大声失败。</strong>服务端 SHOULD 提供稳定的游标，并妥善处理无效游标。无效游标 SHOULD 返回错误 <code class="inline">-32602</code>（Invalid params）。</li>
+    </ul>
+
+    <p>缓存让各页之间的一致性比看上去更差。在 2026-07-28 下，每一页都是「一个可独立缓存的响应」，各自带着 <code class="inline">ttlMs</code>，而且「不存在跨页一致性保证」：客户端在遍历一个很长的 <code class="inline">tools/list</code> 时，「可能会看到重复或缺口」。一旦某个游标失效，客户端 SHOULD 丢弃所有已缓存的页，从头再来。<code class="inline">ttlMs</code> 和 <code class="inline">cacheScope</code> 只存在于 <code class="inline">server/discover</code>、这四个列表方法以及 <code class="inline">resources/read</code> 上，所以缓存能帮到一个庞大的目录，却帮不到一个庞大的工具结果。</p>
+
+    <p>工具调用的分页很早就有人提了，却一直没人接手。Issue #229「Pagination for tool/call」自 2025-03-26 起就一直开着。Issue #798 提议加一个 <code class="inline">paginationHint</code> 注解，并在工具结果里加一个 <code class="inline">pagination: {hasMore, nextCursor}</code> 块，结果在提交当天就被关闭了。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3><code class="inline">tools/call</code> 给你的替代品：内容块、提示和一个判别字段，没有一样能约束大小。</h3>
+
+    <p>一个 2026-07-28 的工具结果包含 <code class="inline">content</code>、<code class="inline">structuredContent</code>、<code class="inline">isError</code>，以及新增的必填字段 <code class="inline">resultType</code>。内容块的类型有 <code class="inline">text</code>、<code class="inline">image</code>、<code class="inline">audio</code>、<code class="inline">resource_link</code> 和内嵌的 <code class="inline">resource</code>。没有任何字段说明结果可以多大，或者太大时该怎么办。看起来相关的四样东西，各有各的失灵方式：</p>
+
+    <ul>
+      <li><strong><code class="inline">structuredContent</code> 可能让你的账单翻倍。</strong>自 SEP-2106 起，它可以是任意 JSON 值。规范还写着「返回结构化内容的工具 SHOULD 同时在一个 TextContent 块里返回序列化后的 JSON」，以保持向后兼容。如果宿主把两份都交给模型，这份负载你就付了两次钱。（OpenAI Agents SDK 在 <code class="inline">use_structured_content=True</code> 时只用结构化的那一份。）在结构化数据旁边放一句简短的文字摘要，而不是把同一份 JSON 发两遍。</li>
+      <li><strong>注解只是提示，而大多数宿主会忽略它们。</strong>内容块可以带 <code class="inline">audience</code>（<code class="inline">"user"</code>、<code class="inline">"assistant"</code>）以及一个 0.0 到 1.0 的 <code class="inline">priority</code>。但没有任何 MUST 要求宿主对模型隐藏 <code class="inline">audience: ["user"]</code> 的内容。路线图自己也承认「大多数实现者都没有采用这些注解」，并提出了弃用它们的设想；试图澄清内容可见性的 SEP-2200 也已关闭。别指望 <code class="inline">priority: 0</code> 能把一个块挡在上下文窗口之外。</li>
+      <li><strong><code class="inline">resultType</code> 不是分块。</strong>它的取值是 <code class="inline">"complete"</code>、用于多轮往返请求（Multi Round-Trip Request）模式的 <code class="inline">"input_required"</code>，以及来自 Tasks 扩展的 <code class="inline">"task"</code>。<code class="inline">input_required</code> 是为<a href="/zh/deep-dives/mcp/mcp-sampling-and-elicitation" class="xref">引导（elicitation）与采样</a>的往返而设的，不是用来说「这是第一部分」的。</li>
+      <li><strong>Tasks 是异步，不是分块。</strong><a href="/zh/deep-dives/mcp/mcp-tasks-and-long-running-work" class="xref">任务句柄</a>让一次慢调用能活过一个 HTTP 响应。但最终结果仍然通过 <code class="inline">tasks/get</code> 整个送达，扩展的摘要也没有为它规定任何大小或分页规则。一个又慢又大的结果，只是变成了一个来得晚的大结果。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>宿主矩阵：一个 60,000 token 的结果会怎样，取决于是谁在读。</h3>
+
+    <p>规范对超大结果只字未提，所以每个宿主都自己拿主意。以下是截至 2026 年 10 月有文档记载的行为。有的宿主按 token 限制，有的按字符限制，两者之间的换算取决于内容：有位报告者测得，一个 50,000 字符的结果在拉丁文本下约合 34k token，在希腊文本下约合 48k（claude-code issue #97622）。</p>
+
+<pre class="standalone"><span class="c-cm">host                 limit                                  over the limit</span>
+<span class="c-kw">Claude Code</span>          warn at 10,000 tokens (fixed)          successful non-image result is <span class="c-out">saved to a file</span>;
+                     cap 25,000 tokens                      the model gets a message naming the path
+                       (<span class="c-fn">MAX_MCP_OUTPUT_TOKENS</span>)
+                     text over 50,000 chars                 saved to a file regardless of the env var,
+                                                            unless the tool raises its own limit
+                     errors over ~11,000 chars              <span class="c-out">first 5,000 + last 5,000 chars</span> kept
+<span class="c-kw">claude.ai / Desktop</span>  ~150,000 characters per tool result    <span class="c-err">not documented</span>
+<span class="c-kw">Codex CLI</span>            <span class="c-fn">tool_output_token_limit</span>, and per tool   truncated to the budget when stored in
+                     <span class="c-fn">mcp_servers.&lt;id&gt;.tools.&lt;tool&gt;</span>          history; the default comes from the model
+                       <span class="c-fn">.output_token_limit</span>                  catalog and is <span class="c-err">not documented</span>
+<span class="c-kw">Gemini CLI</span>           <span class="c-fn">tools.truncateToolOutputThreshold</span>      <span class="c-out">truncated</span> at 40,000 characters by default
+<span class="c-kw">Cursor</span>               none documented                        long MCP output is <span class="c-out">written to a file</span>
+                                                            the agent can read
+<span class="c-kw">VS Code Copilot</span>      none documented                        <span class="c-out">truncated</span>; the hint to read the rest
+                                                            <span class="c-err">fails</span> (vscode #311068)
+<span class="c-kw">OpenAI Agents SDK</span>    none documented                        forwarded; resource blocks become their
+                                                            JSON serialization as text</pre>
+
+    <p>拿一个 60,000 token 的结果把这张矩阵走一遍。Claude Code 把它移出对话，只留下一个文件路径。Gemini CLI 保留前 40,000 个字符。Codex 保留它给该工具的预算所允许的部分。Cursor 写成一个文件。claude.ai 如果能装进大约 150,000 字符就完整保留，装不下会怎样，文档没说。VS Code 在一次被报告的案例里——一个介于 50KB 到 999KB 之间的 <code class="inline">get_file_contents</code> 结果——截断了结果，并让模型去读一个 <code class="inline">vscode-chat-response-resource://</code> URI，而智能体读不了它，因为它「不在工作区内」。同一个服务器、同一次调用，六种不同的结果。唯一能让它们一致的是服务端：永远不返回超过最小宿主承受能力的内容。</p>
+
+    <p>Claude Code 自己的失败提示会让模型「使用分页、过滤或限制参数」，而这只有在你的工具真有这些参数时才管用。Figma 的文档里就展示了一个没有的工具：<code class="inline">get_design_context</code> 在 25,000 的上限面前返回了 351,378 个 token。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>工具级的分页契约：参数里放游标，预算按 token 算，截断标志放进结果里。</h3>
+
+    <p>既然协议把这件事留给了你，那就定义一次，然后用在每一个可能返回大量记录的工具上。通用的结果信封（状态、摘要、投影后的数据、省略计数、下一页游标）在<a href="/zh/deep-dives/tool-capability-design/shaping-tool-results" class="xref">塑造工具结果</a>里讲过。下面是 MCP 特有的部分：</p>
+
+    <ul>
+      <li><strong>把规范的游标规则照搬进你的参数。</strong>用一个由模型原样传回的不透明 <code class="inline">cursor</code> 字符串、一个由服务端选定的默认页大小，以及在游标过期时一个指明修复办法的 <code class="inline">isError</code> 结果。GitHub 的服务器在它基于游标的工具上用的是 <code class="inline">after</code> + <code class="inline">perPage</code>。GitHub 有个 bug（#2122）是这样的：某个工具的描述承诺了游标分页，schema 里却缺了 <code class="inline">after</code>——所以要拿 schema 去对照描述检查一遍。</li>
+      <li><strong>页的大小按 token 定，而不只是按记录数。</strong>Datadog 发现「一条 Datadog 日志消息可能只有 100 个字符，也可能有 1 MB」，所以 N 条记录的一页并没有大小上限。他们的服务器「在达到一定 token 数后截断响应，并返回一个用于获取更多内容的游标」。记录数上限照样保留，但让 token 或字符预算来结束这一页。</li>
+      <li><strong>多取一条记录来判断还有没有更多。</strong>MotherDuck 的服务器会取 <code class="inline">max_rows+1</code> 行（默认 1,024），以此判断结果是否被截断，设置 <code class="inline">truncated: true</code> 并附上警告，然后每次丢弃约 10% 的行，直到 JSON 低于 <code class="inline">max_chars</code>（默认 50,000）。多取一行比跑一次计数查询便宜。</li>
+      <li><strong>把标志放进结果里，紧挨着修复办法。</strong>Grafana 的 Loki 工具直接在响应里返回 <code class="inline">resultsTruncated</code> 和 <code class="inline">maxLinesAllowed</code>。模型看不见的截断，看起来就像一个完整的答案。</li>
+      <li><strong>保持排序稳定。</strong>规范对它自己的列表都不提供跨页一致性，你的工具也不会白白得到它。按唯一键排序，并把位置编码进游标，这样遍历途中插入的一条记录，就不会把后面每一页都挤偏一位。</li>
+      <li><strong>先减少字段，再加分页。</strong>PR #2563 引入精简类型后，GitHub 每个项目条目的负载从约 2,575 token 降到约 180 token（−93%，由维护者在 5 个真实条目上测得）。一条记录本身就有 17KB，什么页大小都救不了它。<a href="/zh/blogs/the-page-was-counted-in-records" class="xref">GitHub 服务器的案例研究</a>梳理了这段历史。</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm">// tools/call arguments: the contract lives here, not in the protocol</span>
+{<span class="c-kw">"name"</span>: <span class="c-st">"search_logs"</span>,
+ <span class="c-kw">"arguments"</span>: {<span class="c-kw">"query"</span>: <span class="c-st">"service:checkout status:error"</span>,
+               <span class="c-kw">"fields"</span>: [<span class="c-st">"ts"</span>, <span class="c-st">"host"</span>, <span class="c-st">"message"</span>],
+               <span class="c-kw">"max_records"</span>: 200,
+               <span class="c-cm">// whichever budget is hit first ends the page</span>
+               <span class="c-kw">"max_tokens"</span>: 8000,
+               <span class="c-kw">"cursor"</span>: <span class="c-st">"c2VhcmNoOjE3Mjk0MDAwMDA6NDQx"</span>}}
+
+<span class="c-cm">// result: the flag and the remedy are in-band</span>
+{<span class="c-kw">"resultType"</span>: <span class="c-st">"complete"</span>,
+ <span class="c-kw">"content"</span>: [{<span class="c-kw">"type"</span>: <span class="c-st">"text"</span>,
+   <span class="c-kw">"text"</span>: <span class="c-st">"141 of 3,912 matching lines (stopped at the 8,000-token budget). Pass next_cursor for more, or add host:… to narrow."</span>}],
+ <span class="c-kw">"structuredContent"</span>: {
+   <span class="c-kw">"records"</span>: [<span class="c-cm">/* 141 projected records */</span>],
+   <span class="c-kw">"truncated"</span>: <span class="c-kw">true</span>,
+   <span class="c-kw">"total_estimate"</span>: 3912,
+   <span class="c-kw">"stopped_by"</span>: <span class="c-st">"token_budget"</span>,
+   <span class="c-kw">"next_cursor"</span>: <span class="c-st">"c2VhcmNoOjE3Mjk0MDAwMDA6NTgy"</span>}}</pre>
+
+    <p>文本块是一句摘要，而不是 JSON 的副本，所以同时把两者展示给模型的宿主也不会让你付两次钱。<code class="inline">max_tokens</code> 的默认值由你决定，而矩阵定下了它的天花板：要远低于 Gemini CLI 的 40,000 字符和 Claude Code 的 10,000 token 警告线。返回之前先测量，正如 Block 的 MCP 实践手册所建议的那样（字节数、字符数、估算 token 数）。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>句柄与落盘文件：用对 <code class="inline">resource_link</code>，并输出宿主可以 grep 的内容。</h3>
+
+    <p>当数据大到没法在对话里分页时，规范只提供了一个引用。「工具 MAY 返回指向 Resources 的链接……工具会返回一个可由客户端订阅或获取的 URI。」一个 <code class="inline">resource_link</code> 带有 <code class="inline">uri</code>、<code class="inline">name</code>、<code class="inline">description</code> 和 <code class="inline">mimeType</code>。用对它，意味着：</p>
+
+    <ul>
+      <li>一个<strong>稳定的 URI</strong>，等模型终于去读它时仍然能解析，因为工具返回的链接「不保证出现在 <code class="inline">resources/list</code> 请求的结果里」；</li>
+      <li>Resource 可选的 <strong><code class="inline">size</code></strong>（字节数）和准确的 <strong><code class="inline">mimeType</code></strong>，让客户端能决定到底要不要去取；</li>
+      <li>以及一段<strong>说明里面有什么的描述</strong>：「3,912 行日志，14:00–15:00 UTC，最新的在前」。</li>
+    </ul>
+
+    <p>然后要做好链接通向死胡同的准备。<code class="inline">resources/read</code> 没有范围读取，也没有分页（范围读取只作为 File Uploads 工作组的一个议题存在），所以获取一个 2MB 的资源就是返回 2MB。许多宿主根本没给模型读取 URI 的途径。尚未合并的 PR #2527 会加一条 SHOULD，要求客户端把资源读取能力暴露给模型；在类似的东西落地之前，<code class="inline">resource_link</code> 在许多客户端里都是一条死路。把它当作分页工具的补充，而不是替代。</p>
+
+    <p>更常见的情况是，不管你要不要，宿主都会把你的结果落盘成文件。Claude Code 和 Cursor 都这么做。而这只有在智能体能读取文件的一部分时才有用：</p>
+
+    <ul>
+      <li><strong>让它按行组织。</strong>Notion 的 <code class="inline">notion-fetch</code> 返回了一个 2,376 行、41,207 token 的页面，却是被压缩到大约五行里的 JSON（notion-mcp-server #206）。Claude Code 把它转存出去之后，智能体没法只读其中一部分，因为 Read 是按行偏移分页的。而整份读取又撞上了 25,000 token 的上限。JSON Lines、Markdown 或每行一条记录，能让落盘文件依然可以用 <code class="inline">grep</code>、<code class="inline">head</code> 和偏移量来读。</li>
+      <li><strong>别让往返编辑依赖模型复述正文。</strong>一个 ADF 格式的 Confluence 页面有 50–70KB。当 Claude Code 把 <code class="inline">getConfluencePage</code> 的输出持久化到磁盘时，模型从未见过正文，也就没法为 <code class="inline">updateConfluencePage</code> 重建它——那本来意味着要内联输出约 15K token（atlassian-mcp-server #106）。编辑类工具应该接收补丁、章节 id 或服务端句柄，而不是要求把整份文档传回来。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p><strong><code class="inline">_meta["anthropic/maxResultSizeChars"]</code> 是权宜之计，不是解决方案。</strong>把它声明在某个工具的 <code class="inline">tools/list</code> 条目上，就能把 Claude Code 对该工具文本结果的阈值调高，最高到 500,000 字符的硬上限，与 <code class="inline">MAX_MCP_OUTPUT_TOKENS</code> 相互独立。把它用在那些大输出本身就是目的的工具上，比如用户明确要求读取整个文件的文件读取工具。它对其他任何宿主都不起作用，所以依赖它的工具照样会撑爆 Gemini CLI 的 40,000 字符和 claude.ai 的约 150,000 字符。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>什么会来，什么不会来。别等它。</h3>
+
+    <p>协议层面的修复在路线图上，但不在规范里。路线图最近一次更新于 2026-08-22，在一个仍在组建中的 Core Primitives 工作组名下列了三个相关条目。没有一项已经发布，也没有一项有日期：</p>
+
+    <ul>
+      <li>对 <strong><code class="inline">tools/call</code> 接口的重新设计</strong>，「以解决不同返回类型之间的保真度差异，并简化结构化与非结构化输出的处理」；</li>
+      <li><strong>渐进式发现</strong>，让客户端「在需要时才了解工具和资源，而不是一开始就吞下整个目录」——这解决的是目录这一侧，不是结果这一侧；</li>
+      <li>用于缓存的 <strong>ETags</strong>，「尤其是工具调用」，这样客户端可以重新验证一个结果，而不必再取一遍。</li>
+    </ul>
+
+    <p>流式相关的提案都被关闭了。SEP-2664（通过带分块的进度通知流式返回工具结果）于 2026-07-02 关闭。SEP-2998（部分工具结果）于 2026-09-22 关闭，维护者的说明是「每一个新 SEP 都应在工作组的协助下推进」，也就是说它是因流程原因被关闭的，这个想法还可能通过某个工作组卷土重来。关于流式工具结果的 Issue #117 自 2024 年 12 月起一直开着。没有任何已接受或在推进中的 SEP 定义了结果大小上限或分块的 <code class="inline">tools/call</code> 结果。</p>
+
+    <div class="callout tip">
+      <p>按协议的现状来构建。每个可能返回无上限记录数的工具，都需要一个不透明游标、一个能结束当前页的 token 预算、一个紧挨着补救说明的 <code class="inline">truncated</code> 标志，以及稳定的排序。先减少返回字段，再加分页；凡是宿主可能落盘的内容，都要按行组织。如果 <code class="inline">tools/call</code> 的重新设计真的发布了，这样构建的工具只需换一个信封；而依赖宿主来兜底的工具则需要重新设计。到底该构建哪些工具，见<a href="/zh/deep-dives/mcp/mcp-tool-design" class="xref">设计 MCP 工具</a>。对于不归你管的服务器，如何在宿主一侧控制溢出的内容，见<a href="/zh/operations/agentops/mcp-context-overload" class="xref">当 MCP 结果撑爆上下文</a>。</p>
+    </div>
+  </div>
+</section>
