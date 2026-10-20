@@ -1,0 +1,104 @@
+<section class="phase">
+  <div class="phase-num">E26</div>
+  <div class="week">Operation · Evaluation &amp; Observability</div>
+  <h2>Thresholds for decision models.</h2>
+  <p class="goal">Swap an LLM classifier call for a decision model and the thing you actually ship is a threshold, not a model — and as of October 2026 no vendor publishes the calibration evidence needed to set one. The probability is worth exactly what you measure on your own labelled traffic, and the cost saving exists only for the share of traffic you can automate above that line.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Why the threshold is the artifact, and why nobody hands it to you.</h3>
+
+    <p>A <a class="xref" href="/concepts/decision-models">decision model</a> — TypeSafe's Jev, the OpenAI Decisions API, Cloudflare's Clef and the rest of the wave compared in <a class="xref" href="/blogs/jev-vs-openai-decisions-vs-clef-vs-pplx-decider">the category write-up</a> — takes a state and a set of typed questions and returns a probability distribution instead of prose. That removes malformed output. It does not remove wrong output, and it does not tell you at what probability an answer is safe to act on. That number is yours to find, and it is the part of the integration that decides whether it works.</p>
+
+    <p>The evidence you would want is missing. As of October 2026, TypeSafe's launch post claims "higher confidence means higher accuracy" with no metrics, and its "antibenchmaxxing" post says it will not publish public benchmark tables at all. OpenAI's Decisions guide tells you to set thresholds from labelled examples and publishes no calibration numbers either. The only published expected calibration error for Jev comes from a third party, the Pinocchio paper (arXiv:2609.24881): ECE 0.133, AUROC 0.666, Brier 0.240 over 1,718 responses — on an off-label task, grading another model's answers, not the in-distribution classification Jev is sold for. It is a warning, not a number you can use.</p>
+
+    <p>One more thing narrows the signal: Jev's <code>confidence</code> field is a deterministic function of <code>probabilities</code>. For a Choice it is <code>(n·p_max − 1)/(n − 1)</code>, so (0.6, 0.3, 0.1) and (0.6, 0.2, 0.2) both read 0.4. It adds no information the distribution did not already carry; any calibration claim attaches to the probabilities. The general theory of turning a score into an abstention gate lives on <a class="xref" href="/concepts/uncertainty-and-calibration">uncertainty and calibration</a>; this page is the runbook for doing it against a decision-model API.</p>
+
+    <div class="callout">
+      <p>The stakes are visible in Vercel's own numbers. Its AI Gateway Production Index (15 October 2026) says 35.3% of paid teams tried Jev in its first two weeks, while it accounted for roughly a quarter of a percent of spend (the report gives 0.27% in its summary). Trying a decision model is cheap. Putting real traffic behind it means doing the work on this page.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Build the labelled set from your own traffic, and size it by arithmetic.</h3>
+
+    <p>Run the decision model in <a class="xref" href="/operations/evaluation-and-observability/shadow-mode-and-dark-launches">shadow</a> beside the LLM call it is meant to replace, on real production inputs, and record both answers plus the full <code>probabilities</code> object. A curated eval set will not do: calibration is a property of a distribution, and the only distribution that matters is yours. TypeSafe's MIT-licensed <code>system-one-adapter-python</code> runs the same typed questions against OpenAI, Anthropic, Gemini or any OpenAI-compatible endpoint, so the incumbent and the candidate can answer the identical question shape — the natural harness for the comparison.</p>
+
+    <p>Label ground truth with humans, not with the incumbent LLM. Agreement with the old model measures imitation; you want correctness. If you scale labelling with a model judge, calibrate the judge first per <a class="xref" href="/operations/evaluation-and-observability/llm-as-judge-for-agents">LLM-as-judge for agents</a>.</p>
+
+    <p>Size the set from the error rate you need to see, not from a round number. Suppose the auto-act band must hold errors near 2%, and you want to know that to within ±1 point at 95% confidence. The normal approximation gives <code>n = 1.96² × 0.02 × 0.98 / 0.01² ≈ 753</code> labelled examples <em>inside the act band</em>. If you expect that band to hold about half your traffic, that is roughly 1,500 labelled inputs overall, before you have looked at the bands below it. The zero-error shortcut is the same message from the other side: seeing no errors in <em>n</em> examples only bounds the true rate at about <code>3/n</code>, so 300 clean examples prove "under 1%", not "zero". Tighter tolerance costs quadratically more labels; decide what you can afford to know before you pick a tolerance you cannot verify.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Read calibration off the probabilities, then pick the operating point.</h3>
+
+    <p>With the labelled set in hand, take the top probability of each answer (for a Noul, the probability itself; it has no <code>confidence</code> field, and a value near 0.5 is the model saying it is unsure). Bin it — tenths are fine at this sample size — and plot accuracy per bin against the bin's mean probability. That reliability diagram tells you whether "0.9" means nine in ten on your traffic. Then sweep a threshold and draw the coverage–risk curve: at each cut, the share of inputs you would answer and the error rate among them.</p>
+
+    <p>Choose the threshold from the curve, per question, by the error you can tolerate for that question. Routing a ticket to the wrong queue and auto-approving a refund are different questions with different thresholds; a single global threshold means you set it for the riskiest one and pay in coverage everywhere else. TypeSafe's docs suggest also trying the top probability and the ratio of top to second probability as signals; if a confirm threshold sits low, a margin test (top minus second) separates a clear 0.55 winner from a 0.55/0.45 coin-flip.</p>
+
+    <div class="callout">
+      <p>Do the cost arithmetic at the chosen point, not at 100%. If 70% of traffic clears the act threshold, the other 30% still goes to the old LLM path or a person, so your bill is the decision model on everything plus the incumbent on the remainder. The headline multipliers — TypeSafe's homepage claims 444.6× cheaper from its own workflow evals, while OpenChamber's tally of user reports found a median of 30× — describe the automated fraction, not your total.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Three bands, scaled to blast radius, with somewhere real to escalate.</h3>
+
+    <p>TypeSafe's confidence docs recommend three bands rather than one cut: high confidence acts, medium confirms, low escalates, with thresholds scaled to the risk of the action. Use that shape.</p>
+
+    <ul>
+      <li><strong>Act.</strong> Above the upper threshold the decision executes with no review. This is the only band that saves money, and the only one whose error rate you measured precisely in STEP 2.</li>
+      <li><strong>Confirm.</strong> Between the thresholds the decision is prepared and a cheap check — a human click, a deterministic rule, a second question — releases it.</li>
+      <li><strong>Escalate.</strong> Below the lower threshold the input goes to the old LLM path or to a person. Keep that path alive and budgeted; decommissioning it the week the new model lands is how the escalate band becomes an outage.</li>
+    </ul>
+
+    <p>Scale the upper threshold to what an error costs. A reversible label can live with a lower bar than an irreversible action, and an action that touches money or a customer should usually have no act band at all until the data says otherwise.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Probe the known jagged edges before trusting the curve.</h3>
+
+    <p>A clean coverage–risk curve on in-distribution traffic says nothing about the ways the model is known to bend. Test each before you promote:</p>
+
+    <ul>
+      <li><strong>Option order.</strong> TypeSafe's Jev 1.13 jaggedness page (last reviewed 2 October 2026) says a Choice "leans toward the option that comes first". Re-run a sample with options permuted and measure how often the answer or the band changes.</li>
+      <li><strong>Repeat requests.</strong> Pinocchio reports Jev returning different scores for identical repeated requests, worth roughly 0.02 of run-to-run variation in their AUROC; TypeSafe's docs promise similar answers for similar inputs but no determinism guarantee. Send identical requests several times and count band flips near each threshold.</li>
+      <li><strong>Adversarial state.</strong> The docs concede the model does not treat state as hostile. HiddenLayer showed an injected page element hijacking a checkout decision; Wu &amp; Lim (arXiv:2609.28613) found injected text shifts probabilities but rarely flips the chosen answer, with adaptive attacks raising success from 1.8% to 3.5%. Read that carefully: a shifted probability can move an answer across your threshold even when the argmax holds.</li>
+      <li><strong>Arithmetic and dates.</strong> The docs say plainly that Jev "is not a calculator" and reads dates as text. Compute counts, sums and date comparisons in code and ask the model only the judgement that remains.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Pin the version, tie thresholds to it, and watch the bands.</h3>
+
+    <p>A threshold is a fact about one model version. The alias moves underneath you: as of 19 October 2026 <code>jev-latest</code> points to 1.13.0, and TypeSafe's 1.14 post says it moves to 1.14.0 one week after the 14 October release, so around 21 October. The docs say aliases move silently and advise pinning the versioned ID if you tuned thresholds against one version. TypeSafe plans 60 days' notice before 1.13.0 is deprecated and 30 days for 1.14.0; the formal deprecation policy is promised but unpublished. Treat every bump as a new model: re-run the labelled set, redraw the curve, re-derive the thresholds, per <a class="xref" href="/operations/agentops/model-deprecation-and-migration">model deprecation and migration</a> and <a class="xref" href="/operations/agentops/unpinned-vendor-defaults">unpinned vendor defaults</a>.</p>
+
+    <pre class="standalone"><span class="c-cm"># request: pin the version the thresholds were derived on</span>
+{ <span class="c-st">"model"</span>: <span class="c-st">"jev-1.13.0"</span>, ... }   <span class="c-cm"># not "jev-latest": the alias moves silently</span>
+
+<span class="c-cm"># thresholds are keyed by version; values here are illustrative</span>
+THRESHOLDS = { <span class="c-st">"jev-1.13.0"</span>: { <span class="c-st">"act"</span>: 0.97, <span class="c-st">"confirm"</span>: 0.80 } }
+
+<span class="c-cm"># choice/score answers; for a noul, use max(p, 1 - p) of its "noul" value</span>
+<span class="c-kw">def</span> <span class="c-fn">band</span>(response, question):
+    t = THRESHOLDS[response[<span class="c-st">"model"</span>]]       <span class="c-cm"># unknown version -&gt; KeyError, by design</span>
+    probs = response[<span class="c-st">"answers"</span>][question][<span class="c-st">"probabilities"</span>]
+    top = <span class="c-fn">max</span>(probs.values())                  <span class="c-cm"># read probabilities, not "confidence"</span>
+    <span class="c-kw">if</span> top &gt;= t[<span class="c-st">"act"</span>]:     <span class="c-kw">return</span> <span class="c-st">"act"</span>
+    <span class="c-kw">if</span> top &gt;= t[<span class="c-st">"confirm"</span>]: <span class="c-kw">return</span> <span class="c-st">"confirm"</span>
+    <span class="c-kw">return</span> <span class="c-st">"escalate"</span>                         <span class="c-cm"># old LLM path or a human</span></pre>
+
+    <p>The response echoes the model that answered, so key the lookup on it rather than on what you asked for; an unknown version then fails loudly instead of silently borrowing old thresholds.</p>
+
+    <p>In production, three signals carry most of the weight. <strong>Band populations</strong>: the share of traffic in act, confirm and escalate is the cheapest regression signal you have, because it needs no labels and moves the day the model or the input distribution shifts. <strong>Escalation rate</strong>: it is the real cost driver, since every escalated input pays for both models. <strong>Spot labels from the act band</strong>: sample a small, steady slice of auto-acted decisions for human review, because that band is where errors ship unseen and where your STEP 2 estimate quietly goes stale. Wire all three into <a class="xref" href="/operations/evaluation-and-observability/quality-regression-detection">quality regression detection</a>.</p>
+
+    <div class="callout tip">
+      <p>Before you route a single live decision: shadow the decision model beside the incumbent and human-label enough traffic to measure the act band's error rate at the precision you need (about 750 in-band examples for 2% ± 1%). Draw the reliability diagram and coverage–risk curve from <code>probabilities</code>, ignoring <code>confidence</code>. Set three bands per question, scaled to blast radius, and keep the escalate path funded. Permute options, repeat requests, inject hostile state. Pin <code>jev-1.13.0</code> or its equivalent, key thresholds by version, and re-derive on every bump. Then watch band shares, escalation rate and act-band spot labels. If you keep one sentence: the vendor sells the model, and the threshold you have to build yourself.</p>
+    </div>
+  </div>
+</section>
