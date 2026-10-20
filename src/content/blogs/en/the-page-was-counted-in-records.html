@@ -1,0 +1,145 @@
+<p class="lede">GitHub's official MCP server paginated from the start — <code>perPage</code> up to 100, <code>after</code> cursors on the newer tools — and its issue tracker still filled with single calls that broke the context window: 30 commits at more than 64k tokens, 30 pull requests at 508KB, 50 project items at about 100K tokens. Pagination bounds how many records come back. The context window is a budget of tokens, and a record can weigh anything. Count your pages in tokens, cut fields before you page, and assume the host your users run will handle the overflow differently from the one you tested.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>The overflow reports on <code>github/github-mcp-server</code>, as of October 2026. Sizes are what each reporter measured, except PR #2563's, which the maintainers measured.</p>
+  <table>
+    <thead>
+      <tr><th>Filed</th><th>Tool</th><th>Reported size</th><th>Response</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>2025-04-06 (#142)</td><td><code>list_commits</code></td><td>30 commits, &gt;64k tokens; ~5–6KB per commit</td><td>Reporter asked for field filtering</td></tr>
+      <tr><td>2025-05-22 (#425)</td><td><code>get_pull_request_comments</code></td><td>26,688 tokens against Claude Code's 25,000 cap</td><td>Requests for pagination followed (#567, #625)</td></tr>
+      <tr><td>2025-06-29 (#608)</td><td><code>get_job_logs</code></td><td>Full logs "can easily exceed LLM context limits"</td><td><code>tail_lines</code> parameter</td></tr>
+      <tr><td>2026-02-02 (#1934)</td><td><code>list_pull_requests</code></td><td>30 PRs, 508KB; ~17KB per PR, 36KB in another query</td><td>Still open; PR #2675 makes <code>search_pull_requests</code> minimal by default</td></tr>
+      <tr><td>2026-03-02 (#2122)</td><td><code>pull_request_read</code></td><td>Payloads above ~50–100KB pin Cursor and VS Code at 100% CPU</td><td>PR #2489 exposed the missing <code>after</code> cursor</td></tr>
+      <tr><td>2026-04-24 (#2383)</td><td>projects</td><td>50 items, ~400KB, ~100K tokens</td><td>PR #2563 minimal types: −93% per item</td></tr>
+      <tr><td>2026-09-07 (#3236)</td><td><code>pull_request_read</code> <code>get_files</code></td><td>Always returns full patches</td><td>Open; #3286 asks for field filtering</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <img src="/blogs/the-page-was-counted-in-records/data-page-of-fifty.svg" alt="Bar chart: a page of 50 GitHub project items is about 128,750 tokens with full objects and about 9,010 tokens with the minimal types from PR #2563, against Claude Code's 10,000-token warning and 25,000-token default cap" width="900" height="400" loading="lazy" />
+    <figcaption>The same page of 50 records, before and after projection. The page size did not change; what each record carries did.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>A paper trail from one server</h2>
+  <p>Most MCP servers that overflow a context window leave no record. GitHub's left eighteen months of one, because its users file issues and its maintainers answer them in public. Read in order, the issues tell the same story every time.</p>
+  <p>The first, #142 in April 2025, was a <code>list_commits</code> call on <code>zalando/skipper</code>. Thirty commits produced more than 64k tokens on the next model call, about 5–6KB per commit. The reporter was a tier-1 OpenAI user and got a 429: the request needed 68,490 tokens against a limit of 30,000 tokens per minute. That is the one hard cost number in this story. The call was well within its page size and still could not be sent.</p>
+  <p>The pattern held. In May 2025 <code>get_pull_request_comments</code> returned 26,688 tokens to a Claude Code user whose cap was 25,000 (#425). In June, a report that complete job logs "can easily exceed LLM context limits" led to a <code>tail_lines</code> parameter (#608). In February 2026, <code>list_pull_requests</code> returned 508KB for 30 PRs — about 17KB each, 36KB each on another query — and the reporter asked for the <code>minimal_output</code> option that <code>search_repositories</code> already had (#1934, still open). In April, 50 project items came to about 400KB, roughly 100K tokens, which the reporter called "roughly half of a typical LLM context window"; two pages of 50 fill one (#2383).</p>
+  <h3>The cause was the record, not the count</h3>
+  <p>GitHub's REST objects are built for programs that ignore what they don't need: user objects carry more than fifteen URL templates, plus reactions and metadata a model will never use. Passed through unchanged, five to seventeen kilobytes per record times a <code>perPage</code> limit of 100 is a page no model can hold. The server's page sizes were reasonable for an HTTP client and far too large for a context window.</p>
+  <p>The fix that worked, each time, was projection. PR #2563, merged on 28 May 2026, added minimal types for project items. The maintainers measured five live items at about 12,875 tokens before and 901 after — a 93.0% cut, from roughly 2,575 tokens per item to 180. Scaled to a page of 50, that is 128,750 tokens down to 9,010. The page size stayed the same, and every record got smaller. The same fix is now spreading endpoint by endpoint: a <code>fields</code> parameter on the issue and pull-request list and search tools, whose README notes that "omitting <code>body</code> drops the largest per-result data"; PR #2675 making <code>search_pull_requests</code> compact by default with <code>minimal_output: false</code> to get the raw objects back; and the minimal types collected in <code>pkg/github/minimal_types.go</code>. As of October 2026, <code>pull_request_read</code> is next in line, still returning full patches from <code>get_files</code> (#3236).</p>
+  <h3>Pagination you cannot reach is not pagination</h3>
+  <p>Issue #2122, from March 2026, shows the other way record pagination fails. <code>pull_request_read</code>'s <code>get_review_comments</code> method advertised cursor pagination, but the <code>after</code> argument was missing from the tool's schema, and <code>page</code> and <code>perPage</code> were silently ignored by three methods. The model could not ask for a second page because nothing in the schema let it. The results, above about 50–100KB, pushed Cursor and VS Code to 100% CPU and needed a hard restart. PR #2489 exposed <code>after</code> and the issue closed in May. A cursor only works if the model can see it in the schema, and only helps if every page fits.</p>
+</section>
+
+<section>
+  <h2>Why a record count cannot bound a window</h2>
+  <figure>
+    <img src="/blogs/the-page-was-counted-in-records/arch-count-vs-budget.svg" alt="Diagram: the same five records, one of them a 1 MB log. Paged by count, all five come back and the page runs past the token budget. Paged by token budget, four come back with a nextCursor and a truncated flag, and the fifth starts the next page" width="900" height="500" loading="lazy" />
+    <figcaption>A page size in records makes the page's token cost whatever the records happen to weigh. A budget fixes the cost and lets the record count vary.</figcaption>
+  </figure>
+  <p>Datadog reached the same conclusion from the opposite kind of data. Its engineers found their agents running out of context because "a few of the logs were huge" — "a Datadog log message might be only 100 characters or it might be 1 MB". No record count bounds that. So they changed what a page means: "The server cuts off its response after a certain number of tokens and returns a cursor for more." The page is defined by tokens, and the cursor carries the rest.</p>
+  <p>They then worked on the cost of each record. CSV used "about half as many tokens" as JSON per record; YAML saved "around 20%" on nested data; the format change plus dropping rarely used fields fit "about 5x more records in the same number of tokens" for some tools. The biggest win was letting agents aggregate instead of page. With SQL, agents could <code>SELECT</code> fields, <code>LIMIT</code> rows or <code>COUNT</code>, and evals ran "about 40% cheaper".</p>
+  <p>Two other servers show what a size-aware page looks like in code. MotherDuck's DuckDB server caps rows at 1,024 and characters at 50,000 by default. It fetches one row more than the cap to find out whether more exists, sets <code>truncated: true</code> with a warning ("Results limited to N rows. Query returned more data."), and if the JSON is still over the character cap it drops about 10% of the rows at a time until it fits. Grafana's <code>query_loki_logs</code> defaults to 10 lines with a maximum of 100 and returns <code>resultsTruncated</code> and <code>maxLinesAllowed</code> alongside the data, and the server has a response-body byte limit that rejects an oversized response with an error rather than passing it on.</p>
+  <p>The servers that take neither precaution show the default. ClickHouse's server documents a query timeout but no row cap; <code>crystaldba/postgres-mcp</code> calls <code>fetchall()</code> with no limit. A <code>SELECT *</code> on a large table through either is bounded only by whatever the host decides to do with it — which is the subject of the next section.</p>
+</section>
+
+<section>
+  <h2>The protocol pages the catalog, not the call</h2>
+  <p>MCP has pagination. It covers exactly four methods — <code>tools/list</code>, <code>resources/list</code>, <code>resources/templates/list</code> and <code>prompts/list</code> — in both the 2025-11-25 and 2026-07-28 revisions. The spec's own wording is "list operations". <code>tools/call</code> has no cursor, no size limit and no chunking in either revision. Every server that pages a tool result invents its own <code>page</code>, <code>perPage</code>, <code>after</code> or <code>cursor</code> argument, as GitHub did.</p>
+  <p>This is not for lack of asking. Issue #229, "Pagination for tool/call", has been open since 26 March 2025. Issue #798 proposed a <code>paginationHint</code> annotation and a <code>pagination: {hasMore, nextCursor}</code> block in tool results and was closed the day it was filed. Two proposals for streaming partial results were closed this year: SEP-2664 on 2 July and SEP-2998 on 22 September, with a maintainer noting that "every new SEP should be developed with the help of a Working Group". The roadmap, last updated 22 August 2026, lists a redesign of the <code>tools/call</code> result shape, "progressive discovery" and ETags for tool-call results. All three are planned. None has shipped or been given a date.</p>
+  <h3>Two bloats, one of them addressed</h3>
+  <p>The well-known context savings of the past year are mostly on the other side of this line. Anthropic's Tool Search cuts tool-<em>definition</em> tokens by about 85%; Cloudflare's Code Mode server describes 2,500-plus endpoints in about 1,000 tokens of definitions instead of 1.17 million; Cursor's folder of synced tool descriptions cut total agent tokens by 46.9% in runs that called an MCP tool. All three shrink the catalog the model reads before it calls anything. None of them makes a single <code>list_pull_requests</code> response smaller. The protocol pages the catalog, and so does most of the industry's optimisation work.</p>
+  <h3>So the host decides, and the hosts disagree</h3>
+  <figure>
+    <img src="/blogs/the-page-was-counted-in-records/arch-host-overflow.svg" alt="Diagram: one oversized tools/call result fans out to six hosts. Claude Code and Cursor spill it to a file; claude.ai and Desktop cap it at about 150,000 characters; Codex CLI applies a token budget that can be set per tool; Gemini CLI truncates at 40,000 characters; VS Code truncates and points at a URI the agent cannot read" width="900" height="500" loading="lazy" />
+    <figcaption>One server, one response, six different outcomes. Nothing in the result tells the host which one the server would want.</figcaption>
+  </figure>
+  <p>With nothing in the protocol, every host sets its own ceiling and its own behaviour past it. As of October 2026:</p>
+  <table>
+    <thead>
+      <tr><th>Host</th><th>Ceiling</th><th>Past the ceiling</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Claude Code</td><td>25,000 tokens by default (<code>MAX_MCP_OUTPUT_TOKENS</code>); warns at 10,000; text over 50,000 characters regardless, unless the server raises that tool's limit</td><td>Successful non-image results are saved to a file and replaced by a message naming the path. Error results over ~11,000 characters keep the first and last 5,000.</td></tr>
+      <tr><td>claude.ai and Claude Desktop</td><td>~150,000 characters per tool result</td><td>Not documented</td></tr>
+      <tr><td>Codex CLI</td><td><code>tool_output_token_limit</code>, and per tool <code>mcp_servers.&lt;id&gt;.tools.&lt;tool&gt;.output_token_limit</code> (merged 28 August 2026)</td><td>Truncated to the token budget; the default is not documented</td></tr>
+      <tr><td>Gemini CLI</td><td><code>tools.truncateToolOutputThreshold</code>, 40,000 characters by default</td><td>Truncated</td></tr>
+      <tr><td>Cursor</td><td>None documented</td><td>Long MCP output written to a file the agent can read (January 2026)</td></tr>
+      <tr><td>VS Code Copilot</td><td>None documented</td><td>Truncated, with a link to the rest that the agent cannot open (microsoft/vscode#311068)</td></tr>
+    </tbody>
+  </table>
+  <p>The units do not even agree. Claude Code's main limit is in tokens, but its 50,000-character file threshold is in characters, and an open issue (#97622) reports a 50,000-character result measuring about 34k tokens in Latin text and about 48k in Greek. Gemini CLI and claude.ai count characters; Codex counts tokens. A page a server author tuned to fit one host can be several times over the line on another.</p>
+</section>
+
+<section>
+  <h2>The file spill is not a page</h2>
+  <p>Spilling to a file looks like the host solving the problem. The result is kept, the window is spared, and the model can read what it needs. Datadog's write-up notes that Cursor and Claude Code now do this and that it may make format efficiency matter less — and that it "is not in the MCP spec yet". In practice the file only helps if the model can read part of it and act on what it reads. Three reports show where that breaks.</p>
+  <ul>
+    <li><strong>Notion, #206 (February 2026).</strong> <code>notion-fetch</code> returned a 2,376-line, 41,207-token page as JSON compressed onto about 5 lines. Claude Code saved it to a file, but its Read tool pages by line offset, so five enormous lines could not be read in part, and reading the whole file failed with "exceeds maximum allowed tokens (25000)". The data was on disk and unreachable.</li>
+    <li><strong>Atlassian, #106 (March 2026).</strong> A Confluence page's ADF body runs 50–70KB. The reporter says Claude Code persists outputs over about 20KB to disk, so the model never saw the body — and to call <code>updateConfluencePage</code> it would have had to emit about 15K tokens of it inline. Reading worked; editing what was read did not. The spill broke the round trip.</li>
+    <li><strong>VS Code, #311068.</strong> A <code>get_file_contents</code> result of 50KB to 999KB is truncated before it reaches the model, with a hint to read the rest through a <code>vscode-chat-response-resource://</code> URI. Reading that URI fails as "outside the workspace". Tested with 120KB and 233KB files on VS Code 1.116.0, the agent is simply stuck.</li>
+  </ul>
+  <p>The hosts are adjusting. Claude Code 2.1.105 began giving the model format-specific recipes for oversized output — <code>jq</code> for JSON, chunk sizes for text — and 2.1.287 stopped telling Claude to page large JSON with Read's offset and limit. That second fix addresses the same trap the Notion report fell into. But each host fixes its own spill, on its own schedule. A server cannot rely on any of them.</p>
+</section>
+
+<section>
+  <h2>What to do on the server side</h2>
+  <p>The server is the one place that knows what a record contains and which fields matter. The four practices below come from the servers that stopped overflowing.</p>
+  <h3>Count the page in tokens</h3>
+  <p>Take a budget, not just a count: add records until the next would cross it, then return a cursor. Keep a record cap as well — it stops a page of tiny records from becoming a very long list — but let the budget decide where the page ends. Measure the budget the way the host will, and since hosts count both tokens and characters, cap both. The Block team's playbook for MCP servers puts the first step plainly: measure output before returning it.</p>
+  <h3>Project before you page</h3>
+  <p>Return the fields an agent will act on by default and make the full object something it asks for. GitHub's −93% came entirely from this, with no change to page size. Keep the identifiers, though. Anthropic's Slack example cut a response from 206 tokens to 72 with a concise format, and the concise form dropped the IDs that later calls need — so "minimal" has to mean minimal for the next call, not for display. Where the agent wants a number rather than rows, give it a way to aggregate, as Datadog's SQL tool does.</p>
+  <h3>Put the truncation flag and the remedy in the result</h3>
+  <p>The model should never have to guess whether it got everything. Fetch one more than the limit to know, say so in a field, and add a sentence on what to do next. Anthropic's tool-writing guidance asks for truncation text that steers the agent toward "many small and targeted searches". A sketch of the envelope, with field names of your choosing:</p>
+  <pre class="standalone">{
+  "items": [ { "number": 4182, "title": "Fix cursor reset", "state": "open" } ],
+  "returned": 40,
+  "truncated": true,
+  "reason": "token_budget",
+  "nextCursor": "eyJvIjo0MH0",
+  "hint": "More PRs match. Pass nextCursor for the next page, or narrow with state or author."
+}</pre>
+  <h3>Design for the smallest host</h3>
+  <p>Size your default page for the strictest host your users run, not for the one on your desk. That means under Claude Code's 25,000-token default — preferably under its 10,000-token warning — and under Gemini CLI's 40,000 characters. Claude Code lets a server raise a single tool's limit through <code>_meta["anthropic/maxResultSizeChars"]</code>, up to 500,000 characters. That is one host's escape hatch, not a fix. If a result must go to a file, make the file line-structured so a reader that pages by line can use it, and don't build an edit flow that needs the model to re-emit a body it could not read.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Does MCP support pagination for tool results?</h3>
+  <p>No. As of the 2026-07-28 revision, MCP pagination covers only tools/list, resources/list, resources/templates/list and prompts/list. A tools/call result has no cursor, no size limit and no chunking, so a server that pages tool results has to define its own cursor argument.</p>
+  <h3>Why did GitHub's MCP server overflow context windows if it paginated?</h3>
+  <p>Its pages were counted in records, and its records were large — 5–6KB per commit and 17–36KB per pull request in the reported cases. A page of 30 could exceed 64k tokens. Minimal response types, not smaller pages, fixed it: PR #2563 cut project items by 93%.</p>
+  <h3>What happens when an MCP tool result is too large in Claude Code?</h3>
+  <p>Claude Code warns at 10,000 tokens and has a 25,000-token default cap, set with MAX_MCP_OUTPUT_TOKENS. A successful text result over the cap, or over 50,000 characters, is saved to a file, and the model gets a message with the file path. Error results over about 11,000 characters keep only the first and last 5,000.</p>
+  <h3>How big should an MCP tool's page be?</h3>
+  <p>Set it in tokens or characters, not records, and size it for the strictest host your users run — under Claude Code's 25,000-token default and Gemini CLI's 40,000-character truncation. Return a truncated flag, a cursor and a sentence on how to narrow the query.</p>
+  <h3>Is the MCP spec going to add tool-result pagination?</h3>
+  <p>Not soon. The roadmap updated in August 2026 plans a redesign of the tools/call result shape and ETags for tool-call results, with no date. Proposals for streaming and partial tool results were closed in July and September 2026, and maintainers now want new proposals developed through working groups.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/deep-dives/mcp/mcp-large-results-and-pagination">Large Results &amp; Pagination in MCP</a> — the spec's pagination rules and a tool-level pagination contract.</li>
+    <li><a href="/operations/agentops/mcp-context-overload">When MCP Results Overload the Context</a> — the same problem from the host operator's side: ceilings, eviction and alarms.</li>
+    <li><a href="/deep-dives/tool-capability-design/shaping-tool-results">Shaping Tool Results</a> — the general result envelope and how to trim it.</li>
+    <li><a href="/deep-dives/mcp/mcp-tool-design">MCP Tool Design</a> — tool granularity and schemas for MCP servers.</li>
+    <li><a href="/concepts/context-windows">Context Windows</a> — what the budget is and why it fills.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li>github/github-mcp-server issues <a href="https://github.com/github/github-mcp-server/issues/142" rel="noopener">#142</a>, <a href="https://github.com/github/github-mcp-server/issues/425" rel="noopener">#425</a>, <a href="https://github.com/github/github-mcp-server/issues/608" rel="noopener">#608</a>, <a href="https://github.com/github/github-mcp-server/issues/1934" rel="noopener">#1934</a>, <a href="https://github.com/github/github-mcp-server/issues/2122" rel="noopener">#2122</a>, <a href="https://github.com/github/github-mcp-server/issues/2383" rel="noopener">#2383</a>, and <a href="https://github.com/github/github-mcp-server/pull/2563" rel="noopener">PR #2563</a></li>
+    <li><a href="https://www.datadoghq.com/blog/engineering/mcp-server-agent-tools/" rel="noopener">Datadog — designing MCP server tools for agents</a></li>
+    <li><a href="https://github.com/motherduckdb/mcp-server-motherduck" rel="noopener">motherduckdb/mcp-server-motherduck</a>; <a href="https://github.com/grafana/mcp-grafana" rel="noopener">grafana/mcp-grafana</a></li>
+    <li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/pagination" rel="noopener">MCP specification 2026-07-28 — Pagination</a>; <a href="https://github.com/modelcontextprotocol/modelcontextprotocol/issues/229" rel="noopener">issue #229</a>; <a href="https://modelcontextprotocol.io/development/roadmap" rel="noopener">MCP roadmap</a></li>
+    <li><a href="https://code.claude.com/docs/en/mcp" rel="noopener">Claude Code — MCP output limits</a>; <a href="https://claude.com/docs/connectors/building/index" rel="noopener">Claude connectors — size and timeout limits</a>; <a href="https://github.com/anthropics/claude-code/issues/97622" rel="noopener">claude-code #97622</a></li>
+    <li><a href="https://developers.openai.com/codex/config-reference" rel="noopener">Codex configuration reference</a>; <a href="https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md" rel="noopener">Gemini CLI configuration</a>; <a href="https://cursor.com/blog/dynamic-context-discovery" rel="noopener">Cursor — Dynamic context discovery</a></li>
+    <li><a href="https://github.com/makenotion/notion-mcp-server/issues/206" rel="noopener">notion-mcp-server #206</a>; <a href="https://github.com/atlassian/atlassian-mcp-server/issues/106" rel="noopener">atlassian-mcp-server #106</a>; <a href="https://github.com/microsoft/vscode/issues/311068" rel="noopener">microsoft/vscode #311068</a></li>
+    <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents" rel="noopener">Anthropic — Writing effective tools for agents</a>; <a href="https://engineering.block.xyz/blog/blocks-playbook-for-designing-mcp-servers" rel="noopener">Block's playbook for designing MCP servers</a></li>
+  </ul>
+</section>

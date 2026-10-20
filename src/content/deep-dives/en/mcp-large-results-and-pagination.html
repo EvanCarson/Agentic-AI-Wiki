@@ -1,0 +1,153 @@
+<section class="phase">
+  <div class="phase-num">C13</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>MCP paginates the catalog, not the call. A tool that can return a lot of data has to carry its own pagination contract, written for the smallest host.</h2>
+  <p class="goal">The protocol's pagination is well specified: opaque cursors, a page size the server chooses, <code class="inline">-32602</code> for a bad cursor. It also covers exactly four methods, and <code class="inline">tools/call</code> is not one of them. A tool result has no cursor, no size limit and no chunking in either 2025-11-25 or 2026-07-28. The only spec primitive for "the data is somewhere else" is <code class="inline">resource_link</code> plus <code class="inline">resources/read</code>, which has no range reads and which many hosts give the model no way to follow. So what happens to a large result is decided by whichever host the user runs, and the hosts disagree. A server author who wants predictable behaviour has to define a result contract in the tool's own arguments and size it for the least forgiving client.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What the spec paginates, and the cursor rules worth copying.</h3>
+
+    <p>The pagination utility opens with "The Model Context Protocol (MCP) supports paginating list operations that may return large result sets", and the key words are <em>list operations</em>. It names four: <code class="inline">tools/list</code>, <code class="inline">resources/list</code>, <code class="inline">resources/templates/list</code> and <code class="inline">prompts/list</code>. The list is the same in 2025-11-25 and 2026-07-28. Nothing was added or removed when the <a href="/deep-dives/mcp/mcp-revision-2026-07-28" class="xref">2026-07-28 revision</a> rewrote most of the rest of the protocol.</p>
+
+    <p>Within those four the rules are short, and they are a good template for your own tools:</p>
+
+    <ul>
+      <li><strong>The cursor is opaque.</strong> It is "an opaque string token, representing a position in the result set". Clients "MUST treat cursors as opaque tokens": they must not parse or modify one, or infer anything from it except whether one was provided. 2026-07-28 added that "an empty string is a valid cursor" and must not be read as end-of-results.</li>
+      <li><strong>The server chooses the page size.</strong> "Page size is determined by the server, and clients MUST NOT assume a fixed page size." The spec has no page-size parameter and no maximum.</li>
+      <li><strong>The end is signalled by absence.</strong> <code class="inline">nextCursor</code> is present "if more results exist", and clients SHOULD treat a missing one as the end.</li>
+      <li><strong>Bad cursors fail loudly.</strong> Servers SHOULD provide stable cursors and handle invalid ones gracefully. An invalid cursor SHOULD produce error <code class="inline">-32602</code> (Invalid params).</li>
+    </ul>
+
+    <p>Caching makes the pages less consistent than they look. Under 2026-07-28 each page is "an independently cacheable response" with its own <code class="inline">ttlMs</code>, and "there is no cross-page consistency guarantee": a client walking a long <code class="inline">tools/list</code> "may observe duplicates or gaps". When a cursor goes invalid the client SHOULD discard every cached page and start again. <code class="inline">ttlMs</code> and <code class="inline">cacheScope</code> exist only on <code class="inline">server/discover</code>, the four list methods and <code class="inline">resources/read</code>, so caching helps a large catalog but not a large tool result.</p>
+
+    <p>Tool-call pagination was asked for early and never picked up. Issue #229, "Pagination for tool/call", has been open since 2025-03-26. Issue #798 proposed a <code class="inline">paginationHint</code> annotation and a <code class="inline">pagination: {hasMore, nextCursor}</code> block in tool results, and was closed the day it was filed.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>What <code class="inline">tools/call</code> gives you instead: content blocks, hints and a discriminator, none of which bounds size.</h3>
+
+    <p>A 2026-07-28 tool result has <code class="inline">content</code>, <code class="inline">structuredContent</code>, <code class="inline">isError</code> and the new required <code class="inline">resultType</code>. The content block types are <code class="inline">text</code>, <code class="inline">image</code>, <code class="inline">audio</code>, <code class="inline">resource_link</code> and embedded <code class="inline">resource</code>. No field states how big a result may be or what to do when it is too big. The four pieces that look relevant each fail differently:</p>
+
+    <ul>
+      <li><strong><code class="inline">structuredContent</code> can double your bill.</strong> Since SEP-2106 it can be any JSON value. The spec also says "a tool that returns structured content SHOULD also return the serialized JSON in a TextContent block" for backwards compatibility. If a host passes both to the model, you pay for the payload twice. (The OpenAI Agents SDK, with <code class="inline">use_structured_content=True</code>, uses only the structured copy.) Send a short text summary next to the structured data, not the same JSON twice.</li>
+      <li><strong>Annotations are hints, and most hosts ignore them.</strong> Content blocks can carry <code class="inline">audience</code> (<code class="inline">"user"</code>, <code class="inline">"assistant"</code>) and a <code class="inline">priority</code> from 0.0 to 1.0. No MUST tells a host to hide <code class="inline">audience: ["user"]</code> content from the model. The roadmap admits that "most implementers haven't adopted these annotations" and floats deprecating them, and SEP-2200, which tried to clarify content visibility, is closed. Do not count on <code class="inline">priority: 0</code> keeping a block out of the context window.</li>
+      <li><strong><code class="inline">resultType</code> is not chunking.</strong> Its values are <code class="inline">"complete"</code>, <code class="inline">"input_required"</code> for the Multi Round-Trip Request pattern, and <code class="inline">"task"</code> from the Tasks extension. <code class="inline">input_required</code> exists for <a href="/deep-dives/mcp/mcp-sampling-and-elicitation" class="xref">elicitation and sampling</a> round trips, not for "here is part one".</li>
+      <li><strong>Tasks are asynchronous, not chunked.</strong> A <a href="/deep-dives/mcp/mcp-tasks-and-long-running-work" class="xref">task handle</a> lets a slow call outlive one HTTP response. The final result still arrives whole through <code class="inline">tasks/get</code>, and the extension's abstract sets no size or pagination rule for it. A slow large result becomes a late large result.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The host matrix: what happens to a 60,000-token result depends on who is reading.</h3>
+
+    <p>The spec says nothing about oversized results, so every host decides for itself. These are the documented behaviours as of October 2026. Some hosts limit in tokens and others in characters, and the conversion depends on the content: one reporter measured a 50,000-character result at about 34k tokens in Latin text and about 48k in Greek (claude-code issue #97622).</p>
+
+<pre class="standalone"><span class="c-cm">host                 limit                                  over the limit</span>
+<span class="c-kw">Claude Code</span>          warn at 10,000 tokens (fixed)          successful non-image result is <span class="c-out">saved to a file</span>;
+                     cap 25,000 tokens                      the model gets a message naming the path
+                       (<span class="c-fn">MAX_MCP_OUTPUT_TOKENS</span>)
+                     text over 50,000 chars                 saved to a file regardless of the env var,
+                                                            unless the tool raises its own limit
+                     errors over ~11,000 chars              <span class="c-out">first 5,000 + last 5,000 chars</span> kept
+<span class="c-kw">claude.ai / Desktop</span>  ~150,000 characters per tool result    <span class="c-err">not documented</span>
+<span class="c-kw">Codex CLI</span>            <span class="c-fn">tool_output_token_limit</span>, and per tool   truncated to the budget when stored in
+                     <span class="c-fn">mcp_servers.&lt;id&gt;.tools.&lt;tool&gt;</span>          history; the default comes from the model
+                       <span class="c-fn">.output_token_limit</span>                  catalog and is <span class="c-err">not documented</span>
+<span class="c-kw">Gemini CLI</span>           <span class="c-fn">tools.truncateToolOutputThreshold</span>      <span class="c-out">truncated</span> at 40,000 characters by default
+<span class="c-kw">Cursor</span>               none documented                        long MCP output is <span class="c-out">written to a file</span>
+                                                            the agent can read
+<span class="c-kw">VS Code Copilot</span>      none documented                        <span class="c-out">truncated</span>; the hint to read the rest
+                                                            <span class="c-err">fails</span> (vscode #311068)
+<span class="c-kw">OpenAI Agents SDK</span>    none documented                        forwarded; resource blocks become their
+                                                            JSON serialization as text</pre>
+
+    <p>Run a 60,000-token result through the matrix. Claude Code takes it out of the conversation and leaves a file path. Gemini CLI keeps the first 40,000 characters. Codex keeps whatever its budget for that tool allows. Cursor writes a file. claude.ai keeps it whole if it fits under about 150,000 characters, and the documentation does not say what happens if it does not. VS Code, in the reported case of a <code class="inline">get_file_contents</code> result between 50KB and 999KB, cut the result and pointed the model at a <code class="inline">vscode-chat-response-resource://</code> URI that the agent could not read because it was "outside the workspace". One server, one call, six different results. Only the server can make them consistent, by never returning more than the smallest host can take.</p>
+
+    <p>Claude Code's own failure message tells the model to "use pagination, filtering, or limit parameters", which only helps if your tool has them. Figma's documentation shows a tool that didn't: <code class="inline">get_design_context</code> returned 351,378 tokens against the 25,000 cap.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>A tool-level pagination contract: a cursor in the arguments, a budget in tokens, and the truncation flag in the result.</h3>
+
+    <p>Since the protocol leaves this to you, define it once and use it in every tool that can return many records. The general result envelope (status, summary, projected data, omitted counts, next cursor) is covered in <a href="/deep-dives/tool-capability-design/shaping-tool-results" class="xref">shaping tool results</a>. These are the MCP-specific parts:</p>
+
+    <ul>
+      <li><strong>Copy the spec's cursor rules into your arguments.</strong> Use an opaque <code class="inline">cursor</code> string the model passes back unchanged, a server-chosen default page size, and an <code class="inline">isError</code> result that names the fix when a cursor is stale. GitHub's server uses <code class="inline">after</code> + <code class="inline">perPage</code> on its cursor-based tools. One GitHub bug (#2122) was a tool whose description promised cursor pagination while <code class="inline">after</code> was missing from its schema, so check the schema against the description.</li>
+      <li><strong>Size the page in tokens, not just records.</strong> Datadog found that "a Datadog log message might be only 100 characters or it might be 1 MB", so a page of N records has no size bound. Their server "cuts off its response after a certain number of tokens and returns a cursor for more." Keep a record limit as well, but let the token or character budget end the page.</li>
+      <li><strong>Fetch one extra record to detect more.</strong> MotherDuck's server fetches <code class="inline">max_rows+1</code> (default 1,024) to find out whether the result was cut, sets <code class="inline">truncated: true</code> with a warning, and then drops about 10% of rows at a time until the JSON is under <code class="inline">max_chars</code> (default 50,000). One extra row is cheaper than a count query.</li>
+      <li><strong>Put the flag in the result, next to the fix.</strong> Grafana's Loki tool returns <code class="inline">resultsTruncated</code> and <code class="inline">maxLinesAllowed</code> in the response itself. A truncation the model cannot see looks like a complete answer.</li>
+      <li><strong>Keep ordering stable.</strong> The spec offers no cross-page consistency for its own lists, and your tool does not get it for free either. Sort on a unique key and encode the position in the cursor, so a record inserted mid-walk does not shift every later page by one.</li>
+      <li><strong>Return fewer fields before you add pages.</strong> GitHub's per-project-item payload fell from about 2,575 to about 180 tokens when PR #2563 introduced minimal types (−93%, measured by the maintainers on 5 live items). No page size fixes a record that is 17KB on its own. The <a href="/blogs/the-page-was-counted-in-records" class="xref">case study of GitHub's server</a> traces that history.</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm">// tools/call arguments: the contract lives here, not in the protocol</span>
+{<span class="c-kw">"name"</span>: <span class="c-st">"search_logs"</span>,
+ <span class="c-kw">"arguments"</span>: {<span class="c-kw">"query"</span>: <span class="c-st">"service:checkout status:error"</span>,
+               <span class="c-kw">"fields"</span>: [<span class="c-st">"ts"</span>, <span class="c-st">"host"</span>, <span class="c-st">"message"</span>],
+               <span class="c-kw">"max_records"</span>: 200,
+               <span class="c-cm">// whichever budget is hit first ends the page</span>
+               <span class="c-kw">"max_tokens"</span>: 8000,
+               <span class="c-kw">"cursor"</span>: <span class="c-st">"c2VhcmNoOjE3Mjk0MDAwMDA6NDQx"</span>}}
+
+<span class="c-cm">// result: the flag and the remedy are in-band</span>
+{<span class="c-kw">"resultType"</span>: <span class="c-st">"complete"</span>,
+ <span class="c-kw">"content"</span>: [{<span class="c-kw">"type"</span>: <span class="c-st">"text"</span>,
+   <span class="c-kw">"text"</span>: <span class="c-st">"141 of 3,912 matching lines (stopped at the 8,000-token budget). Pass next_cursor for more, or add host:… to narrow."</span>}],
+ <span class="c-kw">"structuredContent"</span>: {
+   <span class="c-kw">"records"</span>: [<span class="c-cm">/* 141 projected records */</span>],
+   <span class="c-kw">"truncated"</span>: <span class="c-kw">true</span>,
+   <span class="c-kw">"total_estimate"</span>: 3912,
+   <span class="c-kw">"stopped_by"</span>: <span class="c-st">"token_budget"</span>,
+   <span class="c-kw">"next_cursor"</span>: <span class="c-st">"c2VhcmNoOjE3Mjk0MDAwMDA6NTgy"</span>}}</pre>
+
+    <p>The text block is a summary sentence, not a copy of the JSON, so a host that shows the model both does not pay twice. The default <code class="inline">max_tokens</code> is your choice, and the matrix sets its ceiling: stay well under Gemini CLI's 40,000 characters and Claude Code's 10,000-token warning. Measure before you return, as Block's MCP playbook recommends (bytes, characters, estimated tokens).</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Handles and spill files: <code class="inline">resource_link</code> done right, and output a host can grep.</h3>
+
+    <p>When the data is too big to page through the conversation, the spec offers only a reference. "A tool MAY return links to Resources … the tool will return a URI that can be subscribed to or fetched by the client." A <code class="inline">resource_link</code> carries <code class="inline">uri</code>, <code class="inline">name</code>, <code class="inline">description</code> and <code class="inline">mimeType</code>. Done properly, that means:</p>
+
+    <ul>
+      <li>a <strong>stable URI</strong> that still resolves when the model gets round to it, since links returned by tools "are not guaranteed to appear in the results of a <code class="inline">resources/list</code> request";</li>
+      <li>the Resource's optional <strong><code class="inline">size</code></strong> in bytes and an accurate <strong><code class="inline">mimeType</code></strong>, so the client can decide whether to fetch at all;</li>
+      <li>and a <strong>description that says what is in it</strong>: "3,912 log lines, 14:00–15:00 UTC, newest first".</li>
+    </ul>
+
+    <p>Then plan for the link going nowhere. <code class="inline">resources/read</code> has no range or pagination (range reads exist only as a File Uploads working-group item), so fetching a 2MB resource returns 2MB. Many hosts give the model no way to read a URI. Open PR #2527 would add a SHOULD that clients expose resource reads to the model, and until something like it lands, a <code class="inline">resource_link</code> is a dead end in many clients. Use it as an addition to a paged tool, not a replacement.</p>
+
+    <p>The more common case is that the host spills your result to a file whether you asked or not. Claude Code and Cursor both do. That only helps if the agent can read part of the file:</p>
+
+    <ul>
+      <li><strong>Make it line-structured.</strong> Notion's <code class="inline">notion-fetch</code> returned a 2,376-line, 41,207-token page as JSON compressed onto about five lines (notion-mcp-server #206). Once Claude Code offloaded it, the agent could not read part of it, because Read pages by line offset. A full read failed against the 25,000-token limit. JSON Lines, Markdown or one record per line keeps the spill file usable with <code class="inline">grep</code>, <code class="inline">head</code> and offsets.</li>
+      <li><strong>Don't make round-trip edits depend on the model repeating the body.</strong> A Confluence page in ADF runs 50–70KB. When Claude Code persisted <code class="inline">getConfluencePage</code> output to disk, the model never saw the body and could not rebuild it for <code class="inline">updateConfluencePage</code>, which would have meant emitting about 15K tokens inline (atlassian-mcp-server #106). Edit tools should take a patch, a section id or a server-side handle, not the whole document back.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p><strong><code class="inline">_meta["anthropic/maxResultSizeChars"]</code> is a workaround, not a fix.</strong> Declared on a tool's <code class="inline">tools/list</code> entry, it raises Claude Code's threshold for that tool's text results up to a hard ceiling of 500,000 characters, separately from <code class="inline">MAX_MCP_OUTPUT_TOKENS</code>. Use it for a tool whose large output really is the point, such as a file reader whose user asked for the file. It has no effect on any other host, so a tool that depends on it still overflows Gemini CLI's 40,000 characters and claude.ai's ~150,000.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What is and is not coming. Don't wait for it.</h3>
+
+    <p>The fix at the protocol level is on the roadmap but not in the spec. The roadmap, last updated 2026-08-22, lists three relevant items under a Core Primitives working group that is still forming. None has shipped and none has a date:</p>
+
+    <ul>
+      <li>a <strong>redesign of the <code class="inline">tools/call</code> interface</strong> "to resolve fidelity disparities among return types and streamline the handling of structured and unstructured output";</li>
+      <li><strong>progressive discovery</strong>, where clients learn tools and resources "as they need them instead of ingesting the full catalog up front", which addresses the catalog side, not the result side;</li>
+      <li><strong>ETags</strong> for caching, "in particular tool calls", so a client could revalidate a result instead of fetching it again.</li>
+    </ul>
+
+    <p>The streaming proposals were closed. SEP-2664 (streaming tool results through progress notifications with chunks) closed on 2026-07-02. SEP-2998 (partial tool results) closed on 2026-09-22 with the maintainer note that "every new SEP should be developed with the help of a Working Group", so it was closed on process grounds and the idea could come back through a working group. Issue #117 on streaming tool results has been open since December 2024. No accepted or in-flight SEP defines a result-size limit or a chunked <code class="inline">tools/call</code> result.</p>
+
+    <div class="callout tip">
+      <p>Build for the protocol as it is. Every tool that can return an unbounded number of records needs an opaque cursor, a token budget that ends the page, a <code class="inline">truncated</code> flag next to a remedy sentence, and stable ordering. Return fewer fields before adding pages, and make anything a host might spill to disk line-structured. If the <code class="inline">tools/call</code> redesign ships, a tool built this way needs a new envelope; one that relied on the host to cope needs redesigning. Which tools to build at all is covered in <a href="/deep-dives/mcp/mcp-tool-design" class="xref">designing MCP tools</a>. Controlling what overflows on the host side, for servers you don't own, is in <a href="/operations/agentops/mcp-context-overload" class="xref">when MCP results overload the context</a>.</p>
+    </div>
+  </div>
+</section>
