@@ -1,0 +1,402 @@
+<section class="phase">
+  <div class="phase-num">C14</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>Thirty pull requests cost 187,521 tokens before the fix and 5,379 after. Projection did 97% of that; the token-budgeted page, the bound cursor and the tests only make sure the number stays down.</h2>
+  <p class="goal">This is the implementation page. The protocol reasoning lives in <a href="/deep-dives/mcp/mcp-large-results-and-pagination" class="xref">Large Results &amp; Pagination in MCP</a>, host limits and runbooks in <a href="/operations/agentops/mcp-context-overload" class="xref">When MCP Results Overload the Context</a>, and the GitHub history in <a href="/blogs/the-page-was-counted-in-records">the case study</a>. Here there is one tool, written badly and then fixed, against one fixed payload: the 30 most recent pull requests of <code class="inline">github/github-mcp-server</code>, fetched on 2026-10-21. Every number below was measured on that file with <code class="inline">tiktoken</code> 0.14.0 (<code class="inline">o200k_base</code>), on the official Python SDK <code class="inline">mcp</code> 2.3.0, the TypeScript SDK <code class="inline">@modelcontextprotocol/server</code> 2.3.1, <code class="inline">fastmcp</code> 4.1.3 and <code class="inline">claude-agent-sdk</code> 0.2.170. Writing it turned up three bugs in my own first draft, and they are left in the story, because they are the ones you will write too.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Before: a pass-through tool, and where its tokens actually go.</h3>
+
+    <p>This is the shape most servers ship first: call the upstream API and return what it returns. It even has pagination — <code class="inline">per_page</code> and <code class="inline">page</code>, the same parameters the REST API takes.</p>
+
+<pre class="standalone"><span class="c-cm"># before.py — the tool as most servers first ship it</span>
+<span class="c-kw">import</span> json
+<span class="c-kw">from</span> mcp.server <span class="c-kw">import</span> MCPServer
+
+mcp = MCPServer(<span class="c-st">"prs-before"</span>)
+PRS = json.load(open(<span class="c-st">"prs.json"</span>))          <span class="c-cm"># stand-in for GET /repos/{o}/{r}/pulls</span>
+
+<span class="c-fn">@mcp.tool</span>()
+<span class="c-kw">def</span> list_pull_requests(state: str = <span class="c-st">"all"</span>, per_page: int = 30, page: int = 1) -&gt; str:
+    <span class="c-st">"""List pull requests in the repository."""</span>
+    rows = [p <span class="c-kw">for</span> p <span class="c-kw">in</span> PRS <span class="c-kw">if</span> state == <span class="c-st">"all"</span> <span class="c-kw">or</span> p[<span class="c-st">"state"</span>] == state]
+    start = (page - 1) * per_page
+    <span class="c-kw">return</span> json.dumps(rows[start:start + per_page])   <span class="c-cm"># every field, every nested object</span></pre>
+
+    <p>One call with the defaults returns 656,124 characters, or <strong>187,521 tokens</strong>. That is seven and a half times Claude Code's 25,000-token cap. Run through the Claude Agent SDK, the result was written to a file instead of the context, and the test session, which was allowed only this one tool, could not open the file and never answered. And the wire figure is twice that. Because the function is annotated <code class="inline">-&gt; str</code>, <code class="inline">MCPServer</code> publishes an <code class="inline">outputSchema</code> of <code class="inline">{"result": string}</code> and sends the payload again as <code class="inline">structuredContent</code>: 656,124 characters of text plus 694,798 of structured copy, on every call. The 694,797 characters Claude Code reported match that second copy. <code class="inline">fastmcp</code> does the same. A tool that returns a ready-made JSON string should say so with <code class="inline">@mcp.tool(structured_output=False)</code>, which removes both the schema and the copy; a tool that wants structured output should return it once, deliberately (STEP 3).</p>
+
+    <p>Paging does not help either, because the size is in the record, not the count. A per-field breakdown of the payload shows where:</p>
+
+<pre class="trace"><span class="c-out">field            tokens    share
+head              56,157   29.9%   ┐ each embeds a full repo object:
+base              54,376   29.0%   ┘ 91,207 tokens (48.6%) of copies
+body              44,016   23.5%
+user               9,504    5.1%
+_links             6,540    3.5%
+other *_url        5,700    3.0%
+everything else    ~11,000  ~6%</span></pre>
+
+    <p>Nearly half the payload is repository objects: every pull request carries two full copies, one under <code class="inline">head</code> and one under <code class="inline">base</code>. No model needs it, and no page size removes it. That is why the first fix is projection, not pagination.</p>
+
+    <div class="callout warn">
+      <p>Count with a tokenizer, not <code class="inline">len(text) // 4</code>. On this payload, characters ÷ 4 gives 164,031, an undercount of 12%. On flat tabular JSON, CSV or TOON, characters ÷ 4 undercounts by a third to a half, because digits and punctuation tokenize densely. A budget computed with the heuristic overshoots exactly where it matters.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Project first: name the fields you return, and cap the free text.</h3>
+
+<pre class="standalone"><span class="c-cm"># after.py — same data, a contract the context window can survive</span>
+<span class="c-kw">import</span> base64, hashlib, json
+<span class="c-kw">from</span> typing <span class="c-kw">import</span> Annotated, Any
+<span class="c-kw">from</span> pydantic <span class="c-kw">import</span> BaseModel
+<span class="c-kw">from</span> mcp.server <span class="c-kw">import</span> MCPServer
+<span class="c-kw">from</span> mcp.server.mcpserver.exceptions <span class="c-kw">import</span> ToolError
+<span class="c-kw">from</span> mcp.types <span class="c-kw">import</span> CallToolResult, TextContent
+<span class="c-kw">import</span> tiktoken
+
+mcp = MCPServer(<span class="c-st">"prs-after"</span>)
+PRS = json.load(open(<span class="c-st">"prs.json"</span>))
+ENC = tiktoken.get_encoding(<span class="c-st">"o200k_base"</span>)
+PAGE_BUDGET = 4_000          <span class="c-cm"># tokens per page, sized for the strictest host you support</span>
+ENVELOPE = 150               <span class="c-cm"># cursor, note, flags: reserve it, or the page overshoots</span>
+BODY_CHARS = 280             <span class="c-cm"># preview only; full body via get_pull_request</span>
+
+<span class="c-kw">def</span> tokens(obj: Any) -&gt; int:
+    <span class="c-kw">return</span> len(ENC.encode(json.dumps(obj, separators=(<span class="c-st">","</span>, <span class="c-st">":"</span>))))
+
+<span class="c-cm"># 1. Projection: decide the fields, don't inherit them from the upstream API.</span>
+<span class="c-kw">def</span> project(p: dict) -&gt; dict:
+    body = p.get(<span class="c-st">"body"</span>) <span class="c-kw">or</span> <span class="c-st">""</span>
+    <span class="c-kw">return</span> {
+        <span class="c-st">"number"</span>: p[<span class="c-st">"number"</span>], <span class="c-st">"title"</span>: p[<span class="c-st">"title"</span>], <span class="c-st">"state"</span>: p[<span class="c-st">"state"</span>],
+        <span class="c-st">"draft"</span>: p[<span class="c-st">"draft"</span>], <span class="c-st">"author"</span>: p[<span class="c-st">"user"</span>][<span class="c-st">"login"</span>],
+        <span class="c-st">"labels"</span>: [l[<span class="c-st">"name"</span>] <span class="c-kw">for</span> l <span class="c-kw">in</span> p[<span class="c-st">"labels"</span>]],
+        <span class="c-st">"created_at"</span>: p[<span class="c-st">"created_at"</span>], <span class="c-st">"merged_at"</span>: p[<span class="c-st">"merged_at"</span>],
+        <span class="c-st">"head"</span>: p[<span class="c-st">"head"</span>][<span class="c-st">"ref"</span>], <span class="c-st">"base"</span>: p[<span class="c-st">"base"</span>][<span class="c-st">"ref"</span>],
+        <span class="c-st">"body_preview"</span>: body[:BODY_CHARS],
+        <span class="c-st">"body_truncated"</span>: len(body) &gt; BODY_CHARS,
+    }</pre>
+
+    <p>Applied to all 30 records, <code class="inline">project()</code> brings the payload from 187,521 tokens to <strong>5,297</strong> (−97%). Three rules are encoded in it. Fields are an allow-list you choose, so an upstream API that adds a field does not silently grow your result. Nested objects collapse to the one value an agent uses: <code class="inline">user</code> becomes the login and <code class="inline">head</code> becomes the branch name. Free text gets a preview and a flag saying it was cut, and the full text is one call away in <code class="inline">get_pull_request</code> (STEP 3), which keeps the identifier a follow-up call needs.</p>
+
+    <p>When callers genuinely need different fields, let them ask, from safest to most powerful: a <code class="inline">fields: list[str]</code> argument checked against an allow-list; a JMESPath expression (<code class="inline">jmespath</code> 1.1.0 in Python, <code class="inline">@jmespath-community/jmespath</code> in JavaScript), which has no side effects and is safe to accept from a model; or a jq filter (<code class="inline">jq</code> 1.13.0 bindings), which is Turing-complete and needs a CPU and time limit. All three have precedents in production: Stainless-generated servers add a <code class="inline">jq_filter</code> parameter to every tool, and Zscaler's server takes an optional JMESPath <code class="inline">query</code> on its list tools.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Then page by tokens, with a cursor bound to its query — and count what you send, not what you meant to send.</h3>
+
+<pre class="standalone"><span class="c-cm"># 2. Opaque cursor bound to the query that produced it.</span>
+<span class="c-kw">def</span> query_key(state: str) -&gt; str:
+    <span class="c-kw">return</span> hashlib.sha256(state.encode()).hexdigest()[:12]
+
+<span class="c-kw">def</span> encode_cursor(offset: int, state: str) -&gt; str:
+    raw = json.dumps({<span class="c-st">"o"</span>: offset, <span class="c-st">"q"</span>: query_key(state)}).encode()
+    <span class="c-kw">return</span> base64.urlsafe_b64encode(raw).decode()
+
+<span class="c-kw">def</span> decode_cursor(cursor: str, state: str) -&gt; int:
+    <span class="c-kw">try</span>:
+        data = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+    <span class="c-kw">except</span> Exception:
+        <span class="c-kw">raise</span> ToolError(<span class="c-st">"Invalid cursor. Call again without a cursor to restart."</span>)
+    <span class="c-kw">if</span> data.get(<span class="c-st">"q"</span>) != query_key(state):
+        <span class="c-kw">raise</span> ToolError(<span class="c-st">"This cursor belongs to a different query. Restart without a cursor."</span>)
+    <span class="c-kw">return</span> int(data[<span class="c-st">"o"</span>])        <span class="c-cm"># offset is fine for a frozen list; use a keyset (sort key) for live data</span>
+
+<span class="c-kw">class</span> PullRequestPage(BaseModel):
+    items: list[dict]
+    next_cursor: str | <span class="c-kw">None</span>
+    truncated: bool
+    total_matching: int
+    note: str | <span class="c-kw">None</span> = <span class="c-kw">None</span>
+
+<span class="c-cm"># 3. Page by token budget, not by record count.</span>
+<span class="c-fn">@mcp.tool</span>()
+<span class="c-kw">def</span> list_pull_requests(state: str = <span class="c-st">"all"</span>, cursor: str | <span class="c-kw">None</span> = <span class="c-kw">None</span>) -&gt; Annotated[CallToolResult, PullRequestPage]:
+    <span class="c-st">"""List pull requests, newest first, as compact summaries (no diffs, no full bodies).
+    If truncated is true, call again with next_cursor to continue.
+    Use get_pull_request(number) for one PR's full body."""</span>
+    rows = [p <span class="c-kw">for</span> p <span class="c-kw">in</span> PRS <span class="c-kw">if</span> state == <span class="c-st">"all"</span> <span class="c-kw">or</span> p[<span class="c-st">"state"</span>] == state]
+    offset = decode_cursor(cursor, state) <span class="c-kw">if</span> cursor <span class="c-kw">else</span> 0
+    items, used = [], 0
+    <span class="c-kw">for</span> p <span class="c-kw">in</span> rows[offset:]:
+        row = project(p)
+        cost = tokens(row)
+        <span class="c-kw">if</span> items <span class="c-kw">and</span> used + cost &gt; PAGE_BUDGET - ENVELOPE:
+            <span class="c-kw">break</span>
+        items.append(row); used += cost
+    end = offset + len(items)
+    more = end &lt; len(rows)
+    page = PullRequestPage(
+        items=items, total_matching=len(rows), truncated=more,
+        next_cursor=encode_cursor(end, state) <span class="c-kw">if</span> more <span class="c-kw">else</span> <span class="c-kw">None</span>,
+        note=<span class="c-st">f"Showing {offset + 1}-{end} of {len(rows)}. Pass next_cursor to continue."</span> <span class="c-kw">if</span> more <span class="c-kw">else</span> <span class="c-kw">None</span>,
+    ).model_dump(mode=<span class="c-st">"json"</span>)
+    <span class="c-cm"># 4. Ship the compact text you counted, not the SDK's indent=2 rendering.</span>
+    text = json.dumps(page, separators=(<span class="c-st">","</span>, <span class="c-st">":"</span>))
+    <span class="c-kw">return</span> CallToolResult(content=[TextContent(type=<span class="c-st">"text"</span>, text=text)], structured_content=page)
+
+<span class="c-cm"># 5. Drill-down instead of a bigger page.</span>
+<span class="c-fn">@mcp.tool</span>()
+<span class="c-kw">def</span> get_pull_request(number: int, body_max_chars: int = 4_000) -&gt; dict:
+    <span class="c-st">"""Get one pull request with its body (capped at body_max_chars)."""</span>
+    p = next((p <span class="c-kw">for</span> p <span class="c-kw">in</span> PRS <span class="c-kw">if</span> p[<span class="c-st">"number"</span>] == number), <span class="c-kw">None</span>)
+    <span class="c-kw">if</span> p <span class="c-kw">is</span> <span class="c-kw">None</span>:
+        <span class="c-kw">raise</span> ToolError(<span class="c-st">f"No pull request #{number}. Use list_pull_requests to find numbers."</span>)
+    body = p.get(<span class="c-st">"body"</span>) <span class="c-kw">or</span> <span class="c-st">""</span>
+    <span class="c-kw">return</span> {**project(p), <span class="c-st">"body"</span>: body[:body_max_chars],
+            <span class="c-st">"body_truncated"</span>: len(body) &gt; body_max_chars, <span class="c-st">"url"</span>: p[<span class="c-st">"html_url"</span>]}</pre>
+
+    <p>The loop stops a page when the next record would cross the budget, never on a record count, and it always ships at least one record, so an oversized row cannot produce an empty page and a cursor that never moves. The cursor is opaque base64, but it carries a hash of the query that produced it, so a cursor reused with different filters fails with a message that says what to do instead of returning the wrong rows. The result walks the 30 records in two pages of <strong>3,851</strong> and <strong>1,528</strong> tokens, with <code class="inline">truncated</code>, <code class="inline">total_matching</code>, <code class="inline">next_cursor</code> and a one-line note in the result itself.</p>
+
+    <p>Two things in that code are there because the first draft was wrong, and the tests in STEP 4 caught both.</p>
+
+    <ul>
+      <li><strong>The SDK pretty-prints your result.</strong> The first draft returned the Pydantic model and let <code class="inline">MCPServer</code> serialize it. It renders the text block with <code class="inline">indent=2</code> (<code class="inline">pydantic_core.to_json(result, fallback=str, indent=2)</code> in <code class="inline">func_metadata.py</code>), so a page budgeted at 4,000 tokens went out at <strong>4,838</strong>. Returning a <code class="inline">CallToolResult</code> with text you serialized yourself fixes it, and the <code class="inline">Annotated[CallToolResult, PullRequestPage]</code> return type keeps the published <code class="inline">outputSchema</code> and the validation of <code class="inline">structured_content</code>.</li>
+      <li><strong>The envelope is part of the page.</strong> With the indent gone, the page still came out at 4,016: the budget counted the records and forgot the cursor, the note and the flags. <code class="inline">ENVELOPE</code> reserves room for them.</li>
+      <li><strong>Only <code class="inline">ToolError</code> reaches the model.</strong> The first draft raised <code class="inline">ValueError</code> for a bad cursor. <code class="inline">MCPServer</code> treats any exception other than <code class="inline">ToolError</code> as a crash and sends only <code class="inline">Error executing tool list_pull_requests</code>, so the remedy in the message never arrived. The TypeScript SDK passes a plain <code class="inline">Error</code>'s message through; Python does not.</li>
+    </ul>
+
+    <p>The text block is a compact copy of the structured result, not a summary. The spec says a tool returning structured content SHOULD also return the serialized JSON as text, and clients disagree about which one the model reads: <code class="inline">langchain-mcp-adapters</code> sends the text to the model and keeps <code class="inline">structuredContent</code> as an artifact the model never sees, while the OpenAI Agents SDK defaults <code class="inline">use_structured_content=False</code> precisely because most servers mirror. A mirrored, compact text block is the one choice every client reads correctly, and it is the one the budget measures.</p>
+
+    <p>The same contract on the TypeScript SDK is a line-for-line port; only the tool body differs:</p>
+
+<pre class="standalone">  }, <span class="c-kw">async</span> ({ state, cursor }) =&gt; {
+    <span class="c-kw">const</span> rows = PRS.filter(p =&gt; state === <span class="c-st">'all'</span> || p.state === state);
+    <span class="c-kw">const</span> offset = cursor ? decodeCursor(cursor, state) : 0;
+    <span class="c-kw">const</span> items: ReturnType&lt;<span class="c-kw">typeof</span> project&gt;[] = [];
+    <span class="c-kw">let</span> used = 0;
+    <span class="c-kw">for</span> (<span class="c-kw">const</span> p <span class="c-kw">of</span> rows.slice(offset)) {
+      <span class="c-kw">const</span> row = project(p), cost = tokens(row);
+      <span class="c-kw">if</span> (items.length &amp;&amp; used + cost &gt; PAGE_BUDGET - ENVELOPE) <span class="c-kw">break</span>;
+      items.push(row); used += cost;
+    }
+    <span class="c-kw">const</span> end = offset + items.length, more = end &lt; rows.length;
+    <span class="c-kw">const</span> page = {
+      items, total_matching: rows.length, truncated: more,
+      next_cursor: more ? encodeCursor(end, state) : <span class="c-kw">null</span>,
+      note: more ? <span class="c-st">`Showing ${offset + 1}-${end} of ${rows.length}. Pass next_cursor to continue.`</span> : <span class="c-kw">null</span>,
+    };
+    <span class="c-kw">return</span> { content: [{ <span class="c-kw">type</span>: <span class="c-st">'text'</span>, text: JSON.stringify(page) }], structuredContent: page };</pre>
+
+    <p>It walks the same 30 records in pages of 3,844 and 1,524 tokens. <code class="inline">gpt-tokenizer</code> 4.1.0 provides <code class="inline">o200k_base</code> in pure TypeScript; its <code class="inline">isWithinTokenLimit(text, limit)</code> stops encoding as soon as the limit is crossed, which suits a size check better than encoding the whole string.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Test the contract, not the tool: five assertions that fail when a page grows.</h3>
+
+<pre class="standalone"><span class="c-kw">async</span> <span class="c-kw">def</span> walk(client, **args):
+    cursor, pages = <span class="c-kw">None</span>, []
+    <span class="c-kw">while</span> <span class="c-kw">True</span>:
+        r = <span class="c-kw">await</span> client.call_tool(<span class="c-st">"list_pull_requests"</span>, {**args, **({<span class="c-st">"cursor"</span>: cursor} <span class="c-kw">if</span> cursor <span class="c-kw">else</span> {})})
+        pages.append(r)
+        cursor = r.structured_content[<span class="c-st">"next_cursor"</span>]
+        <span class="c-kw">if</span> cursor <span class="c-kw">is</span> <span class="c-kw">None</span>:
+            <span class="c-kw">return</span> pages
+
+<span class="c-fn">@pytest.mark.anyio</span>
+<span class="c-kw">async</span> <span class="c-kw">def</span> test_every_page_fits_the_budget():
+    <span class="c-kw">async</span> <span class="c-kw">with</span> Client(after.mcp) <span class="c-kw">as</span> c:
+        <span class="c-kw">for</span> r <span class="c-kw">in</span> <span class="c-kw">await</span> walk(c):
+            assert len(ENC.encode(r.content[0].text)) &lt;= after.PAGE_BUDGET
+
+<span class="c-fn">@pytest.mark.anyio</span>
+<span class="c-kw">async</span> <span class="c-kw">def</span> test_cursor_walk_returns_every_record_once():
+    <span class="c-kw">async</span> <span class="c-kw">with</span> Client(after.mcp) <span class="c-kw">as</span> c:
+        numbers = [i[<span class="c-st">"number"</span>] <span class="c-kw">for</span> r <span class="c-kw">in</span> <span class="c-kw">await</span> walk(c) <span class="c-kw">for</span> i <span class="c-kw">in</span> r.structured_content[<span class="c-st">"items"</span>]]
+    assert numbers == [p[<span class="c-st">"number"</span>] <span class="c-kw">for</span> p <span class="c-kw">in</span> after.PRS]
+
+<span class="c-fn">@pytest.mark.anyio</span>
+<span class="c-kw">async</span> <span class="c-kw">def</span> test_truncation_is_in_band():
+    <span class="c-kw">async</span> <span class="c-kw">with</span> Client(after.mcp) <span class="c-kw">as</span> c:
+        first = (<span class="c-kw">await</span> walk(c))[0].structured_content
+    assert first[<span class="c-st">"truncated"</span>] <span class="c-kw">is</span> <span class="c-kw">True</span> <span class="c-kw">and</span> first[<span class="c-st">"next_cursor"</span>] <span class="c-kw">and</span> <span class="c-st">"next_cursor"</span> <span class="c-kw">in</span> first[<span class="c-st">"note"</span>]
+
+<span class="c-fn">@pytest.mark.anyio</span>
+<span class="c-kw">async</span> <span class="c-kw">def</span> test_cursor_from_another_query_is_rejected():
+    <span class="c-kw">async</span> <span class="c-kw">with</span> Client(after.mcp) <span class="c-kw">as</span> c:
+        cur = (<span class="c-kw">await</span> c.call_tool(<span class="c-st">"list_pull_requests"</span>, {<span class="c-st">"state"</span>: <span class="c-st">"all"</span>})).structured_content[<span class="c-st">"next_cursor"</span>]
+        r = <span class="c-kw">await</span> c.call_tool(<span class="c-st">"list_pull_requests"</span>, {<span class="c-st">"state"</span>: <span class="c-st">"open"</span>, <span class="c-st">"cursor"</span>: cur})
+    assert r.is_error <span class="c-kw">and</span> <span class="c-st">"different query"</span> <span class="c-kw">in</span> r.content[0].text
+
+<span class="c-fn">@pytest.mark.anyio</span>
+<span class="c-kw">async</span> <span class="c-kw">def</span> test_one_record_larger_than_the_budget_still_ships(monkeypatch):
+    monkeypatch.setattr(after, <span class="c-st">"PAGE_BUDGET"</span>, 10)   <span class="c-cm"># smaller than any single row</span>
+    <span class="c-kw">async</span> <span class="c-kw">with</span> Client(after.mcp) <span class="c-kw">as</span> c:
+        r = <span class="c-kw">await</span> c.call_tool(<span class="c-st">"list_pull_requests"</span>, {})
+    assert len(r.structured_content[<span class="c-st">"items"</span>]) == 1   <span class="c-cm"># progress over purity: never an empty page</span></pre>
+
+    <p>These run in-process (the <code class="inline">Client(server)</code> pattern from <a href="/deep-dives/mcp/mcp-testing" class="xref">Testing MCP Servers</a>) and take 0.3 seconds. Each guards a different failure. The budget test reads the text block from the wire, which is how it caught the indent bug. The walk test proves the cursor neither skips nor repeats a record. The in-band test fails if someone moves the flag into logs. The foreign-cursor test checks that the error text actually reaches the client, which is how it caught the <code class="inline">ValueError</code>. The last test sets the budget below the size of one row and asserts that a page still ships.</p>
+
+    <p>Point the budget test at a fixture recorded from your largest real account, not a synthetic one. These fixtures are 30 public pull requests; a customer with 4,000-line PR descriptions is the input that breaks a budget, and it is the one you do not have unless you record it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>A server-wide ceiling for the tools nobody has reshaped yet.</h3>
+
+    <p>Per-tool contracts take work, and a server with 40 tools will not get them all at once. A ceiling in middleware covers the rest: it measures every <code class="inline">tools/call</code> result and turns an oversized one into an error the model can act on.</p>
+
+<pre class="standalone"><span class="c-cm"># guard.py — one ceiling for every tool, including the ones nobody re-shaped yet</span>
+<span class="c-kw">import</span> logging
+<span class="c-kw">import</span> tiktoken
+<span class="c-kw">from</span> mcp.types <span class="c-kw">import</span> CallToolResult, TextContent
+
+ENC = tiktoken.get_encoding(<span class="c-st">"o200k_base"</span>)
+HARD_CAP = 20_000   <span class="c-cm"># below Claude Code's 25,000-token cap</span>
+log = logging.getLogger(<span class="c-st">"result-guard"</span>)
+
+<span class="c-kw">async</span> <span class="c-kw">def</span> result_guard(ctx, call_next):
+    result = <span class="c-kw">await</span> call_next(ctx)
+    <span class="c-kw">if</span> ctx.method != <span class="c-st">"tools/call"</span> <span class="c-kw">or</span> <span class="c-kw">not</span> isinstance(result, dict):
+        <span class="c-kw">return</span> result
+    text = <span class="c-st">""</span>.join(b.get(<span class="c-st">"text"</span>, <span class="c-st">""</span>) <span class="c-kw">for</span> b <span class="c-kw">in</span> result.get(<span class="c-st">"content"</span>, []))
+    n = len(ENC.encode(text))
+    <span class="c-kw">if</span> n &lt;= HARD_CAP:
+        <span class="c-kw">return</span> result
+    tool = (ctx.params <span class="c-kw">or</span> {}).get(<span class="c-st">"name"</span>)
+    log.warning(<span class="c-st">"tool %s returned %d tokens (cap %d)"</span>, tool, n, HARD_CAP)
+    <span class="c-kw">return</span> CallToolResult(is_error=<span class="c-kw">True</span>, content=[TextContent(type=<span class="c-st">"text"</span>, text=
+        <span class="c-st">f"{tool} returned about {n:,} tokens, over this server's {HARD_CAP:,}-token limit. "</span>
+        <span class="c-st">"Narrow the query (filters, a smaller page) or fetch one item at a time."</span>)])</pre>
+
+    <p>Registered on the STEP 1 server with <code class="inline">mcp.middleware.append(result_guard)</code>, the 187,521-token result becomes one sentence: <em>"list_pull_requests returned about 187,521 tokens, over this server's 20,000-token limit. Narrow the query (filters, a smaller page) or fetch one item at a time."</em> Two details matter. The replacement must be a <code class="inline">CallToolResult</code> model; a plain dict fails validation under the 2026-07-28 revision because it has no <code class="inline">resultType</code>. And the middleware API is marked provisional in <code class="inline">mcp</code> 2.x ("the signature may change in a 2.x minor release"), so pin the SDK version and keep the test.</p>
+
+    <p>If your server is on <code class="inline">fastmcp</code>, <code class="inline">ResponseLimitingMiddleware(max_size=..., tools=[...])</code> is the built-in equivalent, and its behaviour is worth knowing before you rely on it. It counts bytes of the whole serialized result, not tokens; the 656KB payload measured 1,389,809 bytes, because it counts the text block and the doubled <code class="inline">structuredContent</code> from STEP 1, each with its quotes escaped. Over the limit it truncates instead of refusing: with <code class="inline">max_size=60_000</code> the model received 16,530 tokens of a JSON array cut off mid-string, followed by <code class="inline">[Response truncated due to size limit]</code>. It also drops <code class="inline">structuredContent</code> and removes <code class="inline">outputSchema</code> from every tool it limits. It is a sound backstop and a poor contract, and refusing with a remedy, as above, is usually better than handing the model half a document.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Reshape a server you don't own, at a proxy.</h3>
+
+    <p>Most of the oversized results an agent sees come from third-party servers you cannot edit. <code class="inline">fastmcp</code> can front one as a proxy and replace its tools with shaped versions, without touching the upstream code:</p>
+
+<pre class="standalone"><span class="c-cm"># wrap.py — reshape a server you don't own, without touching its code (fastmcp 4.1.3)</span>
+<span class="c-kw">import</span> json
+<span class="c-kw">from</span> fastmcp <span class="c-kw">import</span> FastMCP
+<span class="c-kw">from</span> fastmcp.server <span class="c-kw">import</span> create_proxy
+<span class="c-kw">from</span> fastmcp.server.middleware.response_limiting <span class="c-kw">import</span> ResponseLimitingMiddleware
+<span class="c-kw">from</span> fastmcp.tools <span class="c-kw">import</span> Tool
+<span class="c-kw">from</span> fastmcp.tools.tool_transform <span class="c-kw">import</span> forward
+<span class="c-kw">from</span> fastmcp.tools.base <span class="c-kw">import</span> ToolResult
+
+<span class="c-cm"># Stand-in for the third-party server: one fat tool.</span>
+upstream = FastMCP(<span class="c-st">"third-party"</span>)
+PRS = json.load(open(<span class="c-st">"prs.json"</span>))
+<span class="c-fn">@upstream.tool</span>
+<span class="c-kw">def</span> list_pull_requests(state: str = <span class="c-st">"all"</span>) -&gt; str:
+    <span class="c-st">"""List pull requests."""</span>
+    <span class="c-kw">return</span> json.dumps([p <span class="c-kw">for</span> p <span class="c-kw">in</span> PRS <span class="c-kw">if</span> state == <span class="c-st">"all"</span> <span class="c-kw">or</span> p[<span class="c-st">"state"</span>] == state])
+
+KEEP = (<span class="c-st">"number"</span>, <span class="c-st">"title"</span>, <span class="c-st">"state"</span>, <span class="c-st">"created_at"</span>, <span class="c-st">"merged_at"</span>)
+
+<span class="c-kw">async</span> <span class="c-kw">def</span> build() -&gt; FastMCP:
+    proxy = create_proxy(upstream, name=<span class="c-st">"prs-gateway"</span>)
+    fat = <span class="c-kw">await</span> proxy.get_tool(<span class="c-st">"list_pull_requests"</span>)
+
+    <span class="c-kw">async</span> <span class="c-kw">def</span> slim(state: str = <span class="c-st">"all"</span>, limit: int = 20) -&gt; ToolResult:
+        raw = <span class="c-kw">await</span> forward(state=state)
+        rows = json.loads(raw.content[0].text)
+        out = [{k: r[k] <span class="c-kw">for</span> k <span class="c-kw">in</span> KEEP} | {<span class="c-st">"author"</span>: r[<span class="c-st">"user"</span>][<span class="c-st">"login"</span>]} <span class="c-kw">for</span> r <span class="c-kw">in</span> rows[:limit]]
+        <span class="c-kw">return</span> ToolResult(content=json.dumps({<span class="c-st">"items"</span>: out, <span class="c-st">"truncated"</span>: len(rows) &gt; limit,
+                                              <span class="c-st">"total_matching"</span>: len(rows)}, separators=(<span class="c-st">","</span>, <span class="c-st">":"</span>)))
+
+    proxy.add_tool(Tool.from_tool(fat, name=<span class="c-st">"list_pull_requests_slim"</span>, transform_fn=slim,
+        description=<span class="c-st">"List pull requests as compact summaries. Raise limit for more."</span>))
+    proxy.disable(names={<span class="c-st">"list_pull_requests"</span>})                      <span class="c-cm"># hide the fat original</span>
+    proxy.add_middleware(ResponseLimitingMiddleware(max_size=60_000))  <span class="c-cm"># bytes, a backstop</span>
+    <span class="c-kw">return</span> proxy</pre>
+
+    <p>The gateway exposes only <code class="inline">list_pull_requests_slim</code>, and all 30 pull requests come back in <strong>1,763 tokens</strong>. <code class="inline">forward()</code> calls the original tool, <code class="inline">disable()</code> hides it from <code class="inline">tools/list</code>, and the byte limit stays behind it as a backstop. The one cost is that the proxy still receives the full upstream payload; it saves the model's context, not the network.</p>
+
+    <p>Packaged alternatives exist, at very different levels of maturity. <code class="inline">atlassian-labs/mcp-compressor</code> (v0.38.0, Apache-2.0, in Python, TypeScript and Rust) is the most maintained: it mainly compresses the tool catalog, and its opt-in <code class="inline">--shrinkfit</code> flag shrinks results over 20,000 characters while keeping the top-level shape and letting the caller ask for the full result with <code class="inline">full=true</code>. <code class="inline">mcp-trunc-proxy</code> (0.2.2, GPL-3.0) implements the handle pattern generically, offloading large results to a store and returning a preview plus a retrieval tool, but it is a small project. The rest of what a search turns up (<code class="inline">mcp-rtk</code>, <code class="inline">mcpslim</code>, <code class="inline">mcpsqueeze</code>, <code class="inline">mcp-context-proxy</code>) had zero to four GitHub stars on 2026-10-21. None of these measured savings have been reproduced here; treat them as the authors' claims.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>Host-side hooks: where each agent framework lets you rewrite a result — and the one that fires too late.</h3>
+
+    <p>If you build the agent rather than the server, you can shape results as they arrive. In the Claude Agent SDK, a <code class="inline">PostToolUse</code> hook can replace an MCP tool's output before the model reads it:</p>
+
+<pre class="standalone"><span class="c-cm"># host.py — shape MCP results in the host, before the model reads them (claude-agent-sdk 0.2.170)</span>
+<span class="c-kw">import</span> asyncio, json, sys
+<span class="c-kw">from</span> claude_agent_sdk <span class="c-kw">import</span> ClaudeAgentOptions, HookMatcher, query
+
+KEEP = (<span class="c-st">"number"</span>, <span class="c-st">"title"</span>, <span class="c-st">"state"</span>, <span class="c-st">"merged_at"</span>)
+
+<span class="c-kw">async</span> <span class="c-kw">def</span> slim_mcp_result(input_data, tool_use_id, context):
+    resp = input_data[<span class="c-st">"tool_response"</span>]          <span class="c-cm"># a string by the time the hook runs</span>
+    <span class="c-kw">try</span>:
+        data = json.loads(resp)
+        <span class="c-kw">if</span> isinstance(data, dict) <span class="c-kw">and</span> <span class="c-st">"result"</span> <span class="c-kw">in</span> data:   <span class="c-cm"># structured {"result": ...} wrapper</span>
+            data = json.loads(data[<span class="c-st">"result"</span>])
+    <span class="c-kw">except</span> (TypeError, ValueError):
+        <span class="c-kw">return</span> {}                               <span class="c-cm"># e.g. Claude Code's "saved to file" notice</span>
+    slim = [{k: r.get(k) <span class="c-kw">for</span> k <span class="c-kw">in</span> KEEP} <span class="c-kw">for</span> r <span class="c-kw">in</span> data]
+    <span class="c-kw">return</span> {<span class="c-st">"hookSpecificOutput"</span>: {
+        <span class="c-st">"hookEventName"</span>: <span class="c-st">"PostToolUse"</span>,
+        <span class="c-st">"updatedMCPToolOutput"</span>: json.dumps(slim, separators=(<span class="c-st">","</span>, <span class="c-st">":"</span>)),
+    }}
+
+options = ClaudeAgentOptions(
+    model=<span class="c-st">"haiku"</span>,
+    mcp_servers={<span class="c-st">"prs"</span>: {<span class="c-st">"type"</span>: <span class="c-st">"stdio"</span>, <span class="c-st">"command"</span>: sys.executable, <span class="c-st">"args"</span>: [<span class="c-st">"before.py"</span>]}},
+    allowed_tools=[<span class="c-st">"mcp__prs__list_pull_requests"</span>],
+    hooks={<span class="c-st">"PostToolUse"</span>: [HookMatcher(matcher=<span class="c-st">"mcp__prs__.*"</span>, hooks=[slim_mcp_result])]},
+)</pre>
+
+    <p>On a two-PR result (about 43,000 characters), the hook worked as documented: asked for the keys of the first record, the model answered <code class="inline">number, title, state, merged_at</code>, the four the hook kept. On the 30-PR result it did nothing, and the reason is not in the documentation. The size limit runs <em>before</em> the hook. By the time <code class="inline">slim_mcp_result</code> fired, <code class="inline">tool_response</code> was already the string <code class="inline">Error: result (694,797 characters) exceeds maximum allowed tokens. Output has been saved to …</code>, so there was nothing left to slim. A host hook can reshape results that are merely wasteful, but not the ones that overflow; those have to be fixed at the server or the proxy. The hook also has to cope with the shape it receives: a JSON string, with a structured result wrapped as <code class="inline">{"result": …}</code>.</p>
+
+    <p>Every major framework has an equivalent interception point. In each, check two things before relying on it: whether it runs before or after the host's own limit, and whether it counts in tokens or characters.</p>
+
+    <ul>
+      <li><strong>OpenAI Agents SDK</strong> (<code class="inline">openai-agents</code> 0.24.0): <code class="inline">ToolOutputTrimmer(recent_turns=2, max_output_chars=500, preview_chars=200, trimmable_tools=...)</code> as a <code class="inline">call_model_input_filter</code>. It trims older turns only and counts characters. It is Python-only; in JavaScript you write your own <code class="inline">callModelInputFilter</code>.</li>
+      <li><strong>LangChain</strong>: <code class="inline">tool_interceptors</code> on <code class="inline">MultiServerMCPClient</code> to rewrite each result, and <code class="inline">ContextEditingMiddleware(edits=[ClearToolUsesEdit(...)])</code> for eviction. Two caveats: <code class="inline">langchain-mcp-adapters</code> 0.3.2 still requires <code class="inline">mcp&lt;2</code>, and the default approximate counter is characters ÷ 4.</li>
+      <li><strong>Vercel AI SDK</strong> (<code class="inline">ai</code> 7.x): <code class="inline">toModelOutput</code> on a tool gives the model a shaped result while the app keeps the full one; <code class="inline">prepareStep</code> with <code class="inline">pruneMessages</code> drops old tool results between steps.</li>
+      <li><strong>Pydantic AI</strong>: <code class="inline">MCPToolset(process_tool_call=...)</code> wraps every call. <strong>Google ADK</strong>: <code class="inline">after_tool_callback</code> returns a replacement response dict, including for <code class="inline">McpToolset</code> tools.</li>
+    </ul>
+
+    <p>Evicting results that were fine when they arrived, through Anthropic's <code class="inline">clear_tool_uses_20250919</code>, compaction or LangChain's <code class="inline">SummarizationMiddleware</code>, is a run-time policy rather than a code change; its settings, and what it does to the prompt cache, are covered in <a href="/operations/agentops/mcp-context-overload" class="xref">the runbook</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 8</div>
+    <h3>The library evaluation: what each one is for, and what to use when.</h3>
+
+    <p>Counting first, because every budget above depends on it.</p>
+
+    <ul>
+      <li><strong><code class="inline">tiktoken</code> 0.14.0 (Python)</strong>: encoding a 34KB JSON string with <code class="inline">o200k_base</code> takes about 1.5ms, cheap enough to run on every result. It is exact only for OpenAI models; there is no entry for the newest model names, so call <code class="inline">get_encoding("o200k_base")</code> explicitly.</li>
+      <li><strong><code class="inline">gpt-tokenizer</code> 4.1.0 (JavaScript)</strong>: pure TypeScript, actively released, with the early-exit <code class="inline">isWithinTokenLimit</code>. <code class="inline">js-tiktoken</code> 1.0.21 works but has not had a release since August 2025.</li>
+      <li><strong>Anthropic <code class="inline">messages.count_tokens</code></strong>: free and rate-limited separately from message creation, but it is a network call, the docs describe its result as an estimate, and it rejects requests that use the MCP connector. There is no current local Claude tokenizer: <code class="inline">@anthropic-ai/tokenizer</code> 0.0.4 dates from 2023, and its README says it is no longer accurate. Anthropic also notes that Claude 4.7 and later models produce about 30% more tokens for the same text. The practical pattern is a local <code class="inline">o200k_base</code> count times a safety factor, calibrated offline with <code class="inline">count_tokens</code> and checked against <code class="inline">usage.input_tokens</code>.</li>
+    </ul>
+
+    <p>Then the encoding. These are the same 30 projected records in four formats (labels joined into a string so every format carries the same information):</p>
+
+<pre class="trace"><span class="c-out">format            tokens   vs compact JSON
+JSON, indent=2     6,361   +21%
+JSON, compact      5,267   baseline
+TOON               4,443   −16%
+CSV                4,165   −21%</span></pre>
+
+    <p>Format is a second-order lever. Minifying is free and always right. TOON (<code class="inline">toon-format</code> 1.2.0 in Python, <code class="inline">@toon-format/toon</code> 4.4.0 in TypeScript) saves a further 16% here and declares the row count in its header, which helps a model notice a short page. Its own README says compact JSON often wins on deeply nested or non-uniform data, and that CSV is smaller for purely flat data, which matches this measurement. Datadog reported the same pattern from its MCP server: CSV used "about half as many tokens" as JSON per record, YAML saved "around 20%" on nested data, and the biggest gain came from letting agents aggregate with SQL rather than page at all, with evals running "about 40% cheaper" (<a href="https://www.datadoghq.com/blog/engineering/mcp-server-agent-tools/" class="xref" rel="noopener">Datadog engineering</a>). Compare that 16–21% with the 97% from projection: change the format after you have chosen the fields, not instead.</p>
+
+    <p>Putting it together:</p>
+
+    <ul>
+      <li><strong>You own a Python server:</strong> the <code class="inline">mcp</code> 2.x <code class="inline">MCPServer</code> pattern above, with <code class="inline">tiktoken</code> for the budget and a middleware ceiling. No SDK paginates tool results for you; that part is always your code. For list-method pagination, <code class="inline">fastmcp</code> offers <code class="inline">FastMCP(list_page_size=N)</code>, while <code class="inline">MCPServer</code> ignores the list cursor.</li>
+      <li><strong>You own a TypeScript server:</strong> <code class="inline">@modelcontextprotocol/server</code> 2.3.x with a zod <code class="inline">outputSchema</code> and <code class="inline">gpt-tokenizer</code>. The v1 <code class="inline">@modelcontextprotocol/sdk</code> line does not implement the 2026-07-28 revision.</li>
+      <li><strong>You don't own the server:</strong> a <code class="inline">fastmcp</code> proxy with <code class="inline">Tool.from_tool</code>, or <code class="inline">mcp-compressor --shrinkfit</code> if you want something packaged.</li>
+      <li><strong>You own the agent:</strong> the framework hook from STEP 7 for waste, and the server or proxy fix for overflow, because in Claude Code the hook fires after the limit.</li>
+      <li><strong>Always:</strong> a real tokenizer instead of characters ÷ 4, and a budget test against a fixture recorded from your largest account.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Every block on this page was run as shown: the excerpts come from files that passed their tests, and together they are about 340 lines, small enough to copy into a repository as a template. The design reasoning behind each choice is in <a href="/deep-dives/mcp/mcp-large-results-and-pagination" class="xref">Large Results &amp; Pagination in MCP</a>; the broader, protocol-independent rules for shaping results are in <a href="/deep-dives/tool-capability-design/shaping-tool-results" class="xref">Shaping Tool Results</a>.</p>
+    </div>
+  </div>
+</section>
