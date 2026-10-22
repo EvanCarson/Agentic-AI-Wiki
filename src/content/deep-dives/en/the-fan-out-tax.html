@@ -1,0 +1,104 @@
+<section class="phase">
+  <div class="phase-num">G12</div>
+  <div class="week">Deep Dive · Multi-Agent Systems</div>
+  <h2>Fan-out is sold as tokens traded for wall-clock, and both sides of that trade are mismeasured: the bill grows faster than the branch count while the time saved stops growing after about three.</h2>
+  <p class="goal">The fourth parallel sub-agent almost always costs more than it is worth, and you can predict that before building it from two numbers you already have — your cacheable prefix and the size of a branch's report. Every branch re-pays a prefix that a single loop had cached at a tenth of the price, and every branch's output is billed twice, once as generation and again as input to the merge; meanwhile the wall-clock saving is capped by the slowest branch, and the slowest of many branches is barely slower than the slowest of a few.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The known multiplier hides where the money actually goes.</h3>
+
+    <p>The headline figure is well travelled: Anthropic's June 2025 write-up of its multi-agent research system put its token usage at roughly <strong>15× a chat interaction</strong>, with an ordinary single agent around 4×. The same post reported the upside honestly — the multi-agent configuration beat a single Claude Opus 4 agent by 90.2% on their internal research eval, and token usage alone explained about 80% of performance variance — and named the condition: the economics only work where the task's value justifies the spend, and tasks whose agents must share context benefit least.</p>
+
+    <p>What the multiplier does not tell you is its <em>shape</em>. Teams read 15× as a constant and budget it as one: four branches instead of two, same multiplier, twice the speed. It is not a constant. It is the sum of three terms that scale differently in the number of branches, and only one of them is the work you wanted done. Separate them and the cap on useful fan-out falls out of the arithmetic rather than out of taste. This page assumes the supervisor shape from <a class="xref" href="/deep-dives/multi-agent-systems/supervisor-worker-pattern">supervisor-worker</a>; <a class="xref" href="/deep-dives/multi-agent-systems/multi-agent-when-and-why">when and why to go multi-agent</a> is the prior question of whether to fan out at all.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Term one: every branch re-pays a prefix the single loop had cached.</h3>
+
+    <p>A sequential agent loop is cheap in a way that is easy to miss, because prompt caching does the work silently. The system prompt and tool definitions sit at the front of the context, unchanged across steps, so they are written to cache once and read back at a discount on every subsequent turn. Anthropic's published multipliers are a cache write at 1.25× the base input price for the default five-minute lifetime (2× for the one-hour option) and a cache read at 0.1× — a 90% discount on the bytes that do not change. <a class="xref" href="/concepts/prompt-caching">Prompt caching</a> has the mechanics and <a class="xref" href="/deep-dives/architectures-and-patterns/context-caching-economics">context-caching economics</a> the break-even arithmetic.</p>
+
+    <p>A sub-agent's prefix is a <em>different</em> prefix. It has its own instructions, usually its own narrowed tool set, and its own slice of the task — which is exactly what <a class="xref" href="/deep-dives/multi-agent-systems/what-a-subagent-inherits">what a subagent inherits</a> is about, and it means the cache entry the parent built does not apply. Each branch opens with a miss and pays the write multiplier:</p>
+
+<pre class="standalone"><span class="c-cm"># the prefix term, in base-input-token equivalents</span>
+prefix        = 8000            <span class="c-cm"># system + tool definitions, identical for every branch</span>
+steps_each    = 6
+write_mult    = 1.25            <span class="c-cm"># 5-minute cache write</span>
+read_mult     = 0.10            <span class="c-cm"># cache read on every later step</span>
+
+<span class="c-cm"># one sequential loop doing all 18 steps: one write, 17 reads</span>
+seq   = prefix * write_mult + prefix * read_mult * 17        <span class="c-cm"># = 23,600</span>
+
+<span class="c-cm"># three branches of 6 steps each: three writes, 5 reads apiece</span>
+three = 3 * (prefix * write_mult + prefix * read_mult * 5)   <span class="c-cm"># = 42,000</span>
+
+<span class="c-cm"># 1.8x on the prefix alone, before any of the real work is counted.</span>
+<span class="c-cm"># six branches of 3 steps: 6 * (10,000 + 1,600) = 69,600, i.e. 2.9x</span></pre>
+
+    <p>The term grows close to linearly in branches while the work per branch shrinks, so the prefix share of your bill rises every time you widen the fan. The practical consequence is a floor on branch length: a branch that runs three steps spends most of its budget introducing itself. If your prefix is large — a wide tool catalogue is the usual cause — fan-out is expensive before it has done anything, and trimming the per-branch tool set is a bigger lever than any model swap. <a class="xref" href="/deep-dives/memory-and-context/kv-cache-budgeting-for-agent-loops">KV-cache budgeting for agent loops</a> is the single-loop version of the same accounting.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Term two: branch output is billed twice, and the second time it lands in the supervisor.</h3>
+
+    <p>Whatever a branch concludes has to reach the supervisor, which means every token of every branch report is generated once at the output rate and then read again as input when the merge happens. That double billing is the same mechanism <a class="xref" href="/operations/economics-roi/fewer-tokens-vs-cheaper-tokens">fewer tokens versus cheaper tokens</a> identifies inside a single loop, but fan-out makes it structural: the merge's input is the sum of all branch outputs by construction, so the supervisor's own context grows with the branch count.</p>
+
+    <p>Three branches returning 2,000-token reports give the supervisor a 6,000-token read on top of its own prefix. Six branches give it 12,000, and now the merge step is the most expensive single call in the task — and the one most exposed to the effective-context problem, since a supervisor reasoning over twelve thousand tokens of six different narratives is in precisely the regime where recall degrades. That is the real ceiling on fan-out, and it is a context ceiling rather than a cost one.</p>
+
+    <p>So the merge budget, not the worker count, is what should cap the fan. Decide the largest merge input you are willing to reason over — call it 8,000 tokens — and derive the branch count from the report size you can actually enforce. If the arithmetic says four branches and you need twelve, the answer is not twelve branches: it is a reduce tree (merge in pairs, each merge producing one report of the same size) or a shared store the branches write to and the supervisor queries rather than ingests. <a class="xref" href="/deep-dives/multi-agent-systems/shared-memory-and-blackboard">Shared memory and the blackboard</a> is that second option, and <a class="xref" href="/deep-dives/tool-capability-design/shaping-tool-results">shaping tool results</a> is how you make a report small enough to be worth returning at all.</p>
+
+    <div class="callout"><p>A report that is not much smaller than the work that produced it means the branch was the wrong unit. Fan-out pays when a branch does a lot of reading and returns a little — search, triage, per-file analysis. It does not pay when the branch's job is to produce the text the user will read, because then nothing compresses and you have paid the prefix and the double billing to save nothing.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Term three: branches cannot see each other, so overlapping discovery is paid per branch.</h3>
+
+    <p>The third term is the one Anthropic's caveat points at. Independent branches rediscover the same things. Two sub-agents researching adjacent questions fetch the same three documents, read the same background, and each pay full price for it; the supervisor then reads both accounts of it in the merge. Nothing in the architecture deduplicates that, because the isolation that makes parallelism possible is the same isolation that prevents sharing.</p>
+
+    <p>This term is invisible in a token total and obvious in a trace. The measurement is cheap: count distinct retrieved documents or tool-call arguments across branches, and divide by the total. A ratio below about 0.7 — more than 30% of branch work is duplicated — means your decomposition is cutting across a shared dependency rather than along an independent seam, and re-cutting the task will beat any amount of per-branch optimisation. <a class="xref" href="/deep-dives/multi-agent-systems/multi-agent-failure-modes">Multi-agent failure modes</a> catalogues what else that bad seam causes, and <a class="xref" href="/deep-dives/multi-agent-systems/sub-agent-patterns-comparison">the sub-agent patterns comparison</a> covers which shape to reach for when the seam will not come clean.</p>
+
+    <p>A cheap partial fix: give the branches a shared read-through cache for retrieval — the same vector or document fetch, keyed and memoised at the tool layer, outside the model. It does not help the model-side duplication (each branch still reads the text into its own context) but it removes the retrieval and reranking spend, which on document-heavy work is frequently the larger line.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The latency side saturates, because the slowest of many is barely slower than the slowest of a few.</h3>
+
+    <p>The benefit half of the trade is also misread. Wall-clock for a fan-out is the slowest branch plus the merge, not the mean branch — and that maximum grows as you add branches. For branch durations with a light tail, the expected maximum of <em>k</em> draws grows roughly like the mean plus a term in <code class="inline">ln k</code>, which has a specific and inconvenient consequence:</p>
+
+    <ul>
+      <li><strong>1 → 3 branches</strong> is the big win. Three sequential sub-tasks of duration <em>T</em> take 3<em>T</em>; in parallel they take about 1.2–1.4<em>T</em> plus the merge. Call it a 2× speed-up for a 1.8× prefix bill — a good trade on a task where latency has a price.</li>
+      <li><strong>3 → 6 branches</strong> is not. The maximum moves from roughly 1.3<em>T</em> to about 1.5<em>T</em>, so you save nothing and may lose, while the prefix term goes from 1.8× to 2.9× and the merge input doubles.</li>
+    </ul>
+
+    <p>Two real effects make this worse than the model suggests. Provider rate limits serialise part of your fan-out whether you planned it or not, so the sixth branch may not actually start when the first five do — the measured maximum then includes queueing. And branch duration in agent work is right-skewed, not light-tailed: one branch hitting a retry loop or a slow tool sets the whole task's clock. The honest summary is that fan-out buys the first factor of two in latency and very little after it. Price that factor properly before spending for it, because the dollar value of latency is not uniform — <a class="xref" href="/operations/economics-roi/pricing-latency">pricing latency</a> shows the cost curve is nearly flat under a second, linear to about ten, and step-shaped after that, and <a class="xref" href="/operations/evaluation-and-observability/measuring-agent-latency">measuring agent latency</a> is how to get the distribution rather than a mean.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to do: three conditions, one cap, three instruments.</h3>
+
+    <p>Fan out when all three hold, and sequentially when any one fails:</p>
+
+    <ul>
+      <li><strong>The branches are long.</strong> Enough steps that the per-branch prefix write amortises — as a rule of thumb, at least five or six tool-using steps each. Shorter than that and <a class="xref" href="/concepts/parallel-tool-calls">parallel tool calls</a> inside one loop gives you most of the concurrency at none of the prefix cost, which is the option teams skip because it is less interesting.</li>
+      <li><strong>The branches are independent.</strong> Duplicate-work ratio above about 0.7 on a traced sample. Below it, re-cut the task.</li>
+      <li><strong>The branches compress.</strong> A report materially smaller than the work that produced it, with the size enforced in the sub-agent's instructions rather than hoped for.</li>
+    </ul>
+
+    <p>Then cap the fan by merge budget rather than by worker count: pick the largest merge input you will reason over, divide by the enforced report size, and that is your branch count. Needing more means a reduce tree or a shared store, and both are cheaper than a supervisor drowning in six narratives. Keep <a class="xref" href="/deep-dives/multi-agent-systems/terminating-a-multi-agent-run">a real termination condition</a> on every branch, because a step cap turns a slow branch into a silently truncated one and the merge cannot tell the difference.</p>
+
+    <p>Three instruments tell you whether a given fan-out is earning its keep, and none of them is total token count:</p>
+
+    <ul>
+      <li><strong>Cache-hit rate per branch.</strong> If branches are hitting cache less than the single loop did, you have found the prefix term in your own traces. Falling hit rate as fan-out widens is the signal that the fan is too wide.</li>
+      <li><strong>Merge input as a share of total input.</strong> Rising means you are paying to read your own output. Past roughly a third, restructure before optimising.</li>
+      <li><strong>Seconds saved per extra dollar.</strong> The actual exchange rate of the trade, measured against a sequential baseline you still run on a sample. It is the only number that answers "should the fourth branch exist", and it is almost always worse than the third branch's.</li>
+    </ul>
+
+    <div class="callout tip"><p>Before you widen a fan-out: measure your cacheable prefix and the enforced branch report size, then compute the prefix term and the merge input for the branch count you want. Fan out only where branches are long, independent and compressing; use parallel tool calls inside one loop when they are short, and a shared store or a reduce tree when they are many. Cap the fan at the merge budget you can reason over, not at the worker count you can afford. Instrument cache-hit rate per branch, merge share of input, and seconds saved per extra dollar against a sequential baseline — and fold the result into <a class="xref" href="/operations/economics-roi/unit-economics">cost per successful task</a>, because a faster wrong answer is still a failed task. If you keep one sentence: fan-out buys the first factor of two in latency and charges super-linearly for the rest.</p></div>
+  </div>
+</section>
