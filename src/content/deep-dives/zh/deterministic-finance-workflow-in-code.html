@@ -1,0 +1,365 @@
+<section class="phase">
+  <div class="phase-num">D15</div>
+  <div class="week">深入解析 · 架构与模式</div>
+  <h2>让三个 Claude 模型对一个月的银行流水做对账，25 次给出结果中只有 21 次是对的，而 25 份答案都说差额是 0.00。解决办法不是更好的提示词。匹配、算术和签核都交给代码；模型只为代码无法定论的那十来行提出配对建议。</h2>
+  <p class="goal">这是确定性财务工作流的实现篇。财务流程中哪些步骤才允许是概率性的，在 <a href="/zh/deep-dives/architectures-and-patterns/deterministic-boundary-for-finance-agents" class="xref">财务智能体的确定性边界</a> 中有论证；银行和会计软件厂商实际在跑什么，见 <a href="/zh/blogs/the-model-proposes-the-ledger-decides">这篇行业分析</a>。本页只做一件事：9 月份的银行对账单与现金日记账对账，先做错，再修好。数据由一个带固定种子的脚本生成：两边各 406 行，并按真实月份中常见的方式埋入了六个项目——同一天的两笔 450.00 电汇、一笔录入为 1,245.30 但实际以 1,254.30 清算的付款、一笔晚了九天才清算的付款、一笔银行手续费和一笔利息、一张未兑现支票，以及一笔在途存款。本页所有模型调用都通过 <code class="inline">claude -p</code>（Claude Code 2.1.303）完成，禁用工具，模型为 Haiku 5.5、Sonnet 5.5 和 Opus 5.5。代码运行在 Python 3.14 与 <code class="inline">pydantic</code> 2.14.1 上，八个测试全部通过。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>改造前：把整个月的数据交给模型，让它做对账。</h3>
+
+    <p>团队最先搭出来的往往是这个版本，因为它在演示时能跑通：把两本账都放进提示词，要求给出匹配结果、未匹配的行和银行余额调节表。</p>
+
+<pre class="standalone"><span class="c-st">"""BEFORE: hand the whole reconciliation to the model, numbers and all. Do not ship this."""</span>
+<span class="c-kw">import</span> json, subprocess, sys
+
+PROMPT = <span class="c-st">"""You are an accountant. Reconcile this September 2026 bank statement against the cash book.
+Match each bank line to its ledger line, list everything unmatched, and prepare the bank
+reconciliation: adjusted bank balance, adjusted book balance, and the difference.
+Reply with JSON only:
+{"matches": [["B..","L.."]], "unmatched_bank": ["B.."], "unmatched_ledger": ["L.."],
+ "adjusted_bank_balance": "0.00", "adjusted_book_balance": "0.00", "difference": "0.00",
+ "explanation": "..."}
+
+DATA:
+"""</span></pre>
+
+    <p>它一共跑了 28 次，覆盖两种规模（每边 50 行和 406 行）和两种变体：一种导出数据里带期末余额，另一种需要模型自己把每一行加总。对照已知答案评分：</p>
+
+<pre class="trace"><span class="c-out">runs                                   28   Haiku 5.5, Sonnet 5.5, Opus 5.5
+returned a difference                  25   every one of them: "0.00"
+correct and complete                   21
+  Sonnet, 406 lines, no totals          1   both closing balances +2,372.53; book total
+                                            "derived from the bank total"
+  Haiku, 50 and 406 lines               2   adjusted balances 1,245.30 below the correct
+                                            figure; the 9.00 fix described, not applied
+  Haiku, 406 lines                      1   listed 3 of 403 matched pairs
+declined to compute                     3   Haiku, 406 lines, no totals: all nulls
+keyed-error pair called a "match"   9 of 25 the same books, classified two ways</span></pre>
+
+    <p>这些模型做这件事其实很在行。Opus 和 Sonnet 在大多数运行中都能手工把 406 行正确加总，而且每一次给出数字的运行都找到了那笔 9.00 的录入错误。问题出在输出没有告诉你的东西上。25 份答案都说差额是 0.00，其中包括两个期末余额都错了 2,372.53 的那一份——它的说明里承认，账簿总额是从银行一侧倒推出来的。算出来的平衡和声称出来的平衡，在 JSON 里看起来一模一样。在同一实验的一次预跑中，还有一次 Sonnet 运行返回了一个根本不存在的分类账 ID <code class="inline">L390X</code>，只在文字说明里才自我更正。</p>
+
+    <p>审阅者如果想知道哪些运行是错的，就只能把对账重做一遍。所以对账从一开始就应该是代码，模型只负责真正需要“读懂”的那部分。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>金额跨越任何边界时都以字符串传递，在内部以整数分存储。</h3>
+
+<pre class="standalone">MONEY = re.compile(r<span class="c-st">"-?\d+\.\d{2}"</span>)
+
+<span class="c-kw">def</span> cents(s: str) -&gt; int:
+    <span class="c-st">"""'-1254.30' -&gt; -125430. Money crosses every boundary as a string, never a float."""</span>
+    <span class="c-kw">if</span> <span class="c-kw">not</span> isinstance(s, str) <span class="c-kw">or</span> <span class="c-kw">not</span> MONEY.fullmatch(s):
+        <span class="c-kw">raise</span> ValueError(<span class="c-st">f"money must be a string like '-1254.30', got {s!r}"</span>)
+    <span class="c-kw">return</span> int(s.replace(<span class="c-st">"."</span>, <span class="c-st">""</span>))
+
+<span class="c-kw">def</span> fmt(c: int) -&gt; str:
+    <span class="c-kw">return</span> <span class="c-st">f"{'-' if c &lt; 0 else ''}{abs(c) // 100}.{abs(c) % 100:02d}"</span></pre>
+
+    <p>这个解析器是刻意写得很严格的，而且在本页中，还没有任何模型参与，它就已经证明了自己的价值。数据生成器的第一个版本把一个 <code class="inline">Decimal</code> 除以 100，写出了 <code class="inline">7889.4</code>，被 <code class="inline">cents()</code> 拒绝了。换成浮点数流水线，这个值会被悄无声息地带下去。常见的陷阱值得烂熟于心：<code class="inline">0.1 + 0.2</code> 等于 <code class="inline">0.30000000000000004</code>，<code class="inline">round(2.675, 2)</code> 等于 <code class="inline">2.67</code>，而 <code class="inline">Decimal("100.00") / 3</code> 量化后再乘回去得到 <code class="inline">99.99</code>——所以拆分金额时，除非把余数分配出去，否则就会丢一分钱。</p>
+
+    <p>有一个陷阱恰好就在模型边界上。把 Pydantic 字段声明为 <code class="inline">Decimal</code> 并不能保护你：如果模型发来的是一个 JSON 数字，JSON 解析器会先把它变成浮点数——<code class="inline">12345678901234567.89</code> 到手时成了 <code class="inline">12345678901234568</code>。在任何由模型填写的 schema 中，都要把金额定义为带正则约束的字符串，再在代码里转换。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>代码匹配一切能证明的，其余的拒绝猜测。</h3>
+
+<pre class="standalone"><span class="c-kw">def</span> exact_pass(bank, ledger, window=3):
+    <span class="c-st">"""Same amount to the cent, dates within the window, and unique in BOTH directions."""</span>
+    near = <span class="c-kw">lambda</span> b, l: b.cents == l.cents <span class="c-kw">and</span> abs((b.day - l.day).days) &lt;= window
+    pairs = []
+    <span class="c-kw">for</span> b <span class="c-kw">in</span> sorted(bank, key=<span class="c-kw">lambda</span> x: x.id):
+        ls = [l <span class="c-kw">for</span> l <span class="c-kw">in</span> ledger <span class="c-kw">if</span> near(b, l)]
+        <span class="c-kw">if</span> len(ls) == 1 <span class="c-kw">and</span> sum(near(x, ls[0]) <span class="c-kw">for</span> x <span class="c-kw">in</span> bank) == 1:
+            pairs.append((b.id, ls[0].id))
+    <span class="c-kw">return</span> pairs</pre>
+
+    <p>只有当金额精确到分相等、日期相差不超过三天，且任何一方都没有第二个候选时，配对才会被接受。真正关键的是最后一个条件。同一天的两笔 450.00 电汇各自都能看到两条可能的分类账记录，因此代码让这四行全部保持未匹配，而不是按位置把它们配上——规则引擎正是这样悄无声息地错误过账的。在 406 行的这个月里，这一轮匹配定下了 400 对，剩下 12 行。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>模型为剩下的行提出配对建议，由代码判定每条建议的性质。</h3>
+
+<pre class="standalone"><span class="c-kw">class</span> Proposal(BaseModel):
+    bank_id: str
+    ledger_id: str
+    reason: str = Field(max_length=300)
+
+<span class="c-kw">class</span> Proposals(BaseModel):
+    proposals: list[Proposal]
+
+LLM = Callable[[str], str]          <span class="c-cm"># prompt in, JSON text out</span>
+
+PROPOSE = <span class="c-st">"""These bank and cash-book lines did not match automatically. Propose bank-&gt;ledger
+pairs that are the same transaction. Do not compute balances. Reply with JSON only:
+{"proposals": [{"bank_id": "B..", "ledger_id": "L..", "reason": "..."}]}
+"""</span>
+
+<span class="c-kw">def</span> propose(llm: LLM, bank, ledger) -&gt; list[Proposal]:
+    rows = <span class="c-kw">lambda</span> ls: [{<span class="c-st">"id"</span>: l.id, <span class="c-st">"date"</span>: l.day.isoformat(), <span class="c-st">"amount"</span>: fmt(l.cents), <span class="c-st">"text"</span>: l.text} <span class="c-kw">for</span> l <span class="c-kw">in</span> ls]
+    text = llm(PROPOSE + json.dumps({<span class="c-st">"bank"</span>: rows(bank), <span class="c-st">"ledger"</span>: rows(ledger)}, sort_keys=<span class="c-kw">True</span>))
+    <span class="c-kw">return</span> Proposals.model_validate_json(re.search(r<span class="c-st">"\{.*\}"</span>, text, re.S).group(0)).proposals
+
+<span class="c-kw">def</span> dispose(p: Proposal, open_b: dict, open_l: dict, max_days=14) -&gt; tuple[str, str]:
+    b, l = open_b.get(p.bank_id), open_l.get(p.ledger_id)
+    <span class="c-kw">if</span> b <span class="c-kw">is</span> <span class="c-kw">None</span> <span class="c-kw">or</span> l <span class="c-kw">is</span> <span class="c-kw">None</span>:
+        <span class="c-kw">return</span> <span class="c-st">"rejected"</span>, <span class="c-st">"unknown or already-used id"</span>
+    <span class="c-kw">if</span> b.cents != l.cents:
+        <span class="c-kw">return</span> <span class="c-st">"break"</span>, <span class="c-st">f"amounts differ by {fmt(b.cents - l.cents)}"</span>
+    <span class="c-kw">if</span> abs((b.day - l.day).days) &gt; max_days:
+        <span class="c-kw">return</span> <span class="c-st">"rejected"</span>, <span class="c-st">"dates too far apart"</span>
+    <span class="c-kw">return</span> <span class="c-st">"review"</span>, p.reason                      <span class="c-cm"># a human confirms before it counts</span></pre>
+
+    <p>模型看到的是 12 行而不是 812 行，它唯一可以返回的，是一组带理由的 ID 配对。它不需要计算任何东西。随后，代码给每条建议三种结果之一：未知或已被使用的 ID 被拒绝；金额不同的配对成为一个<em>差异项</em>，并附上精确差额；金额相等的配对作为待确认的匹配交给人工。模型说的任何话都不会被过账。在相同的剩余行上，Haiku 跑三次、Sonnet 跑三次：</p>
+
+<pre class="trace"><span class="c-out">                 Haiku 5.5 (x3)   Sonnet 5.5 (x3)
+exact, by code        400              400
+to review               3                3     both wires by payee; the 9-day Proseware payment
+breaks                  1                1     B269/L005, difference -9.00
+rejected                0                0
+adjusted bank    289,941.09       289,941.09
+adjusted book    289,941.09       289,941.09
+can sign off          no               no     until a person confirms 3 pairs and the -9.00 entry</span></pre>
+
+    <p>六次运行的结果完全相同。理由的措辞每次都不一样，但这些措辞都不属于账簿的一部分。较便宜的模型和较大的模型做得一样好，因为它被要求做的事情（读两段描述，判断它们是不是同一笔付款）是阅读任务，而不是计算。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>按规则对剩余项分类，计算调节表，并为签核设置门槛。</h3>
+
+<pre class="standalone"><span class="c-kw">def</span> classify(side: str, l: Line, period_end: date) -&gt; str:
+    <span class="c-kw">if</span> side == <span class="c-st">"ledger"</span> <span class="c-kw">and</span> l.cents &gt; 0 <span class="c-kw">and</span> (period_end - l.day).days &lt;= 3:
+        <span class="c-kw">return</span> <span class="c-st">"deposit_in_transit"</span>
+    <span class="c-kw">if</span> side == <span class="c-st">"ledger"</span> <span class="c-kw">and</span> l.cents &lt; 0 <span class="c-kw">and</span> l.text.lower().startswith(<span class="c-st">"cheque"</span>):
+        <span class="c-kw">return</span> <span class="c-st">"outstanding_cheque"</span>
+    <span class="c-kw">if</span> side == <span class="c-st">"bank"</span> <span class="c-kw">and</span> l.cents &lt; 0 <span class="c-kw">and</span> re.search(r<span class="c-st">"\b(FEE|CHARGE)\b"</span>, l.text):
+        <span class="c-kw">return</span> <span class="c-st">"bank_charge"</span>
+    <span class="c-kw">if</span> side == <span class="c-st">"bank"</span> <span class="c-kw">and</span> l.cents &gt; 0 <span class="c-kw">and</span> <span class="c-st">"INTEREST"</span> <span class="c-kw">in</span> l.text:
+        <span class="c-kw">return</span> <span class="c-st">"bank_interest"</span>
+    <span class="c-kw">return</span> <span class="c-st">"unexplained"</span></pre>
+
+<pre class="standalone"><span class="c-kw">def</span> reconcile(month: dict, llm: LLM | <span class="c-kw">None</span>, period_end=date(2026, 9, 30)) -&gt; Report:
+    bank, ledger = load(month[<span class="c-st">"bank"</span>]), load(month[<span class="c-st">"ledger"</span>])
+    r = Report()
+    <span class="c-cm"># Every total is recomputed from the lines and tied to the statement's own figure.</span>
+    bank_close = cents(month[<span class="c-st">"opening_balance_bank"</span>]) + sum(l.cents <span class="c-kw">for</span> l <span class="c-kw">in</span> bank)
+    book_close = cents(month[<span class="c-st">"opening_balance_book"</span>]) + sum(l.cents <span class="c-kw">for</span> l <span class="c-kw">in</span> ledger)
+    <span class="c-kw">if</span> <span class="c-st">"closing_balance_bank"</span> <span class="c-kw">in</span> month:
+        assert bank_close == cents(month[<span class="c-st">"closing_balance_bank"</span>]), <span class="c-st">"statement does not foot"</span>
+
+    <span class="c-kw">for</span> b, l <span class="c-kw">in</span> exact_pass(bank, ledger):
+        r.matched.append((b, l, <span class="c-st">"exact"</span>))
+    used_b = {m[0] <span class="c-kw">for</span> m <span class="c-kw">in</span> r.matched}; used_l = {m[1] <span class="c-kw">for</span> m <span class="c-kw">in</span> r.matched}
+    open_b = {l.id: l <span class="c-kw">for</span> l <span class="c-kw">in</span> bank <span class="c-kw">if</span> l.id <span class="c-kw">not</span> <span class="c-kw">in</span> used_b}
+    open_l = {l.id: l <span class="c-kw">for</span> l <span class="c-kw">in</span> ledger <span class="c-kw">if</span> l.id <span class="c-kw">not</span> <span class="c-kw">in</span> used_l}
+
+    <span class="c-kw">if</span> llm <span class="c-kw">and</span> open_b <span class="c-kw">and</span> open_l:
+        <span class="c-kw">for</span> p <span class="c-kw">in</span> propose(llm, sorted(open_b.values(), key=<span class="c-kw">lambda</span> x: x.id), sorted(open_l.values(), key=<span class="c-kw">lambda</span> x: x.id)):
+            verdict, why = dispose(p, open_b, open_l)
+            <span class="c-kw">if</span> verdict == <span class="c-st">"rejected"</span>:
+                r.rejected.append((p.bank_id, p.ledger_id, why)); <span class="c-kw">continue</span>
+            b, l = open_b.pop(p.bank_id), open_l.pop(p.ledger_id)
+            <span class="c-kw">if</span> verdict == <span class="c-st">"break"</span>:
+                r.breaks.append((b.id, l.id, b.cents - l.cents))
+            <span class="c-kw">else</span>:
+                r.review.append((b.id, l.id, why))
+
+    r.items = ([(<span class="c-st">"bank"</span>, l.id, classify(<span class="c-st">"bank"</span>, l, period_end), l.cents) <span class="c-kw">for</span> l <span class="c-kw">in</span> open_b.values()] +
+               [(<span class="c-st">"ledger"</span>, l.id, classify(<span class="c-st">"ledger"</span>, l, period_end), l.cents) <span class="c-kw">for</span> l <span class="c-kw">in</span> open_l.values()])
+    timing = sum(c <span class="c-kw">for</span> side, _, cat, c <span class="c-kw">in</span> r.items <span class="c-kw">if</span> cat <span class="c-kw">in</span> (<span class="c-st">"deposit_in_transit"</span>, <span class="c-st">"outstanding_cheque"</span>))
+    bank_side = sum(c <span class="c-kw">for</span> side, _, cat, c <span class="c-kw">in</span> r.items <span class="c-kw">if</span> cat <span class="c-kw">in</span> (<span class="c-st">"bank_charge"</span>, <span class="c-st">"bank_interest"</span>))
+    correction = sum(d <span class="c-kw">for</span> _, _, d <span class="c-kw">in</span> r.breaks)
+    r.adjusted_bank = bank_close + timing
+    r.adjusted_book = book_close + bank_side + correction
+    r.can_sign_off = (r.adjusted_bank == r.adjusted_book <span class="c-kw">and</span> <span class="c-kw">not</span> r.review <span class="c-kw">and</span> <span class="c-kw">not</span> r.breaks
+                      <span class="c-kw">and</span> all(cat != <span class="c-st">"unexplained"</span> <span class="c-kw">for</span> *_, cat, _ <span class="c-kw">in</span> r.items))
+    check_invariants(bank, ledger, r)
+    <span class="c-kw">return</span> r</pre>
+
+    <p>差额之所以不能当作检查，原因在于算术本身。当两本账从同一期初余额出发时，任何一份把每条未匹配行都作为本方调节项列示的对账，都会天然平衡：调整后账面余额减去调整后银行余额，等于各匹配对差额之和，也就是零。STEP 1 中那两次结果少了 1,245.30 的 Haiku 运行正是这样做的，而且都报告了 0.00。所以在这里真正起作用的是另外几道控制：</p>
+
+    <ul>
+      <li><strong>对账单能够轧平。</strong>期末余额由各行重新计算，并与银行自己给出的数字做断言比对，因此漏掉一行就会让整次运行失败。</li>
+      <li><strong>每条未匹配行都有一个来自规则的类别。</strong>在途存款是最后三天内的一条正数分类账记录，未兑现支票是一条属于支票的负数分类账记录。任何规则都认领不了的行就是 <code class="inline">unexplained</code>，单凭这一点就会阻止签核。</li>
+      <li><strong>错误要做成分录，而不是调整。</strong>那笔 9.00 的差异项会产生一条账簿需要的更正分录，签核要等到它过账并获批之后。</li>
+    </ul>
+
+    <p>谁有权审批是一个策略问题，用策略来表达比用 <code class="inline">if</code> 语句更好。在 Cedar（<code class="inline">cedarpy</code> 4.12.2）中，<code class="inline">permit(principal, action == Action::"approve", resource) when { resource.maker != principal };</code> 在对账服务试图审批自己生成的更正分录时返回 <code class="inline">Deny</code>，而对一位具名的财务主管返回 <code class="inline">Allow</code>。</p>
+
+<pre class="standalone"><span class="c-kw">def</span> check_invariants(bank, ledger, r: Report) -&gt; <span class="c-kw">None</span>:
+    seen_b = [m[0] <span class="c-kw">for</span> m <span class="c-kw">in</span> r.matched + r.review + r.breaks] + [i[1] <span class="c-kw">for</span> i <span class="c-kw">in</span> r.items <span class="c-kw">if</span> i[0] == <span class="c-st">"bank"</span>]
+    seen_l = [m[1] <span class="c-kw">for</span> m <span class="c-kw">in</span> r.matched + r.review + r.breaks] + [i[1] <span class="c-kw">for</span> i <span class="c-kw">in</span> r.items <span class="c-kw">if</span> i[0] == <span class="c-st">"ledger"</span>]
+    assert sorted(seen_b) == sorted(l.id <span class="c-kw">for</span> l <span class="c-kw">in</span> bank), <span class="c-st">"every bank line accounted for exactly once"</span>
+    assert sorted(seen_l) == sorted(l.id <span class="c-kw">for</span> l <span class="c-kw">in</span> ledger), <span class="c-st">"every ledger line accounted for exactly once"</span>
+    amt = {l.id: l.cents <span class="c-kw">for</span> l <span class="c-kw">in</span> bank + ledger}
+    assert all(amt[b] == amt[l] <span class="c-kw">for</span> b, l, _ <span class="c-kw">in</span> r.matched + r.review), <span class="c-st">"a match is equal to the cent"</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>记录模型的回复，让审计师的重跑就是同一次运行。</h3>
+
+    <p>审计师会要求你在 12 月重新执行 9 月的对账。靠再问一次模型是做不到的，因为没有任何一家托管服务商保证两次给出相同的回复（<a href="/zh/deep-dives/architectures-and-patterns/deterministic-boundary-for-finance-agents" class="xref">边界篇</a>列出了各家分别提供什么）。因此，可复现性来自记录，而不是采样参数。</p>
+
+<pre class="standalone"><span class="c-kw">class</span> Recorded:
+    <span class="c-st">"""Same model + same prompt -&gt; the stored reply, so an auditor's rerun is byte-identical."""</span>
+    <span class="c-kw">def</span> __init__(self, llm: LLM | <span class="c-kw">None</span>, model: str, path: str):
+        self.llm, self.model, self.path = llm, model, path
+        <span class="c-kw">try</span>: self.store = json.load(open(path))
+        <span class="c-kw">except</span> FileNotFoundError: self.store = {}
+        self.calls = 0
+    <span class="c-kw">def</span> __call__(self, prompt: str) -&gt; str:
+        key = hashlib.sha256(<span class="c-st">f"{self.model}\0{prompt}"</span>.encode()).hexdigest()
+        <span class="c-kw">if</span> key <span class="c-kw">not</span> <span class="c-kw">in</span> self.store:
+            <span class="c-kw">if</span> self.llm <span class="c-kw">is</span> <span class="c-kw">None</span>:
+                <span class="c-kw">raise</span> LookupError(<span class="c-st">f"no recorded reply for {key[:12]}; replay cannot call a model"</span>)
+            self.store[key] = self.llm(prompt); self.calls += 1
+            json.dump(self.store, open(self.path, <span class="c-st">"w"</span>), indent=1, sort_keys=<span class="c-kw">True</span>)
+        <span class="c-kw">return</span> self.store[key]</pre>
+
+    <p>键涵盖模型名称和完整的提示词，而提示词由排序后的行构建，所以同一个月总是生成同一个键。不挂接模型的回放会返回存储的回复，调用次数为零，并产出完全相同的报告。找不到记录的回放会直接报错，而不是悄悄去调用模型。把这个存储和该期间的工作底稿放在一起保存。它是证据，证明财务主管批准的那些建议正是模型当时给出的。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 7</div>
+    <h3>模型撰写文字时，其中的每个数字都必须是代码算出来的。</h3>
+
+    <p>对于 CFO 要读的说明文字，模型确实很有用。它可以根据报告来写这段说明，前提是你要检查它写了什么。</p>
+
+<pre class="standalone">
+<span class="c-kw">def</span> figures(report) -&gt; set[str]:
+    <span class="c-st">"""The only numbers the commentary may state, as normalised strings."""</span>
+    vals = [report.adjusted_bank, report.adjusted_book] + [c <span class="c-kw">for</span> *_, c <span class="c-kw">in</span> report.items] + [d <span class="c-kw">for</span> *_, d <span class="c-kw">in</span> report.breaks]
+    out = {fmt(abs(v)) <span class="c-kw">for</span> v <span class="c-kw">in</span> vals}
+    out |= {str(len(report.matched)), str(len(report.review)), str(len(report.breaks)), <span class="c-st">"0.00"</span>}
+    <span class="c-kw">return</span> out
+
+<span class="c-kw">def</span> unsupported(text: str, allowed: set[str]) -&gt; list[str]:
+    bad = []
+    <span class="c-kw">for</span> raw <span class="c-kw">in</span> NUM.findall(text):
+        n = raw.strip(<span class="c-st">"()$-"</span>).replace(<span class="c-st">","</span>, <span class="c-st">""</span>)
+        <span class="c-kw">if</span> re.fullmatch(r<span class="c-st">"20\d\d"</span>, n):        <span class="c-cm"># a year, not an amount</span>
+            <span class="c-kw">continue</span>
+        <span class="c-kw">if</span> <span class="c-st">"."</span> <span class="c-kw">in</span> n:
+            n = str(Decimal(n).quantize(Decimal(<span class="c-st">"0.01"</span>))) <span class="c-kw">if</span> len(n.split(<span class="c-st">"."</span>)[1]) &lt;= 2 <span class="c-kw">else</span> n
+        <span class="c-kw">if</span> n <span class="c-kw">not</span> <span class="c-kw">in</span> allowed:
+            bad.append(raw)</pre>
+
+    <p>十段说明（五段 Haiku、五段 Sonnet），每段都只根据报告中的数字撰写，没有出现任何无依据的数字。当模型是被“给予”数字而不是被“索要”数字时，这正是预期的结果，而这道检查让你可以放心依赖它。在测试套件中，同一个函数能在一句本应写 9.00 和 3 的句子里，标记出埋入的“90.00”和“12 items”。检查中的金额以规范化的 <code class="inline">Decimal</code> 字符串比较，从不使用浮点数。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 8</div>
+    <h3>测试：把设计的承诺写下来。</h3>
+
+<pre class="standalone"><span class="c-kw">def</span> test_model_proposals_are_disposed_by_code():
+    (b1, l1), (b2, l2) = NAMED[<span class="c-st">"wires"</span>]
+    r = reconcile(MONTH, fake({<span class="c-st">"proposals"</span>: [
+        {<span class="c-st">"bank_id"</span>: b1, <span class="c-st">"ledger_id"</span>: l1, <span class="c-st">"reason"</span>: <span class="c-st">"same payee"</span>},
+        {<span class="c-st">"bank_id"</span>: TP_B, <span class="c-st">"ledger_id"</span>: TP_L, <span class="c-st">"reason"</span>: <span class="c-st">"same vendor"</span>},      <span class="c-cm"># amounts differ by 9.00</span>
+        {<span class="c-st">"bank_id"</span>: b2, <span class="c-st">"ledger_id"</span>: <span class="c-st">"L390X"</span>, <span class="c-st">"reason"</span>: <span class="c-st">"typo"</span>},          <span class="c-cm"># no such ledger line</span>
+    ]}))
+    assert [x[:2] <span class="c-kw">for</span> x <span class="c-kw">in</span> r.review] == [(b1, l1)]
+    assert r.breaks == [(TP_B, TP_L, -900)]
+    assert r.rejected == [(b2, <span class="c-st">"L390X"</span>, <span class="c-st">"unknown or already-used id"</span>)]
+    assert <span class="c-kw">not</span> r.can_sign_off
+
+<span class="c-kw">def</span> test_dropping_a_line_fails_the_tie_to_the_statement():
+    m = copy.deepcopy(MONTH); m[<span class="c-st">"bank"</span>].pop()
+    <span class="c-kw">with</span> pytest.raises(AssertionError, match=<span class="c-st">"does not foot"</span>):
+        reconcile(m, <span class="c-kw">None</span>)
+
+<span class="c-kw">def</span> test_input_order_does_not_change_the_result():
+    m = copy.deepcopy(MONTH); random.Random(7).shuffle(m[<span class="c-st">"bank"</span>]); random.Random(8).shuffle(m[<span class="c-st">"ledger"</span>])
+    a, b = reconcile(MONTH, <span class="c-kw">None</span>), reconcile(m, <span class="c-kw">None</span>)
+    assert (sorted(a.matched), sorted(a.items), a.adjusted_bank) == (sorted(b.matched), sorted(b.items), b.adjusted_bank)
+
+<span class="c-kw">def</span> test_replay_is_identical_and_makes_no_call(tmp_path):
+    path = str(tmp_path / <span class="c-st">"replies.json"</span>)
+    live = Recorded(fake({<span class="c-st">"proposals"</span>: [{<span class="c-st">"bank_id"</span>: TP_B, <span class="c-st">"ledger_id"</span>: TP_L, <span class="c-st">"reason"</span>: <span class="c-st">"x"</span>}]}), <span class="c-st">"m"</span>, path)
+    first = reconcile(MONTH, live)
+    replay = Recorded(<span class="c-kw">None</span>, <span class="c-st">"m"</span>, path)
+    second = reconcile(MONTH, replay)
+    assert (live.calls, replay.calls) == (1, 0)
+    assert first == second
+    <span class="c-kw">with</span> pytest.raises(LookupError):
+        reconcile(MONTH, Recorded(<span class="c-kw">None</span>, <span class="c-st">"other-model"</span>, path))</pre>
+
+    <p>完整的测试套件有八个测试。按顺序，它们分别检查：</p>
+
+    <ul>
+      <li>金额解析器会拒绝 <code class="inline">0.1</code>、<code class="inline">"7889.4"</code>、<code class="inline">"1.234"</code> 和 <code class="inline">"1,254.30"</code>；</li>
+      <li>在 <code class="inline">Decimal</code> 字段中，JSON 数字确实会丢失分位；</li>
+      <li>仅靠代码时，两笔相同的电汇都保持未匹配；</li>
+      <li>幻觉出来的 ID、金额不符的配对和有效配对各自得到正确的结果；</li>
+      <li>删掉一条银行流水，会导致与对账单的勾稽失败；</li>
+      <li>打乱输入顺序不会改变任何结果；</li>
+      <li>回放结果完全一致，且不发起任何调用；</li>
+      <li>说明文字中的无依据数字会被捕获。</li>
+    </ul>
+
+    <p>这些测试都不调用模型。代替模型的是一个返回固定回复的假对象，而这恰恰是重点：这些保证是代码的属性，所以可以像测试代码一样测试它们。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 9</div>
+    <h3>库：各自适用于什么，以及我们踩过的坑。</h3>
+
+    <p>下面每个库都在 2026-10-22 安装并实际试用过。标注为“实测”的行为是我们自己跑出来的。</p>
+
+    <p><strong>金额与算术。</strong></p>
+    <ul>
+      <li><strong>Python <code class="inline">decimal</code>：</strong>正确的基础类型，前提是始终从字符串构造值，并用显式的舍入模式量化。默认上下文是 <code class="inline">ROUND_HALF_EVEN</code>，即银行家舍入，所以 <code class="inline">Decimal("2.665")</code> 舍入为 2.66，而四舍五入得到 2.67。有些税务和开票规则要求四舍五入，因此要把舍入模式做成一个具名参数。</li>
+      <li><strong>整数最小货币单位：</strong>本页采用的方式。用 <code class="inline">BIGINT</code> 存分，或者在 Postgres 中用 <code class="inline">NUMERIC(p,s)</code> 列，绝不用 <code class="inline">float8</code>。<code class="inline">babel</code> 2.18.0 提供每种货币的精度：JPY 为 0 位小数，BHD 为 3 位。</li>
+      <li><strong><code class="inline">py-moneyed</code> 3.0：</strong>能阻止你把 USD 和 EUR 相加，但不会按货币精度量化（<code class="inline">Money("10.005", "USD")</code> 仍是 10.005），而且最后一次发布是在 2022 年。</li>
+      <li><strong>JavaScript：</strong><code class="inline">dinero.js</code> 2.0.2（经历多年 alpha 版本后，自 2026 年 3 月起稳定）使用整数最小货币单位，并提供 <code class="inline">allocate</code>。<code class="inline">decimal.js</code> 10.6.0 和 <code class="inline">big.js</code> 7.0.1 负责任意精度算术。</li>
+    </ul>
+
+    <p><strong>账簿。</strong></p>
+    <ul>
+      <li><strong><code class="inline">beancount</code> 3.2.3：</strong>会拒绝不平衡的交易。实测：写成两位小数的 <code class="inline">balance</code> 断言会容忍一分钱的差异，所以 <code class="inline">-1199.99 USD</code> 在实际为 -1200.00 时也通过了。写成 <code class="inline">-1199.99 ~ 0.00 USD</code> 才是精确比对。许可证为 GPL-2.0。</li>
+      <li><strong>TigerBeetle 0.17.9：</strong>专为借贷记账打造的数据库，其两阶段挂起转账可以对应到制单-复核，转账 ID 具备幂等性。它仍处于 0.x 阶段，所以要把客户端和服务器版本一起锁定。</li>
+      <li><strong>Formance Ledger 和 Blnk：</strong>可自行部署的账簿服务。Blnk 自带一个带匹配规则的对账引擎。</li>
+      <li><strong><code class="inline">python-accounting</code> 2.0.0：</strong>不同时装好 MySQL 和 Postgres 客户端库就无法安装。</li>
+    </ul>
+
+    <p><strong>差异比对与数据校验。</strong></p>
+    <ul>
+      <li><strong><code class="inline">datacompy</code> 1.1.0（Capital One）：</strong>按键比对两份导出数据的最快方式。实测：1.x 版本移除了 <code class="inline">datacompy.Compare</code>，所以要用 <code class="inline">PandasCompare</code> 并设置 <code class="inline">abs_tol=0</code>。它能处理 <code class="inline">Decimal</code> 列。</li>
+      <li><strong><code class="inline">pandera</code> 0.34.1、Great Expectations 1.24.0 和 Pointblank 1.1.1：</strong>在流水线的数据表进入对账之前先做校验。Great Expectations 正在转由 Fivetran 管理。</li>
+      <li><strong>Splink 5.0.0：</strong>用于交易对手名称的概率性匹配。把它的分数送入一个确定性的阈值，绝不直接用于过账。第 5 版有破坏性的 API 变更。</li>
+    </ul>
+
+    <p><strong>规则、策略与证明。</strong></p>
+    <ul>
+      <li><strong>GoRules ZEN（<code class="inline">zen-engine</code> 2.1.3）：</strong>财务主管看得懂的决策表。实测：数字返回 Python 时是浮点数（<code class="inline">10000.10</code> 返回为 <code class="inline">10000.1</code>），所以进出都用整数分。</li>
+      <li><strong>Cedar 和 OPA：</strong>用于“谁可以审批什么”。Cedar 的制单-复核规则见 STEP 5。</li>
+      <li><strong>Z3（<code class="inline">z3-solver</code> 5.3.1.0）：</strong>用编码好的规则检验模型给出的结论。实测：在费用政策为 2%、上限 25.00，余额为 1,500.00 的条件下，“费用是 35.00”这一断言返回 <code class="inline">unsat</code>。</li>
+      <li><strong>AWS Bedrock Automated Reasoning checks：</strong>这一思路的托管版本，自 2025 年 8 月起正式可用。它只报告发现，从不拦截内容。它仅支持英语、不支持流式输出，其文档也提醒，复利这类非线性算术可能返回 <code class="inline">TOO_COMPLEX</code>。用它来处理资格和政策类问题，而不是计算金额。</li>
+    </ul>
+
+    <p><strong>与模型交互。</strong></p>
+    <ul>
+      <li><strong>原生结构化输出、Instructor 1.17.0、PydanticAI 和 BAML：</strong>它们都能让你拿到合法的结构，但没有一个能让你拿到正确的数字。Instructor 的“重试直到合法”循环会让输出最终合法，同时多出需要记录的调用。BAML 的宽松解析会把格式错误的回复强行凑成结构。无论哪种，都要在下游校验。</li>
+      <li><strong>Outlines 1.3.3：</strong>用于自托管模型的约束解码。</li>
+      <li><strong>Guardrails AI 和 NeMo Guardrails：</strong>用于安全与格式检查。LLM Guard 的代码仓库已归档。</li>
+    </ul>
+
+    <p><strong>持久化执行。</strong>Temporal、DBOS 或 Restate 会把每次模型调用记录为一个步骤，因此恢复的工作流会回放记录下来的回复，而不是再次调用模型。这就是基础设施层面的 STEP 6。Restate 的服务器采用 BSL 1.1 许可证。</p>
+
+    <ul>
+      <li><strong>从这里起步：</strong>配合严格字符串解析器的整数分、一轮拒绝歧义的精确匹配、只返回 ID 配对的模型、负责分类的代码、一条审批策略，以及一个回复记录存储。这些全部只需 Python 标准库加上 Pydantic。</li>
+      <li><strong>当智能体的输出会过账时，再引入账簿</strong>（TigerBeetle、Formance 或 Blnk），不要提前。</li>
+      <li><strong>当模型对政策作出断言时，再引入 Z3 或 Automated Reasoning</strong>，例如资格、费用减免或限额，而不是提出匹配建议的场景。</li>
+      <li><strong>永远不要引入</strong>让 LLM 评审来裁决某个数字。<a href="/zh/deep-dives/architectures-and-patterns/deterministic-boundary-for-finance-agents" class="xref">边界篇</a>解释了原因。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>本页每个代码块都取自通过了测试的文件。合计约 250 行（含测试），外加一个 70 行的数据生成器，小到足以改造成适配你自己的对账单格式。其他财务流程见领域手册：<a href="/zh/playbooks/domain-playbooks/accounts-payable-agents" class="xref">应付账款</a>、<a href="/zh/playbooks/domain-playbooks/expense-and-travel-audit-agents" class="xref">费用审计</a>和<a href="/zh/playbooks/domain-playbooks/payroll-and-tax-compliance-agents" class="xref">薪资</a>；<a href="/zh/playbooks/domain-playbooks/finance-agents" class="xref">财务智能体</a>则涵盖它们共用的那套护栏。</p>
+    </div>
+  </div>
+</section>
