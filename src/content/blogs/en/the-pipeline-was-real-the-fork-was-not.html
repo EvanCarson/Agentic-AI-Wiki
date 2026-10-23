@@ -1,0 +1,130 @@
+<p class="lede">The malicious LiteLLM wheel was built by LiteLLM's own release workflow. Not a typosquat, not a hijacked maintainer account publishing by hand — the project's real, signed, logged pipeline, pointed at a fork called <code>Berri-AI/litellm</code> instead of <code>BerriAI/litellm</code>. That single hyphen is the whole lesson, because build provenance attests the workflow that ran and says nothing about the repository it read. Every team that spent 2026 adopting attestation as its supply-chain answer would have had that answer return "verified".</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>All times UTC on 21 October 2026, per Datadog Security Labs' published timeline. The window from publication to PyPI quarantine was one hour and forty-one minutes; Docker images came down thirty-three minutes after that.</p>
+  <table>
+    <thead>
+      <tr><th>Time</th><th>Event</th><th>What it means for you</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>11:39</td><td>Malicious <code>litellm</code> 1.107.0 published to PyPI</td><td>Any unpinned install from here on took it</td></tr>
+      <tr><td>~11:46</td><td>Socket flags the malicious wheels</td><td>Detection worked; it does not uninstall anything</td></tr>
+      <tr><td>13:20</td><td>PyPI quarantines 1.107.0</td><td>New installs stop. Existing ones do not</td></tr>
+      <tr><td>13:53</td><td>Affected container images removed</td><td>Tags <code>v1.107.0</code>, <code>latest</code>, <code>main-latest</code>, <code>main-stable</code></td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/the-pipeline-was-real-the-fork-was-not/arch-how-the-release-was-built.svg" alt="Stolen GitHub CLI tokens from three engineer accounts trigger LiteLLM's genuine release workflow, which reads a lookalike fork and publishes signed artefacts to PyPI and two container registries." width="900" height="500" loading="lazy" />
+    <figcaption>Every box after the first is the project's real infrastructure. The substitution happened at the input, where nothing was checking.</figcaption>
+  </figure>
+
+  <p>LiteLLM is the open-source gateway that sits in front of model providers for a large share of the agent ecosystem — Datadog Security Labs puts it at roughly 23 million weekly downloads. The compromised release carried an infostealer plus a dormant second-stage loader. The last known-good version is 1.106.2. This is the project's second compromise of 2026; versions 1.82.7 and 1.82.8 were affected earlier in the year, and no link between the two has been established.</p>
+</section>
+
+<section>
+  <h2>What was taken was the release path, not the repository</h2>
+  <p>Per Datadog's account, the attackers held GitHub CLI OAuth tokens belonging to three engineers' accounts. They did not need to push a commit to the real repository, open a pull request, or get a review approved. They needed to start a workflow — and a developer CLI token is sufficient authority to do that.</p>
+
+  <p>The workflow then did its job correctly. It checked out the source it was told to check out, built it, and published the result to PyPI, GitHub Container Registry and Docker Hub under the project's own identity. Nothing malfunctioned. The one input nobody validated was which repository the word "source" resolved to, and <code>Berri-AI</code> versus <code>BerriAI</code> is a difference designed to survive a human glance at a log line.</p>
+
+  <p>This is the specific failure that makes the incident worth your attention rather than just your rotation runbook. A hijacked-maintainer-account attack produces an artefact with the wrong signer. A typosquat produces a package with the wrong name. This produced an artefact with the <em>right</em> signer, the right name, the right version sequence, and a build log showing it came from the official workflow.</p>
+
+  <div class="callout warn">
+    <p>The credential class that mattered here was a developer's own CLI token — the thing sitting in <code>~/.config/gh/hosts.yml</code> on three laptops. If your release workflow can be dispatched by anyone holding a personal token, your release authority is the weakest laptop on the team, whatever your branch protection says.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Which control would have caught it, and which would have blessed it</h2>
+  <figure>
+    <img src="/blogs/the-pipeline-was-real-the-fork-was-not/compare-what-each-control-sees.svg" alt="Three columns comparing a floating tag, a build provenance attestation and a digest pin against what each one actually verifies and whether it stopped this release." width="900" height="300" loading="lazy" />
+    <figcaption>Two of the three answer a question about origin. Only the third answers a question about bytes.</figcaption>
+  </figure>
+
+  <p>Sort your supply-chain controls by the question they answer and this incident separates them cleanly. <strong>Floating references</strong> — <code>latest</code>, <code>main-stable</code>, an unpinned <code>pip install litellm</code> — answer "what is newest?", and for one hour and forty-one minutes the honest answer was the malware. <strong>Provenance attestation</strong> answers "was this built by the project's pipeline?", and here the truthful answer was yes; a verifier checking it would have passed the artefact and logged a success. <strong>A digest pin</strong> answers "are these the exact bytes I reviewed?", and the answer was no, so nothing moved.</p>
+
+  <p>That ordering is uncomfortable because provenance is the control the industry has been building toward, and it is genuinely valuable against a large class of attacks. It just is not a content check. An attestation is a statement about a process, and a process can be aimed somewhere new without ceasing to be the same process. The site's note on <a href="/concepts/pinning-and-verification">pinning and verification</a> makes the general version of this point: a name that resolves through somebody else's namespace is a preference, and a digest that <em>is</em> the content is a lock. Here the namespace being resolved was a GitHub organisation name, one character wide.</p>
+
+  <p>The corollary is the part worth arguing with your platform team about. Adding provenance verification to a pipeline that pulls floating tags does not make the pipeline safer against this attack; it makes the pipeline's logs more confident about an artefact it was going to install anyway. The safety came from refusing unreviewed bytes, and only the digest does that.</p>
+</section>
+
+<section>
+  <h2>The blast radius was the interpreter, not the gateway</h2>
+  <p>The payload dropped three files into <code>site-packages</code>: <code>cook.pth</code>, <code>cook.py</code> and <code>sitecustomize.py</code>. Python executes <code>.pth</code> files and <code>sitecustomize.py</code> at interpreter start, which means the stealer ran whenever anything in that environment ran Python. Not when an agent called the gateway. Not when <code>litellm</code> was imported. Whenever <code>python</code> or <code>pip</code> started.</p>
+
+  <p>Two consequences follow, and both of them break the intuitions people use when triaging a dependency incident.</p>
+
+  <p><strong>Uninstalling the package does not remove the malware.</strong> The three files live beside the package, not inside it, so <code>pip uninstall litellm</code> leaves them in place — and the <code>pip</code> that runs the uninstall triggers them. Datadog's remediation starts with deleting the three files by hand for exactly this reason. A team that reasoned "we removed the bad version, we're clean" is still running it.</p>
+
+  <p><strong>The reachable set is the environment's whole credential surface.</strong> Datadog's analysis lists cloud credentials including instance metadata for AWS, GCP and Azure; Kubernetes, Docker, Vault and Terraform secrets; SSH, GPG and TLS keys; Git, npm and PyPI tokens; <code>.env</code> files and shell history; browser-saved passwords and cookies; and provider API keys and sessions for Claude, Codex, Gemini, Cursor and Copilot. Exfiltration was encrypted with AES-256 and RSA-4096 and sent to <code>www.litellm[.]dev/healthcheck</code> — a lookalike domain and a path chosen to read as noise in an egress log.</p>
+
+  <p>That last group deserves its own sentence. If the LiteLLM proxy had a database configured, the upstream provider credentials stored in its tables were in scope. This is the structural hazard of the pattern, not a bug in this product: the advice to move provider keys out of the model's reach and into a broker at the egress boundary is correct, and it concentrates every provider credential you own into one process with one upgrade path. We wrote that up separately as <a href="/operations/safety-and-security/when-the-credential-broker-is-compromised">when the credential broker is compromised</a>, because the design response is a different piece of work from the incident response.</p>
+</section>
+
+<section>
+  <h2>Two hours is longer than an install and shorter than a detection</h2>
+  <p>One hour and forty-one minutes of PyPI availability sounds survivable until you count what fires automatically inside a window that size. Every CI job that resolves dependencies without a lockfile. Every container build that pulls <code>latest</code>. Every autoscaling event that starts a fresh node and installs from scratch. Every developer who ran an upgrade that morning. None of these involve a human deciding to adopt a new version; they are the machinery of a normal Wednesday.</p>
+
+  <p>Detection, meanwhile, worked impressively well and did not help the people who had already installed. Socket flagged the wheels roughly seven minutes after publication. That is close to the floor of what automated scanning can achieve, and it was still after the first installs. The asymmetry is the point: scanning shortens the window for the <em>next</em> victim, and does nothing for anyone inside it. Which is the <a href="/concepts/fail-closed-and-fail-open">fail-closed</a> question wearing supply-chain clothes — a scanner that has not yet flagged a package is indistinguishable from a scanner that has cleared it.</p>
+
+  <figure>
+    <img src="/blogs/the-pipeline-was-real-the-fork-was-not/data-exposure-window.svg" alt="A timeline from 11:30 to 14:00 UTC showing the malicious release installable from PyPI for 101 minutes and the container images available for 134 minutes, against a 7-minute detection bar." width="900" height="400" loading="lazy" />
+    <figcaption>Detection landed at seven minutes. The quarantine landed at 101. Everything installed in between stayed installed.</figcaption>
+  </figure>
+
+  <p>There is also a rollback trap worth naming. A team pinning <code>main-stable</code> has no record of which immutable artefact it was running last week, so "roll back to the known-good version" requires first reconstructing what the known-good version was. The teams who recovered fastest here were the ones whose lockfile already named 1.106.2 with a hash, which is to say the ones who were never exposed.</p>
+</section>
+
+<section>
+  <h2>What to actually do</h2>
+  <p>In rough order of how much protection each buys per hour of work:</p>
+  <ul>
+    <li><strong>Pin by digest, for images and for Python.</strong> Immutable image digests rather than tags, and hashes in your lockfile (<code>pip install --require-hashes</code>, or a resolver that writes them). This is the only control in this article that stopped the attack rather than describing it.</li>
+    <li><strong>Lock release workflows to an allowlist of repository and branch.</strong> Datadog's recommendation, and the fix closest to the root cause: a workflow that can only build from one source cannot be aimed at a fork. Audit which identities can dispatch yours.</li>
+    <li><strong>Treat developer CLI tokens as release credentials.</strong> They were the initial access here. Short lifetimes, no long-lived personal tokens with workflow scope, and a hardware-backed second factor on the accounts that can trigger a publish.</li>
+    <li><strong>Write the "we installed a compromised package" runbook before you need it,</strong> and make its first step <em>find files the package manager does not own</em>. The <code>.pth</code> persistence trick is not novel and it defeats the obvious remediation.</li>
+    <li><strong>Inventory what your gateway host can reach,</strong> not what your gateway is configured to do. The question is which of the four groups above live in that environment, and whether the answer needs to.</li>
+    <li><strong>Rotate from a clean machine.</strong> Rotating credentials from the compromised host hands the new ones to the stealer. Obvious written down, routinely skipped under pressure.</li>
+  </ul>
+
+  <p>And keep the scope of the argument honest. LiteLLM responded quickly, published what happened, and the detection ecosystem around it performed close to its theoretical best. Nothing here is a reason to prefer a closed gateway, where the same substitution would simply have been invisible. The reason to care is narrower and more durable: the control that was supposed to answer "can I trust this build?" answered yes, truthfully, about malware — and it will do so again, because that is what it was designed to assert.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Which LiteLLM versions were affected?</h3>
+  <p>Only <code>litellm</code> 1.107.0 on PyPI, plus the container images tagged <code>v1.107.0</code>, <code>latest</code>, <code>main-latest</code> and <code>main-stable</code> on GitHub Container Registry and Docker Hub. The last known-good release is 1.106.2.</p>
+  <h3>Is uninstalling LiteLLM enough to clean a host?</h3>
+  <p>No. The payload wrote <code>cook.pth</code>, <code>cook.py</code> and <code>sitecustomize.py</code> into <code>site-packages</code> alongside the package rather than inside it, so uninstalling leaves them — and Python runs them at every interpreter start, including the one that performs the uninstall. Delete the three files explicitly, then rebuild the environment.</p>
+  <h3>Would a provenance attestation have caught this?</h3>
+  <p>No, and that is the central point. The artefact was built by the project's genuine release workflow under the project's own identity; only the source repository was substituted. An attestation of build provenance would have verified successfully.</p>
+  <h3>What credentials should be rotated?</h3>
+  <p>Everything reachable from the affected environment, rotated from a machine that was never exposed: cloud and orchestration credentials, SSH, GPG and TLS keys, Git, npm and PyPI tokens, model provider API keys, and any upstream provider credentials stored in the LiteLLM proxy's own database. Then audit logs for use of those credentials during and after the window.</p>
+  <h3>Was a second-stage payload ever delivered?</h3>
+  <p>Not as far as has been reported. <code>sitecustomize.py</code> polled a file in a GitHub repository hourly for a domain to download and execute, but the file held only test values and the repository has since been removed. The loader was present and functional; the payload was not observed in the wild.</p>
+  <h3>Does this mean self-hosting a gateway is the wrong call?</h3>
+  <p>No. It means a self-hosted gateway is a credential concentrator whose upgrade path you own, so digest pinning and host-level credential hygiene are load-bearing rather than optional. A hosted gateway moves the same risk to a vendor whose release pipeline you cannot pin at all.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/pinning-and-verification">Pinning and verification</a> — why a name is a preference and a digest is a lock.</li>
+    <li><a href="/operations/safety-and-security/when-the-credential-broker-is-compromised">When the credential broker is compromised</a> — the design response to a concentrated key store.</li>
+    <li><a href="/deep-dives/agent-security/agent-supply-chain-security">Agent supply-chain security</a> — the broader class this belongs to.</li>
+    <li><a href="/operations/safety-and-security/secrets-management-for-agents">Secrets management for agents</a> — the broker pattern this incident stress-tests.</li>
+    <li><a href="/concepts/ai-gateways">AI gateways</a> — what the component does and why it holds what it holds.</li>
+    <li><a href="/operations/agentops/unpinned-vendor-defaults">Unpinned vendor defaults</a> — the adjacent habit of inheriting choices without a version number.</li>
+    <li><a href="/operations/safety-and-security/detecting-agent-compromise">Detecting agent compromise</a> — what the egress log should have shown.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://securitylabs.datadoghq.com/articles/litellm-compromised-pypi-docker/">Datadog Security Labs — LiteLLM supply chain compromise: what you need to know</a> (timeline, IOCs, remediation)</li>
+    <li><a href="https://www.theregister.com/security/2026/10/21/litellm-supply-chain-attack-hoovers-up-passwords-and-secrets/">The Register — LiteLLM supply chain attack hoovers up passwords and secrets</a> (21 October 2026)</li>
+    <li><a href="https://www.helpnetsecurity.com/2026/10/22/litellm-compromised-supply-chain-attack-pypi-docker/">Help Net Security — LiteLLM hit by second supply chain attack this year</a> (22 October 2026)</li>
+    <li><a href="https://www.bleepingcomputer.com/news/security/litellm-release-pipeline-hacked-to-distribute-info-stealer-malware/">BleepingComputer — LiteLLM release pipeline hacked to distribute info-stealer malware</a></li>
+  </ul>
+</section>

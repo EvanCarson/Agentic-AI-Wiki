@@ -1,21 +1,61 @@
 <section class="phase">
   <div class="phase-num">B3</div>
   <div class="week">Operation · Economics &amp; ROI</div>
-  <h2>You cannot manage a cost you cannot attribute, and a budget without a circuit breaker is a wish.</h2>
-  <p class="goal">An undifferentiated monthly model bill is operationally useless: it tells you that you spent money, not which feature, tenant, or user spent it, and it arrives a month after the spending decision was irreversible. Cost attribution is the discipline of tagging every model and tool call with the dimensions you make decisions on, so spend becomes a per-feature, per-tenant signal — and budgets only protect you if exceeding them does something at runtime, not in a report.</p>
+  <h2>An estimated cost does not just carry error. It carries error that ranks your features in the wrong order.</h2>
+  <p class="goal">Two requests with byte-identical prompts can differ more than twelvefold in input cost, because one wrote a cache entry at 1.25× the base input rate and the other read it at 0.1× — and nothing in your prompt tells you which happened. That matters far beyond precision: a busy feature runs warm and a quiet one runs cold, so estimating cost from token counts overstates the first by up to an order of magnitude while understating the second, and the feature you kill is the cheap one. Attribution is therefore a logging decision made at the call site before the first request ships, not an analysis you can perform later, because the fields that decide the number are returned by the provider and reconstructible from nothing else.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>The provider bill is at the wrong granularity to act on.</h3>
+    <h3>The invoice is aggregated along the two dimensions you cannot act on.</h3>
 
-    <p>The invoice is aggregated by API key and month — the two dimensions you can do nothing with. The questions that drive decisions are: which <em>feature</em> is unprofitable, which <em>tenant</em> is subsidized by the others, which <em>user</em> is a cost outlier, which <em>code path</em> regressed after the last deploy. None of these are answerable from the bill. Attribution means carrying the dimensions you decide on through every call, so spend is queryable along feature, tenant, user, and version — the axes of your actual decisions.</p>
+    <p>The bill arrives by API key and by month. The questions that drive decisions are which <em>feature</em> is unprofitable, which <em>tenant</em> is subsidised by the others, which <em>user</em> is an outlier, and which <em>code path</em> regressed after Tuesday's deploy. None of those is answerable from the invoice, and no amount of after-the-fact analysis recovers a dimension that was never recorded — which is the whole reason this is an engineering task rather than a finance one.</p>
+
+    <p>So attribution means carrying the dimensions you decide on through every call, and recording spend against them as it happens. The part teams get wrong is not the carrying. It is believing that "spend" can be computed later from what they did record.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
+    <h3>Record the provider's usage object, because three line items are not in your prompt.</h3>
+
+    <p>The intuitive estimate — count the tokens you sent, multiply by the list price — is wrong in three ways that all push in traffic-dependent directions.</p>
+
+    <ul>
+      <li><strong>Cache state.</strong> Anthropic bills a cache write at 1.25× the base input rate for the five-minute lifetime and 2× for the one-hour lifetime, and a cache read at 0.1×. The response tells you which you got, in <code class="inline">cache_creation_input_tokens</code> and <code class="inline">cache_read_input_tokens</code>; your prompt does not, because it is identical either way. OpenAI reports the same distinction as <code class="inline">input_tokens_details.cached_tokens</code>.</li>
+      <li><strong>Reasoning tokens.</strong> They are billed at the output rate and counted inside <code class="inline">output_tokens</code>, itemised under <code class="inline">output_tokens_details.reasoning_tokens</code>, and they do not appear in the visible response text. Any estimate derived from the length of what came back undercounts a reasoning-heavy call — and undercounts it worst when the model thought hardest, which is when the call was most expensive. <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/reasoning-token-accounting">Accounting for reasoning tokens</a> works through the measurement side.</li>
+      <li><strong>Retries and fan-out.</strong> One user task is not one request. It is the product of your step limit, your parallel tool calls, your sub-agent fan-out and every retry policy in the stack, and the largest term is in no config file — the model deciding to try again differently. <a class="xref" href="/concepts/retry-amplification">Retry amplification</a> is the full treatment; for attribution the consequence is that spend has to be summed over a request tree you did not enumerate in advance.</li>
+    </ul>
+
+    <p>The fix is mechanical and it is the single highest-value line in this page: record the <code class="inline">usage</code> object the provider returned, keyed to your cost context, on every call. Not your estimate of it. Not the token count you computed before sending. The returned object, stored whole, because next quarter's question will need a field you did not think to extract.</p>
+
+    <div class="callout warn">
+      <p>A corollary that catches teams who did everything else right: if your cost figures come from a tokenizer you run locally against your own prompt, they are a model of your spend, not a measurement of it — and the model has no term for cache state, no term for reasoning, and no term for the retries that happened downstream of the call you measured.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Work the arithmetic once, and the misranking becomes obvious.</h3>
+
+    <p>Take a shared 8,000-token system prefix — instructions, tool schemas, a few examples — and price it in units of the base input rate, so the numbers transfer to any model.</p>
+
+    <ul>
+      <li><strong>Uncached:</strong> 8,000 × 1.0 = <strong>8,000</strong> units.</li>
+      <li><strong>Cold, writing a five-minute cache entry:</strong> 8,000 × 1.25 = <strong>10,000</strong> units.</li>
+      <li><strong>Warm, reading it:</strong> 8,000 × 0.1 = <strong>800</strong> units.</li>
+    </ul>
+
+    <p>Cold to warm is a 12.5× spread on the identical prefix. Now apply it to two features sharing that prefix. Feature A serves a request every few seconds, so almost every call reads a warm cache and truly costs about 800 units of prefix. Feature B is used twice an hour, always past the five-minute window, so every call writes and truly costs 10,000. Estimate both at the list input rate and you record 8,000 for each: you have overstated A by a factor of ten and understated B by a fifth. A is roughly twelve times cheaper per call than B on this component, and your dashboard says they are identical.</p>
+
+    <p>That is the argument of this page in one worked example. The error in an estimate is not noise that averages out across features; it is a function of call frequency, which is precisely the variable that distinguishes features from one another. So the estimate does not merely blur the ranking, it inverts it — and attribution exists to produce that ranking. A number that misorders the two things you were choosing between is worse than no number, because you will act on it.</p>
+
+    <p>While the arithmetic is on the table, two things fall out of it for free. The five-minute cache is ahead of uncached from the first reuse (1.25 + 0.1 = 1.35 against 2.0 for two uncached calls). The one-hour cache, at a 2× write, needs the second reuse to pull ahead (2.0 + 0.1 + 0.1 = 2.2 against 3.0). If your traffic does not reliably deliver a second hit inside the hour, the longer lifetime is a loss — and that is a decision you can only make from recorded hit rates, which brings you back to STEP 2.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
     <h3>Stamp a cost context on every call and propagate it through fan-out.</h3>
 
-    <p>A cost-context object is created when a task starts and travels with it — including into every sub-agent and tool call. Each model response's usage is recorded against that context. The hard part is propagation: a sub-agent that loses the context attributes its spend to nobody, and fan-out is exactly where the expensive spend hides.</p>
+    <p>A cost-context object is created when a task starts and travels with it, including into every sub-agent and tool call. Each response's usage is recorded against that context. The hard part is propagation, and it is hard in exactly the place the money is: a sub-agent that loses the context attributes its spend to nobody, and fan-out is where the expensive deep work lives.</p>
 
 <pre class="standalone"><span class="c-cm"># cost/attribution.py — context travels with the task, into children</span>
 <span class="c-kw">class</span> <span class="c-fn">CostContext</span>:
@@ -23,47 +63,53 @@
         self.tenant, self.feature = tenant, feature
         self.user, self.version   = user, version
 
-    <span class="c-kw">def</span> <span class="c-fn">record</span>(self, call):
+    <span class="c-kw">def</span> <span class="c-fn">record</span>(self, resp):
+        u = resp.usage                      <span class="c-cm"># the PROVIDER's object, not an estimate</span>
         emit(<span class="c-st">"spend"</span>, tenant=self.tenant, feature=self.feature,
-             user=self.user, version=self.version, usd=call.cost_usd)
+             user=self.user, version=self.version,
+             input=u.input_tokens,
+             cache_write=u.cache_creation_input_tokens,
+             cache_read=u.cache_read_input_tokens,
+             output=u.output_tokens,         <span class="c-cm"># includes reasoning tokens</span>
+             reasoning=u.reasoning_tokens,
+             raw=u)                          <span class="c-cm"># keep it whole; next quarter needs a field</span>
 
 <span class="c-kw">def</span> <span class="c-fn">spawn_child</span>(ctx):
     <span class="c-kw">return</span> ctx          <span class="c-cm"># SAME context — unattributed spend is the bug</span></pre>
 
-    <div class="callout warn"><p>The classic attribution hole: sub-agents and async tool calls drop the context, so 30–60% of spend lands in an "unknown" bucket — and the unknown bucket is disproportionately the expensive deep work. Untagged spend is not a rounding error; it is usually the part you most needed to see.</p></div>
-  </div>
+    <p>Store the token counts rather than a computed dollar figure, and apply prices at query time. Prices change, and a stored dollar amount freezes the rate you happened to be on, which makes a year of history uncomparable and silently misstates the quarter in which a provider cut a price. <a class="xref" href="/operations/economics-roi/price-deflation-and-cost-per-task">Price deflation and cost per task</a> is why this matters more in this market than in most.</p>
 
-  <div class="step">
-    <div class="step-num">STEP 3</div>
-    <h3>Attribute to the dimension you can act on, not the one easy to log.</h3>
-
-    <p>Logging the model name is easy and nearly useless for decisions. Attribute along the axes that map to a lever: <em>feature</em> (kill or reprice it), <em>tenant</em> (renegotiate or rate-limit), <em>user cohort</em> (detect abuse or a power user to learn from), <em>version</em> (catch a deploy that doubled cost). The test for a useful attribution dimension: a clear bad reading on it triggers a specific action this week. If nothing would happen, the tag is telemetry theater.</p>
-  </div>
-
-  <div class="step">
-    <div class="step-num">STEP 4</div>
-    <h3>A budget is a runtime control or it is a wish.</h3>
-
-    <p>A monthly budget you compare to actuals in a dashboard does nothing — by the time the dashboard is red the money is gone. A real budget is a counter, scoped per tenant or feature, decremented in the request path, that changes behavior when crossed. The enforcement, not the number, is the budget.</p>
-
-    <ul>
-      <li><strong>Per-tenant ceilings</strong> so one customer's runaway cannot consume the shared pool and starve everyone else.</li>
-      <li><strong>Soft then hard thresholds</strong> — at the soft line, degrade (cheaper model, smaller context, disable optional tools); at the hard line, fail closed and alert.</li>
-      <li><strong>Enforced in the request path</strong>, checked before the expensive call, not reconciled after it.</li>
-    </ul>
+    <p>Then reconcile, because reconciliation is the only thing that tells you the pipeline works. Sum your recorded spend for the month, compare it to the invoice, and publish the gap as a percentage next to every attribution number you report. A gap under a few percent means your contexts propagate; a large one means spend is landing in an unattributed bucket, and that bucket is disproportionately the deep multi-step work, because that is the work that fans out. The honest version of a per-feature cost is the figure plus its reconciliation error, exactly as <a class="xref" href="/operations/economics-roi/unit-economics">unit economics</a> argues a unit cost is only as good as the verifier behind it.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>The circuit breaker stops the bleed; alerting just narrates it.</h3>
+    <h3>Attribute to the dimension that maps to a lever, then make the budget a runtime control.</h3>
 
-    <p>Alerting tells a human about a cost incident already in progress; by the time anyone reads it, an unbounded loop has billed for an hour. A circuit breaker — trip on spend velocity, on a per-tenant ceiling, on cost-per-task exceeding N× the historical median — halts the spend automatically and degrades or fails the request closed. Alerting and breaking are complementary: the breaker bounds the loss, the alert explains it. A system with only alerting has chosen to pay for every incident in full.</p>
+    <p>Logging the model name is easy and nearly useless. Attribute along axes that map to an action: <em>feature</em> (kill or reprice it), <em>tenant</em> (renegotiate or rate-limit), <em>user cohort</em> (detect abuse, or find a power user to learn from), <em>version</em> (catch the deploy that doubled cost). The test for a useful dimension is that a clear bad reading on it triggers a specific action this week. If nothing would happen, the tag is telemetry theatre. One addition in this market: record the <em>model and effort setting</em> as a dimension too, because a provider default that moves under you changes cost with no diff in your repository — the failure <a class="xref" href="/operations/agentops/unpinned-vendor-defaults">unpinned vendor defaults</a> is about.</p>
+
+    <p>And a monthly budget compared to actuals in a dashboard does nothing, because by the time the dashboard is red the money is gone. A real budget is a counter, scoped per tenant or feature, decremented in the request path, that changes behaviour when crossed.</p>
+
+    <ul>
+      <li><strong>Per-tenant ceilings</strong>, so one customer's runaway cannot consume the shared pool and starve everyone else.</li>
+      <li><strong>Soft then hard thresholds</strong> — at the soft line, degrade (cheaper model, lower effort, smaller context, optional tools off); at the hard line, fail closed and alert.</li>
+      <li><strong>Checked before the expensive call</strong>, not reconciled after it.</li>
+      <li><strong>A circuit breaker on velocity</strong>, tripping on spend per minute or on cost-per-task exceeding a multiple of the historical median. Alerting narrates an incident already in progress; the breaker bounds it. A system with only alerting has chosen to pay for every incident in full, and with a stolen credential in the path that bill is somebody else's volume — see <a class="xref" href="/operations/safety-and-security/denial-of-wallet-and-cost-attacks">denial of wallet</a>.</li>
+    </ul>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>When fine-grained attribution costs more than it saves.</h3>
+    <h3>When finer attribution costs more than it saves.</h3>
 
-    <p>Per-call attribution and a budget check on the hot path add latency, storage, and code surface; for a low-volume internal tool with a flat budget this instrumentation can cost more than the spend it governs. Attribute at the granularity your decisions actually use, and no finer. <strong>Always run the per-tenant circuit breaker — it is cheap and bounds catastrophe — but reserve per-user, per-call attribution for products where pricing and margin decisions genuinely depend on it.</strong></p>
+    <p>Per-call attribution and a hot-path budget check add latency, storage and code surface. For a low-volume internal tool on a flat budget, the instrumentation can genuinely cost more than the spend it governs. Attribute at the granularity your decisions use and no finer.</p>
+
+    <p>The split that holds up in practice: <strong>always record the provider's usage object and always run the per-tenant circuit breaker.</strong> The first is a few fields on a log line you are already emitting, and it is the one thing you cannot backfill — a month without it is a month you can never analyse. The second is cheap and bounds catastrophe. Reserve per-user and per-call rollups, and the storage they imply, for products where a pricing or margin decision genuinely depends on them.</p>
+
+    <p>If you run a credit-metered product, note that you now have a second denominator — credits consumed versus credits sold — and the two can move in opposite directions. <a class="xref" href="/operations/economics-roi/credit-metered-agent-products">Credit-metered agent products</a> covers that case, and it is the one place where attribution feeds pricing directly rather than through a margin review.</p>
+
+    <div class="callout tip">
+      <p>Do the smallest version this week: add the provider's returned <code class="inline">usage</code> object, stored whole, to the log line your calls already emit, with tenant, feature and version beside it. That is an afternoon, it is the only part of this page that cannot be done retrospectively, and it is what makes every later question answerable. Then reconcile one month against the invoice and write the gap down — if it is large, fix context propagation through sub-agents before you build a single dashboard, because a chart over an unattributed majority is a confident wrong answer.</p>
+    </div>
   </div>
 </section>
