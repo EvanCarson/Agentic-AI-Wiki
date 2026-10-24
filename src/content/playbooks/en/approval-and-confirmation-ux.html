@@ -1,25 +1,26 @@
 <section class="phase">
   <div class="phase-num">H2</div>
   <div class="week">Playbook · Agent UX &amp; Human Interaction</div>
-  <h2>Approval UX fails the moment the human stops reading the payload.</h2>
-  <p class="goal">A confirmation dialog is only oversight if a human meaningfully evaluates what they approve. Most deployed approval flows do not clear that bar: they ask too often, about the wrong things, with payloads no one reads, and produce the well-documented failure mode of <em>confirmation fatigue</em> — users blindly clicking Approve to clear notifications. This essay is about designing gates that route the rare consequential decision to a human who actually looks, and get out of the way otherwise.</p>
+  <h2>An approval is worth whatever record it leaves of what the human saw.</h2>
+  <p class="goal">A dialog the user clears in under a second is not oversight, and you cannot prove it was — which is the same defect twice. Design the gate to emit a binding artefact instead of a boolean: the exact payload, its digest, who approved, what they were shown, how long they looked. That single artefact is simultaneously the control that stops payload drift, the evidence an auditor will ask for, and the only measurement that tells you whether anyone is reading.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
     <h3>Tier gates by consequence and reversibility, not by action type.</h3>
-    <p>"Confirm before any write" is the anti-pattern that manufactures fatigue. The dimension that matters is not <em>what kind</em> of action it is but <strong>how bad the worst case is</strong> and <strong>how cheaply it can be undone</strong>. A useful three-tier model:</p>
+    <p>"Confirm before any write" is the anti-pattern that manufactures fatigue. What matters is not <em>what kind</em> of action it is but <strong>how bad the worst case is</strong> and <strong>how cheaply it can be undone</strong>:</p>
     <ul>
       <li><strong>Auto</strong> — reversible, low blast radius, in-distribution. Execute and log; no prompt. (Drafting, read-only queries, idempotent retries.)</li>
-      <li><strong>Notify</strong> — consequential but reversible. Execute, but surface prominently with one-click undo. (Sending an internal message, creating a ticket.)</li>
+      <li><strong>Notify</strong> — consequential but reversible. Execute, surface prominently, offer one-click undo. (An internal message, a ticket.)</li>
       <li><strong>Gate</strong> — irreversible or high blast radius. Block on explicit human approval. (Money movement, external email, deletes, production deploys.)</li>
     </ul>
-    <p>The oversight level is a property of the <em>decision</em>, computed from risk and context — not a static flag on the tool.</p>
+    <p>Run the arithmetic on your own trace before arguing about the tiers. A forty-step coding or ops run with a confirm-every-write policy typically produces eight to twelve gates. If a reviewer spends a median of about a second on each — which is what a reflexive click looks like in your own latency data — you have bought roughly ten seconds of human attention spread so thin that none of it landed on the one step that mattered. Tier the same run to two gates and the same reviewer can spend thirty seconds on each and still finish faster. The quantity you are managing is a budget, and it is small.</p>
+    <p>The tier is a property of the <em>decision</em>, computed from risk and context, not a static flag on the tool — which is why it belongs in the same policy layer as everything else in <a class="xref" href="/concepts/blast-radius">blast radius</a>, and why <a class="xref" href="/playbooks/agent-ux-and-human-interaction/progressive-autonomy">progressive autonomy</a> treats the ladder as per-scope rather than per-agent.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>Pin the approved payload, or you are confirming a different action than the one that runs.</h3>
-    <p>The most common HITL bug in production: the approval UI shows the user one set of arguments, but the agent re-runs an LLM call on resume and the args mutate between approval and execution. The user approved an email to <code class="inline">alice@</code>; the executed call went to <code class="inline">all-staff@</code>. The fix is structural — hash the exact payload at interrupt time, show <em>that</em> payload, and refuse to execute if the hash drifts.</p>
+    <h3>Pin the payload, or you are confirming a different action than the one that runs.</h3>
+    <p>The most common human-in-the-loop bug in production: the approval UI shows one set of arguments, the agent re-plans on resume, and the args mutate between approval and execution. The user approved an email to <code class="inline">alice@</code>; the executed call went to <code class="inline">all-staff@</code>. The fix is structural — freeze the exact payload at interrupt time, show <em>that</em>, and refuse to execute if the digest drifts.</p>
 <pre class="standalone"><span class="c-cm"># Approve the bytes that will run, not a regenerated paraphrase</span>
 payload = tool_call.freeze()
 h = sha256(payload)
@@ -28,31 +29,54 @@ decision = <span class="c-kw">await</span> human.review(payload, digest=h)
     <span class="c-kw">await</span> execute(payload)
 <span class="c-kw">else</span>:
     <span class="c-kw">await</span> abort(<span class="c-st">"payload drifted or rejected"</span>)</pre>
-    <div class="callout warn"><p>If your agent re-plans on resume, "approved" means nothing without payload pinning. Treat a hash mismatch as a hard failure, never as a re-prompt.</p></div>
+    <p>This is where the shipping harnesses differ, and as of October 2026 none of them does it for you. LangGraph's <code class="inline">interrupt()</code> persists the <em>graph state</em> through a checkpointer and resumes with a <code class="inline">Command</code>; the OpenAI Agents SDK marks a tool <code class="inline">needs_approval</code>, surfaces a tool-approval interruption, and resumes from serialised run state; the Claude Agent SDK asks inline through a <code class="inline">canUseTool</code> callback behind hooks, allow/ask/deny rules and a permission mode (<code class="inline">default</code>, <code class="inline">acceptEdits</code>, <code class="inline">plan</code>, <code class="inline">bypassPermissions</code>). Every one of them pins the <em>pause</em>. None of them pins the <em>arguments</em> to the thing the human was shown — that comparison is the subject of <a class="xref" href="/blogs/langgraph-vs-openai-agents-sdk-vs-ai-sdk-vs-temporal-approvals">the four-way approvals comparison</a>, and the general failure is <a class="xref" href="/blogs/the-approval-was-never-bound">the approval was never bound</a>.</p>
+    <div class="callout warn"><p>Two consequences of resume semantics that bite in production. Treat a digest mismatch as a hard failure, never as a re-prompt. And make every gated tool <strong>idempotent</strong> before you ship approvals at all: resuming a run that had parallel interrupts has been a reported source of duplicated side effects in more than one framework, so "approved once" must survive being executed twice.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>Batch and defer to fight decision fatigue.</h3>
-    <p>Ten approvals in a row degrade into ten reflexive clicks. Reduce the <em>count</em> of decisions, not just their friction: batch homogeneous low-stakes actions into one reviewable list ("approve all 12 of these label changes"), and defer interrupts so the agent does parallelizable safe work first and presents one consolidated decision point instead of stuttering. The metric to drive down is <strong>approvals per completed task</strong>; the metric to protect is <strong>time spent on each gated payload</strong> — a gate the user clears in under a second is not a gate.</p>
+    <h3>Emit an approval record, and make it the artefact — not a log line.</h3>
+    <p>This is the step almost everyone skips, and it is the one that makes the other five provable. A boolean tells you the dialog closed. A record tells you what the oversight actually was, and it is the only version you can show an auditor, replay in an incident, or compute a metric from.</p>
+<pre class="standalone"><span class="c-cm"># The artefact the gate produces. Append-only, outside the agent's write surface.</span>
+{
+  <span class="c-st">"approval_id"</span>:    <span class="c-st">"apr_01HQ…"</span>,
+  <span class="c-st">"run_id"</span>:         <span class="c-st">"run_8f2c"</span>,       <span class="c-cm"># which run, which step</span>
+  <span class="c-st">"step"</span>:           17,
+  <span class="c-st">"tool"</span>:           <span class="c-st">"payments.transfer"</span>,
+  <span class="c-st">"payload_digest"</span>: <span class="c-st">"sha256:9b1f…"</span>,    <span class="c-cm"># the bytes, not a paraphrase</span>
+  <span class="c-st">"rendered_view"</span>:  <span class="c-st">"sha256:4c70…"</span>,    <span class="c-cm"># what the human was SHOWN</span>
+  <span class="c-st">"tier"</span>:           <span class="c-st">"gate"</span>,
+  <span class="c-st">"decided_by"</span>:     <span class="c-st">"u_4471"</span>,         <span class="c-cm"># a person, not a service account</span>
+  <span class="c-st">"decision"</span>:       <span class="c-st">"approve"</span>,
+  <span class="c-st">"dwell_ms"</span>:       860,              <span class="c-cm"># the fatigue signal</span>
+  <span class="c-st">"policy_version"</span>: <span class="c-st">"tiers@2026-10-24"</span>
+}</pre>
+    <p>Two fields do the unusual work. <code class="inline">rendered_view</code> is a digest of the <em>presentation</em>, not the payload: it is how you later answer "was the destination account visible, or was it collapsed behind a disclosure triangle?" — a question that decides liability and that no payload hash can answer. And <code class="inline">dwell_ms</code> turns fatigue from a hunch into a number you can alert on. Keep the stream append-only and outside anything the agent can write, for the same reason <a class="xref" href="/deep-dives/agent-security/decision-receipts-and-audit">decision receipts</a> and <a class="xref" href="/operations/governance-compliance/audit-trails">audit trails</a> insist on it: a record the subject can edit is not a record.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>Defaults are the real policy — choose them adversarially.</h3>
-    <p>Whatever the dialog pre-selects is what a fatigued user will choose. So the default <em>is</em> your safety policy, regardless of what the docs say. Two rules: (1) the default must be the <em>safe, reversible</em> option, never the destructive one, even though that costs a click on the common path; (2) never put a destructive primary button under the keyboard-Enter / muscle-memory position. Design the default for the user who isn't reading, because under load that is every user.</p>
+    <h3>Drive down the count; protect the dwell. Both come off the same record.</h3>
+    <p>Once gates emit records, the two metrics that matter are computable on day one, and they move in opposite directions on purpose.</p>
+    <ul>
+      <li><strong>Approvals per completed task</strong> — drive it down. Batch homogeneous low-stakes actions into one reviewable list ("approve all twelve label changes"), and defer interrupts so the agent finishes the parallelisable safe work first and presents one consolidated decision instead of stuttering. A plan-level gate, as in <a class="xref" href="/playbooks/agent-ux-and-human-interaction/plan-review-and-editing">plan review and editing</a>, often replaces five step-level ones.</li>
+      <li><strong>Median dwell on gated payloads</strong> — protect it, and alert when it falls. A p50 under about two seconds on a <code class="inline">gate</code>-tier action means the tier is miscalibrated or the queue is too long; the content of the dialog is not the problem. Watch it per reviewer too, because fatigue concentrates: the person who clears thirty gates a day is the one whose approvals mean least.</li>
+    </ul>
+    <p>The ratio is the thing to report upward. "We cut approvals per task from eleven to two and median dwell went from 0.9s to 24s" is a statement about oversight actually happening. "We shipped an approval dialog" is not. Where approvals arrive as a queue rather than inline, the throughput design in <a class="xref" href="/playbooks/agent-ux-and-human-interaction/review-queues-for-agent-output">review queues</a> is the companion piece.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>Irreversible actions need a different interaction, not a louder dialog.</h3>
-    <p>For genuinely unrecoverable actions (wire transfer, prod data delete, sending to a customer), a yes/no modal is structurally too weak — it is the same gesture the user has been reflexively approving all day. Escalate the <em>modality</em>: require re-typing the target ("type the table name to confirm"), enforce a cool-down delay that makes the consequence concrete, or require a second approver for the highest tier. Better still, engineer reversibility in first — a 30-second send delay with undo converts most "irreversible" actions into reversible ones and removes the need for the heavy gate entirely.</p>
-    <div class="callout tip"><p>Before adding a scarier confirmation, ask whether you can make the action reversible instead. A soft-delete plus undo beats the strongest modal that still gets reflex-clicked.</p></div>
+    <h3>Defaults are the policy; irreversible actions need a different gesture, not a louder one.</h3>
+    <p>Whatever the dialog pre-selects is what a fatigued user chooses, so the default <em>is</em> your safety policy regardless of what the docs say. Two rules: the default must be the safe, reversible option even though that costs a click on the common path; and never put a destructive primary action under the keyboard-Enter or muscle-memory position. The same logic condemns a blanket mode: a session-wide "accept everything" setting is a default applied to actions nobody has seen yet, which is why those modes belong to throwaway sandboxes and not to anything with production credentials.</p>
+    <p>For genuinely unrecoverable actions a yes/no modal is structurally too weak — it is the same gesture the reviewer has been clearing all day. Escalate the <em>modality</em> instead: re-type the target ("type the table name"), enforce a cool-down that makes the consequence concrete, or require a second approver for the top tier (the separation argument in <a class="xref" href="/deep-dives/agent-security/separation-of-duties-for-agents">separation of duties</a>). Better still, engineer reversibility first.</p>
+    <div class="callout tip"><p>Before adding a scarier confirmation, ask whether you can make the action reversible instead. A thirty-second send delay with undo converts most "irreversible" actions into reversible ones and removes the heavy gate entirely — the full argument is in <a class="xref" href="/playbooks/agent-ux-and-human-interaction/undo-and-reversibility">undo and reversibility</a>. A soft-delete plus undo beats the strongest modal that still gets reflex-clicked.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>When NOT to add an approval gate.</h3>
-    <p><strong>If the action is cheaply reversible and low blast radius, a gate doesn't add safety — it adds fatigue that you then pay back on the gate that actually mattered.</strong></p>
+    <h3>When not to add a gate at all.</h3>
+    <p><strong>If the action is cheaply reversible and low blast radius, a gate does not add safety — it adds fatigue that you then pay back on the gate that actually mattered.</strong> Delete it and spend the attention elsewhere.</p>
+    <p>Three more cases where the gate is the wrong instrument. When the reviewer cannot evaluate the payload — a diff of four hundred lines, a SQL statement nobody on the rota reads — the honest answer is a policy check on the arguments, not a human rubber stamp. When the approval is a grant rather than a single action ("let it use this connector"), it belongs in <a class="xref" href="/playbooks/agent-ux-and-human-interaction/permission-grants-and-revocation-ux">permission grants and revocation</a>, where it can be reviewed and withdrawn, rather than in a modal that disappears. And when the action is routine and high-volume, the gate is a staffing decision in disguise — price the reviewer time before you ship it, as <a class="xref" href="/concepts/human-in-the-loop">human-in-the-loop</a> argues, because an approval queue nobody funds degrades into automatic approval within a fortnight.</p>
   </div>
 </section>
