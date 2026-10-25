@@ -1,0 +1,78 @@
+<section class="phase">
+  <div class="phase-num">A47</div>
+  <div class="week">Concepts · Agentic AI Explained</div>
+  <h2>Auto-approval &amp; command allowlists.</h2>
+  <p class="goal">An allowlist that matches shell strings is a second shell parser, and the moment it disagrees with the real one the approval is worthless — which is why nine advisories hit one coding agent's approval gate between March and October 2026 without a single one of them being a mistake in the list's contents. Approve the object you will actually execute, usually an argv vector, and make the sandbox rather than the list carry the consequence of being wrong.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What auto-approval is for, and what it quietly becomes.</h3>
+
+    <p>Every agent that can act has to decide, per action, whether to act or ask. Asking every time destroys the point: a coding agent that stops for permission on <code class="inline">git status</code> is slower than doing the work yourself. So harnesses ship a pre-approval mechanism — a list of commands, tools or path prefixes the user has blessed in advance, after which the agent proceeds silently. Claude Code's permission rules, Cursor's command allowlist, and the "always approve execute" setting in editor agents are all this feature.</p>
+
+    <p>It starts life as a <strong>convenience</strong>: fewer prompts for actions the user already trusts. Within about a week it has become a <strong>security boundary</strong>, because the thing on the other side of it is a shell running with the developer's own SSH agent, cloud profile and repository write access. Nobody decides to make that promotion; it happens because the list is the only thing standing between model output and execution. The two roles want opposite designs. A convenience feature should be permissive and forgiving. A boundary should be exact, and exactness is the thing a string match cannot deliver.</p>
+
+    <div class="callout">
+      <p>The test for which role your list is playing: if the list were bypassed on the next call, would you need an incident response? If yes, it is a boundary, and it needs the properties of a <a class="xref" href="/concepts/reference-monitor">reference monitor</a> — non-bypassable, always-invoked, small enough to verify — rather than the properties of a config file.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Why matching a command string fails as a class.</h3>
+
+    <p>A shell command is a program in a language with operators, quoting, substitution, redirection, globbing and comments. To decide whether <code class="inline">foo</code> is the command being run, you have to parse that language. If your gate parses it one way and the shell you then hand the string to parses it another way, the gate approved a command that never ran and the shell ran one that was never approved. CWE-436 calls this an <em>interpretation conflict</em>, and it is the precise name for the whole category.</p>
+
+    <p>Roo Code is the worked example because somebody enumerated it in public. Nine GitHub advisories between 30 March and 13 October 2026 — five published on that single October day — all land on one decision path, with seven researcher writeups naming seven different constructs: redirects, glob tokens, quote boundaries, comment boundaries, the pipe-both operator, command substitution, and output used as a command. One of them is small enough to read in full. The gate stripped redirections before matching, using <code class="inline">/\d*&gt;&amp;\d*/</code> so that a harmless <code class="inline">2&gt;&amp;1</code> would not break the prefix check. Both digit groups are optional, so the pattern also eats a bare <code class="inline">&gt;&amp;</code> — which in bash is not a descriptor duplication but "send both streams to the file named next":</p>
+
+<pre class="standalone">ALLOW = ["echo"]    DENY = ["touch"]
+
+<span class="c-cm"># gate strips "&gt;&amp;", sees `echo touch ...`, matches ALLOW, approves.</span>
+<span class="c-cm"># bash reads: redirect both streams to a file named "echo", then run touch.</span>
+&gt;&amp;echo touch /tmp/PWNED        <span class="c-out">gate: auto_approve   bash: touch runs</span></pre>
+
+    <p>A second variant sits one layer lower. The tokeniser used a general-purpose shell-quote library that begins a comment at a <code class="inline">#</code> even mid-word, and returned the rest as one comment token the gate's loop then dropped. Bash starts a comment only at the start of a word, so in <code class="inline">echo hi#;touch /tmp/PWNED</code> the <code class="inline">#</code> is literal, the <code class="inline">;</code> is a real separator, and the gate never saw the second command at all. Three layers — bash, the tokenising library, the gate's own regex normalisation — each held a different theory about where the command began.</p>
+
+    <p>The lesson is not "write a better regex". Each individual fix is correct and closes exactly one finding. The set of shell constructs is defined by bash, it is larger than your test suite, and it grows. A control whose correctness depends on out-parsing a shell you do not own has no stable state.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Approve the object you execute.</h3>
+
+    <p>The fix is structural, and it is cheap: make the thing the gate inspects be the thing the operating system runs. In practice that means having the model emit an <strong>argv vector</strong> and executing it directly, with no shell in the path.</p>
+
+<pre class="standalone"><span class="c-cm"># Fragile: one string, two readers, and only one of them executes.</span>
+decision = gate(cmd_string)
+<span class="c-kw">if</span> decision == <span class="c-st">"approve"</span>: subprocess.run(cmd_string, shell=<span class="c-kw">True</span>)
+
+<span class="c-cm"># Sound: the gate inspects argv[0] and the flags that will actually be exec'd.</span>
+argv = [<span class="c-st">"git"</span>, <span class="c-st">"status"</span>, <span class="c-st">"--short"</span>]
+<span class="c-kw">if</span> gate(argv): subprocess.run(argv, shell=<span class="c-kw">False</span>)   <span class="c-cm"># no shell: no redirects,</span>
+                                                 <span class="c-cm"># globs, substitution, comments</span></pre>
+
+    <p>With no shell, the constructs that caused all nine advisories do not exist. Redirection, piping and globbing become explicit tool parameters when the agent genuinely needs them — <code class="inline">{"cmd": [...], "stdout_to": "out.txt"}</code> — which also makes them visible to the gate instead of hidden inside a string. Three properties follow for free: there is exactly one reading of the command, the gate's reading is the executed reading, and a reviewer can tell from the log what ran.</p>
+
+    <p>Argv matching removes the parsing class; it does not remove argument abuse. <code class="inline">git -c core.sshCommand=…</code>, <code class="inline">find -exec</code>, and anything with a <code class="inline">--eval</code> flag are shells by another route, so a serious list allows <em>flags</em> as well as binaries, or keeps the dangerous binary out of the environment entirely. That is a finite, enumerable problem about a specific tool, which is exactly what the string-matching version never was.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Put the risk where parsing cannot be wrong.</h3>
+
+    <p>Even a correct allowlist is the wrong place to hold the consequence. A list is a statement about <em>syntax</em>; what you actually care about is <em>effects</em> — what gets read, written, or sent. Effects are enforceable by the kernel, carry no parsing risk, and hold whatever string gets through:</p>
+
+    <ul>
+      <li><strong>Run it in a sandbox, not on the laptop.</strong> A bypass inside a container with no credentials, a read-only mount and <a class="xref" href="/operations/safety-and-security/egress-control-for-agents">default-deny egress</a> is a nuisance. The same bypass on a developer workstation reaches an SSH agent and a cloud profile — see <a class="xref" href="/playbooks/coding-and-computer-use-agents/agents-on-developer-workstations">agents on developer workstations</a> and <a class="xref" href="/concepts/sandboxing-and-code-execution">sandboxing &amp; code execution</a>.</li>
+      <li><strong>Size the list to the blast radius, not the other way round.</strong> Pre-approval is only as safe as what it fronts; the question is never "is <code class="inline">echo</code> safe" but <a class="xref" href="/concepts/blast-radius">what an approved call can reach</a>.</li>
+      <li><strong>Assume the command came from an attacker.</strong> The published CVSS vectors for the October cluster record <em>passive</em> user interaction and no privileges: the developer asks the agent to read an issue or a changelog, and the text contains the command. That is ordinary <a class="xref" href="/concepts/prompt-injection-101">indirect prompt injection</a>, and an agent with untrusted input, private data and a shell is the <a class="xref" href="/concepts/lethal-trifecta">lethal trifecta</a> with the allowlist as its only mitigation.</li>
+      <li><strong>Fail closed, and log the pair.</strong> An unparseable or unrecognised command asks the human; see <a class="xref" href="/concepts/fail-closed-and-fail-open">fail-closed vs fail-open</a>. Then record the proposed command, the verdict, and the exit status together — without that pairing a bypass is indistinguishable from a normal approval, which is how one goes unnoticed for seven months.</li>
+    </ul>
+
+    <p>Scope matters too, and it is usually set too wide: a rule granted for one task tends to persist for the session. Prefer per-task grants over per-session ones, re-ask when the scope changes, and keep the grant readable to the user — the UX half of this is <a class="xref" href="/playbooks/agent-ux-and-human-interaction/approval-and-confirmation-ux">approval &amp; confirmation UX</a>, and the policy half is <a class="xref" href="/deep-dives/agent-security/policy-as-code-for-agents">policy as code</a>.</p>
+
+    <div class="callout tip">
+      <p>Do three things this week. Switch the gate's input from a command string to an argv vector and execute with <code class="inline">shell=False</code>. Move the agent's shell into a container with no ambient credentials and default-deny egress, so a bypass costs you a rebuild rather than an incident. Then add one log line per decision pairing the proposed command with the verdict — if you cannot reconstruct, from logs alone, every command your allowlist approved last week, you do not have a boundary, you have a setting. The field evidence is in <a class="xref" href="/blogs/the-allowlist-and-the-shell-disagreed">the allowlist and the shell disagreed</a>.</p>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,149 @@
+<p class="lede">2026 年 3 月到 10 月之间，九份安全公告打中同一个编程智能体的命令批准闸门，其中五份发布在同一天，而没有一份是允许清单内容本身的错。它们全是同一个缺陷：闸门解析命令字符串，然后把同一个字符串交给 bash，而两者对「命令在哪里结束」各执一词。如果你的智能体是靠对 shell 字符串做模式匹配来决定跑什么，那你就是在维护第二个 shell——而你会输。</p>
+
+<section>
+  <h2>一眼概览</h2>
+  <p>Roo Code 是一个 VS Code 编程智能体，GitHub 上有 24.3k 星。它的自动批准功能让开发者可以按前缀预先批准命令——<code>echo</code>、<code>git status</code>、<code>npm test</code>——此后智能体就能不弹窗地执行它们。下面每一份公告都打在这同一条判定路径上。</p>
+
+  <table>
+    <thead>
+      <tr><th>发布日期</th><th>CVE</th><th>公告点名的组件</th><th>严重度</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>2026-03-30</td><td>CVE-2026-30307</td><td>命令自动批准模块（OS 命令注入）</td><td>Critical</td></tr>
+      <tr><td>2026-07-20</td><td>CVE-2026-63108</td><td>自动批准的执行路径（命令注入）</td><td>High</td></tr>
+      <tr><td>2026-09-08</td><td>CVE-2026-82536、CVE-2026-82537</td><td>shell 命令自动批准绕过</td><td>High</td></tr>
+      <tr><td>2026-10-13</td><td>CVE-2026-110202 … CVE-2026-110206</td><td><code>getCommandDecision()</code> 与 <code>parseCommandLine()</code></td><td>High（CVSS v4.0 7.7）</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/the-allowlist-and-the-shell-disagreed/data-cve-timeline.svg" alt="Roo Code 命令批准相关公告按 2026 年发布日期的条形图：3 月一份、7 月一份、9 月两份、10 月五份。" width="900" height="400" loading="lazy" />
+    <figcaption>九份公告、一个模块、七个月。十月那一簇是一位研究者在系统性地把解析器过一遍。</figcaption>
+  </figure>
+
+  <p>有两个事实框住了后面的一切。第一，这九份全写着「3.54.0 及以下」，而没有一份列出已修复版本。第二，该仓库已于 2026 年 5 月 15 日被其所有者归档、变为只读；README 写着「The Roo Code Extension was shut down on May 15th」，并把用户指向社区 fork ZooCode，以及 Roo Code 自己当初 fork 出来的 Cline。所以「3.54.0 及以下」不是一个等着被关闭的版本区间，而是终局状态。</p>
+</section>
+
+<section>
+  <h2>两个解析器，一个字符串</h2>
+  <figure>
+    <img src="/blogs/the-allowlist-and-the-shell-disagreed/arch-two-parsers.svg" alt="示意图：模型的命令字符串既流入一个按自己方式分词的批准闸门，也流入按另一种方式分词的 bash；闸门批准了一条 bash 永远不会运行的命令。" width="900" height="500" loading="lazy" />
+    <figcaption>闸门按它对字符串的读法做判定。shell 执行它自己的读法。没有任何东西检查两者是否一致。</figcaption>
+  </figure>
+
+  <p>这个控制的形状简单到可以放在脑子里。模型提出一个字符串。闸门把它拆成子命令、各自做归一化，再把第一个词拿去对允许清单与拒绝清单匹配。如果每个子命令都被允许，这个字符串就被交给一个 shell，以开发者本人的权限运行——他的 SSH agent、他的云配置、他对仓库的写权限。</p>
+
+  <p>闸门对这个字符串的读法，是一次关于「shell 会拿它做什么」的猜测。十月那批已核实的发现，是这次猜测出错的两种不同方式，对应两个不同的 CWE，位于两个不同的文件。</p>
+
+  <h3>那个把命令挪了位置的重定向</h3>
+
+  <p>CVE-2026-110202 位于 <code>src/core/auto-approval/commands.ts</code> 的 <code>getCommandDecision()</code> 中。匹配之前，这个函数会剥掉重定向，好让一个无害的 <code>2&gt;&amp;1</code> 不至于搅乱前缀匹配。在 v3.54.0 上，那一行是这样：</p>
+
+<pre class="standalone"><span class="c-cm">// Remove simple PowerShell-like redirections (e.g. 2&gt;&amp;1) before checking</span>
+<span class="c-kw">const</span> cmdWithoutRedirection = cmd.<span class="c-fn">replace</span>(<span class="c-st">/\d*&gt;&amp;\d*/</span>, <span class="c-st">""</span>).<span class="c-fn">trim</span>()</pre>
+
+  <p>两处数字组都是 <code>\d*</code>，所以这个模式也会匹配一个光秃秃的 <code>&gt;&amp;</code>。而在 bash 里，光秃秃的 <code>&gt;&amp;</code> 不是文件描述符复制，它把 stdout 和 stderr 都重定向到<em>由紧接着那个词命名的文件</em>。删掉这个运算符，那个文件名就滑进了命令位置，而允许清单会欣然匹配它：</p>
+
+<pre class="trace">ALLOW = ["echo"]    DENY = ["touch"]
+
+input                               gate says        bash does
+---------------------------------   --------------   ----------------------------
+touch /tmp/ROO_PWNED                auto_deny        (blocked)
+echo hi 2&gt;&amp;1                        auto_approve     echo hi
+&gt;&amp;notecho touch /tmp/ROO_PWNED      ask_user         (blocked)
+&gt;&amp;echo touch /tmp/ROO_PWNED         auto_approve     touch /tmp/ROO_PWNED</pre>
+
+  <p>在最后一行，闸门剥掉 <code>&gt;&amp;</code>，看见 <code>echo touch /tmp/ROO_PWNED</code>，匹配上 <code>echo</code> 前缀，于是批准。bash 把同一个字符串读成「把两个流都重定向到一个叫 <code>echo</code> 的文件，然后运行 <code>touch</code>」。文件出现了，被拒绝的命令跑了。GitHub 把它归为 CWE-436，解释冲突——这个名字准确得很。</p>
+
+  <h3>那个其实不是注释的注释</h3>
+
+  <p>第二种机制低一层，在分词器里。<code>src/shared/parse-command.ts</code> 中的 <code>parseCommand()</code> 用 <code>shell-quote</code> 库来拆字符串。<code>shell-quote</code> 即便 <code>#</code> 紧贴在一个词的末尾，也当它开始一段注释，并把其余部分作为单个注释对象返回。而 Roo Code 的记号循环只处理运算符记号和字符串记号，于是一个没有 <code>op</code> 属性的对象记号两个分支都不匹配，被静默丢弃：</p>
+
+<pre class="trace">parse("echo hi#;touch /tmp/ROO_PWNED")
+  → ["echo", "hi", { comment: ";touch /tmp/ROO_PWNED" }]
+
+gate sees:  echo hi                    → matches ALLOW, approve
+bash sees:  echo hi#  ;  touch ...      → '#' mid-word is literal, touch runs</pre>
+
+  <p>bash 只在一个词的开头才开始注释。在 <code>hi#</code> 里，<code>#</code> 是个普通字符，它后面的 <code>;</code> 是真正的分隔符，而后面那条命令会执行。闸门根本就没看见它——不是判断失误，是没看见。同胞 CVE-2026-110205 是第三个变种：<code>parseCommandLine()</code> 会丢掉紧挨着通配字符的命令替换，于是 <code>echo *$(...)</code> 匹配上了一个被允许的前缀。GitHub 把那一个归为 CWE-184，「被禁输入清单不完整」。</p>
+</section>
+
+<section>
+  <h2>七种分歧，三个层次</h2>
+  <p>研究者为这一簇公开的手记，各以它所滥用的构造命名：重定向、通配符记号、引号边界、注释边界、「两流同管」运算符、函数替换，以及把输出当成命令。七篇手记，一个模块。这才是值得盯着看的数字，因为它告诉你：缺陷不在这七个之中的任何一个里。</p>
+
+  <p>同时有三个不同的层次在各执一词，而每一层对「命令从哪里开始」都有自己的说法：</p>
+
+  <ul>
+    <li><strong>bash</strong>，唯一真正会执行的那套读法。</li>
+    <li><strong><code>shell-quote</code> 库</strong>，一个泛化的、近 POSIX 的分词器；它从来不是 bash 模拟器，也没声称是——它的注释规则不一样，而这个不一样就是一次绕过。</li>
+    <li><strong>闸门自己那层正则</strong>，手写的归一化，叠在分词器的输出之上，带着自己的缺陷（上面那个 <code>\d*</code>），而且没有 <code>g</code> 标志，于是连它本来想做的事都止步于第一次匹配。</li>
+  </ul>
+
+  <p>修好其中任何一个，另外两个仍然各执一词。这就是为什么那些手记提出的修法同时既正确又不够：在重定向正则里要求 <code>\d+</code> 恰好关掉 CVE-2026-110202，却一点没动这个控制的形状。下一个构造会是项目里还没人想过的某个 shell 特性，而 bash 的特性相当多。</p>
+
+  <figure>
+    <img src="/blogs/the-allowlist-and-the-shell-disagreed/compare-where-the-control-sits.svg" alt="三列对比批准判定所在的位置：匹配 shell 字符串、匹配 argv 向量、约束沙箱；只有第三种把解析风险降到零。" width="900" height="300" loading="lazy" />
+    <figcaption>同一条策略，在三个不同的地方强制执行。其中只有两个不含解析器。</figcaption>
+  </figure>
+
+  <p>也请注意 CVSS v4.0 向量关于可达性说了什么：<code>AV:N/AC:L/AT:P/PR:N/UI:P</code>——网络攻击向量、低复杂度、无需权限，以及<em>被动</em>的用户交互。开发者不需要点任何东西。他请智能体概述一个 issue、读一份 README，或者整理某个依赖的更新日志，而他让它读的那段文字里带着命令。这就是普通的<a href="/zh/concepts/prompt-injection-101">间接提示注入</a>；而允许清单是它与一个 shell 之间全部的控制。</p>
+</section>
+
+<section>
+  <h2>那个不会到来的补丁</h2>
+  <p>归档日期比它看起来更重要。一个还在维护的产品里的漏洞是个排期问题。一个有 24.3k 星、已变为只读的仓库里的漏洞，是所有仍在运行该扩展的机器、以及所有从那棵代码树起步的 fork 的永久属性。</p>
+
+  <p>后半句才是比产品活得更久的那部分。ZooCode 起步于一个社区 fork；它按当时的样子继承了 <code>commands.ts</code> 与 <code>parse-command.ts</code>，也继承了那七种分歧——除非有人独立地把每一处修法重新推导了一遍。Cline 位于 Roo Code 的上游而非下游，所以它不继承这些具体的回归——但它出货的是同一类功能，而每一个带自动批准清单的编程智能体都是如此。一次绕过是这种做法的属性，不是某个品牌的属性。任何出货「按前缀匹配的 shell 批准」的人，都该把那七篇手记当成一份测试套件，而不是别人家的事故。而如果你正在评估一个编程智能体，「它有没有允许清单」是错的问题；<a href="/zh/deep-dives/agent-security/vetting-a-third-party-skill">这份允许清单到底在保护什么</a>才是对的问题。</p>
+</section>
+
+<section>
+  <h2>该把判定放到哪里</h2>
+  <p>有用的推广是：一个批准闸门必须对系统真正会作用于的那个对象做判定。shell 字符串不是那个对象——它是一门有自己解析器的语言里的程序，而除了真正运行它，你对它做的任何事都是近似。四个动作，大致按收益排序：</p>
+
+  <ul>
+    <li><strong>批准一个 argv 向量，而不是一个字符串。</strong>让模型产出 <code>["git", "status", "--short"]</code>，再用 <code>spawn</code>、不带 shell 执行它。现在命令恰好只有一种读法，闸门读到的就是被执行的那一份，而重定向、通配、替换、管道和注释都不存在了，因为路径上没有 shell。模型真正需要的那些运算符，变成显式的工具参数而不是语法。</li>
+    <li><strong>让沙箱、而不是清单，承担风险。</strong>一条逃出允许清单的命令，若落在一个没有凭据、仓库只读挂载、并且<a href="/zh/operations/safety-and-security/egress-control-for-agents">默认拒绝外发</a>的容器里，只是件麻烦事。同一条命令落在开发者笔记本上，就能摸到 SSH agent 和一份云配置。预先批准的安全程度不会超过它所挡着的那片<a href="/zh/concepts/blast-radius">爆炸半径</a>，而笔记本是运行它最糟的地方。</li>
+    <li><strong>批准效果，而不是语法。</strong>「可以写入 <code>./src</code>、不可触网、不可碰 <code>~/.ssh</code>」由内核就能强制，且不带解析风险。「以 <code>echo</code> 开头的命令」只能由你自己写的解析器强制。</li>
+    <li><strong>记录你真正执行的那个字符串，连同放它过去的那次判定。</strong>这些绕过中的每一个，事后都能在一条把「被提议的命令、闸门的判决、退出码」配在一起的日志里看出来。没有这份配对，你无法把一次绕过与一次正常批准区分开——而这正是一次绕过能七个月无人察觉的原因。</li>
+  </ul>
+
+  <p>这些都不要求你放弃自动批准。它要求你接受：允许清单是一个用来少弹窗的便利功能，不是一道安全边界——然后在它底下放一道真正的边界。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>这只是 Roo Code 的问题吗？</h3>
+  <p>不是。缺陷是 Roo Code 的，但这个设计——对 shell 字符串做前缀清单匹配，然后把字符串交给一个 shell——是大多数带自动批准功能的编程智能体共有的。Roo Code 只是那个有人坐下来把分歧公开枚举了一遍的。</p>
+
+  <h3>我直接修正则不行吗？</h3>
+  <p>你可以关掉每一个具体的发现，那些提出的修法也确实做到了。靠打补丁做不到的，是让一个手写的归一化器在每一种构造上都与 bash 一致——因为构造的集合由 bash 定义，而它一直比你的测试套件大。</p>
+
+  <h3>为什么 CVSS 说无需权限、交互是被动的？</h3>
+  <p>因为攻击者根本不接触那台机器。他们把命令放进智能体会去读的内容里——一条 issue 评论、一个网页、某个依赖的发布说明——而开发者那句「去读一下这个」的普通请求，就是全部的用户交互。</p>
+
+  <h3>argv 允许清单就完全没有绕过了吗？</h3>
+  <p>它彻底消掉了 shell 解析这一类，也就是这九份公告所在的那一类。它没有消掉参数层面的滥用：带 <code>-c core.sshCommand=…</code> 的 <code>git</code>，或任何带 <code>--exec</code> 旗标的二进制，仍然是换条路走的 shell。请把旗标也一起允许，或者把那个二进制从沙箱里拿掉。</p>
+
+  <h3>仓库都归档了，为什么还要写它？</h3>
+  <p>因为归档的代码不会停止运行，而 fork 是从它起步的。这一簇也是目前能拿到的最清晰的公开证据，说明「按前缀匹配的 shell 批准」是整类失效，而不是一串疏忽。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站：</h3>
+  <ul>
+    <li><a href="/zh/concepts/auto-approval-and-allowlists">自动批准与命令允许清单</a> —— 概念页，含 argv 与字符串之争的那条规则。</li>
+    <li><a href="/zh/concepts/ambient-authority">环境权限</a> —— 为什么开发者自己的凭据才是真正的载荷。</li>
+    <li><a href="/zh/concepts/blast-radius">爆炸半径</a> —— 给一次绕过能摸到的范围定尺寸。</li>
+    <li><a href="/zh/playbooks/coding-and-computer-use-agents/agents-on-developer-workstations">开发者工作站上的智能体</a> —— 这些闸门实际运行的环境。</li>
+    <li><a href="/zh/deep-dives/agent-security/prompt-injection-defense-2026">2026 年的提示注入防御</a> —— 这九个共同的投递机制。</li>
+  </ul>
+  <h3>信息来源：</h3>
+  <ul>
+    <li><a href="https://github.com/advisories/GHSA-v45q-xfmj-r4wr">GHSA-v45q-xfmj-r4wr / CVE-2026-110202</a> —— 剥重定向导致的绕过，CWE-436。</li>
+    <li><a href="https://github.com/advisories/GHSA-66pw-2qq8-258w">GHSA-66pw-2qq8-258w / CVE-2026-110205</a> —— 紧邻通配符的命令替换，CWE-184。</li>
+    <li><a href="https://github.com/7rah/oss-cve">7rah/oss-cve</a> —— 七篇手记，附可复现的 PoC。</li>
+    <li><a href="https://github.com/RooCodeInc/Roo-Code/blob/v3.54.0/src/core/auto-approval/commands.ts">Roo-Code v3.54.0 的 <code>commands.ts</code></a> —— 出货时的判定函数。</li>
+  </ul>
+</section>
