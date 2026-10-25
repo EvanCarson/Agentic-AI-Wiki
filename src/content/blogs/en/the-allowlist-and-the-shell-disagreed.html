@@ -1,0 +1,149 @@
+<p class="lede">Nine advisories landed against one coding agent's command-approval gate between March and October 2026, five of them on a single day, and not one of them is a bug in the allowlist's contents. They are all the same defect: the gate parses the command string, then hands the same string to bash, and the two do not agree about where the command ends. If your agent decides what to run by pattern-matching a shell string, you are maintaining a second shell — and you will lose.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>Roo Code was a VS Code coding agent with 24.3k GitHub stars. Its auto-approval feature let a developer pre-approve commands by prefix — <code>echo</code>, <code>git status</code>, <code>npm test</code> — so the agent could run them without a prompt. Every advisory below is against that one decision path.</p>
+
+  <table>
+    <thead>
+      <tr><th>Published</th><th>CVE</th><th>Component named in the advisory</th><th>Severity</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>2026-03-30</td><td>CVE-2026-30307</td><td>Command auto-approval module (OS command injection)</td><td>Critical</td></tr>
+      <tr><td>2026-07-20</td><td>CVE-2026-63108</td><td>Auto-approve execute path (command injection)</td><td>High</td></tr>
+      <tr><td>2026-09-08</td><td>CVE-2026-82536, CVE-2026-82537</td><td>Shell command auto-approve bypass</td><td>High</td></tr>
+      <tr><td>2026-10-13</td><td>CVE-2026-110202 … CVE-2026-110206</td><td><code>getCommandDecision()</code> and <code>parseCommandLine()</code></td><td>High (CVSS v4.0 7.7)</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/the-allowlist-and-the-shell-disagreed/data-cve-timeline.svg" alt="Bar chart of Roo Code command-approval advisories by publication date in 2026: one in March, one in July, two in September, five in October." width="900" height="400" loading="lazy" />
+    <figcaption>Nine advisories, one module, seven months. The October cluster is one researcher working through the parser systematically.</figcaption>
+  </figure>
+
+  <p>Two facts frame everything that follows. First, all nine say "through 3.54.0" and none lists a patched version. Second, the repository was archived by its owner on 15 May 2026 and is read-only; the README says "The Roo Code Extension was shut down on May 15th" and points users at ZooCode, a community fork, and at Cline, the project Roo Code was itself forked from. So "through 3.54.0" is not a version range waiting to be closed. It is the final state.</p>
+</section>
+
+<section>
+  <h2>Two parsers, one string</h2>
+  <figure>
+    <img src="/blogs/the-allowlist-and-the-shell-disagreed/arch-two-parsers.svg" alt="Diagram: the model's command string flows into an approval gate that tokenises it one way and into bash that tokenises it another way; the gate approves a command bash never runs." width="900" height="500" loading="lazy" />
+    <figcaption>The gate decides on its reading of the string. The shell executes its own reading. Nothing checks that the two agree.</figcaption>
+  </figure>
+
+  <p>The shape of the control is simple enough to hold in your head. The model proposes a string. The gate splits it into sub-commands, normalises each one, and checks the first word against an allowlist and a denylist. If every sub-command is allowed, the string is passed to a shell and run with the developer's own privileges — their SSH agent, their cloud credentials, their write access to the repository.</p>
+
+  <p>The gate's reading of the string is a guess about what the shell will do with it. The verified October findings are two different ways that guess was wrong, with two different CWEs, in two different files.</p>
+
+  <h3>The redirect that moved the command</h3>
+
+  <p>CVE-2026-110202 is in <code>getCommandDecision()</code> in <code>src/core/auto-approval/commands.ts</code>. Before matching, the function stripped redirections so that a benign <code>2&gt;&amp;1</code> would not confuse the prefix match. The line, at v3.54.0, reads:</p>
+
+<pre class="standalone"><span class="c-cm">// Remove simple PowerShell-like redirections (e.g. 2&gt;&amp;1) before checking</span>
+<span class="c-kw">const</span> cmdWithoutRedirection = cmd.<span class="c-fn">replace</span>(<span class="c-st">/\d*&gt;&amp;\d*/</span>, <span class="c-st">""</span>).<span class="c-fn">trim</span>()</pre>
+
+  <p>Both digit groups are <code>\d*</code>, so the pattern also matches a bare <code>&gt;&amp;</code>. In bash a bare <code>&gt;&amp;</code> is not a file-descriptor duplication; it redirects both stdout and stderr to the <em>file named by the next word</em>. Delete the operator and that filename slides into command position, where the allowlist happily matches it:</p>
+
+<pre class="trace">ALLOW = ["echo"]    DENY = ["touch"]
+
+input                               gate says        bash does
+---------------------------------   --------------   ----------------------------
+touch /tmp/ROO_PWNED                auto_deny        (blocked)
+echo hi 2&gt;&amp;1                        auto_approve     echo hi
+&gt;&amp;notecho touch /tmp/ROO_PWNED      ask_user         (blocked)
+&gt;&amp;echo touch /tmp/ROO_PWNED         auto_approve     touch /tmp/ROO_PWNED</pre>
+
+  <p>On the last line the gate strips <code>&gt;&amp;</code>, sees <code>echo touch /tmp/ROO_PWNED</code>, matches the <code>echo</code> prefix and approves. Bash reads the same string as "redirect both streams to a file called <code>echo</code>, then run <code>touch</code>." The file appears and the denied command runs. GitHub classifies this CWE-436, Interpretation Conflict, which is exactly the right name for it.</p>
+
+  <h3>The comment that was not a comment</h3>
+
+  <p>The second mechanism is one layer lower, in the tokeniser. <code>parseCommand()</code> in <code>src/shared/parse-command.ts</code> uses the <code>shell-quote</code> library to split the string. <code>shell-quote</code> treats a <code>#</code> as starting a comment even when it is glued to the end of a word, and returns the remainder as a single comment object. Roo Code's token loop handled operator tokens and string tokens, so an object token with no <code>op</code> property matched neither branch and was silently dropped:</p>
+
+<pre class="trace">parse("echo hi#;touch /tmp/ROO_PWNED")
+  → ["echo", "hi", { comment: ";touch /tmp/ROO_PWNED" }]
+
+gate sees:  echo hi                    → matches ALLOW, approve
+bash sees:  echo hi#  ;  touch ...      → '#' mid-word is literal, touch runs</pre>
+
+  <p>Bash starts a comment only at the beginning of a word. In <code>hi#</code> the <code>#</code> is an ordinary character, the <code>;</code> after it is a real separator, and the command behind it executes. The gate never saw it at all — not misjudged, not seen. The sibling CVE-2026-110205 is a third variant: <code>parseCommandLine()</code> discarded command substitutions placed next to glob characters, so <code>echo *$(...)</code> matched an allowlisted prefix. GitHub files that one as CWE-184, Incomplete List of Disallowed Inputs.</p>
+</section>
+
+<section>
+  <h2>Seven disagreements, three layers</h2>
+  <p>The researcher's public writeups for this cluster are named for the construct each one abuses: redirects, glob tokens, quote boundaries, comment boundaries, the pipe-both operator, function substitution, and output used as a command. Seven writeups, one module. That is the number worth staring at, because it tells you the defect is not located in any of the seven.</p>
+
+  <p>Three different layers were disagreeing at once, and each had its own notion of where a command begins:</p>
+
+  <ul>
+    <li><strong>bash</strong>, the only reading that actually executes.</li>
+    <li><strong>the <code>shell-quote</code> library</strong>, a generic POSIX-ish tokeniser that was never a bash emulator and does not claim to be — its comment rule differs, and that difference is a bypass.</li>
+    <li><strong>the gate's own regex layer</strong>, hand-written normalisation applied on top of the tokeniser's output, with its own bugs (the <code>\d*</code> above) and no <code>g</code> flag, so even its intended behaviour stopped at the first match.</li>
+  </ul>
+
+  <p>Patch any one of these and the other two still disagree. That is why the fixes the writeups propose are correct and insufficient at the same time: requiring <code>\d+</code> in the redirect regex closes CVE-2026-110202 exactly, and leaves the shape of the control untouched. The next construct is a shell feature nobody on the project had thought about yet, and bash has a lot of them.</p>
+
+  <figure>
+    <img src="/blogs/the-allowlist-and-the-shell-disagreed/compare-where-the-control-sits.svg" alt="Three columns comparing where the approval decision sits: matching a shell string, matching an argv vector, and constraining the sandbox; parsing risk falls to zero only in the third." width="900" height="300" loading="lazy" />
+    <figcaption>The same policy, enforced at three different places. Only two of them are free of a parser.</figcaption>
+  </figure>
+
+  <p>Note also what the CVSS v4.0 vectors say about reachability: <code>AV:N/AC:L/AT:P/PR:N/UI:P</code> — network attack vector, low complexity, no privileges, and <em>passive</em> user interaction. The developer does not click anything. They ask the agent to summarise an issue, read a README, or triage a dependency's changelog, and the text they asked it to read contains the command. That is ordinary <a href="/concepts/prompt-injection-101">indirect prompt injection</a>; the allowlist was the entire control standing between it and a shell.</p>
+</section>
+
+<section>
+  <h2>The patch that is not coming</h2>
+  <p>The archive date matters more than it looks. A vulnerability in a maintained product is a scheduling problem. A vulnerability in a read-only repository with 24.3k stars is a permanent property of every machine still running the extension, and of every fork that started from that tree.</p>
+
+  <p>That second clause is the part that outlives the product. ZooCode began as a community fork; it inherits <code>commands.ts</code> and <code>parse-command.ts</code> as they stood, and the seven disagreements with it, unless somebody has re-derived each fix independently. Cline is upstream of Roo Code rather than downstream, so it does not inherit these specific regressions — but it ships the same category of feature, as does every coding agent with an auto-approve list. A bypass is a property of the approach, not of the brand. Anybody shipping prefix-matched shell approval should treat the seven writeups as a test suite, not as somebody else's incident. And if you are evaluating a coding agent, "does it have an allowlist" is the wrong question; <a href="/deep-dives/agent-security/vetting-a-third-party-skill">what the allowlist is protecting</a> is the right one.</p>
+</section>
+
+<section>
+  <h2>Where to put the decision instead</h2>
+  <p>The useful generalisation is that an approval gate must decide on the same object the system will act on. A shell string is not that object — it is a program in a language with its own parser, and anything you do to it short of running it is an approximation. Four moves, in rough order of how much they buy:</p>
+
+  <ul>
+    <li><strong>Approve an argv vector, not a string.</strong> Have the model emit <code>["git", "status", "--short"]</code> and execute it with <code>spawn</code> and no shell. There is now exactly one reading of the command, the gate's reading is the executed reading, and redirects, globs, substitutions, pipes and comments do not exist because no shell is involved. Operators the model genuinely needs become explicit tool parameters instead of syntax.</li>
+    <li><strong>Make the sandbox, not the list, carry the risk.</strong> A command that escapes the allowlist inside a container with no credentials, a read-only mount of the repo and a <a href="/operations/safety-and-security/egress-control-for-agents">default-deny egress policy</a> is a nuisance. The same command on a developer laptop reaches an SSH agent and a cloud profile. Pre-approval is only as safe as the <a href="/concepts/blast-radius">blast radius</a> it sits in front of, and the laptop is the worst place to run it.</li>
+    <li><strong>Approve effects, not syntax.</strong> "May write under <code>./src</code>, may not reach the network, may not touch <code>~/.ssh</code>" is enforceable by the kernel and carries no parsing risk. "Commands starting with <code>echo</code>" is enforceable only by a parser you wrote.</li>
+    <li><strong>Log the string you executed, with the decision that let it through.</strong> Every one of these bypasses is visible after the fact in a log pairing the proposed command, the gate's verdict, and the exit status. Without that pairing you cannot tell a bypass from a normal approval, which is how a bypass goes unnoticed for seven months.</li>
+  </ul>
+
+  <p>None of this requires giving up auto-approval. It requires accepting that the allowlist is a convenience feature for reducing prompts, not a security boundary — and putting a real boundary underneath it.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Is this only a Roo Code problem?</h3>
+  <p>No. The bugs are Roo Code's, but the design — match a shell string against a prefix list, then hand the string to a shell — is shared by most coding agents with an auto-approve feature. Roo Code is the one where somebody sat down and enumerated the disagreements publicly.</p>
+
+  <h3>Can I just fix the regex?</h3>
+  <p>You can close each specific finding, and the proposed fixes do. What you cannot do by patching is make a hand-written normaliser agree with bash on every construct, because the set of constructs is bash's to define and it keeps being larger than your test suite.</p>
+
+  <h3>Why does the CVSS say no privileges and passive interaction?</h3>
+  <p>Because the attacker never touches the machine. They put the command in content the agent will read — an issue comment, a web page, a dependency's release notes — and the developer's ordinary request to read that content is the whole of the user interaction.</p>
+
+  <h3>Does an argv allowlist have no bypasses at all?</h3>
+  <p>It removes the shell-parsing class entirely, which is the one these nine advisories live in. It does not remove argument-level abuse: <code>git</code> with <code>-c core.sshCommand=…</code>, or any binary with a <code>--exec</code> flag, is still a shell by another route. Allowlist the flags too, or keep the binary out of the sandbox.</p>
+
+  <h3>The repository is archived. Why write about it?</h3>
+  <p>Because archived code does not stop running, and forks start from it. The cluster is also the clearest public evidence available that prefix-matched shell approval fails as a class rather than as a sequence of mistakes.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/auto-approval-and-allowlists">Auto-approval &amp; command allowlists</a> — the concept page, including the argv-vs-string rule.</li>
+    <li><a href="/concepts/ambient-authority">Ambient authority</a> — why the developer's own credentials are the real payload.</li>
+    <li><a href="/concepts/blast-radius">Blast radius</a> — sizing what a bypass reaches.</li>
+    <li><a href="/playbooks/coding-and-computer-use-agents/agents-on-developer-workstations">Agents on developer workstations</a> — the environment these gates actually run in.</li>
+    <li><a href="/deep-dives/agent-security/prompt-injection-defense-2026">Prompt-injection defence in 2026</a> — the delivery mechanism for all nine.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://github.com/advisories/GHSA-v45q-xfmj-r4wr">GHSA-v45q-xfmj-r4wr / CVE-2026-110202</a> — redirect-stripping bypass, CWE-436.</li>
+    <li><a href="https://github.com/advisories/GHSA-66pw-2qq8-258w">GHSA-66pw-2qq8-258w / CVE-2026-110205</a> — glob-adjacent command substitution, CWE-184.</li>
+    <li><a href="https://github.com/7rah/oss-cve">7rah/oss-cve</a> — the seven writeups, with reproducible proofs of concept.</li>
+    <li><a href="https://github.com/RooCodeInc/Roo-Code/blob/v3.54.0/src/core/auto-approval/commands.ts">Roo-Code v3.54.0 <code>commands.ts</code></a> — the decision function as shipped.</li>
+  </ul>
+</section>
