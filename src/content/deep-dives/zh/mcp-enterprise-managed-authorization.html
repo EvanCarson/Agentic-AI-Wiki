@@ -1,0 +1,67 @@
+<section class="phase">
+  <div class="phase-num">C15</div>
+  <div class="week">深入解析 · MCP</div>
+  <h2>企业托管授权（EMA）是 MCP 里第一种「把智能体关掉就真的关掉了」的鉴权模式——而这个杠杆就是令牌有效期，大多数服务器在下一行代码里就把它扔掉了。</h2>
+  <p class="goal">在普通 OAuth 下吊销一个智能体的 MCP 访问权，在它手里那枚访问令牌过期之前什么都停不下来；在企业托管授权下，身份提供方会拒绝下一次交换，于是吊销在几秒内生效、而不是几小时。这份收益完全取决于交换之后你签发的令牌活多久——签一枚八小时的，你就是用一套额外的仪式造出了同一份常驻授权。EMA 是 MCP <a href="/zh/deep-dives/mcp/mcp-revision-2026-07-28" class="xref">2026-07-28 规范</a>中的一个扩展，与 Tasks、MCP Apps 并列列出；它管的是连接，从不管那一次工具调用。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>那块同意页面到底在做什么，以及什么取代了它。</h3>
+    <p><a href="/zh/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 配置</a>问的是人：浏览器弹开，用户批准 MCP 服务器申请的 scope，客户端拿到一枚访问令牌、通常还附一枚刷新令牌。那一次点击做了两件事。它证明了某个具体的人想要这一条具体的连接，同时也造出了一份比那场对话活得更久的授权。第二件事才是麻烦。躺在客户端里的刷新令牌就是<a href="/zh/concepts/ambient-authority" class="xref">环境权限</a>：没人需要再问一次，也没有任何环节会重新核对这个人是否还在职、是否还在那个组里、是否还在受管设备上。</p>
+    <p>EMA 删掉了那次点击，把决定权挪给企业身份提供方。用户用公司 IdP 登录的是 MCP <em>客户端</em>。客户端留下这次登录的身份断言——一枚 OIDC ID Token 或一份 SAML 断言。当它遇到一台要求企业托管授权的服务器时，它向 IdP 申请一枚以那台服务器为受众（audience）的 <strong>ID-JAG</strong>（Identity Assertion JWT Authorization Grant，身份断言 JWT 授权许可），再拿这枚 ID-JAG 到该服务器自己的授权服务器那里换取访问令牌。这套机制并没有发明新的密码学：它是把 RFC 8693 的令牌交换与 RFC 7523 的 JWT bearer 许可组合起来。</p>
+    <div class="callout"><p>ID-JAG 是一份断言，不是一份凭证。交换响应把这一点明写在外面：它的 <code class="inline">token_type</code> 是 <code class="inline">N_A</code>。把它当成面向服务器的 bearer 令牌存起来的客户端，是读错了这条流程——它只是一张一次性的取票凭证，用来去换那枚真正的令牌。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>三方之中，如今唯一能说「不」的是 IdP。</h3>
+    <p>把「拒绝」这条路径走一遍，变化就一目了然。在 OAuth 配置下，访问权终止于 MCP 服务器的授权服务器吊销那份授权——这意味着管理员得逐台服务器跑过去、找出每一份授权、在那里吊销。在 EMA 下，访问权终止于 IdP 不再签发下一枚 ID-JAG；而 IdP 恰恰是那个早就知道谁离职了、谁的组变了、哪台设备没过检、以及条件访问规则怎么写的系统。</p>
+<pre class="standalone"><span class="c-cm"># EMA: the client holds an identity, not a grant</span>
+assertion = idp.login(user)                    <span class="c-cm"># OIDC ID Token / SAML assertion</span>
+
+<span class="c-cm"># per server, per expiry — policy is evaluated HERE, every time</span>
+id_jag = idp.token_exchange(
+    subject_token=assertion,
+    audience=<span class="c-st">"https://mcp.vendor.example"</span>,       <span class="c-cm"># one server, not "all MCP"</span>
+)                                              <span class="c-cm"># -&gt; token_type: "N_A"</span>
+
+access = vendor_as.exchange(id_jag)            <span class="c-cm"># RFC 7523 JWT bearer grant</span>
+<span class="c-cm"># Revoke in the IdP and the NEXT exchange fails.</span>
+<span class="c-cm"># `access` keeps working until it expires. That TTL is your blast radius.</span></pre>
+    <p>所以如实的说法要比宣传语窄得多。EMA 并不吊销任何东西。它让吊销<em>可以从一个地方发生</em>，并把延迟的上限收到「最后一枚已签发访问令牌的有效期」。你暴露面上的其余一切，都没有变。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>如果 MCP 服务器是你在运营：令牌要短，否则你什么都没建起来。</h3>
+    <p>这是最值得带走的一句。一台接受了 ID-JAG、然后签发一枚「整个工作日都有效」的令牌的授权服务器，已经把一次逐请求的策略判断，重新变回了一天一次。IdP 的条件访问、它的组成员关系、它的设备姿态——全都只在交换那一刻被查过一次，接下来八小时再不会被问。</p>
+    <ul>
+      <li><strong>按分钟签，不要按小时。</strong>重新交换是一次廉价的机器对机器往返，中间没有人——这正是删掉同意页面的全部意义。把有效期按你预期的最长单次工具调用来定，而不是按一次会话的长度。</li>
+      <li><strong>不要签发刷新令牌。</strong>刷新令牌会把 EMA 被引入来消除的那份常驻授权重新造出来。客户端手上本来就握着一样可续的东西：它在 IdP 的登录。</li>
+      <li><strong>按资源服务器的标准校验，而不是按熟人的标准。</strong>对着 IdP 的 JWKS 验签，再加签发方、受众与过期时间。一枚受众指向另一台服务器的 ID-JAG，就是换了件外套的<a href="/zh/concepts/confused-deputy" class="xref">混淆代理</a>。</li>
+      <li><strong>用 <code class="inline">sub</code> 关联，把 <code class="inline">email</code> 当线索。</strong>这份许可一定带有 subject claim，可能还带一个能映射到既有账号的 email。邮箱是可变、可被重新分配的；把租户关系挂在它上面，正是两个人最后共用同一个智能体历史的原因。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>它授权的是连接。关于那一次工具调用，它什么也没说。</h3>
+    <p>EMA 决定这个用户的客户端能否与这台服务器通话。它不决定 <code class="inline">delete_repository</code> 能不能跑、跑在哪个仓库上、带什么参数。那件事的判定点仍然在你这边：请求路径上的一个策略引擎，依据令牌里已被验证的 claim 与这次调用的参数来裁决。规范废弃会话状态这件事反而让它更容易做对，因为现在每个请求都自带身份，而不是从一次握手里继承来一个。</p>
+    <p>团队把「企业托管」读成「已受治理」，于是停手不再建设——这才是那个昂贵的错误。通常的搭配是：门口放 EMA，每个工具上放<a href="/zh/deep-dives/agent-security/policy-as-code-for-agents" class="xref">策略即代码</a>，两者背后再放<a href="/zh/deep-dives/mcp/mcp-ops-in-production" class="xref">逐工具的 kill switch</a>。这个扩展里没有任何东西能替掉第二层和第三层；它只是让第一层有了一个总开关。</p>
+    <div class="callout warn"><p>一个具体例子：一个持有有效 15 分钟令牌的智能体，调用了一个转账工具。EMA 核实过：一位在职员工的客户端连上来了。它没有核实这位员工是否可以在凌晨两点、无人看管地、把那笔金额转到那个账户。如果你对第二个问题的回答是「令牌证明了他是本公司员工」，那你的授权模型只有一层。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>落地它实际要付的代价。</h3>
+    <p>依赖关系搬家了。在 OAuth 下，MCP 服务器才是权威，IdP 只是顺带；在 EMA 下，IdP 不可达时你的智能体连什么都连不上，因为已经没有一份存好的授权可以兜底。这是正确的取舍——在身份系统故障时对一个有写权限的智能体采取<a href="/zh/concepts/fail-closed-and-fail-open" class="xref">失败即拦截</a>的姿态，本来就是你想要的——但它需要是某个人做出的决定，旁边配着一个 IdP 可用性数字，而不是第一次故障时才发现的意外。</p>
+    <p>同一次规范修订里还有两件相邻的事，值得一起做掉。动态客户端注册（DCR）已被正式废弃，改用 Client ID Metadata Documents，并给出至少十二个月的窗口才会真正移除；所以一个你本来就要为 EMA 动手改的客户端，正好在同一次改动里把它从 DCR 上迁走。另外，由于 ID-JAG 是按受众签发的，这次交换会给你「每台服务器 × 每个用户 × 每个周期」一条日志：一次<a href="/zh/operations/governance-compliance/access-reviews-for-agent-credentials" class="xref">访问权复核</a>从「爬遍每家厂商的授权列表」，变成对 IdP 的一次查询。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>截至 2026 年 10 月，各家厂商走到了哪里。</h3>
+    <p>Okta 随着 Agent SSO 于 2026 年 8 月 24 日正式可用，把支撑这条流程的 Cross-App Access 标准并入了自家核心 SSO 产品，在核心 SSO 方案内不额外收费，并把这种连接描述为「由管理员托管、运行时无需用户同意」。微软则通过它的 Foundry 端点与<a href="/zh/operations/safety-and-security/agent-directory-accounts" class="xref">智能体目录账号</a>来推销面向 MCP 的企业托管身份，而面向智能体的条件访问那部分被圈在一个付费附加项后面。对两家都用同一种方式对待：去问你的哪些 MCP 服务器今天就能校验 ID-JAG——因为一个两端都必须实现的扩展，普及度只等于更薄的那一侧。</p>
+    <div class="callout tip"><p>照这个做：挑出写权限范围最大的那一台 MCP 服务器。查清它的授权服务器今天是否接受 ID-JAG，以及交换之后它签出来的令牌有效期是多久。如果答案是以小时计，那就在迁移任何别的东西之前，先把它压到分钟级并删掉刷新令牌——有效期就是全部收益所在，而它只是一行配置。然后再去把 EMA 不会替你建的那一层逐工具策略建起来。</p></div>
+  </div>
+</section>
