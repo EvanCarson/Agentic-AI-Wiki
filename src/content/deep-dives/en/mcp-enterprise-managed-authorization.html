@@ -1,0 +1,67 @@
+<section class="phase">
+  <div class="phase-num">C15</div>
+  <div class="week">Deep Dive · MCP</div>
+  <h2>Enterprise-Managed Authorization is the first MCP auth mode where switching an agent off actually switches it off — and the lever is token lifetime, which most servers throw away on the next line.</h2>
+  <p class="goal">Revoke an agent's MCP access under plain OAuth and nothing stops until the access token it already holds expires; under Enterprise-Managed Authorization the identity provider refuses the next exchange, so revocation lands in seconds instead of hours. That gain is entirely a function of how long the token you mint after the exchange lives — issue an eight-hour one and you have built the same ambient grant with extra ceremony. EMA is an extension in the MCP <a href="/deep-dives/mcp/mcp-revision-2026-07-28" class="xref">2026-07-28 specification</a>, named alongside Tasks and MCP Apps, and it governs the connection, never the tool call.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What the consent screen was actually doing, and what replaces it.</h3>
+    <p>The <a href="/deep-dives/mcp/mcp-auth-oauth21" class="xref">OAuth 2.1 profile</a> asks the human: a browser opens, the user approves the MCP server's scopes, and the client receives an access token and usually a refresh token. That click did two jobs. It proved a specific human wanted this specific connection, and it created a grant that outlives the conversation in which it was made. The second job is the problem. A refresh token sitting in a client is <a href="/concepts/ambient-authority" class="xref">ambient authority</a>: nobody has to ask again, and nothing re-checks whether the human is still employed, still in the group, still on a managed device.</p>
+    <p>EMA deletes the click and moves the decision to the enterprise identity provider. The user signs in to the MCP <em>client</em> with the corporate IdP. The client keeps that login's identity assertion — an OIDC ID Token or a SAML assertion. When it meets a server that requires enterprise-managed authorization, it asks the IdP for an <strong>ID-JAG</strong> (Identity Assertion JWT Authorization Grant) naming that server as the audience, and exchanges the ID-JAG for an access token at the server's own authorization server. The mechanism is not new cryptography: it composes RFC 8693 token exchange with the RFC 7523 JWT bearer grant.</p>
+    <div class="callout"><p>The ID-JAG is an assertion, not a credential. The exchange response says so in the open: its <code class="inline">token_type</code> is <code class="inline">N_A</code>. A client that stores one as if it were a bearer token for the server has misread the flow — it is a single-use ticket to go and get the real token.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Three parties, and the only one that can say no is now the IdP.</h3>
+    <p>Walk the refusal paths and the change is obvious. Under the OAuth profile, access ends when the MCP server's authorization server revokes the grant — which means an admin has to go to each server, find each grant, and revoke it there. Under EMA, access ends when the IdP declines to mint the next ID-JAG, and the IdP is the one system that already knows about the leaver, the group change, the failed device check and the conditional-access rule.</p>
+<pre class="standalone"><span class="c-cm"># EMA: the client holds an identity, not a grant</span>
+assertion = idp.login(user)                    <span class="c-cm"># OIDC ID Token / SAML assertion</span>
+
+<span class="c-cm"># per server, per expiry — policy is evaluated HERE, every time</span>
+id_jag = idp.token_exchange(
+    subject_token=assertion,
+    audience=<span class="c-st">"https://mcp.vendor.example"</span>,       <span class="c-cm"># one server, not "all MCP"</span>
+)                                              <span class="c-cm"># -&gt; token_type: "N_A"</span>
+
+access = vendor_as.exchange(id_jag)            <span class="c-cm"># RFC 7523 JWT bearer grant</span>
+<span class="c-cm"># Revoke in the IdP and the NEXT exchange fails.</span>
+<span class="c-cm"># `access` keeps working until it expires. That TTL is your blast radius.</span></pre>
+    <p>So the honest claim is narrower than the marketing. EMA does not revoke anything. It makes revocation <em>possible from one place</em> and bounds the delay at the lifetime of the last access token issued. Everything else about your exposure is unchanged.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>If you run the MCP server: short tokens, or you have built nothing.</h3>
+    <p>This is the sentence worth taking away. An authorization server that accepts an ID-JAG and then issues a token valid for the rest of the working day has converted a per-request policy decision back into a once-a-day one. The IdP's conditional access, its group membership, its device posture — all of it is consulted at the moment of exchange and then not again for eight hours.</p>
+    <ul>
+      <li><strong>Mint minutes, not hours.</strong> Re-exchange is a cheap machine-to-machine round trip with no human in it, which is the whole point of deleting the consent screen. Size the lifetime to the longest single tool call you expect, not to the length of a session.</li>
+      <li><strong>Do not issue a refresh token.</strong> A refresh token re-creates the standing grant EMA was adopted to remove. The client already holds something renewable: its IdP login.</li>
+      <li><strong>Validate like a resource server, not like a friend.</strong> Signature against the IdP's JWKS, plus issuer, audience and expiry. An ID-JAG whose audience is another server is the <a href="/concepts/confused-deputy" class="xref">confused deputy</a> in a new coat.</li>
+      <li><strong>Link on <code class="inline">sub</code>, treat <code class="inline">email</code> as a hint.</strong> The grant always carries a subject claim and may carry an email you can map to an existing account. Email is mutable and re-assignable; keying your tenancy to it is how two people end up sharing one agent's history.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>It authorizes the connection. It says nothing about the tool call.</h3>
+    <p>EMA decides whether this user's client may talk to this server. It does not decide whether <code class="inline">delete_repository</code> may run, or on which repository, or with what argument. The decision point for that is still yours: a policy engine in the request path, keyed on the verified claims in the token and the arguments of the call. The spec's deprecation of session state makes this easier to get right, because every request now carries its own identity rather than inheriting one from a handshake.</p>
+    <p>Teams read "enterprise-managed" as "governed" and stop building, which is the expensive mistake. The usual pairing is EMA at the door and <a href="/deep-dives/agent-security/policy-as-code-for-agents" class="xref">policy-as-code</a> at every tool, with <a href="/deep-dives/mcp/mcp-ops-in-production" class="xref">per-tool kill switches</a> behind both. Nothing in the extension replaces the second and third layer; it just means the first one has a single off switch.</p>
+    <div class="callout warn"><p>A worked case: an agent with a valid 15-minute token calls a tool that transfers money. EMA verified that a current employee's client is connected. It did not verify that this employee may move that amount, to that account, at 02:00, unattended. If your answer to the second question is "the token proves they are staff", you have an authorization model with one layer.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>What it costs you to adopt, in practice.</h3>
+    <p>The dependency moves. Under OAuth the MCP server was the authority and the IdP was incidental; under EMA your agent cannot connect to anything when the IdP is unreachable, because there is no stored grant to fall back on. That is the correct trade — a <a href="/concepts/fail-closed-and-fail-open" class="xref">fail-closed</a> posture on an identity outage is what you want from an agent with write access — but it needs to be a decision somebody made, with an IdP availability number next to it, rather than a surprise during the first outage.</p>
+    <p>Two adjacent moves in the same specification revision are worth doing together. Dynamic Client Registration is formally deprecated in favour of Client ID Metadata Documents, with a twelve-month minimum window before anything is removed, so a client you are already touching for EMA is a client you should move off DCR in the same change. And because the ID-JAG is minted per audience, the exchange gives you a log line per server per user per interval: an <a href="/operations/governance-compliance/access-reviews-for-agent-credentials" class="xref">access review</a> that previously meant crawling every vendor's grant list becomes one query against the IdP.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Where the vendors are, as of October 2026.</h3>
+    <p>Okta brought the Cross-App Access standard that underpins this flow into its core SSO product with the general availability of Agent SSO on 24 August 2026, at no additional cost on core SSO plans, and describes the connection as admin-managed with no runtime user consent. Microsoft markets enterprise-managed identity for MCP through its Foundry endpoint and its <a href="/operations/safety-and-security/agent-directory-accounts" class="xref">agent directory accounts</a>, with the agent-facing conditional-access pieces gated behind a paid add-on. Treat both the same way: ask which of your MCP servers can validate an ID-JAG today, because an extension both ends must implement is only as adopted as the thinner side.</p>
+    <div class="callout tip"><p>Do this: pick the one MCP server with the widest write scope. Check whether its authorization server accepts an ID-JAG, and what token lifetime it mints after the exchange. If the answer is hours, cap it at minutes and delete the refresh token before you migrate anything else — the lifetime is the whole benefit, and it is one config line. Then go build the per-tool policy layer that EMA does not give you.</p></div>
+  </div>
+</section>
