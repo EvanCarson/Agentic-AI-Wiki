@@ -1,0 +1,73 @@
+<section class="phase">
+  <div class="phase-num">T12</div>
+  <div class="week">Deep Dive · Training Agentic Models</div>
+  <h2>Your trace log is a record of your harness, not a dataset of good behaviour &mdash; and the part worth keeping is the environment, not the transcripts.</h2>
+  <p class="goal">Every team with an agent in production eventually proposes the flywheel: we have millions of real trajectories, let's fine-tune on the good ones. The arithmetic that kills it is older than agents &mdash; behaviour cloning's error compounds in the square of the horizon, because the first deviation puts the model in a state your data has never contained, and a trace log contains only states your old policy visited. Harvest traces for the environment, the eval set and the failure labels; reach for the weights last, and expect the harness to be baked into whatever you get.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three filters sit between production and your dataset, and nobody chose any of them.</h3>
+    <p>A trace is not a sample of "tasks an agent should do well." It is a sample of tasks that <em>survived three filters</em>, each applied by a system with its own agenda.</p>
+    <p><strong>What users attempted.</strong> Users learn your agent fast. Within a month they have stopped asking for the things it does badly, which means the distribution you are logging is the distribution your current model is already good at. The hardest category in your product is also the rarest category in your logs, and it is rare <em>because</em> it is hard.</p>
+    <p><strong>What completed.</strong> Runs that hit a step limit, a timeout, a tool 500 or a refusal are over-represented in your error dashboards and under-represented in anything a training pipeline would call usable, because they have no clean final answer to supervise against. The trajectories that look most like training data are the ones where nothing interesting happened.</p>
+    <p><strong>What you kept.</strong> Your <a class="xref" href="/operations/evaluation-and-observability/trace-sampling-and-retention">sampling and retention policy</a> is now a data-selection policy. Head-based sampling at 5% silently discards 95% of the tail you most want; a 30-day window deletes exactly the seasonal cases you cannot generate; a <a class="xref" href="/operations/governance-compliance/zero-data-retention-and-abuse-monitoring">zero-retention</a> commitment to one enterprise customer removes your most demanding workload from the corpus entirely.</p>
+    <div class="callout">
+      <p>Write down the join between your retention config and your training set before anyone writes a loader. The honest sentence is usually "we are about to fine-tune on a 5% head-sampled, 30-day, success-biased subset of what our smallest customers asked for," and that sentence changes the project.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The quadratic term: why 99% per-step accuracy is not a 26% failure rate.</h3>
+    <p>Here is the arithmetic every flywheel proposal runs, and the one it is missing. Suppose your fine-tuned policy deviates from the demonstrated action on 1% of steps. Over a 30-step task, the independent-errors calculation gives <code class="inline">1 &minus; 0.99³⁰ = 0.26</code> &mdash; a 26% chance of at least one deviation, which sounds survivable, and teams ship on it.</p>
+    <p>It is the optimistic bound, not the realistic one. The classic imitation-learning result &mdash; restated for LLM agents in a May 2026 paper revisiting DAgger &mdash; is that behaviour-cloning error does not accumulate linearly in the horizon <em>T</em>; it accumulates quadratically, because the states are not independent. The first deviation moves the agent into a state distribution the demonstrations never covered, where its error rate is not 1% but unknown, and every subsequent step compounds from there. Training on states induced by the teacher (your old policy, or a stronger model you distilled from) while evaluating on states induced by the student is the train&ndash;test mismatch the whole field is named after.</p>
+    <p>Two consequences follow, and both are practical. First, the horizon is a first-class term in your dataset design: the same corpus that produces a solid 5-step tool-calling model produces a disappointing 40-step research agent, and the fix is not more of the same data. Second, the data you most need is data about <strong>recovery</strong> &mdash; what a good policy does from a state a bad policy created &mdash; and that is precisely the data a success-filtered trace log does not contain. The DAgger remedy is to shift the state distribution gradually from teacher-induced toward student-induced: run the candidate policy, collect the states <em>it</em> reaches, and label the right action there.</p>
+<pre class="standalone"><span class="c-cm"># the two datasets are not the same shape</span>
+teacher_states = traces.<span class="c-fn">filter</span>(success=<span class="c-kw">True</span>)       <span class="c-cm"># where the OLD policy went</span>
+student_states = rollouts(candidate).<span class="c-fn">collect</span>()  <span class="c-cm"># where the NEW policy goes</span>
+
+<span class="c-cm"># round k: label the states the student actually reaches</span>
+<span class="c-kw">for</span> k <span class="c-kw">in</span> range(rounds):
+    s = mix(teacher_states, student_states, beta=<span class="c-st">0.9</span> ** k)
+    labels = oracle(s)        <span class="c-cm"># verifier, stronger model, or human</span>
+    candidate = <span class="c-fn">train</span>(candidate, s, labels)
+    student_states = rollouts(candidate).<span class="c-fn">collect</span>()</pre>
+    <p>Note what the loop requires that a trace log does not supply: an <strong>oracle</strong> for states nobody has seen yet. If you cannot produce one &mdash; a verifier, a test suite, a stronger model, a human in a labelling queue &mdash; the flywheel does not turn, and <a class="xref" href="/deep-dives/training-agentic-models/environment-engineering-for-rl">environment engineering</a> is the prerequisite project rather than a later one.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Rejection sampling discards exactly the distribution you need.</h3>
+    <p>The standard recipe is rejection fine-tuning: sample trajectories, keep the ones the verifier marks correct, train on those. It works, it is cheap, and it is the first thing to try &mdash; Nebius's public OpenHands work released roughly 67k trajectories together with RFT checkpoints and reported that it captures much of the quality of a reinforcement-learning run without the rollout infrastructure an RL loop demands. That is a real result and the right starting point; <a class="xref" href="/deep-dives/training-agentic-models/sft-rejection-sampling-distillation">SFT, rejection sampling &amp; distillation</a> covers the mechanics.</p>
+    <p>What the filter costs is worth naming precisely. Keeping only correct trajectories removes the full distribution of attempts, which means the tuned model never observes the failure modes it will meet in production &mdash; and in an agent loop, <em>observing a failure and recovering</em> is a skill with its own token budget. A model trained exclusively on runs where the first tool call returned 200 has no representation of what to do with a 429, a partial result, or a tool that answered confidently and wrongly.</p>
+    <p>So change the label, not the filter. A trace has at least four outcomes worth distinguishing &mdash; succeeded cleanly, succeeded after recovering from an error, failed on the environment, failed on the model &mdash; and the second category is the valuable one. Keep failures with their outcome labels and use them for evaluation and for negative-preference signal rather than discarding them at ingest, where the decision becomes irreversible. Pushing the rejection-sampling or preference rounds too hard has its own cost on the other side: diversity collapse, where the model converges on one style of solution and loses the ability to try a second approach when the first does not work.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The harness is in the data, which makes the fine-tune a dependency on your own tool surface.</h3>
+    <p>This is the cost that surprises people after the model ships. A trajectory is not abstract reasoning; it is a sequence of tool names, JSON argument shapes, system-prompt phrasing and error strings, all of which are properties of your harness on the day the trace was written. Fine-tune on that and you have encoded your tool catalogue into the weights.</p>
+    <p>Then ordinary maintenance becomes a model problem. You rename <code class="inline">search_docs</code> to <code class="inline">search_knowledge_base</code>; you tighten a schema from a free-text <code class="inline">filter</code> to an enum; you split one tool into two because the first was too coarse. Each of those is a routine improvement that a prompted model absorbs from its tool definitions in a single turn, and that a trace-tuned model fights, because its prior now favours a call shape that no longer exists. The team's instinct is to freeze the tool surface to protect the fine-tune, which is the moment the asset becomes a liability &mdash; you have bought a few points of accuracy with your ability to change the product.</p>
+    <p>There is a second, quieter version in evaluation: traces used for training and traces used for scoring come from the same pipe, so your eval set is drawn from the same distribution your weights memorised, and improvements measured against it are partly <a class="xref" href="/deep-dives/evaluating-agents/benchmark-contamination">contamination</a>. Split the corpus by time and by customer before anything touches a loader, and hold the newest slice out entirely.</p>
+    <div class="callout warn">
+      <p>If the deployment plan requires the tool definitions to stop moving, the fine-tune has failed its own cost-benefit test. Budget the model as something you re-train when the surface changes, or keep the behaviour in the prompt and the <a class="xref" href="/deep-dives/training-agentic-models/prompt-finetune-or-rl">context</a> where a schema change is free.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>What you are allowed to keep is a design constraint, not a legal footnote.</h3>
+    <p>Production traces are the richest personal-data artifact most agent teams own: the user's actual request, the documents retrieved on their behalf, the arguments passed to a CRM, sometimes the contents of an inbox. Two obligations follow and they pull against each other. <a class="xref" href="/operations/evaluation-and-observability/pii-redaction-in-agent-traces">Redaction</a> protects the subject and degrades the data &mdash; a trace with the entity names replaced by placeholders is still useful for measuring tool-call structure and nearly useless for teaching retrieval judgement. Meanwhile a deletion request has to reach the corpus, and once a trace has been baked into weights there is no row to delete; the only honest answer is a retrain, which is why <a class="xref" href="/operations/governance-compliance/data-governance">data governance</a> for an agent has to decide in advance which corpora are trainable at all.</p>
+    <p>The practical shape most teams land on: a short-retention, un-redacted operational store for debugging and <a class="xref" href="/operations/evaluation-and-observability/replay-testing-with-recorded-traces">replay</a>, and a separate, consent-scoped, redaction-processed corpus that is the only thing a training job may read. Two stores, two retention clocks, one of them nameable in a contract. Decide this before the flywheel ships, because retrofitting consent onto a corpus you have already trained on is the one failure in this essay with no engineering remedy.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The order of operations that actually pays.</h3>
+    <p>Traces are genuinely valuable; they are just valuable in an order most teams get backwards. Run it in this sequence and each step pays for the next.</p>
+    <p><strong>First, the eval set.</strong> Mine failures &mdash; not successes &mdash; for the cases your agent gets wrong, cluster them with a <a class="xref" href="/operations/evaluation-and-observability/failure-taxonomy-and-triage">failure taxonomy</a>, and turn each cluster into a scored case. This is the highest-value use of a trace log by a wide margin and it needs no GPU. <strong>Second, the environment.</strong> Replay the hard traces into a sandbox with a verifier, which converts a transcript into something that can be <em>re-run</em> &mdash; the asset that survives the model you are about to train, as <a class="xref" href="/deep-dives/training-agentic-models/environment-engineering-for-rl">environment engineering</a> argues. <strong>Third, the prompt and the tools.</strong> Most clusters in a real taxonomy dissolve into a tool whose error message was unreadable or a schema that invited the wrong call; those fixes ship today and cost nothing in flexibility. <strong>Fourth, and only now, weights.</strong> Start with rejection fine-tuning on the verifier you built in step two, then add student-induced states if the horizon is long.</p>
+    <div class="callout tip">
+      <p><strong>Do this.</strong> Before approving a fine-tune on production traces, write three numbers on one page: the median and p95 <em>horizon</em> of the tasks you are targeting (the quadratic term lives here), the share of your corpus that is success-filtered, and the date of the oldest trace that will be in the training split. If the horizon is long, the corpus is success-only, and the oldest trace predates your current tool schema, you are not building a flywheel &mdash; you are about to encode last quarter's harness into weights and discover it the first time you rename a tool. Spend that quarter on the verifier instead; it is the only artifact in this pipeline that keeps its value when the model changes.</p>
+    </div>
+  </div>
+</section>
