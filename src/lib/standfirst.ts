@@ -27,3 +27,17 @@ export function withStandfirst(body: string, title: string): { body: string; sta
   const swapped = `${m[1]}<h1 class="phase-title">${escapeHtml(title)}</h1><p class="standfirst">${m[3].trim()}</p>`;
   return { body: body.replace(m[0], swapped), standfirst: true };
 }
+
+// "STEP 3" labels. ~6,000 fragments put the step number in its own
+// <div class="step-num">STEP 3</div> directly above the step's <h3>, which set
+// it as a red eyebrow over every heading. The number moves into the heading as
+// a ringed numeral, the station mark the sidebar and blog sections use; the
+// word stays for screen readers. Other step-num forms ("2.1", "WORKED
+// EXAMPLE") are left as they are.
+const STEP_LABEL = /<div class="step-num">STEP (\d+)<\/div>(\s*)<h3>/g;
+
+export function withStepRings(body: string, locale: 'en' | 'zh'): string {
+  const word = locale === 'zh' ? '步骤 ' : 'Step ';
+  return body.replace(STEP_LABEL, (_m, n: string, ws: string) =>
+    `${ws}<h3 class="has-step-ring"><span class="step-ring"><span class="visually-hidden">${word}</span>${n}</span>`);
+}
