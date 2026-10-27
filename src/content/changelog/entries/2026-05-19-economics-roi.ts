@@ -11,5 +11,6 @@ const entry: ChangelogEntry = {
     L('Grounded in 2025–2026 sources: McKinsey State of AI ROI patterns, the cost-per-successful-task framing, the SaaS-vs-agent gross-margin shift (80–90% to 50–60%), and the 2.5–3.5× outcome-pricing rule of thumb.',
       '依据 2025–2026 来源：麦肯锡《人工智能现状》回报模式、「每个成功任务成本」框架、SaaS 与智能体毛利之差（80–90% 降至 50–60%），以及结果定价 2.5–3.5× 的经验法则。'),
   ],
+  lines: ['op'],
 };
 export default entry;

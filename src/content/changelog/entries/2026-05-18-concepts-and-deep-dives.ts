@@ -15,5 +15,6 @@ const entry: ChangelogEntry = {
     L('Replaced the unused Posts section with this Changelog.',
       '以本「更新日志」替换了未使用的「文章」板块。'),
   ],
+  lines: ['co', 'dd'],
 };
 export default entry;

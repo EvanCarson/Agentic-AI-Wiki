@@ -9,5 +9,6 @@ const entry: ChangelogEntry = {
     L('Language switcher and localized navigation, metadata, and sitemap.',
       '语言切换器，以及本地化的导航、元数据与站点地图。'),
   ],
+  lines: ['hub'],
 };
 export default entry;

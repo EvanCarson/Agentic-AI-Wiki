@@ -20,6 +20,7 @@ const entry: ChangelogEntry = {
       '“更新日志”回到了顶部导航栏和手机菜单中，位于“AI 博客”之后；此前为了给“书籍”腾位置，它被挪到了页脚，在手机上就只能滑到每页最底部才找得到。',
     ),
   ],
+  lines: ['hub'],
 };
 
 export default entry;

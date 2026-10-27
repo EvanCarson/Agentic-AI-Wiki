@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '每个条目遵循百科格式（目标引言 + 分步讲解），完全双语（中/英），并交叉链接到本站对应的进阶深入解析路径。',
     ),
   ],
+  lines: ['co'],
 };
 export default entry;

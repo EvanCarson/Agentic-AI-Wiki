@@ -24,6 +24,7 @@ const entry: ChangelogEntry = {
       '更正了两个现有页面：「金融智能体」（Y7）不再声称温度为 0 加缓存能让输出一致；「决策回执与审计」（S8）改为说明 SR 26-2 把智能体 AI 排除在外，并把欧盟 AI 法案高风险义务的日期更正为 2027 年 12 月 2 日。',
     ),
   ],
+  lines: ['dd', 'pb', 'bl'],
 };
 
 export default entry;

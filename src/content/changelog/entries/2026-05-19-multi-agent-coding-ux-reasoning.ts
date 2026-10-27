@@ -13,5 +13,6 @@ const entry: ChangelogEntry = {
     L('New Deep-Dive group "Reasoning & Test-Time Compute" — 6 essays: chain-of-thought, self-consistency & sampling, tree & graph of thought, verifier-guided search, inference-time scaling, and when reasoning helps vs burns money.',
       '新增「深度剖析」分组「推理与测试时计算」——6 篇文章：思维链、自一致性与采样、思维树与思维图、核验器引导的搜索、推理时扩展，以及推理何时有用、何时烧钱。'),
   ],
+  lines: ['dd', 'pb'],
 };
 export default entry;

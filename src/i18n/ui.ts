@@ -82,7 +82,13 @@ export interface UIStrings {
            maintainerH: string; maintainerHtml: string;
            authorshipH: string; authorshipHtml: string;
            contactH: string; contactHtml: string };
-  changelog: { kicker: string; metaTitle: string; metaDesc: string; h1: string; intro: string; jumpTo: string };
+  changelog: { kicker: string; metaTitle: string; metaDesc: string; h1: string; intro: string;
+    /** The "How the network grew" chart, filter chips and month counts. */
+    chartTitle: string; chartLegend: string; show: string; all: string; site: string;
+    /** Change counts; `{n}` is replaced with the number. */
+    countOne: string; countMany: string;
+    /** Prefix for the visually hidden list of sections on an entry row. */
+    sections: string };
   og: { tagline: string };
   theme: { ariaLight: string; ariaDark: string; ariaAuto: string };
   seriesTitle: string;
@@ -234,7 +240,9 @@ export const ui: Record<Locale, UIStrings> = {
       authorshipHtml: 'A scheduled AI agent drafts part of this site. Each day it reads the section manifests and the changelog to find the gaps, researches the topic against primary sources, writes both language versions, runs the site’s verification gates, and opens a pull request that merges on its own. Its prompt is version-controlled in the <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/tree/main/docs/routines" rel="noopener" style="color:var(--accent);">repository</a> rather than living in a console, and every batch it ships is itemised in the <a href="%CHANGELOG%" style="color:var(--accent);">changelog</a>. The standard it is held to, the review of what lands, and the corrections remain the maintainer’s — please report anything that reads wrong.',
       contactH: 'Contributing & contact',
       contactHtml: 'Corrections, suggestions, and new entries are welcome — open an issue or pull request on <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a>, or reach out via <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a>.' },
-    changelog: { jumpTo: 'Jump to', kicker: 'Changelog', metaTitle: 'Changelog — Agentic AI Wiki',
+    changelog: { kicker: 'Changelog',
+      chartTitle: 'How the network grew', chartLegend: 'Lines', show: 'Show', all: 'All', site: 'Site',
+      countOne: '{n} change', countMany: '{n} changes', sections: 'Sections:', metaTitle: 'Changelog — Agentic AI Wiki',
       metaDesc: 'What changed on the Agentic AI Wiki, newest first.',
       h1: 'Changelog',
       intro: 'Notable changes to this site — new sections, content, and improvements.' },
@@ -390,7 +398,9 @@ export const ui: Record<Locale, UIStrings> = {
       authorshipHtml: '本站有一部分内容由一个定时运行的 AI 智能体起草。它每天读取各板块的内容清单与更新日志，找出其中的缺口，对照一手资料做研究，写出中英两个版本，跑完本站的校验关卡，然后开出一个会自行合并的 pull request。它的提示词与代码一起版本化保存在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/tree/main/docs/routines" rel="noopener" style="color:var(--accent);">仓库</a> 里，而不是躺在某个后台控制台中；它每一批交付的内容，都逐条记录在 <a href="%CHANGELOG%" style="color:var(--accent);">更新日志</a> 上。它所遵循的标准、对落地内容的复核，以及纠错的责任，仍然在维护者身上 — 读到不对劲的地方，欢迎告知。',
       contactH: '贡献与联系',
       contactHtml: '欢迎纠错、建议与新增词条 — 在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a> 提交 issue 或 pull request，或通过 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a> 联系。' },
-    changelog: { jumpTo: '快速跳转', kicker: '更新日志', metaTitle: '更新日志 — Agentic AI 维基',
+    changelog: { kicker: '更新日志',
+      chartTitle: '网络如何生长', chartLegend: '线路', show: '显示', all: '全部', site: '全站',
+      countOne: '{n} 项更新', countMany: '{n} 项更新', sections: '板块：', metaTitle: '更新日志 — Agentic AI 维基',
       metaDesc: '本站的变更记录，按时间倒序。',
       h1: '更新日志',
       intro: '本站的重要变更 — 新板块、新内容与改进。' },

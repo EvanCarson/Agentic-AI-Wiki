@@ -24,6 +24,7 @@ const entry: ChangelogEntry = {
       '新增标签：voice-agents、realtime、durable-execution。',
     ),
   ],
+  lines: ['bl'],
 };
 
 export default entry;

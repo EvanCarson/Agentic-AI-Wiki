@@ -8,7 +8,7 @@
 // To add a new entry: create `src/content/changelog/entries/<YYYY-MM-DD>-<short-slug>.ts`
 // that `export default`s a `ChangelogEntry`. See any existing file for the shape.
 import type { ChangelogEntry } from './changelog/types.ts';
-export type { ChangelogEntry, Localized } from './changelog/types.ts';
+export type { ChangelogEntry, Localized, LineKey } from './changelog/types.ts';
 
 interface EntryModule { default: ChangelogEntry }
 const modules = import.meta.glob<EntryModule>('./changelog/entries/*.ts', { eager: true });

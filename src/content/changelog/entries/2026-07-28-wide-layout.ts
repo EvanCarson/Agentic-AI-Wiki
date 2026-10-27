@@ -36,5 +36,6 @@ const entry: ChangelogEntry = {
       '手机端渲染完全不变——已在 375px、390px、430px 三种宽度、明暗两种主题下逐像素校验一致。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '新增标签：reinforcement-learning、trading。',
     ),
   ],
+  lines: ['bl'],
 };
 export default entry;

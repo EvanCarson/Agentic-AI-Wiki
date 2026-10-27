@@ -24,6 +24,7 @@ const entry: ChangelogEntry = {
       '新增标签：computer-use、browser-agents、mcp、protocols、ecosystem、closed-source。',
     ),
   ],
+  lines: ['bl'],
 };
 
 export default entry;

@@ -16,5 +16,6 @@ const entry: ChangelogEntry = {
       '结论：多数团队最终落在 Postgres + pgvector 或 OpenSearch（因为已在跑其中之一）、Pinecone/Turbopuffer（因为没有运维人头）、或 Qdrant/Milvus/Weaviate（因为需要调参面）。先选品类；品类内的品牌是口味与价格问题。',
     ),
   ],
+  lines: ['dd'],
 };
 export default entry;

@@ -45,9 +45,13 @@ their own file, so changelog edits **never collide**. This is required, not
 optional. New section/entries, content edits worth noting, nav/IA changes,
 notable accessibility/SEO/design changes — all get an entry file.
 
-- Each file `export default`s `{ date: 'YYYY-MM-DD', title: Localized, items: Localized[] }`.
+- Each file `export default`s `{ date: 'YYYY-MM-DD', title: Localized, items: Localized[], lines: LineKey[] }`.
   Import the shape + the `L(en, zh)` helper from `../types.ts`. Copy any
   existing file under `entries/` as a template.
+- Set `lines` to the sections the change touched, as line keys (`fg` Field
+  Guide, `bk` Books, `co` Concepts, `dd` Deep-Dives, `pb` Playbooks, `op`
+  Operations, `bl` AI Blog, `hub` site-wide/infrastructure). Required by
+  `changelog.test.mjs`; it drives the /changelog/ chart and filter chips.
 - The filename **date prefix MUST equal** the entry's `date` field — the
   `changelog.test.mjs` test enforces this; the aggregator sorts by filename
   descending (newest date first, alphabetical slug tiebreaker within a day).

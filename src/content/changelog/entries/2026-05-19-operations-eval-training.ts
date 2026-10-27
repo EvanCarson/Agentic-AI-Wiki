@@ -11,5 +11,6 @@ const entry: ChangelogEntry = {
     L('New Deep-Dive group "Training Agentic Models" — 6 essays: prompt vs fine-tune vs RL, RLHF & RLAIF, RL for tool use, reward design & reward hacking, SFT/rejection sampling/distillation, and process vs outcome reward models.',
       '新增「深度剖析」分组「训练智能体模型」——6 篇文章：提示 vs 微调 vs 强化学习、RLHF 与 RLAIF、面向工具使用的强化学习、奖励设计与奖励黑客、SFT/拒绝采样/蒸馏，以及过程奖励 vs 结果奖励模型。'),
   ],
+  lines: ['dd', 'op'],
 };
 export default entry;

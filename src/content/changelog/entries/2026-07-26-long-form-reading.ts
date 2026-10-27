@@ -36,5 +36,6 @@ const entry: ChangelogEntry = {
       '设计检查新增一项：核查任何可横向滚动的容器确实显示了滚动提示，手机与桌面宽度均需通过。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

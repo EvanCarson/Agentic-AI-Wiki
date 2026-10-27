@@ -24,6 +24,7 @@ const entry: ChangelogEntry = {
       '更正 GPT Researcher 对比文章：其 v3.7.0 的上下文过滤器使用的是 TypeSafe AI 的 Jev（以 BM25 兜底），而不是一个同名的自研打分器。',
     ),
   ],
+  lines: ['co', 'op', 'bl'],
 };
 
 export default entry;

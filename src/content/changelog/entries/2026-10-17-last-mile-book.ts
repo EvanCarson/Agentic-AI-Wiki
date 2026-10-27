@@ -16,5 +16,6 @@ const entry: ChangelogEntry = {
     L('New annotation boxes mark composite scenarios and dated facts, so invented examples never read like real cases.',
       '新增两种标注框，分别标出合成案例与注明日期的事实，让虚构示例永远不会被误读为真实案例。'),
   ],
+  lines: ['bk'],
 };
 export default entry;

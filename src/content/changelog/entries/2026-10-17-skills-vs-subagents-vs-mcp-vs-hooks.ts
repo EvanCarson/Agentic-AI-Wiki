@@ -20,6 +20,7 @@ const entry: ChangelogEntry = {
       '在 Claude Code、Codex 和 Cursor 之间逐一核对同名机制：Codex 只在被要求时才派生子智能体，另外两者会自行委派；Codex 也写明其钩子是一道护栏，而不是完整的强制边界。',
     ),
   ],
+  lines: ['dd'],
 };
 
 export default entry;

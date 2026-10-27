@@ -28,6 +28,7 @@ const entry: ChangelogEntry = {
       '实战手册 · 智能体体验——《透明度与可解释性》重建（682 → 1,850 词），围绕一个被厂商从你手里拿走的决定：截至 2026 年 10 月，各家主要推理 API 返回的隐藏推理都是加密的——Anthropic 放在每个 thinking 块的 signature 字段里，Google 用 thought signature，OpenAI 用 reasoning.encrypted_content——而可读的那部分只是另一次独立生成的可选摘要；文档写明 summarized 是 Claude Opus 4.6 与 Sonnet 4.6 上的默认值，另有一个返回空 thinking 字段的 omitted 模式。于是你的界面与真正的计算之间如今隔着三道未经验证的跳跃而不是一道，而你唯一掌控的那一层，是你自己框架吐出来的那层：准确的工具调用、那条查询、那份 diff、带文档 id 与时间戳的被引用原文。重建后的页面补上了一个算到底的三层退款示例，以及把 signature 当作凭据来处理的规矩——逐字节原样回传，否则多轮推理会以「看起来像模型退化」的方式崩掉；并且永不回显它，因为 2026 年 8 月的一篇 arXiv 论文报告称加密推理可以从一个兼容模型里被重放出来。',
     ),
   ],
+  lines: ['dd', 'pb', 'op', 'bl'],
 };
 
 export default entry;

@@ -18,6 +18,7 @@ const entry: ChangelogEntry = {
     L('The running insurer example now continues across all ten Part II chapters on one checked timeline, and the How to Use index and the *From SDLC to AI-Driven SDLC* book now link to the new chapters.',
       '贯穿全书的保险公司合成案例，如今在第 II 部分全部十章中沿着同一条核对过的时间线展开；导读的处境索引和《从 SDLC 到 AI 驱动的 SDLC》一书也已链接到新章节。'),
   ],
+  lines: ['bk'],
 };
 
 export default entry;

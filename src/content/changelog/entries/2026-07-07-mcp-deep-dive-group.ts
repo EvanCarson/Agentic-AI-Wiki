@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '分组的 order 设为 25（紧接协议与互操作之后），使其读起来就是 mcp-architecture 概念介绍之上的更深实操层。',
     ),
   ],
+  lines: ['dd'],
 };
 export default entry;

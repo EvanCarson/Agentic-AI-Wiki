@@ -18,6 +18,7 @@ const entry: ChangelogEntry = {
     L('Chapters now link to the appendices, including 26 links from case mentions to their Case File entries.',
       '各章现已链接到附录，其中 26 处案例提及链接到《案例档案》中的对应条目。'),
   ],
+  lines: ['bk'],
 };
 
 export default entry;

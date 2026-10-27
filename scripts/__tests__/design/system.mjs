@@ -481,6 +481,9 @@ describe('design system', () => {
    * stops matching cannot pass vacuously.
    */
   const measureChars = () => {
+    // /changelog/ collapses every entry at every width (2026-10-27); its
+    // bullets are the prose, so measure them as a reader sees them, opened.
+    for (const d of document.querySelectorAll('details.changelog-detail')) d.open = true;
     const c = document.createElement('canvas').getContext('2d');
     const ab = 'abcdefghijklmnopqrstuvwxyz ';
     const visible = (el) => {
@@ -526,9 +529,7 @@ describe('design system', () => {
         await goto(page, path);
         const { max, worst, seen } = await page.evaluate(measureChars);
         total += seen;
-        // A page with no multi-line prose at this width is not a failure —
-        // /changelog/ below 900px is entirely inside a collapsed <details>
-        // and its hero lede is 74 characters, so nothing on it can wrap.
+        // A page with no multi-line prose at this width is not a failure.
         // Coverage is enforced across widths by the assertion below instead,
         // so a page cannot silently drop out of the audit.
         if (seen === 0) continue;

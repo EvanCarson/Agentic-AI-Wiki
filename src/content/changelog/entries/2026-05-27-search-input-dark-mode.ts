@@ -24,5 +24,6 @@ const entry: ChangelogEntry = {
       '修复：点击「加载更多结果」后无法滚动——打开搜索面板时正文滚动被锁定，但面板本身没有设置滚动溢出。现在为面板加上 overflow-y: auto，结果增多时可正常滚动；同时将关闭按钮 ✕ 固定在视口右上角，滚动后仍可点击。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

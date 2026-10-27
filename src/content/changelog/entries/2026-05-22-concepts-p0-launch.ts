@@ -16,5 +16,6 @@ const entry: ChangelogEntry = {
       '条目：prompt-injection-101（智能体 AI）、guardrails-101 与 evals-101（基础构件）。',
     ),
   ],
+  lines: ['co'],
 };
 export default entry;

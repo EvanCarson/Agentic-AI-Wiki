@@ -11,5 +11,6 @@ const entry: ChangelogEntry = {
     L('Regulatory content is intentionally qualitative and is not legal advice; it maps the shape of obligations so engineers know what to ask qualified counsel.',
       '监管内容刻意保持定性，且不构成法律意见；它勾勒义务的形状，使工程师知道该向有资质的法律顾问问什么。'),
   ],
+  lines: ['op'],
 };
 export default entry;

@@ -16,5 +16,6 @@ const entry: ChangelogEntry = {
       '新增标签:sandboxing、code-execution、infrastructure。',
     ),
   ],
+  lines: ['bl'],
 };
 export default entry;

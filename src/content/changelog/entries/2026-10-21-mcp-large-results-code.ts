@@ -16,6 +16,7 @@ const entry: ChangelogEntry = {
       '消除了 GitHub 案例、C13 分页深入解析与 O34 运行手册之间的重复：三页各守一个角度（故事、协议设计、宿主运维），宿主限制清单只保留在 O34，其余页面改为链接过去。',
     ),
   ],
+  lines: ['dd', 'op', 'bl'],
 };
 
 export default entry;

@@ -14,6 +14,7 @@ const entry: ChangelogEntry = {
     L('Ch 18, Levels, Burnout and What Comes Next: the only published level distinction asks for leverage, not endurance; nobody has published attrition data; and a growth plan that ties level, load and exits together.',
       '第 18 章《职级、倦怠与下一步》：唯一公开的级别区分，要求的是杠杆而不是耐力；目前没有人公布过流失数据；附一份把职级、负担与出路放在一起规划的成长计划。'),
   ],
+  lines: ['bk'],
 };
 
 export default entry;

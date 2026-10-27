@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '尊重 prefers-reduced-motion 设置；复制按钮与徽章已排除于搜索索引之外。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

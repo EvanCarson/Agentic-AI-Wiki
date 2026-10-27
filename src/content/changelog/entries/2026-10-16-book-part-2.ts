@@ -20,6 +20,7 @@ const entry: ChangelogEntry = {
       '在核查第二部分时发现并修正了第 2 章的几处错误：Slack 的 80% 指的是 9 个抽样文件中被转换的代码比例，而不是文件比例；Elastic 是在智能体删掉一次版本升级之后才加上禁止降级的规则，而不是之前；Uber 的引文已恢复原文；Spotify Fleet Management 的自动合并不再一概算作确定性的，因为 Spotify 没有说明其中有多少出自其 LLM 智能体；BiAn 的 20.5% 是相对 RCACopilot 基线测得的。',
     ),
   ],
+  lines: ['bk'],
 };
 
 export default entry;

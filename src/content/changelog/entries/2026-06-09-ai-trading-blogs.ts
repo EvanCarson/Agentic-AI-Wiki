@@ -16,6 +16,7 @@ const entry: ChangelogEntry = {
       '新增 AI Blog 文章——《智能体 AI 用于交易研究》：写清 TradingAgents 提出的「智能体公司」模式（分析师 → 多空辩论 → 交易员 → 风控监督者）、一个交易智能体需要的工具面与记忆切分、BloombergGPT 与 FinGPT 与被提示的通用 LLM 的取舍，以及 LiveTradeBench 50 天实盘评估揭示的「LMArena 名次预测不了 P&L 名次」这一发现。配五张示意图、一组带 FAQPage JSON-LD 的常见问答，中英双语，并交叉链接到多智能体拓扑、监督者/工作者模式、辩论与集成、智能体式检索、结构化工具 I/O，以及配套的栈视角文章。',
     ),
   ],
+  lines: ['bl'],
 };
 
 export default entry;

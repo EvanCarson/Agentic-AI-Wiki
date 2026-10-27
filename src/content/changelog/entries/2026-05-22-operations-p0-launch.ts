@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '治理：eu-ai-act-for-agents、nist-ai-rmf-for-agents。安全：agent-identity、scoped-credentials-for-agents。',
     ),
   ],
+  lines: ['op'],
 };
 export default entry;

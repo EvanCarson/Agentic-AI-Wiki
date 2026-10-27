@@ -16,5 +16,6 @@ const entry: ChangelogEntry = {
       '新增标签：rag、vector-databases、infrastructure。',
     ),
   ],
+  lines: ['bl'],
 };
 export default entry;

@@ -11,5 +11,6 @@ const entry: ChangelogEntry = {
     L('Recurring themes made concrete per vertical: the confidently-wrong output as the failure that matters, read-only / consent / approval gates as upstream constraints, and limits enforced in tool signatures rather than prompts.',
       '反复出现的主题在每个垂直领域被具体化：自信的错误输出才是要紧的失败、只读/同意/审批关卡作为上游约束、以及把限制强制在工具签名而非提示里。'),
   ],
+  lines: ['pb'],
 };
 export default entry;

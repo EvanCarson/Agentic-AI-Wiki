@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '编码与交互：browser-agents、ide-agents、outbound-voice-agents、progressive-disclosure-ux。',
     ),
   ],
+  lines: ['pb'],
 };
 export default entry;

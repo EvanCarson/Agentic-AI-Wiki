@@ -31,7 +31,12 @@ const entry: ChangelogEntry = {
       'Fixed: 93 page titles across Deep-Dives, Playbooks, Operations and Concepts showed a literal "&amp;" in sidebars, breadcrumbs and browser tabs; they now show "&".',
       '修复：深度剖析、实战手册、运维与概念中有 93 个页面标题在侧边栏、面包屑和浏览器标签里显示成字面的「&amp;」，现已正确显示为「&」。',
     ),
+    L(
+      'The changelog opens with "How the network grew": one bar per month, as long as that month\'s number of changes and split into the colours of the sections they touched. Chips above the list show one section at a time, and each entry is now a single row of date, section dots and title, with its details a tap away.',
+      '更新日志以「网络如何生长」开篇：每个月一条色条，长度等于当月的更新数，并按所涉及板块的颜色分段。列表上方的筛选按钮可以一次只看一个板块；每条更新现在只占一行——日期、板块圆点和标题，细节点开即见。',
+    ),
   ],
+  lines: ['hub'],
 };
 
 export default entry;

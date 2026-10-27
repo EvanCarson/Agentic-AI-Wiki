@@ -9,5 +9,6 @@ const entry: ChangelogEntry = {
     L('Introduced this Changelog, replacing the unused Posts section; the home page now links the latest entries.',
       '引入本「更新日志」，替换未使用的「文章」板块；首页现在链接到最新条目。'),
   ],
+  lines: ['hub'],
 };
 export default entry;

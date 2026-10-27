@@ -28,6 +28,7 @@ const entry: ChangelogEntry = {
       '新增运营页 `/operations/evaluation-and-observability/pii-redaction-in-agent-traces`（E18）——OpenTelemetry 的 GenAI 约定把每一个装内容的属性都设为「选择加入」，正是为了让内容不会因为谁忘了一个开关就出现；而那个默认值，是这整件事里最后一个便宜的时刻。本页主张脱敏属于 SDK，而不属于下游任何位置，因为到了 collector，数据已经跨过了一道进程边界、通常还跨过了一个网络——后端遮蔽只是展示层脱敏，原始值还在存储里、备份里和搜索索引里。文中主张用确定性的带类型令牌取代遮罩（`<EMAIL_7f2a>` 保住了那些能回答「是一个客户还是一个系统性 bug」的关联，也让一次删除请求变成你真的执行得了的事），主张把「按实体类型、对着标注语料量出来的召回率」做成 CI 闸门，而不是看一个被容易类别主导的总体值；并主张把破玻璃未脱敏层的 TTL 定在实测 MTTD 之上——24 小时的 TTL 配上九天的察觉中位耗时，每一次你需要它的时候它都是空的。',
     ),
   ],
+  lines: ['dd', 'pb', 'op', 'bl'],
 };
 
 export default entry;

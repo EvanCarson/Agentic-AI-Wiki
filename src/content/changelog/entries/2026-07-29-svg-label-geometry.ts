@@ -28,6 +28,7 @@ const entry: ChangelogEntry = {
       '更新了每日内容批处理流程文档（`docs/routines/daily-content-batch.prompt.md`）里对这道检测的说明，把三项检查——同一行文字重叠、跑出 viewBox、标签叠在填色方框上——都写全了，而不只是前两项。',
     ),
   ],
+  lines: ['bl'],
 };
 
 export default entry;

@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '与新增的"计算机操作与图形界面智能体"概念页及既有的厂商 computer-use 文章互为补充；完全双语（中/英），并配有 SVG 图示（星标图、特性矩阵、感知谱系、框架 vs MCP 集成模型）。',
     ),
   ],
+  lines: ['bl'],
 };
 export default entry;

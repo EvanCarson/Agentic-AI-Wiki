@@ -36,5 +36,6 @@ const entry: ChangelogEntry = {
       '新增了一道常驻检查 `npm run test:design`：在真实浏览器中打开构建后的站点，核查对比度、段落行长、头部高度、可点击区域大小、横向溢出与代码高亮配色——12 项检查全部通过——为这套设计系统建立起一道防止悄然退化的测试屏障。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

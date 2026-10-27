@@ -11,5 +11,6 @@ const entry: ChangelogEntry = {
     L('Hardened structured-data (JSON-LD) output against script-tag breakout.',
       '加固结构化数据（JSON-LD）输出，防止 script 标签逃逸。'),
   ],
+  lines: ['hub'],
 };
 export default entry;

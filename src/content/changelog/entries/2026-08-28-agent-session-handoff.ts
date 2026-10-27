@@ -20,6 +20,7 @@ const entry: ChangelogEntry = {
       '把三种失效模式分开，并指出其中只有一种是格式问题：工具 schema（一次记录在案的 `Edit` 调用及其悬空的 `tool_use_id`，对一个手持 `apply_patch` 的智能体毫无意义）、系统提示（那些轮次以模型视为“自己过去的推理”的角色抵达，且没有任何机制去怀疑它们），以及缓存与环境（即便是同一智能体的恢复也不还原 `--mcp-config`、`--settings`、`--plugin-dir` 或 `--add-dir`；Claude Code 之所以对长时间闲置的会话提议做摘要，正是因为提示缓存已经过期）。文章还厘清了两个都叫 ACP 的协议——Zed 的 Agent Client Protocol 标准化的是编辑器到智能体，并且是把历史重放给客户端而非另一个智能体，而并入 A2A 的那个是 Agent Communication Protocol——最后给出一份交接文件模板，只依一条规则：每一行要么是一个事实、后面跟着重新核验它的命令，要么是一个被标记出来的决策；其余都是装饰。',
     ),
   ],
+  lines: ['bl'],
 };
 
 export default entry;

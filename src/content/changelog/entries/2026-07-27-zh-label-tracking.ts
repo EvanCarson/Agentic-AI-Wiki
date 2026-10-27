@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '设计检查现在会按字号比例核查中文文字的字距，确保该问题不会因新增了使用不同字号的组件而重新出现。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

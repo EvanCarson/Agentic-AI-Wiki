@@ -13,5 +13,6 @@ const entry: ChangelogEntry = {
     L('Mobile polish: the close control is now a comfortable thumb-sized target, and tapping outside the panel dismisses search just like on desktop.',
       '移动端优化：关闭按钮现已是适合拇指点按的尺寸，点击面板以外区域即可关闭搜索，与桌面端体验一致。'),
   ],
+  lines: ['hub'],
 };
 export default entry;

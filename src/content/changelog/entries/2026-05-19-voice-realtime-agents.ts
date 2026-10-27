@@ -9,5 +9,6 @@ const entry: ChangelogEntry = {
     L('Grounded in the 2025–2026 realtime landscape: speech-to-speech APIs (OpenAI Realtime / gpt-realtime, Gemini Live), semantic-VAD endpointing, sub-second turn budgets, and SIP/PSTN telephony constraints.',
       '立足 2025–2026 的实时格局：语音到语音 API（OpenAI Realtime / gpt-realtime、Gemini Live）、语义 VAD 端点检测、亚秒轮次预算，以及 SIP/PSTN 电话约束。'),
   ],
+  lines: ['pb'],
 };
 export default entry;

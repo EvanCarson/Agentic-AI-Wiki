@@ -16,5 +16,6 @@ const entry: ChangelogEntry = {
       '同时预先加了一条重置规则，确保嵌套在 <pre> 代码块内的 <code> 不会继承行内代码的样式。目前没有任何内容这样写，但既然改为给裸元素挂样式，不预先处理就会给日后的作者埋下陷阱。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

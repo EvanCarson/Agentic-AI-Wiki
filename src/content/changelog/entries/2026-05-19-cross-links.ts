@@ -11,5 +11,6 @@ const entry: ChangelogEntry = {
     L('Proposed a site-wide navigation/information-architecture plan (grouping, "start here" path, related-pages and concepts↔deep-dives mapping) for review as a follow-up.',
       '提出一份全站导航/信息架构方案（分组、「从这里开始」路径、相关页面与概念↔深度剖析映射），作为后续工作待评审。'),
   ],
+  lines: ['co', 'dd'],
 };
 export default entry;

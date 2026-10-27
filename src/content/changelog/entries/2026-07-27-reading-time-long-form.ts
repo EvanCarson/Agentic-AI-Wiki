@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '「概念」板块的条目有意不显示阅读时长——该板块是由短条目构成的术语表，逐条标注反而是干扰而非信息。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

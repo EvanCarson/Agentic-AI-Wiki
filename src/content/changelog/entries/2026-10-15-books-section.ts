@@ -20,6 +20,7 @@ const entry: ChangelogEntry = {
       '导航——「书籍」加入顶部导航栏，紧挨实战指南；「更新日志」移到页脚（页脚中原本就有它）。',
     ),
   ],
+  lines: ['bk'],
 };
 
 export default entry;

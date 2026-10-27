@@ -9,5 +9,6 @@ const entry: ChangelogEntry = {
     L('No user-facing change — the Deep-Dives index renders the same groups and entries in the same order; the public manifest API (ENTRIES, entryBySlug, entryTitle, groupedEntries) is preserved.',
       '无用户可见变化——「深度剖析」索引以相同顺序渲染相同的分组与词条；清单的公开 API（ENTRIES、entryBySlug、entryTitle、groupedEntries）保持不变。'),
   ],
+  lines: ['dd'],
 };
 export default entry;
