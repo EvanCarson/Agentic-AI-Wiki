@@ -35,6 +35,10 @@ const entry: ChangelogEntry = {
       'The changelog opens with "How the network grew": one bar per month, as long as that month\'s number of changes and split into the colours of the sections they touched. Chips above the list show one section at a time, and each entry is now a single row of date, section dots and title, with its details a tap away.',
       '更新日志以「网络如何生长」开篇：每个月一条色条，长度等于当月的更新数，并按所涉及板块的颜色分段。列表上方的筛选按钮可以一次只看一个板块；每条更新现在只占一行——日期、板块圆点和标题，细节点开即见。',
     ),
+    L(
+      'The About page now shows the daily service: a departures board of the last seven content batches, with when each merged, which sections it called at, the page it rebuilt and a link to its pull request, read from GitHub every time the site is built. Below it, the six stops every batch makes, from finding the gap to merging only when the checks pass.',
+      '「关于」页面现在展示的是每日班次：一块发车看板列出最近七个内容批次——每批何时合并、停靠了哪些板块、重写了哪个页面，并链接到它的 pull request，数据在每次构建站点时从 GitHub 读取。看板下方是每一批都会经过的六个站，从找出缺口，到只在检查全部通过时才合并。',
+    ),
   ],
   lines: ['hub'],
 };

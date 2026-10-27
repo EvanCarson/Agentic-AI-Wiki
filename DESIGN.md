@@ -374,6 +374,9 @@ Running-text links are ink with a 1px dotted underline in the line's mark colour
 ### Code
 Blocks sit on the always-dark `code-bg` in 13px Mono, 6px corners from 700px up, with scroll fades. Inline code is 0.85em Mono on the line's soft tint, with 2px corners. Vendor code tabs keep their brand hue as a 2px underline, with a separate -ink shade for the label.
 
+### Departures board (About)
+The About page's evidence that a scheduled agent drafts part of the site: the inverse panel (the page's only one) holding a real table of the last seven content batches, with merge time in tabular Mono, a dot plus section name for each line called at (dots in the `-inv` shades), the rebuilt page and the PR link in `line-dd-inv`. The newest row sits on `--surface-inverse-hi` with a `line-co-inv` status dot; secondary text uses `--surface-inverse-muted`, rules `--surface-inverse-rule`. Data comes from GitHub at build time (`lib/batches.ts`), falling back to the changelog. Below it, the six stops every batch calls at run on a 4px hub-ink line with 16px rings, horizontal from 760px and vertical below.
+
 ### Tags and chips
 Blog tags are 12px Mono pills with a 1px hairline border, turning line-ink on hover.
 
