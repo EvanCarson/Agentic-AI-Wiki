@@ -1270,7 +1270,9 @@ describe('design system', () => {
   test('index grids hold their column counts across the widening', async () => {
     const bad = [];
     const cases = [
-      ['/', '.home-grid', [[390, 1], [600, 2], [768, 3], [1728, 3]]],
+      // The home page's card grid became the hero's two columns (search, map)
+      // in the 2026-10-27 redesign; one column until 1024px, then two.
+      ['/', '.home-hero', [[390, 1], [768, 1], [1024, 2], [1728, 2]]],
       ['/blogs/', '.blog-list', [[390, 1], [768, 1], [1024, 2], [1728, 2]]],
       ['/deep-dives/', '.group-card-grid', [[390, 1], [768, 2], [1728, 2]]],
     ];

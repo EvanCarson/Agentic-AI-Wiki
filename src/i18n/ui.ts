@@ -38,6 +38,8 @@ export interface UIStrings {
           latest: string;
           entries: string; updated: string; exploreKicker: string;
           seeAllChapters: string; browseAll: string;
+          /** The home page's section map (LineMap.astro). */
+          mapAria: string; youAreHere: string; books: string; posts: string;
           fromTheBlog: string; readPost: string; morePosts: string };
   fg: { metaTitle: string; metaDesc: string };
   books: {
@@ -131,6 +133,8 @@ export const ui: Record<Locale, UIStrings> = {
       entries: 'entries', updated: 'Updated', exploreKicker: 'Everything else',
       seeAllChapters: 'See all chapters →', browseAll: 'Browse all →',
       fromTheBlog: 'From the blog', readPost: 'Read the post →', morePosts: 'All posts →',
+      mapAria: 'Sections of the wiki, each line as long as its number of entries',
+      youAreHere: 'You are here', books: 'books', posts: 'posts',
     },
     fg: { metaTitle: 'The Agentic AI Field Guide',
           metaDesc: "A working engineer's guide to building agentic systems, end to end." },
@@ -158,7 +162,7 @@ export const ui: Record<Locale, UIStrings> = {
       tagline: 'AI & agentic AI explained — plain-language entries for newcomers and intermediates.',
       emptyHtml: 'Concept entries are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
       readingPath: {
-        badge: 'NEW HERE?',
+        badge: 'New here?',
         intro: 'New to agentic AI? Read these five concepts in order:',
         escapePrefix: 'Or follow the full guided path in the',
         escapeLinkLabel: 'Field Guide →',
@@ -171,7 +175,7 @@ export const ui: Record<Locale, UIStrings> = {
       tagline: 'Engineering fundamentals — architectures, memory, RAG, protocols, tools, reasoning, training, multi-agent.',
       emptyHtml: 'Deep-dive essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
       readingPath: {
-        badge: 'NEW HERE?',
+        badge: 'New here?',
         prefix: 'These essays assume Concepts fluency — new here?',
         linkLabel: 'Start with Concepts →',
       },
@@ -183,7 +187,7 @@ export const ui: Record<Locale, UIStrings> = {
       tagline: 'Applied recipes for building agents in specific domains and roles.',
       emptyHtml: 'Playbook essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
       readingPath: {
-        badge: 'NEW HERE?',
+        badge: 'New here?',
         prefix: 'These playbooks assume Concepts fluency — new here?',
         linkLabel: 'Start with Concepts →',
       },
@@ -195,7 +199,7 @@ export const ui: Record<Locale, UIStrings> = {
       tagline: 'How to run agents in production — evals, observability, cost, safety, governance.',
       emptyHtml: 'Operations essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
       readingPath: {
-        badge: 'NEW HERE?',
+        badge: 'New here?',
         prefix: 'These ops essays assume Concepts fluency — new here?',
         linkLabel: 'Start with Concepts →',
       },
@@ -285,6 +289,8 @@ export const ui: Record<Locale, UIStrings> = {
       entries: '条', updated: '更新于', exploreKicker: '其余内容',
       seeAllChapters: '查看全部章节 →', browseAll: '浏览全部 →',
       fromTheBlog: '博客精选', readPost: '阅读全文 →', morePosts: '全部文章 →',
+      mapAria: '本站各板块，每条线的长度与其条目数成正比',
+      youAreHere: '你在这里', books: '本', posts: '篇',
     },
     fg: { metaTitle: 'Agentic AI 实战指南',
           metaDesc: '一线工程师的智能体系统构建全程指南。' },
