@@ -1,0 +1,93 @@
+<section class="phase">
+  <div class="phase-num">B23</div>
+  <div class="week">Operation &middot; Economics &amp; ROI</div>
+  <h2>The per-step cost of looking.</h2>
+  <p class="goal">A screenshot-driven agent spends most of its invoice on pixels it has already seen, and the lever that fixes it is not the one teams reach for: trimming old screenshots out of the history saves roughly nothing and destroys the prompt cache, which was the only thing keeping a 40-step task linear instead of quadratic. Turn caching on and keep the transcript append-only, then buy detail with a zoom on the region you are about to click rather than with a bigger frame.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The bill is denominated in looks, not in prose.</h3>
+    <p>A text agent's input is mostly tokens you can read. A GUI agent's input is mostly an image, and the image has a published price in tokens. Anthropic's computer-use tool documents the conversion exactly: a screenshot costs <code class="inline">&lceil;width / 28&rceil; &times; &lceil;height / 28&rceil;</code> visual tokens, with the current toolset capping a single image at 4,784 of them and 2,576 pixels on the long edge. That formula is the whole cost model, and it is worth evaluating once on your own resolutions before anybody argues about model pricing.</p>
+<pre class="standalone"># visual tokens = ceil(w / 28) * ceil(h / 28)
+
+1024 x  768   ->  37 x 28  =  1,036    # docs recommend this for desktop
+1280 x  800   ->  46 x 29  =  1,334    # docs recommend this for web
+1366 x  768   ->  49 x 28  =  1,372
+1920 x 1080   ->  69 x 39  =  2,691    # docs warn against going above
+2576 x 1448   ->  92 x 52  =  4,784    # the documented per-image ceiling</pre>
+    <p>Two things fall out immediately. The documented recommendations sit at about a fifth of the ceiling, so the ceiling is headroom rather than a default &mdash; a point the <a class="xref" href="/blogs/the-same-model-two-different-computer-tools">tool-version split</a> makes from the other direction, since the earlier tool version caps at roughly 1.15 megapixels and cannot reach these numbers at all. And the full-frame ceiling costs 4.6&times; what the recommended desktop resolution does, on every single step, which is a larger multiple than any model price cut in the last two years.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The naive loop is quadratic, and the exponent is the problem.</h3>
+    <p>Pricing one screenshot is the easy half. The expensive half is that an agent loop re-sends its transcript on every step, so a screenshot taken at step 3 is an input token at step 3 and again at steps 4 through N. Count the image reads rather than the images.</p>
+<pre class="standalone"># N = 40 steps, one screenshot per step, nothing dropped
+# step i sends images 1..i, so total image reads = N(N+1)/2
+
+reads         = 40 * 41 / 2            =    820 image reads
+tokens        = 820 * 1,036            = 849,520 visual tokens
+# 40 screenshots were taken. 820 were paid for.</pre>
+    <p>That is the arithmetic behind the sense that GUI agents are disproportionately expensive, and it is the same quadratic that governs text loops &mdash; see <a class="xref" href="/concepts/agent-cost-control">agent cost control</a> &mdash; except that the per-item constant is 1,036 tokens instead of a 40-token tool result. The images are not a line item alongside the transcript. On a long task they <em>are</em> the transcript.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Prompt caching turns the quadratic back into a line.</h3>
+    <p>The 820 figure assumes every re-read is billed at the full input rate. With prompt caching and an append-only transcript it is not: the prefix is a cache read, and only the newest image is written. Using the standard multipliers &mdash; 1.25&times; to write a cache entry, 0.1&times; to read one &mdash; the same task re-prices by a factor of six.</p>
+<pre class="standalone"># Same 40 steps, caching on, history append-only.
+# Step i: read images 1..i-1 from cache (0.1x), write image i (1.25x).
+
+cache reads   = 0.1 * (0 + 1 + ... + 39) = 0.1 * 780 =  78 units
+cache writes  = 1.25 * 40                            =  50 units
+total                                                = 128 units
+
+# versus 820 units uncached -> 6.4x cheaper, same screenshots,
+# same resolution, same model.</pre>
+    <p>This is the first thing to fix and it is usually free, because a computer-use loop is already append-only in shape: perceive, act, perceive again. The reason it so often is not cached in practice is that the harness mutates history for unrelated reasons &mdash; injecting a reminder, re-ordering blocks, rebuilding the message list from a database each turn. Each of those invalidates the prefix and silently restores the quadratic. The mechanics of which edits cost what are in <a class="xref" href="/deep-dives/architectures-and-patterns/context-caching-economics">context-caching economics</a> and <a class="xref" href="/deep-dives/memory-and-context/kv-cache-budgeting-for-agent-loops">KV-cache budgeting for agent loops</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Trimming old screenshots is the wrong lever, and it is worse than nothing.</h3>
+    <p>The intuitive saving is to keep only the last few frames. Run the numbers on it and the intuition collapses, because dropping the oldest image changes the prefix on every step, which is exactly the edit that costs you the cache.</p>
+<pre class="standalone"># Keep only the last 3 screenshots, N = 40.
+reads  = 1 + 2 + 3 * 38          = 117 image reads
+
+# (a) you had no cache:   117 units  vs 820  -> 7.0x better
+# (b) you had a cache:    117 units  vs 128  -> 1.09x better
+# (c) you trim AND pay cache writes on a prefix that
+#     changes every step: 117 * 1.25 = 146 units -> WORSE than 128</pre>
+    <p>So the ranking is not what the planning meeting assumes. Against an uncached loop, trimming looks like a 7&times; win and caching like a 6.4&times; win, and they appear interchangeable. They are not, because they do not compose: a trimmed history cannot be cached, so you get one of them, and the one that also preserves the agent's ability to compare the current screen against three steps ago is the cache. Case (c) is the one actually shipping in production somewhere right now &mdash; a team that enabled caching for the text prefix and then added image trimming as a second optimisation, paying the write premium on a cache that never hits.</p>
+    <div class="callout">
+      <p>Rank the candidate levers on a 40-step task, all else equal: caching with an append-only history, 6.4&times;; dropping the frame from 1920&times;1080 to 1024&times;768, 2.6&times;; moving to a model at half the input price, 2&times;; trimming to the last three frames on top of a working cache, 1.09&times;. The only lever that is both large and free is the one nobody negotiates, and the one everyone negotiates is the smallest of the four.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Buy detail with a zoom, not with a bigger frame.</h3>
+    <p>Resolution is not purely a cost question, which is what makes it the hard one. Spatial <a class="xref" href="/concepts/gui-grounding">grounding</a> &mdash; producing the coordinate rather than naming the target &mdash; is the dominant error class in GUI agents and it degrades as you downscale, so cutting the frame to save tokens buys a cheaper step and a less accurate one. The current toolset resolves that trade rather than splitting it: capture the frame at the recommended size and re-capture only the region you are about to act on.</p>
+<pre class="standalone"># Full frame at the ceiling, every step:
+2576 x 1448                            = 4,784 tokens / step
+
+# Recommended frame, plus a zoom on a 400x300 region:
+1024 x  768   ->  37 x 28  =  1,036
+ 400 x  300   ->  15 x 11  =    165
+                             -------
+                               1,201 tokens / step
+
+# 4.0x cheaper, and full resolution exactly where the click lands.</pre>
+    <p>Two cliffs sit next to this and both are easy to walk off. The first is the documented image-count threshold: once a request carries more than 20 images, the per-side limit tightens to 2,000 pixels &mdash; so a full-retention loop changes its own observation contract at around step 21, which will read as an unexplained accuracy drop halfway through long tasks. The second is coordinate scaling. Coordinates come back in screenshot pixels, so if you downscale before sending you must scale the model's answer back up, and a rounding error there is a click that lands near the button rather than on it. That turns a cost decision into a <a class="xref" href="/deep-dives/architectures-and-patterns/browser-agent-failure-modes">failure mode</a>, which is why the resolution lever deserves less enthusiasm than its multiple suggests.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Measure it per step, not per task.</h3>
+    <p>The unit that makes this manageable is visual tokens per step and steps per completed task, held separately. They move for different reasons and they respond to different fixes: tokens per step is a harness setting you control in one place, while steps per task is a competence number that changes when the model or the target application changes. Reporting only the blended cost per task hides which one regressed, and on this surface they regress in opposite directions &mdash; a sharper frame raises tokens per step and lowers steps per task, and the sign of the net effect is an empirical question about your targets.</p>
+    <p>Three numbers are worth putting on a dashboard and keeping there. Visual tokens per step, computed from the formula rather than estimated, so a resolution change shows up the day it ships. Cache hit rate on the image blocks specifically, because a global hit rate stays healthy on the text prefix while the expensive half misses. And image reads per completed task, which is the quantity the quadratic acts on and the one that catches a retry storm turning a 40-step task into a 90-step one. Record all three against the model and tool version, as <a class="xref" href="/operations/economics-roi/cost-attribution">cost attribution</a> requires, and reconcile against the provider's returned usage object rather than your own tokenizer, because visual tokens are not something you can recount locally.</p>
+    <div class="callout tip">
+      <p><strong>What to do.</strong> In order, and stop when the bill is acceptable. First, confirm the image blocks are actually cache hits &mdash; not the request overall, the image blocks &mdash; and make the transcript append-only so they stay that way; this is the 6&times; and it costs a day. Second, delete any image-trimming logic you added on top of a working cache; it is buying 9% and spending the 6.4&times; that paid for everything. Third, pin the capture resolution to the documented recommendation rather than the display's, and route every demand for more detail through a region re-capture. Only then look at the model's price per token, which is the smallest of the four levers and the only one that requires somebody's signature. The companion arithmetic for text-token loops is in <a class="xref" href="/operations/economics-roi/fewer-tokens-vs-cheaper-tokens">fewer tokens vs cheaper tokens</a>, and the per-task denominator belongs in <a class="xref" href="/operations/economics-roi/unit-economics">unit economics</a>; the behaviour this page is pricing is described in <a class="xref" href="/playbooks/coding-and-computer-use-agents/computer-use-and-gui-agents">computer-use &amp; GUI agents</a>.</p>
+    </div>
+  </div>
+</section>

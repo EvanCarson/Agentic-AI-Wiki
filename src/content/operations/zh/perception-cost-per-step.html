@@ -1,0 +1,93 @@
+<section class="phase">
+  <div class="phase-num">B23</div>
+  <div class="week">运维 &middot; 经济性与投资回报</div>
+  <h2>「看一眼」的每步成本。</h2>
+  <p class="goal">一个靠截图驱动的智能体，账单的大头花在它早就看过的那些像素上；而能修好这件事的杠杆，并不是团队习惯去拽的那一根：把旧截图从历史里裁掉几乎省不下什么，却会毁掉提示词缓存——而缓存正是那个让一次 40 步任务保持线性、而不是变成平方的唯一东西。先把缓存打开、把对话记录保持为只追加，然后用「对你即将点下去的那块区域做一次 zoom」来买细节，而不是用一个更大的画幅。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>这笔账是以「看了几眼」计价的，不是以文字计价的。</h3>
+    <p>一个文本智能体的输入，大部分是你读得懂的 token。一个 GUI 智能体的输入，大部分是一张图，而这张图有一个以 token 公布的价格。Anthropic 的电脑操作工具把换算写得很明确：一张截图耗费 <code class="inline">&lceil;宽 / 28&rceil; &times; &lceil;高 / 28&rceil;</code> 个视觉 token，而当前的 toolset 把单张图封顶在 4,784 个、长边 2,576 像素。这个公式就是整个成本模型；在任何人开始争论模型定价之前，都值得先拿自己的分辨率算一遍。</p>
+<pre class="standalone"># visual tokens = ceil(w / 28) * ceil(h / 28)
+
+1024 x  768   ->  37 x 28  =  1,036    # docs recommend this for desktop
+1280 x  800   ->  46 x 29  =  1,334    # docs recommend this for web
+1366 x  768   ->  49 x 28  =  1,372
+1920 x 1080   ->  69 x 39  =  2,691    # docs warn against going above
+2576 x 1448   ->  92 x 52  =  4,784    # the documented per-image ceiling</pre>
+    <p>有两件事立刻掉了出来。文档里的那些推荐值大约只是上限的五分之一，所以那个上限是余量、而不是默认值——<a class="xref" href="/zh/blogs/the-same-model-two-different-computer-tools">工具版本的那次分叉</a>从另一头说明了同一点，因为更早的工具版本封顶在约 115 万像素、压根到不了这些数字。而满画幅的上限，在每一步上都是推荐桌面分辨率的 4.6 倍——这个倍数比过去两年里任何一次模型降价都大。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>朴素的那个循环是平方的，而问题出在那个指数上。</h3>
+    <p>给一张截图定价是容易的那一半。贵的那一半是：智能体循环每一步都会把对话记录重发一遍，所以第 3 步拍的那张截图，在第 3 步是一次输入 token，在第 4 步到第 N 步还要再算一次。请数「图被读了几次」，而不是「有几张图」。</p>
+<pre class="standalone"># N = 40 steps, one screenshot per step, nothing dropped
+# step i sends images 1..i, so total image reads = N(N+1)/2
+
+reads         = 40 * 41 / 2            =    820 image reads
+tokens        = 820 * 1,036            = 849,520 visual tokens
+# 40 screenshots were taken. 820 were paid for.</pre>
+    <p>这就是「GUI 智能体贵得不成比例」那种直觉背后的算术；而它跟支配文本循环的是同一个平方——见<a class="xref" href="/zh/concepts/agent-cost-control">智能体成本控制</a>——只不过单项的那个常数是 1,036 个 token，而不是一条 40 token 的工具结果。这些图不是对话记录旁边的一个费用项。在一次长任务里，它们<em>就是</em>对话记录。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>提示词缓存把那个平方变回一条直线。</h3>
+    <p>820 这个数字假设每一次重读都按完整输入价计费。而只要有提示词缓存、并且对话记录是只追加的，就不是这样：前缀是一次缓存读取，只有最新那张图需要写入。用标准倍率来算——写一条缓存 1.25 倍、读一条 0.1 倍——同一次任务的价格会重估为六分之一。</p>
+<pre class="standalone"># Same 40 steps, caching on, history append-only.
+# Step i: read images 1..i-1 from cache (0.1x), write image i (1.25x).
+
+cache reads   = 0.1 * (0 + 1 + ... + 39) = 0.1 * 780 =  78 units
+cache writes  = 1.25 * 40                            =  50 units
+total                                                = 128 units
+
+# versus 820 units uncached -> 6.4x cheaper, same screenshots,
+# same resolution, same model.</pre>
+    <p>这是该先修的那件事，而且通常是免费的，因为一个电脑操作循环在形状上本来就是只追加的：感知、动作、再感知。它在实践中如此频繁地没被缓存，原因是外壳为了别的理由在改动历史——塞进一句提醒、重排内容块、每一轮都从数据库重建消息列表。这每一样都会让前缀失效，并静默地把那个平方请回来。哪些编辑分别要付什么代价，其机理在<a class="xref" href="/zh/deep-dives/architectures-and-patterns/context-caching-economics">上下文缓存经济学</a>与<a class="xref" href="/zh/deep-dives/memory-and-context/kv-cache-budgeting-for-agent-loops">为智能体循环做 KV 缓存预算</a>里。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>裁掉旧截图是错的那根杠杆，而且比什么都不做更糟。</h3>
+    <p>直觉上的省钱办法是只留最后几帧。把数字算出来，这个直觉就塌了，因为丢掉最旧那张图会在每一步上改变前缀——而这恰恰就是那种让你丢掉缓存的编辑。</p>
+<pre class="standalone"># Keep only the last 3 screenshots, N = 40.
+reads  = 1 + 2 + 3 * 38          = 117 image reads
+
+# (a) you had no cache:   117 units  vs 820  -> 7.0x better
+# (b) you had a cache:    117 units  vs 128  -> 1.09x better
+# (c) you trim AND pay cache writes on a prefix that
+#     changes every step: 117 * 1.25 = 146 units -> WORSE than 128</pre>
+    <p>所以排序并不是规划会议上以为的那样。对着一个没有缓存的循环，裁剪看着像 7 倍的胜利、缓存看着像 6.4 倍的胜利，两者显得可以互换。它们不可互换，因为它们不叠加：一份被裁剪过的历史没法被缓存，于是你只能二选一——而其中那个同时还保住了「智能体能把当前屏幕跟三步之前对比」这项能力的，是缓存。情形 (c) 正是此刻某处真实上线着的那一种——某个团队为文本前缀启用了缓存，然后又把图像裁剪当作第二项优化加上去，于是在一个永不命中的缓存上付着写入溢价。</p>
+    <div class="callout">
+      <p>在一次 40 步任务上、其余条件相同，把候选杠杆排个序：只追加历史加缓存，6.4 倍；把画幅从 1920&times;1080 降到 1024&times;768，2.6 倍；换成输入价减半的模型，2 倍；在一个已经工作的缓存之上再裁到最后三帧，1.09 倍。唯一既大又免费的那根杠杆，是没人去谈的那根；而所有人都在谈的那根，是这四根里最小的。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>用 zoom 买细节，不要用更大的画幅买。</h3>
+    <p>分辨率不是一个纯粹的成本问题——这正是它难的地方。空间<a class="xref" href="/zh/concepts/gui-grounding">定位</a>——给出坐标、而不是叫出目标的名字——是 GUI 智能体里占主导的错误类别，而它会随着你缩小尺寸而退化；所以为了省 token 而砍画幅，买到的是一步更便宜、也更不准的步。当前的 toolset 没有把这个取舍劈成两半，而是解掉了它：画幅按推荐尺寸捕捉，只对你即将动手的那块区域重新捕捉一次。</p>
+<pre class="standalone"># Full frame at the ceiling, every step:
+2576 x 1448                            = 4,784 tokens / step
+
+# Recommended frame, plus a zoom on a 400x300 region:
+1024 x  768   ->  37 x 28  =  1,036
+ 400 x  300   ->  15 x 11  =    165
+                             -------
+                               1,201 tokens / step
+
+# 4.0x cheaper, and full resolution exactly where the click lands.</pre>
+    <p>紧挨着这件事有两道坎，而且都很容易一脚踏空。第一道是文档里那个图片数量阈值：一旦一个请求携带超过 20 张图，每边的上限就收紧到 2,000 像素——于是一个全量保留的循环会在大约第 21 步上改变自己的观测契约，而这在长任务里会读起来像是「中途莫名其妙掉准」。第二道是坐标换算。坐标是以截图像素返回的，所以如果你在发送前缩了尺寸，就必须把模型的答案等比放回去；而那里的一个取整误差，就是一次落在按钮旁边、而不是落在按钮上的点击。这就把一个成本决定变成了一种<a class="xref" href="/zh/deep-dives/architectures-and-patterns/browser-agent-failure-modes">失效模式</a>——这也正是分辨率这根杠杆，值得比它的倍数所暗示的更少一点热情的原因。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>按步测量，不要按任务测量。</h3>
+    <p>让这件事可管理的那个单位，是「每步的视觉 token」与「每完成一次任务的步数」，而且要分开记。它们因不同的理由而动，也对不同的修法有反应：每步 token 是一项你在一处就能控制的外壳设置，而每任务步数是一个能力数字，会在模型或目标应用变化时改变。只报混在一起的每任务成本，会把「是哪一个回退了」遮起来；而在这个接口上，这两者回退的方向相反——更锐的画幅抬高每步 token、压低每任务步数，而净效应的正负是一个关于你自己那些目标的实证问题。</p>
+    <p>有三个数字值得放上看板并一直留着。每步的视觉 token，用公式算出来而不是估出来，这样一次分辨率改动在它上线那天就会现形。专门针对图像内容块的缓存命中率，因为一个全局命中率会在文本前缀上保持健康，而贵的那一半在不命中。以及每完成一次任务的图像读取次数——这正是那个平方作用于其上的量，也是那个能抓到「一场重试风暴把 40 步任务变成 90 步」的量。请把这三个都按模型与工具版本记录下来（<a class="xref" href="/zh/operations/economics-roi/cost-attribution">成本归因</a>要求如此），并与提供方返回的 usage 对象对账、而不是跟你自己的分词器对账，因为视觉 token 不是你能在本地重新数一遍的东西。</p>
+    <div class="callout tip">
+      <p><strong>该做什么。</strong>按顺序来，账单可以接受就停。第一，确认那些图像内容块真的是缓存命中——不是整个请求，是那些图像块——并把对话记录改成只追加，让它们保持命中；这就是那 6 倍，代价是一天工夫。第二，把你加在一个已工作缓存之上的任何图像裁剪逻辑删掉；它买到的是 9%，花掉的是那个付清了一切的 6.4 倍。第三，把捕捉分辨率钉在文档推荐值上、而不是钉在显示器上，并把每一次「要更多细节」的需求都路由到一次区域重新捕捉上。只有到这一步之后，才去看模型的每 token 单价——那是这四根杠杆里最小的一根，也是唯一一根需要谁签字的。文本 token 循环对应的那套算术在<a class="xref" href="/zh/operations/economics-roi/fewer-tokens-vs-cheaper-tokens">更少的 token 对更便宜的 token</a>；每任务那个分母属于<a class="xref" href="/zh/operations/economics-roi/unit-economics">单位经济学</a>；而本页在给它定价的那个行为，描述在<a class="xref" href="/zh/playbooks/coding-and-computer-use-agents/computer-use-and-gui-agents">计算机操作与 GUI 智能体</a>里。</p>
+    </div>
+  </div>
+</section>
