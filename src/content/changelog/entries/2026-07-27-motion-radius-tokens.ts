@@ -24,5 +24,6 @@ const entry: ChangelogEntry = {
       '每次构建现在都会运行一项检查，防止这些数值再次各自漂移——这与已在保护站点字号、间距与字重的检查属于同一类。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

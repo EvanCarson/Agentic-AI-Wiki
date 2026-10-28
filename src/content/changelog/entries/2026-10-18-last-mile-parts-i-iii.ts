@@ -16,6 +16,7 @@ const entry: ChangelogEntry = {
     L('Earlier chapters now link to the new ones, and Ch 6\'s citation of vendor guidance is regraded T4, in line with the book\'s rule that vendor advice and stated targets are T4 and vendor-reported measurements T2.',
       '已发布章节现已链接到新章节；第 6 章对供应商指南的引用改为 T4，与本书的规则一致：供应商建议与既定目标归为 T4，供应商自报的测量结果归为 T2。'),
   ],
+  lines: ['bk'],
 };
 
 export default entry;

@@ -20,6 +20,7 @@ const entry: ChangelogEntry = {
       '全书勘误：dotnet/runtime 的撤回对比是智能体对其他所有拉取请求（含机器人），而不是对人类（第 3、6、11 章）；Fedora 的 AI 政策现按其理事会工单原文引用；注明了内核的 Assisted-by 格式在不同文档构建中有所不同；删去了一个无法追溯来源的 Uber 人均花费数字。全书的章节引用现在都已改为链接。',
     ),
   ],
+  lines: ['bk'],
 };
 
 export default entry;

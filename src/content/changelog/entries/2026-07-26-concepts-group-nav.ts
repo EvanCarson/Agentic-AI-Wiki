@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '跳转目标会避开固定页头，而不是落到它下面；中文页面的锚点还做了去重——有几个分组名会缩略成相同的 slug，否则其中一个分组将永远无法抵达。',
     ),
   ],
+  lines: ['co'],
 };
 export default entry;

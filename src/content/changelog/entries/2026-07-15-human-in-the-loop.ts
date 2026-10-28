@@ -16,5 +16,6 @@ const entry: ChangelogEntry = {
       '它是把自主性等级与护栏连接到智能体 UX 实战手册（批准与确认、渐进式自主）以及智能体安全"决策回执"深入解析的入门引桥。完全双语（中/英）。',
     ),
   ],
+  lines: ['co'],
 };
 export default entry;

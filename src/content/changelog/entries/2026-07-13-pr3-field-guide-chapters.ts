@@ -24,5 +24,6 @@ const entry: ChangelogEntry = {
       '这一 PR 收束了 2026-07 新技术页面 slate 的第三条也是最后一条轨——加上 PR #89（MCP 深入解析分组）与 PR #90（深入解析新增），这份 42 页的 slate 以 42 页交付。',
     ),
   ],
+  lines: ['fg'],
 };
 export default entry;

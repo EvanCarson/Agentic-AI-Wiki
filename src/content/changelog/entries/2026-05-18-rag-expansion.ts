@@ -11,5 +11,6 @@ const entry: ChangelogEntry = {
     L('Field Guide updates: RAGAS evaluation vocabulary in the eval chapter; parent-document and late chunking in the retrieval chapter.',
       '实战指南更新：评估章节加入 RAGAS 评测术语；检索章节加入父文档与延迟分块。'),
   ],
+  lines: ['fg', 'co', 'dd'],
 };
 export default entry;

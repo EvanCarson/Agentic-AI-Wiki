@@ -118,6 +118,7 @@ Every page — new or rebuilt — must **argue one non-obvious, load-bearing poi
 - Register every new non-blog page in its section's manifest or group file (table in §1), with bilingual title, summary and group.
 - Add ONE changelog entry at `src/content/changelog/entries/<YYYY-MM-DD>-<slug>.ts` covering the whole batch. The filename date prefix MUST equal the `date` field and MUST be the actual merge day; get it with `date -u +%F`. A test enforces this.
 - **The changelog `title` is a headline, not a summary: at most 110 characters in English and 60 in Chinese — a test enforces this from 2026-10-17.** Something like "Two AI Blog posts, two new pages and a rebuilt Concepts page" is right. On a phone the collapsed title is all a reader sees, and long titles made the page ~62 screens long. Put the detail — each page's argument and numbers — in the `items` bullets, one bullet per page, the rebuilt page as its own bullet saying it was rebuilt and what it now argues.
+- Set the entry's `lines` field to every section the batch touched, as line keys: `fg` Field Guide, `bk` Books, `co` Concepts, `dd` Deep-Dives, `pb` Playbooks, `op` Operations, `bl` AI Blog, `hub` site-wide (e.g. `lines: ['co', 'dd', 'pb', 'bl']`). A test enforces it; it drives the /changelog/ chart and filters.
 
 ## 6. Gates — all must pass before merging
 

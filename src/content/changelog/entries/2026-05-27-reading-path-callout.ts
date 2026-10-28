@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '所有文案位于 src/i18n/ui.ts（双语）；五条核心路径以 CORE_PATH_SLUGS 从「概念」清单导出，词条重命名时只需改一个文件。Closes #46。',
     ),
   ],
+  lines: ['co', 'dd'],
 };
 export default entry;

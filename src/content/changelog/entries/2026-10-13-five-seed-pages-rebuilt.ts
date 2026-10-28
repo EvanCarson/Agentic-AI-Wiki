@@ -28,6 +28,7 @@ const entry: ChangelogEntry = {
       '实战手册 · 编码与计算机操作智能体——评估编码智能体：改写为实战手册——鉴于 SWE-bench 的测试已被证实既会放过错误补丁、也会拒掉正确补丁，应从已合并的 PR 构建自有评测：隐藏测试、评审可合并性细则、pass^k 可靠性与每份可合并 diff 的成本，并在 CI 中设门禁。',
     ),
   ],
+  lines: ['co', 'dd', 'pb', 'op'],
 };
 
 export default entry;

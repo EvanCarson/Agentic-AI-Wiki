@@ -28,6 +28,7 @@ const entry: ChangelogEntry = {
       '书籍——章节页现在有完整的全书侧边栏（尚未发布的章节以浅色显示）、会跳过未发布章节的上一章/下一章链接，以及“在此基础上展开的章节”列表；本书也已列入 llms.txt。',
     ),
   ],
+  lines: ['bk'],
 };
 
 export default entry;

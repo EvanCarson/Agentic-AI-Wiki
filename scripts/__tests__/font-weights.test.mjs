@@ -61,12 +61,19 @@ function facesResolve(css) {
   return missing;
 }
 
-/** Map the CSS custom property back to the family it resolves to. */
-const TOKEN_FAMILY = {
-  '--font-display': 'Space Grotesk',
-  '--font-body': 'Inter',
-  '--font-mono': 'JetBrains Mono',
-};
+/** Map the CSS custom property back to the family it resolves to.
+    Read from the token layer itself (the first family named on bare :root),
+    so a redesign that swaps faces cannot leave this test checking the old
+    ones. It held hand-typed names until the 2026-10-27 redesign, which
+    surfaced exactly that drift. */
+const TOKENS_CSS = read('../../src/styles/tokens.css');
+const TOKEN_FAMILY = Object.fromEntries(
+  ['--font-display', '--font-body', '--font-mono'].map((tok) => {
+    const m = TOKENS_CSS.match(new RegExp(`${tok}:\\s*'([^']+)'`));
+    assert.ok(m, `tokens.css does not define ${tok} with a quoted first family`);
+    return [tok, m[1]];
+  }),
+);
 
 test('every declared font-weight is loaded for its family', () => {
   const loaded = loadedWeights(FONTS_CSS);

@@ -16,6 +16,7 @@ const entry: ChangelogEntry = {
       '它为什么能发出去：生产构建跑的是 `build`、`verify`、`search:index` 与 `test:search`，唯独**没有** `test:design`——而后者正是专门测量这一类缺陷的套件。于是一张标签互相碰撞、跑出 viewBox 或压在填充色块上的图，可以在 CI 全绿的情况下进入生产环境，这次就是如此。考虑到每日内容批次是无人值守合并的，这个缺口值得补上。',
     ),
   ],
+  lines: ['bl'],
 };
 
 export default entry;

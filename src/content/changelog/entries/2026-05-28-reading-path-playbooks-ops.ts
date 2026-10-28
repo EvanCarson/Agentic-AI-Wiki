@@ -16,5 +16,6 @@ const entry: ChangelogEntry = {
       '组件 mode 取值扩展为 \'concepts\' | \'deepDives\' | \'playbooks\' | \'operations\'。三种单行模式共用渲染，差异只在文案（取自 src/i18n/ui.ts 中各板块的 readingPath）。',
     ),
   ],
+  lines: ['pb', 'op'],
 };
 export default entry;

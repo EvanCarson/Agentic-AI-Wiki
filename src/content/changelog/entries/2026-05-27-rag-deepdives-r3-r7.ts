@@ -32,5 +32,6 @@ const entry: ChangelogEntry = {
       '评估 RAG——把检索、接地与答案质量分开打分（recall@k、忠实性、答案相关性），附带最小可用评测配方与 LLM 裁判告诫。',
     ),
   ],
+  lines: ['dd'],
 };
 export default entry;

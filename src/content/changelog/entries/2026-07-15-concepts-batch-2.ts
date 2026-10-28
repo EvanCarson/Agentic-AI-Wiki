@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '完全双语（中/英）；概念百科现已达 44 个条目。',
     ),
   ],
+  lines: ['co'],
 };
 export default entry;

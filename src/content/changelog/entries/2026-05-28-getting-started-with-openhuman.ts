@@ -16,6 +16,7 @@ const entry: ChangelogEntry = {
       '修订 OpenClaw vs OpenHuman vs Hermes Agent 对比文章：将"纯本地"的表述更正为更准确的"本地数据 + 托管服务"模型，并更新 OpenHuman 的 Star 数以反映其已突破 29,000 的增长。',
     ),
   ],
+  lines: ['bl'],
 };
 
 export default entry;

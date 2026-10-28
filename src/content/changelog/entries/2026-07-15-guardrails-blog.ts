@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '与《用大白话讲护栏》概念页及"智能体安全"深入解析分组互为补充；完全双语（中/英），并配有 SVG 图示（星标图、特性矩阵、护栏落位图，以及"四种形态"示意）。',
     ),
   ],
+  lines: ['bl'],
 };
 export default entry;

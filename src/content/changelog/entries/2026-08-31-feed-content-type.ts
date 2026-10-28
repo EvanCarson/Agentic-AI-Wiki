@@ -12,6 +12,7 @@ const entry: ChangelogEntry = {
       '`/rss.xml` 与 `/zh/rss.xml` 现在以 `application/rss+xml; charset=utf-8` 提供。这两个订阅源路由本身就设置了该响应头，但在静态构建中，Astro 会把端点的响应体写成磁盘上的文件、并丢弃它的响应头，于是生产环境用的是 Vercel 对 `.xml` 的默认映射——`application/xml`，且不带字符集。阅读器能接受这一点；但对于一份有一半是中文的订阅源来说，把编码交给隐式推断仍然不是该冒的险。现已在 `vercel.json` 中固定，并在订阅源构建代码里留了注释，让两处保持同步。',
     ),
   ],
+  lines: ['hub'],
 };
 
 export default entry;

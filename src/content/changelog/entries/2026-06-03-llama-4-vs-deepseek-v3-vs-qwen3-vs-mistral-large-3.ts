@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '新增标签：model-comparison、frontier-models、self-hosted。',
     ),
   ],
+  lines: ['bl'],
 };
 export default entry;

@@ -28,6 +28,7 @@ const entry: ChangelogEntry = {
       '重建概念「推理 vs 非推理模型」（E5），720 → 约 1,320 词：现在它主张「推理模型」是一笔你花出去的预算，而不是一个你挑选的模型。思考按输出价计费、与答案共用 max_tokens 上限（那个空响应 bug），而且无法按请求预测。Anthropic 在 4.7 及之后直接拒绝 budget_tokens、转向自适应 effort，OpenAI 用 reasoning_effort，Google 用思考档位——而更高并非单调更好。算过的例子：把 effort 只放给二十步里的两步，能把推理那一项成本砍掉 90%。',
     ),
   ],
+  lines: ['co', 'op', 'bl'],
 };
 
 export default entry;

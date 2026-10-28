@@ -28,5 +28,6 @@ const entry: ChangelogEntry = {
       '所有改动均在浏览器中实测而非想当然：在 390px 与 1280px 下、明暗两种主题、覆盖 12 种页面类型重新计算对比度，行长按渲染字形宽度实测，表格滚动状态逐档验证。390px 下任何页面均无横向溢出。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

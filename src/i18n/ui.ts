@@ -38,6 +38,8 @@ export interface UIStrings {
           latest: string;
           entries: string; updated: string; exploreKicker: string;
           seeAllChapters: string; browseAll: string;
+          /** The home page's section map (LineMap.astro). */
+          mapAria: string; youAreHere: string; books: string; posts: string;
           fromTheBlog: string; readPost: string; morePosts: string };
   fg: { metaTitle: string; metaDesc: string };
   books: {
@@ -75,12 +77,29 @@ export interface UIStrings {
     onThisPage: string;
   };
   about: { kicker: string; h1: string; metaDesc: string;
-           missionH: string; missionHtml: string;
-           coveredH: string; coveredHtml: string;
-           maintainerH: string; maintainerHtml: string;
+           /** Opens the page under the h1; replaces the old "Mission" section. */
+           standfirst: string;
+           /** The departures board: the daily content batch, from GitHub at build time. */
+           board: { title: string; departs: string; region: string;
+                    date: string; merged: string; calls: string; rebuilt: string; pr: string;
+                    /** "{n} AI Blog" when a batch added more than one post. */
+                    blogCount: string;
+                    /** Footer; {n}, {date}, %CHANGELOG%. */
+                    foot: string;
+                    /** Footer when the build fell back to the changelog (no count, no times). */
+                    footFallback: string };
+           stopsH: string; stops: { name: string; note: string }[];
            authorshipH: string; authorshipHtml: string;
-           contactH: string; contactHtml: string };
-  changelog: { kicker: string; metaTitle: string; metaDesc: string; h1: string; intro: string; jumpTo: string };
+           maintainerH: string; maintainerHtml: string;
+           /** Contributing, contact and the llms.txt pointer, under "Who maintains it". */
+           contactHtml: string };
+  changelog: { kicker: string; metaTitle: string; metaDesc: string; h1: string; intro: string;
+    /** The "How the network grew" chart, filter chips and month counts. */
+    chartTitle: string; chartLegend: string; show: string; all: string; site: string;
+    /** Change counts; `{n}` is replaced with the number. */
+    countOne: string; countMany: string;
+    /** Prefix for the visually hidden list of sections on an entry row. */
+    sections: string };
   og: { tagline: string };
   theme: { ariaLight: string; ariaDark: string; ariaAuto: string };
   seriesTitle: string;
@@ -131,6 +150,8 @@ export const ui: Record<Locale, UIStrings> = {
       entries: 'entries', updated: 'Updated', exploreKicker: 'Everything else',
       seeAllChapters: 'See all chapters →', browseAll: 'Browse all →',
       fromTheBlog: 'From the blog', readPost: 'Read the post →', morePosts: 'All posts →',
+      mapAria: 'Sections of the wiki, each line as long as its number of entries',
+      youAreHere: 'You are here', books: 'books', posts: 'posts',
     },
     fg: { metaTitle: 'The Agentic AI Field Guide',
           metaDesc: "A working engineer's guide to building agentic systems, end to end." },
@@ -158,7 +179,7 @@ export const ui: Record<Locale, UIStrings> = {
       tagline: 'AI & agentic AI explained — plain-language entries for newcomers and intermediates.',
       emptyHtml: 'Concept entries are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
       readingPath: {
-        badge: 'NEW HERE?',
+        badge: 'New here?',
         intro: 'New to agentic AI? Read these five concepts in order:',
         escapePrefix: 'Or follow the full guided path in the',
         escapeLinkLabel: 'Field Guide →',
@@ -171,7 +192,7 @@ export const ui: Record<Locale, UIStrings> = {
       tagline: 'Engineering fundamentals — architectures, memory, RAG, protocols, tools, reasoning, training, multi-agent.',
       emptyHtml: 'Deep-dive essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
       readingPath: {
-        badge: 'NEW HERE?',
+        badge: 'New here?',
         prefix: 'These essays assume Concepts fluency — new here?',
         linkLabel: 'Start with Concepts →',
       },
@@ -183,7 +204,7 @@ export const ui: Record<Locale, UIStrings> = {
       tagline: 'Applied recipes for building agents in specific domains and roles.',
       emptyHtml: 'Playbook essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
       readingPath: {
-        badge: 'NEW HERE?',
+        badge: 'New here?',
         prefix: 'These playbooks assume Concepts fluency — new here?',
         linkLabel: 'Start with Concepts →',
       },
@@ -195,7 +216,7 @@ export const ui: Record<Locale, UIStrings> = {
       tagline: 'How to run agents in production — evals, observability, cost, safety, governance.',
       emptyHtml: 'Operations essays are coming soon — in the meantime, dive into the <a href="%FG%" style="color:var(--accent);">Field Guide</a>.',
       readingPath: {
-        badge: 'NEW HERE?',
+        badge: 'New here?',
         prefix: 'These ops essays assume Concepts fluency — new here?',
         linkLabel: 'Start with Concepts →',
       },
@@ -219,18 +240,31 @@ export const ui: Record<Locale, UIStrings> = {
       onThisPage: 'On this page',
     },
     about: { kicker: 'About', h1: 'Agentic AI Wiki',
-      metaDesc: 'What the Agentic AI Wiki is, what it covers, and who maintains it.',
-      missionH: 'Mission',
-      missionHtml: 'The Agentic AI Wiki is a living, open knowledge base for building agentic AI well. It favors durable understanding over hype — clear explanations, working mental models, and practitioner depth that stays useful as the field moves.',
-      coveredH: "What's covered",
-      coveredHtml: 'The <a href="%FG%" style="color:var(--accent);">Field Guide</a> is a hands-on, end-to-end engineering course for building and shipping agents. <a href="%CONCEPTS%" style="color:var(--accent);">Concepts</a> is a plain-language encyclopedia for newcomers and intermediates. <a href="%DEEP%" style="color:var(--accent);">Deep-Dives</a> are advanced essays on architectures, protocols, memory, and agentic security. Everything is bilingual (English / 中文). For AI assistants and other tools, <a href="%LLMS%" style="color:var(--accent);">llms.txt</a> is a plain-text index of every page with its summary.',
-      maintainerH: 'Who maintains it',
-      maintainerHtml: 'Built and maintained by <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">Chen Qian</a> as an independent, open project.',
+      metaDesc: 'What the Agentic AI Wiki is, how a scheduled AI agent drafts part of it every day, and who maintains it.',
+      standfirst: 'A living, open knowledge base for building agentic AI well, written for engineers and backed by working evidence. Part of it is drafted every day by a scheduled AI agent. Here is its timetable.',
+      board: { title: 'Daily content batch', departs: 'Departs 08:00 UTC · 2 blog posts, 2 new pages, 1 rebuilt page',
+        region: 'The last seven content batches',
+        date: 'Date', merged: 'Merged', calls: 'Calling at', rebuilt: 'Rebuilt', pr: 'PR',
+        blogCount: '{n} AI Blog',
+        foot: '{n} batches merged since {date}. Times are UTC. Every batch is listed in the <a href="%CHANGELOG%">changelog</a>.',
+        footFallback: 'Every batch is listed in the <a href="%CHANGELOG%">changelog</a>.' },
+      stopsH: 'Every batch calls at',
+      stops: [
+        { name: 'Find the gap', note: 'Manifests, changelog, search demand' },
+        { name: 'Research', note: 'Primary sources, dated' },
+        { name: 'Write twice', note: 'English and 中文' },
+        { name: 'Run the gates', note: 'Build, tests, links, design' },
+        { name: 'Open a PR', note: 'Public, on GitHub' },
+        { name: 'Merge', note: 'Only when the gates pass' },
+      ],
       authorshipH: 'How it is written',
-      authorshipHtml: 'A scheduled AI agent drafts part of this site. Each day it reads the section manifests and the changelog to find the gaps, researches the topic against primary sources, writes both language versions, runs the site’s verification gates, and opens a pull request that merges on its own. Its prompt is version-controlled in the <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/tree/main/docs/routines" rel="noopener" style="color:var(--accent);">repository</a> rather than living in a console, and every batch it ships is itemised in the <a href="%CHANGELOG%" style="color:var(--accent);">changelog</a>. The standard it is held to, the review of what lands, and the corrections remain the maintainer’s — please report anything that reads wrong.',
-      contactH: 'Contributing & contact',
-      contactHtml: 'Corrections, suggestions, and new entries are welcome — open an issue or pull request on <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a>, or reach out via <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a>.' },
-    changelog: { jumpTo: 'Jump to', kicker: 'Changelog', metaTitle: 'Changelog — Agentic AI Wiki',
+      authorshipHtml: 'A scheduled AI agent drafts part of this site. Each day it reads the section manifests and the changelog to find the gaps, researches the topic against primary sources, writes both language versions, runs the site’s verification gates, and opens a pull request that merges on its own. Its prompt is version-controlled in the <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/tree/main/docs/routines" rel="noopener">repository</a> rather than living in a console, and every batch it ships is itemised in the <a href="%CHANGELOG%">changelog</a>. The standard it is held to, the review of what lands, and the corrections remain the maintainer’s — please report anything that reads wrong.',
+      maintainerH: 'Who maintains it',
+      maintainerHtml: 'Built and maintained by <a href="https://www.linkedin.com/in/cqian06/" rel="noopener">Chen Qian</a> as an independent, open project.',
+      contactHtml: 'Corrections, suggestions, and new entries are welcome — open an issue or pull request on <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener">GitHub</a>, or reach out via <a href="https://www.linkedin.com/in/cqian06/" rel="noopener">LinkedIn</a>. For AI assistants and other tools, <a href="%LLMS%">llms.txt</a> is a plain-text index of every page with its summary.' },
+    changelog: { kicker: 'Changelog',
+      chartTitle: 'How the network grew', chartLegend: 'Lines', show: 'Show', all: 'All', site: 'Site',
+      countOne: '{n} change', countMany: '{n} changes', sections: 'Sections:', metaTitle: 'Changelog — Agentic AI Wiki',
       metaDesc: 'What changed on the Agentic AI Wiki, newest first.',
       h1: 'Changelog',
       intro: 'Notable changes to this site — new sections, content, and improvements.' },
@@ -285,6 +319,8 @@ export const ui: Record<Locale, UIStrings> = {
       entries: '条', updated: '更新于', exploreKicker: '其余内容',
       seeAllChapters: '查看全部章节 →', browseAll: '浏览全部 →',
       fromTheBlog: '博客精选', readPost: '阅读全文 →', morePosts: '全部文章 →',
+      mapAria: '本站各板块，每条线的长度与其条目数成正比',
+      youAreHere: '你在这里', books: '本', posts: '篇',
     },
     fg: { metaTitle: 'Agentic AI 实战指南',
           metaDesc: '一线工程师的智能体系统构建全程指南。' },
@@ -373,18 +409,31 @@ export const ui: Record<Locale, UIStrings> = {
       onThisPage: '本页目录',
     },
     about: { kicker: '关于', h1: 'Agentic AI 维基',
-      metaDesc: '关于 Agentic AI 维基：它是什么、涵盖什么，以及由谁维护。',
-      missionH: '使命',
-      missionHtml: 'Agentic AI 维基是一个持续更新、开放的知识库，专注于把 Agentic AI 构建好。它重视可沉淀的理解而非炒作 — 清晰的讲解、可用的心智模型，以及在领域演进中依然有效的实践深度。',
-      coveredH: '涵盖内容',
-      coveredHtml: '<a href="%FG%" style="color:var(--accent);">实战指南</a> 是端到端、动手构建并交付智能体的工程课程。<a href="%CONCEPTS%" style="color:var(--accent);">概念</a> 是面向新手与进阶者的白话百科。<a href="%DEEP%" style="color:var(--accent);">深度剖析</a> 是关于架构、协议、记忆与智能体安全的进阶文章。全部内容均为双语（English / 中文）。面向 AI 助手与其他工具，<a href="%LLMS%" style="color:var(--accent);">llms.txt</a> 是一份带摘要的全站页面纯文本索引。',
-      maintainerH: '维护者',
-      maintainerHtml: '由 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">Chen Qian</a> 独立构建与维护的开放项目。',
+      metaDesc: '关于 Agentic AI 维基：它是什么、一个定时运行的 AI 智能体如何每天起草其中一部分，以及由谁维护。',
+      standfirst: '一个持续更新、开放的知识库，专注于把 Agentic AI 构建好：为工程师而写，以可运行的证据为依据。其中一部分内容由一个定时运行的 AI 智能体每天起草。下面是它的时刻表。',
+      board: { title: '每日内容批次', departs: '08:00 UTC 发车 · 2 篇博客、2 个新页面、1 个重写页面',
+        region: '最近七个内容批次',
+        date: '日期', merged: '合并', calls: '停靠', rebuilt: '重写', pr: 'PR',
+        blogCount: '{n} 篇 AI 博客',
+        foot: '自 {date}以来已合并 {n} 批。时间均为 UTC。每一批都逐条记录在<a href="%CHANGELOG%">更新日志</a>里。',
+        footFallback: '每一批都逐条记录在<a href="%CHANGELOG%">更新日志</a>里。' },
+      stopsH: '每一批都停靠这些站',
+      stops: [
+        { name: '找缺口', note: '内容清单、更新日志、搜索需求' },
+        { name: '做研究', note: '一手资料，注明日期' },
+        { name: '写两遍', note: 'English 与中文' },
+        { name: '过关卡', note: '构建、测试、链接、设计' },
+        { name: '开 PR', note: '公开，在 GitHub 上' },
+        { name: '合并', note: '只在关卡全部通过时' },
+      ],
       authorshipH: '本站如何写成',
-      authorshipHtml: '本站有一部分内容由一个定时运行的 AI 智能体起草。它每天读取各板块的内容清单与更新日志，找出其中的缺口，对照一手资料做研究，写出中英两个版本，跑完本站的校验关卡，然后开出一个会自行合并的 pull request。它的提示词与代码一起版本化保存在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/tree/main/docs/routines" rel="noopener" style="color:var(--accent);">仓库</a> 里，而不是躺在某个后台控制台中；它每一批交付的内容，都逐条记录在 <a href="%CHANGELOG%" style="color:var(--accent);">更新日志</a> 上。它所遵循的标准、对落地内容的复核，以及纠错的责任，仍然在维护者身上 — 读到不对劲的地方，欢迎告知。',
-      contactH: '贡献与联系',
-      contactHtml: '欢迎纠错、建议与新增词条 — 在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener" style="color:var(--accent);">GitHub</a> 提交 issue 或 pull request，或通过 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener" style="color:var(--accent);">LinkedIn</a> 联系。' },
-    changelog: { jumpTo: '快速跳转', kicker: '更新日志', metaTitle: '更新日志 — Agentic AI 维基',
+      authorshipHtml: '本站有一部分内容由一个定时运行的 AI 智能体起草。它每天读取各板块的内容清单与更新日志，找出其中的缺口，对照一手资料做研究，写出中英两个版本，跑完本站的校验关卡，然后开出一个会自行合并的 pull request。它的提示词与代码一起版本化保存在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/tree/main/docs/routines" rel="noopener">仓库</a> 里，而不是躺在某个后台控制台中；它每一批交付的内容，都逐条记录在 <a href="%CHANGELOG%">更新日志</a> 上。它所遵循的标准、对落地内容的复核，以及纠错的责任，仍然在维护者身上 — 读到不对劲的地方，欢迎告知。',
+      maintainerH: '维护者',
+      maintainerHtml: '由 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener">Chen Qian</a> 独立构建与维护的开放项目。',
+      contactHtml: '欢迎纠错、建议与新增词条 — 在 <a href="https://github.com/EvanCarson/Agentic-AI-Wiki/issues" rel="noopener">GitHub</a> 提交 issue 或 pull request，或通过 <a href="https://www.linkedin.com/in/cqian06/" rel="noopener">LinkedIn</a> 联系。面向 AI 助手与其他工具，<a href="%LLMS%">llms.txt</a> 是一份带摘要的全站页面纯文本索引。' },
+    changelog: { kicker: '更新日志',
+      chartTitle: '网络如何生长', chartLegend: '线路', show: '显示', all: '全部', site: '全站',
+      countOne: '{n} 项更新', countMany: '{n} 项更新', sections: '板块：', metaTitle: '更新日志 — Agentic AI 维基',
       metaDesc: '本站的变更记录，按时间倒序。',
       h1: '更新日志',
       intro: '本站的重要变更 — 新板块、新内容与改进。' },

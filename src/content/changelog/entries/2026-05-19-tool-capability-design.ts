@@ -9,5 +9,6 @@ const entry: ChangelogEntry = {
     L('Grounded in 2025–2026 practice: Anthropic\'s tool-writing and deferred-loading guidance, the measured ~95%→~71% tool-selection accuracy drop under tool overload, and real consolidations (GitHub Copilot 40→13 tools, Block 30+→2 Linear tools).',
       '立足 2025–2026 实践：Anthropic 的工具编写与延迟加载指南、工具过载下实测约 95%→71% 的工具选择准确率下降，以及真实的工具收拢（GitHub Copilot 40→13 个工具、Block 30 多→2 个 Linear 工具）。'),
   ],
+  lines: ['dd'],
 };
 export default entry;

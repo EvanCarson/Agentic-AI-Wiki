@@ -32,5 +32,6 @@ const entry: ChangelogEntry = {
       '「概念」百科现已收录 63 则条目。',
     ),
   ],
+  lines: ['co'],
 };
 export default entry;

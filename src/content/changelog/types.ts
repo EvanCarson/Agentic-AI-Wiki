@@ -9,12 +9,26 @@ import type { Localized } from '../../i18n/index';
 
 export type { Localized };
 
+/**
+ * A section of the site, as a line on the Line Map (see DESIGN.md):
+ * fg Field Guide, bk Books, co Concepts, dd Deep-Dives, pb Playbooks,
+ * op Operations, bl AI Blog, hub site-wide / infrastructure.
+ */
+export type LineKey = 'hub' | 'fg' | 'bk' | 'co' | 'dd' | 'pb' | 'op' | 'bl';
+
 export interface ChangelogEntry {
   /** ISO date the change merged to main, YYYY-MM-DD. */
   date: string;
   title: Localized;
   /** Bullet points describing what changed; each must be bilingual. */
   items: Localized[];
+  /**
+   * Which sections this change touched, as line keys. Drives the colour dots
+   * and the "How the network grew" chart on /changelog/. Use 'hub' for
+   * design, infrastructure and site-wide changes. When omitted, a keyword
+   * classifier in src/lib/changelog-lines.ts guesses — set it explicitly.
+   */
+  lines?: LineKey[];
 }
 
 /** Bilingual literal helper — keeps entry files terse. */

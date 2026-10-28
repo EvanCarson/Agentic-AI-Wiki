@@ -57,3 +57,16 @@ test(`changelog: titles from ${CAP_FROM} are headline length (en ≤ ${MAX_EN}, 
     assert.ok([...e.title.zh].length <= MAX_ZH, `${f}: zh title is ${[...e.title.zh].length} chars (max ${MAX_ZH}) — move the detail into items`);
   }
 });
+
+// Every entry names the lines (site sections) it touched; the /changelog/
+// chart and filter chips are built from them. The classifier in
+// src/lib/changelog-lines.ts is only a fallback, so the field is required.
+const LINE_KEYS = new Set(['hub', 'fg', 'bk', 'co', 'dd', 'pb', 'op', 'bl']);
+test('changelog: every entry has a non-empty, valid `lines` array', async () => {
+  for (const f of files) {
+    const e = (await import(pathToFileURL(entriesDir + f).href)).default;
+    assert.ok(Array.isArray(e.lines) && e.lines.length > 0, `${f}: missing \`lines\` (e.g. lines: ['bl', 'op'])`);
+    for (const k of e.lines) assert.ok(LINE_KEYS.has(k), `${f}: unknown line key '${k}'`);
+    assert.equal(new Set(e.lines).size, e.lines.length, `${f}: duplicate line key in \`lines\``);
+  }
+});

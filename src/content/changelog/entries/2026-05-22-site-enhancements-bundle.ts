@@ -40,5 +40,6 @@ const entry: ChangelogEntry = {
       '长篇正文页面新增「本页目录」侧栏 —— 涵盖实战指南章节、概念、深度剖析、实战手册与运维。滚动时高亮当前小节；标题数少于 3 个时自动隐藏。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

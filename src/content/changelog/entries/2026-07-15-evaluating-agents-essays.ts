@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '"评估智能体"深入解析分组从 3 篇增至 5 篇；完全双语（中/英），代码块逐字节一致。',
     ),
   ],
+  lines: ['dd'],
 };
 export default entry;

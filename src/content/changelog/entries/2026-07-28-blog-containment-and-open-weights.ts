@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '两篇均为中英双语，并配有八幅可随主题变色的 SVG——八阶段入侵路径、控制项对阶段的围栏矩阵、隔离评测靶场、K3 的稀疏路由与内存占用，以及与 K2.6 的价格对比。',
     ),
   ],
+  lines: ['bl'],
 };
 export default entry;

@@ -20,6 +20,7 @@ const entry: ChangelogEntry = {
       '一个值得点明的副作用：读者不再在每次浏览时被通报给第三方。从 Google 加载字体，意味着每一次访问都会把读者的 IP 地址与浏览器标识发送给 Google——无论这位读者本身与 Google 有没有任何关系。',
     ),
   ],
+  lines: ['hub'],
 };
 
 export default entry;

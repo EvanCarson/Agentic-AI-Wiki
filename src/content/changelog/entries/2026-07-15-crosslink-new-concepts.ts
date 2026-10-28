@@ -16,5 +16,6 @@ const entry: ChangelogEntry = {
       '这些链接弥合了可发现性的缺口：读者在既有基础页面上即可顺着语境抵达更新的内容，而不再是新页面只单向向外链接。',
     ),
   ],
+  lines: ['co'],
 };
 export default entry;

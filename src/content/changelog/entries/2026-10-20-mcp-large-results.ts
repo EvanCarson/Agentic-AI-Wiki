@@ -24,6 +24,7 @@ const entry: ChangelogEntry = {
       '为「塑形工具返回值」与「设计 MCP 工具」两页添加了指向新分页深入解析的链接。',
     ),
   ],
+  lines: ['dd', 'op', 'bl'],
 };
 
 export default entry;

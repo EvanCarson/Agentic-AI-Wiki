@@ -28,5 +28,6 @@ const entry: ChangelogEntry = {
       '设计检查新增一项：直接在渲染后的页面上核查是否存在被伪造成斜体的中文，确保该问题不会因新增文章、新增版式或行内样式而重新出现。',
     ),
   ],
+  lines: ['hub'],
 };
 export default entry;

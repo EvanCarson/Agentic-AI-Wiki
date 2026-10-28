@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '每个板块与分组都有专属落地页，包含主旨说明与阅读顺序。',
     ),
   ],
+  lines: ['pb', 'op', 'hub'],
 };
 export default entry;

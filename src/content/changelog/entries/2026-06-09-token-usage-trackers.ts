@@ -20,6 +20,7 @@ const entry: ChangelogEntry = {
       '新增标签：cost、tooling。',
     ),
   ],
+  lines: ['bl'],
 };
 
 export default entry;

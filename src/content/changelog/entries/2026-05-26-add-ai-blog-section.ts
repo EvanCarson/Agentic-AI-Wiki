@@ -16,6 +16,7 @@ const entry: ChangelogEntry = {
       '首篇：OpenClaw vs OpenHuman vs Hermes Agent —— 三段架构详解、五项横向对比、十张示意图，中英双语同步发布。',
     ),
   ],
+  lines: ['bl'],
 };
 
 export default entry;

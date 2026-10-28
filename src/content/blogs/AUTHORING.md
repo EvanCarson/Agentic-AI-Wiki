@@ -377,7 +377,8 @@ grep -o '"@type":"FAQPage"'     dist/blogs/<slug>/index.html  # matches if FAQ e
 Every post ships with a changelog entry at
 `src/content/changelog/entries/<merge-date>-<short-slug>.ts`. Date must
 equal the merge day. Bilingual title + bullets. Copy any existing entry as
-a template.
+a template. Set `lines` to the sections the change touched (`bl` for a post,
+plus `co`/`dd`/`pb`/`op`/`fg`/`bk` for any other page, `hub` for site-wide).
 
 ## 10. Pre-merge checklist
 

@@ -20,5 +20,6 @@ const entry: ChangelogEntry = {
       '把新篇章反向链回 17 个既有页面（每语种共 +19 处 xref），让读者从旧主题也能找到 2026 年的新内容。',
     ),
   ],
+  lines: ['dd'],
 };
 export default entry;
