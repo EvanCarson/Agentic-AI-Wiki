@@ -1,0 +1,74 @@
+<section class="phase">
+  <div class="phase-num">A50</div>
+  <div class="week">Concepts · Agentic AI Explained</div>
+  <h2>End-of-turn detection.</h2>
+  <p class="goal">The single largest line in a voice agent's response latency is usually not the model — it is the time the agent spends deciding the human has stopped talking, and a fixed silence timer adds that delay to every turn whether or not the caller was finished. End-of-turn detection is the decision that releases the agent to speak. In 2026 it stopped being a threshold you tune and became a classifier you buy, which changes the question from &ldquo;how long do we wait?&rdquo; to &ldquo;what rate of cutting people off can we live with?&rdquo;</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>It is a prediction about completion, not a measurement of silence.</h3>
+
+    <p>Three things in a voice stack are routinely conflated, and keeping them apart is most of the value of the term.</p>
+
+    <ul>
+      <li><strong>Voice activity detection (VAD)</strong> answers &ldquo;is there speech in this frame?&rdquo; It is cheap, acoustic, and runs continuously. It knows nothing about whether a sentence is finished.</li>
+      <li><strong>Endpointing</strong> is the policy layer that turns VAD output into a decision: typically, &ldquo;speech stopped and has stayed stopped for <em>N</em> milliseconds, so the turn is over.&rdquo;</li>
+      <li><strong>End-of-turn detection</strong> is the prediction that the <em>utterance is complete</em> — that the speaker has said what they meant to say and is yielding the floor. Completion is a property of the content and the prosody, not of the energy level.</li>
+    </ul>
+
+    <p>The distinction has a canonical example. A caller says &ldquo;my account number is four seven&rdquo; and pauses. VAD correctly reports silence. An endpointer with a 500 ms timer correctly reports that silence has lasted 500 ms. Both are right, and the agent that interrupts here is wrong, because the utterance is obviously unfinished to any listener who heard the words.</p>
+
+    <div class="callout">
+      <p>A voice agent interrupting people is almost never a VAD bug. VAD usually did its job. The defect is that a system with no model of completion was asked to infer completion from duration.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>No silence threshold separates the two distributions.</h3>
+
+    <p>The reason a timer cannot be tuned into correctness is statistical rather than engineering. Pauses <em>within</em> a turn and gaps <em>at the end</em> of a turn are drawn from two distributions that overlap heavily. Any threshold you pick cuts through both of them, so every setting buys a reduction in one error by paying for an increase in the other.</p>
+
+<pre class="standalone"><span class="c-cm"># The timer's two errors, and why they trade</span>
+threshold too low    <span class="c-cm"># fires inside a mid-turn pause  -&gt; false cutoff</span>
+threshold too high   <span class="c-cm"># waits out a finished utterance -&gt; dead air, every turn</span>
+
+<span class="c-cm"># And the second cost is unconditional:</span>
+added_latency = threshold          <span class="c-cm"># paid on EVERY turn, not just the ambiguous ones</span>
+cutoff_rate   = P(pause &gt; threshold | mid-turn)</pre>
+
+    <p>The overlap also moves with the speaker, which is what defeats a per-deployment tuning exercise. Second-language speakers, older callers, people reading a number off a screen and anybody thinking while they talk all sit further right on the pause distribution than a fluent native speaker finishing a sentence. One vendor write-up puts mean pauses for Mandarin&ndash;English bilinguals around 686 ms against roughly 546 ms for native English speakers — a figure we have not been able to trace to a primary dataset, but directionally the familiar one. A threshold tuned on your own team is a threshold tuned on the fastest, most fluent tenth of your callers.</p>
+
+    <p>The consequence for <a class="xref" href="/concepts/multilingual-agents">multilingual agents</a> is sharper than it looks: one global timeout encodes a different interruption rate for each language group you serve, and nothing in your dashboard will break it out that way.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The 2026 shape: the biggest line is now a model.</h3>
+
+    <p>The market answer is to predict completion directly from the signal rather than infer it from duration. A model-based end-of-turn detector consumes the audio, the partial transcript, or both, and emits a probability that the speaker has yielded — which can fire <em>before</em> the silence timer would have, on an utterance that sounds finished, and hold the floor open through a long pause on one that does not.</p>
+
+    <p>The architectural move of 2026 was to collapse this into the recognition model itself. Deepgram's Flux, launched that year, performs transcription and turn detection in one model and so needs no separate VAD-plus-endpointing stage; Deepgram documents end-of-turn decisions at roughly 260 ms, and its multilingual variant at under 400 ms across ten languages. Those are vendor figures measured on the vendor's own path, which is the usual caveat, but the structural claim underneath them is checkable and matters more: fusing the two removes a serial hop, and a serial hop is the thing <a class="xref" href="/playbooks/voice-realtime-agents/latency-budget">the latency budget</a> is made of.</p>
+
+    <p>Two practical notes survive the vendor churn. Model-based detection is normally run <em>alongside</em> acoustic VAD rather than instead of it — VAD is near-free and still the fastest way to know that the caller has started talking, which is what barge-in needs. And detectors expose a decision threshold, so adopting one does not remove the operating-point choice below; it gives you a better curve to pick a point on.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Pick an operating point, and never report one side of it.</h3>
+
+    <p>There is no standard for an acceptable false-interruption rate, so the number is yours to set and yours to defend. Set it per use case: an agent taking a payment card or a booking reference should hold the floor through long pauses and accept the added latency, because an interruption there costs a restart of the whole value; an agent handling short confirmations can fire early because the cost of a wrong cut is one repeated word.</p>
+
+    <p>The reporting discipline is the part teams skip. A latency improvement that was bought by lowering the threshold is not an improvement, it is a transfer, and it will show up weeks later as abandoned calls that nobody connects to the change.</p>
+
+    <div class="callout warn">
+      <p>Response latency and false-cutoff rate are a single measurement with two faces. Publishing either one alone — in a vendor comparison, a sprint review or a benchmark — is the standard way this trade gets made accidentally. Record them together or you have recorded neither.</p>
+    </div>
+
+    <p>Finally, know what happens when the event disappears. A full-duplex model that listens while it speaks never emits an end-of-turn event at all, and every downstream consumer that was silently subscribed to it — tool dispatch, trace spans, guardrail checkpoints, handoff logic — loses its trigger. That is a change of architecture rather than of latency, and it is the subject of <a class="xref" href="/concepts/full-duplex-speech">full-duplex speech</a>.</p>
+
+    <div class="callout tip">
+      <p>Start by measuring what you have: log the per-turn gap between last-speech-detected and first-audio-out, and the rate at which the agent's first words overlap the caller's. If the first number is dominated by a constant, you are paying a fixed timer on every turn and a model-based detector is the highest-return change available in the stack. See <a class="xref" href="/playbooks/voice-realtime-agents/turn-taking-and-barge-in">turn-taking and barge-in</a> for the correctness half, and <a class="xref" href="/operations/economics-roi/cost-of-a-voice-minute">the cost of a voice minute</a> for what those seconds bill.</p>
+    </div>
+  </div>
+</section>
