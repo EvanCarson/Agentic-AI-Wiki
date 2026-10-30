@@ -1,0 +1,76 @@
+<section class="phase">
+  <div class="phase-num">V24</div>
+  <div class="week">Playbook · Voice &amp; Realtime Agents</div>
+  <h2>Audio quality and codecs: the band the call arrives in is a ceiling your speech model cannot lift.</h2>
+  <p class="goal">A phone call sampled at 8&nbsp;kHz physically cannot carry sound above 4&nbsp;kHz, and most of what distinguishes <em>S</em> from <em>F</em> lives above it — so every recognizer you will ever buy has the same blind spot on a PSTN leg, and no amount of model quality closes it. Your audio path is the one quality lever in a voice agent that no one on the ML team owns, and the decision that sets it was made by a carrier negotiating a codec in a SIP handshake. Treat the band as a first-class deployment parameter: know which one you receive, stop pretending resampling fixed it, and measure accuracy separately per band.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Start from Nyquist, because the limit is arithmetic and not a model property.</h3>
+
+    <p>G.711 — the μ-law and A-law pair that the public telephone network has carried for decades — samples at 8&nbsp;kHz and spends 64&nbsp;kbit/s doing it. Sampling at 8&nbsp;kHz puts a hard theoretical ceiling of 4&nbsp;kHz on representable frequency, and the practical telephone passband is narrower still, roughly 300–3400&nbsp;Hz. Nothing above that line reaches your recognizer, ever, because it was discarded before the first packet left the carrier.</p>
+
+    <p>That matters because of <em>which</em> sounds live up there. The unvoiced fricatives and sibilants — <code class="inline">/s/</code>, <code class="inline">/f/</code>, <code class="inline">/θ/</code>, <code class="inline">/ʃ/</code> — carry most of their discriminating energy in the 4–8&nbsp;kHz region. The classic failures of telephone speech are exactly the pairs those sounds distinguish: fifteen against fifty, <em>S</em> against <em>F</em> against <em>X</em>, <em>thin</em> against <em>fin</em>. When your transcript confuses them, the model did not make a mistake in the ordinary sense; it inferred the most likely word from evidence that no longer contained the distinguishing cue. This is why <a href="/playbooks/voice-realtime-agents/alphanumerics-over-voice" class="xref">alphanumerics over voice</a> is a structurally hard problem rather than a tuning problem, and why spelling alphabets have been standard in aviation and emergency dispatch for seventy years.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Audit what your own stack delivers, because the default is narrowband end to end.</h3>
+
+    <p>The common 2026 telephony voice agent is a frontier speech model fed 1970s-grade audio, and most teams have never checked. Twilio's Media Streams, the most widely used bridge from a phone call into a model, delivers base64 G.711 μ-law at 8&nbsp;kHz. On the model side, OpenAI's Realtime API takes either a μ-law telephony format — fixed at 8&nbsp;kHz, so a rate parameter is meaningless on it — or linear PCM at 24&nbsp;kHz; the field names moved between the beta and GA shapes, so read the current reference rather than a tutorial. Pick the telephony format and your path is narrowband from carrier to tokens. Pick PCM and you have added a resampling stage, which is a different thing from having added bandwidth.</p>
+
+    <p>Write the chain down explicitly, hop by hop, with a sample rate on every arrow. Most teams discover two things doing this. The first is a transcode they did not know about, usually because a provider normalises to G.711 at an interconnect even when both endpoints could have spoken something better — the cost of which <a href="/playbooks/voice-realtime-agents/telephony-and-pstn-integration" class="xref">telephony and PSTN integration</a> covers as a quality pass. The second is that the number in their ASR vendor's accuracy claim was measured at a rate that appears nowhere in their own diagram.</p>
+
+<pre class="standalone"><span class="c-cm"># write the band on every hop. the lowest one is your real ceiling.</span>
+caller  --[ G.711 u-law  8 kHz ]--&gt;  carrier
+carrier --[ G.711 u-law  8 kHz ]--&gt;  telephony API        <span class="c-cm"># ceiling: 4 kHz</span>
+tel API --[ G.711 u-law  8 kHz ]--&gt;  your media bridge
+bridge  --[ PCM16      24 kHz ]--&gt;  speech model         <span class="c-cm"># upsampled, NOT wideband</span>
+
+<span class="c-cm"># the same path, after negotiating wideband on the legs you control:</span>
+caller  --[ Opus     48 kHz ]--&gt;  WebRTC edge             <span class="c-cm"># app/browser callers only</span>
+edge    --[ PCM16    24 kHz ]--&gt;  speech model            <span class="c-cm"># ceiling: 12 kHz</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Resampling satisfies an input contract; it does not restore a band.</h3>
+
+    <p>Upsampling 8&nbsp;kHz audio to 16 or 24&nbsp;kHz produces a tensor of the right shape and adds no information whatsoever — the 4–12&nbsp;kHz region of the result is interpolation, not speech. This is worth stating flatly because the opposite belief is common and it is load-bearing in the wrong direction: a team sees <code class="inline">24000</code> in its own config, concludes it is running wideband, and then cannot explain why accuracy on phone calls sits well below the benchmark number.</p>
+
+    <p>There is a second-order cost too. A badly implemented resampler introduces aliasing and imaging artefacts that are not merely absent information but actively misleading information, and every conversion stage adds a few milliseconds to a budget that is already the hardest constraint in the system — see <a href="/playbooks/voice-realtime-agents/latency-budget" class="xref">the latency budget</a>. If you must resample, do it once, in one place, with a library you did not write, and record the rate you did it at so a later comparison is interpretable.</p>
+
+    <div class="callout warn"><p>Bandwidth-extension models that synthesise plausible high-frequency content from narrowband input are a real research area, and they are the wrong tool in front of a recognizer. They invent the fricative energy rather than recovering it, which means they can turn an honest low-confidence <em>S-or-F</em> into a confident wrong answer. Use them for playback to humans if at all, never on the input path to a decision.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Where the one upgrade available to you actually is.</h3>
+
+    <p>The wideband options are well established. G.722 samples at 16&nbsp;kHz and is the lowest-friction upgrade on SIP interconnects that support it. Opus covers 8–48&nbsp;kHz and is, with G.711, mandatory to implement in WebRTC, which is why an in-app or in-browser caller is the one population you can usually serve at full band. The rule that governs all of it is unforgiving: <strong>the path runs at the band of its narrowest hop</strong>, so one G.711 interconnect in the middle collapses an otherwise wideband route, and you get nothing for the rest of the work.</p>
+
+    <p>Which gives a clean prioritisation. Legs you own end to end — your mobile app, your web widget, your internal agent-to-agent audio — should be Opus at 16&nbsp;kHz or better, and that is usually a configuration change rather than a project. Inbound PSTN calls, which is to say most of your traffic in a support or outbound-dialling product, are narrowband and will stay narrowband; spending a quarter trying to negotiate G.722 across carriers you do not control is the most common way this work goes wrong. Two smaller things pay more reliably: avoid double transcoding, because a chain such as G.729 to G.711 decodes and re-encodes the signal and the loss compounds in a way neither hop predicts, and keep packetisation at the conventional 20&nbsp;ms, since larger frames trade latency for marginal bandwidth you do not need and smaller ones multiply per-packet overhead and loss exposure.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Nobody can tell you the size of the penalty, so measure it on your own calls.</h3>
+
+    <p>The honest state of the published evidence is thin. The figure usually cited for the narrowband penalty comes from a 2014 EUSIPCO study that reported roughly a 20% <em>relative</em> word-error-rate reduction when sampling moved from 8 to 16&nbsp;kHz — two recognizer generations ago, on an architecture nobody deploys now. Vendor material since then asserts that wideband helps and almost never attaches a number, and the number that matters to you depends on your vocabulary, your callers' accents, your noise floor and your carrier mix. Any single figure you adopt from a blog post, this one included, is a guess.</p>
+
+    <p>So make the band an explicit dimension of your evaluation rather than a constant you forgot to record. Build the holdout set from recorded production calls, not from clean read speech, and report word error rate — and, more usefully, task success and the rate of mis-captured entities — sliced by codec, by carrier and by whether the leg was wideband. The method is the one in <a href="/playbooks/voice-realtime-agents/evaluating-voice-agents" class="xref">evaluating voice agents</a>; the addition here is a single column. Two results pay for the whole exercise: you learn whether your wideband legs are in fact measurably better, which tells you whether to fund the negotiation work, and you stop attributing a band problem to the model and swapping models to fix it.</p>
+
+    <div class="callout"><p>Keep a recording of the same utterance through each path you support — one caller saying a postcode and an email address, captured as 8&nbsp;kHz μ-law and as wideband Opus. It takes an afternoon, it never goes stale, and it settles the "is it the model or the line" argument in about thirty seconds the next time it comes up.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Design for 4 kHz, because that is what you are going to get.</h3>
+
+    <p>Accept the ceiling and the design work moves to the things that still pay underneath it. Bias the recognizer toward the vocabulary a turn can legitimately contain — product names, city names, the finite set of statuses — because a strong prior is the one mechanism that genuinely substitutes for missing acoustic evidence. Use a spelling alphabet for anything alphanumeric and read it back once, which is the only reliable repair for the confusion pairs narrowband creates. Route confirmation by consequence rather than by confidence score alone, so a mis-heard digit in an account number costs a re-prompt rather than a wrong transfer, as <a href="/playbooks/voice-realtime-agents/voice-failure-modes" class="xref">voice failure modes</a> sets out. And remember that noise and channel distortion hurt a 4&nbsp;kHz signal disproportionately, so a caller on a car speakerphone is operating well below your test conditions even before the codec.</p>
+
+    <p>The underlying point is worth separating from the tactics. Most voice-agent quality work is implicitly an argument about the model, and a meaningful share of the gap between a demo and a deployment is instead an argument about a wire. The band is not a detail of the transport layer; it is an upper bound on the evidence your system will ever have, and the teams that measure it stop running experiments that cannot succeed.</p>
+
+    <div class="callout tip"><p>Do these three today. Write the sample rate on every hop of your audio path and find the narrowest one. Switch every leg you fully control to Opus at 16&nbsp;kHz or better, and leave the PSTN legs alone. Then add a codec column to your evaluation set and re-run it, so that the next time accuracy is questioned you can answer with a number per band instead of a model change.</p></div>
+  </div>
+</section>
