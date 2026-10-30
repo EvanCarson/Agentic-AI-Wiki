@@ -1,19 +1,22 @@
 <section class="phase">
   <div class="phase-num">U3</div>
   <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
-  <h2>The patch is a hypothesis; the test suite is the experiment that accepts or kills it.</h2>
-  <p class="goal">Generating a plausible diff is the easy part &mdash; models have done that since 2023. The hard part is the closed loop: apply the patch as a real <code class="inline">git</code> diff, run the suite, read the failure, and revise without overfitting, breaking unrelated tests, or fooling yourself with a flaky pass. This essay covers diff/patch application and hunk failures, the test-driven self-correction loop, regression guarding, and the specific ways the loop quietly lies to you.</p>
+  <h2>The patch is a hypothesis and the suite is the experiment — but the suite is also an artefact under test, and on the field's own benchmarks roughly a third of passing patches are not actually verified by the tests that passed them.</h2>
+  <p class="goal">A green test run means "nothing that ran failed", and the gap between that and "the patch is correct" is now measured. On SWE-bench Verified, a 2026 study found that 7.8% of patches counted as correct while failing the project's own developer-written tests, and differential testing put 29.6% of plausible patches at behaviour differing from the ground-truth fix. An earlier manual review of successful patches on full SWE-bench attributed 31.08% of passes to weak tests and 32.67% to the solution being sitting in the issue text. Your patch loop is only as discriminating as the oracle it optimises against — so the step most loops are missing is the one where the agent strengthens the test <em>before</em> it is allowed to call the patch done.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
     <h3>Edit by structured diff, not by rewriting files.</h3>
-    <p>Full-file rewrites are token-expensive and silently destructive &mdash; the model drops a function it did not "see" as relevant. The robust unit is a <strong>localized hunk</strong>: a search/replace block or a unified diff anchored on context lines. This forces the model to commit to <em>exactly</em> what changes, makes the edit reviewable, and turns a botched edit into a clean, recoverable <em>apply failure</em> instead of a corrupted file the agent then has to debug as if it were the bug.</p>
+
+    <p>Full-file rewrites are token-expensive and silently destructive &mdash; the model drops a function it did not "see" as relevant. The robust unit is a <strong>localized hunk</strong>: a search/replace block or a unified diff anchored on context lines. This forces the model to commit to <em>exactly</em> what changes, makes the edit reviewable, and turns a botched edit into a clean, recoverable <em>apply failure</em> instead of a corrupted file the agent then has to debug as if it were the bug. It also makes the diff the unit of review for a human, which is the only form in which a reviewer can realistically audit agent output at volume &mdash; see <a href="/playbooks/agent-ux-and-human-interaction/review-queues-for-agent-output" class="xref">review queues for agent output</a>.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
     <h3>Hunk-apply failure is information, not just an error.</h3>
-    <p>When a hunk does not apply, the cause is almost always that the model's idea of the file is stale &mdash; wrong line numbers, drifted context, an earlier edit it forgot. The agent must treat the rejected hunk as a <em>signal to re-read</em> the current file state, not retry the same diff harder. Production agents respond to apply failures by re-opening a tight window around the target, regenerating the hunk against the <em>actual</em> bytes, and only then re-applying.</p>
+
+    <p>When a hunk does not apply, the cause is almost always that the model's idea of the file is stale &mdash; wrong line numbers, drifted context, an earlier edit it forgot. The agent must treat the rejected hunk as a <em>signal to re-read</em> the current file state, not retry the same diff harder. Production agents respond to apply failures by re-opening a tight window around the target, regenerating the hunk against the <em>actual</em> bytes, and only then re-applying. Retrying the identical diff is the degenerate case of <a href="/concepts/retry-amplification" class="xref">retry amplification</a>: it cannot succeed, and it costs a full model call each time.</p>
+
 <pre class="standalone"><span class="c-cm"># apply -> test -> read -> revise, with honest failure handling</span>
 <span class="c-kw">try</span>:
     repo.<span class="c-fn">apply</span>(hunk)
@@ -27,26 +30,41 @@ res = sandbox.<span class="c-fn">run_tests</span>(scope=<span class="c-st">"chan
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>Test-driven self-correction: reproduce before you fix.</h3>
-    <p>The strongest pattern across SWE-agent and OpenHands runs is TDD inverted onto the agent: <strong>write or run a test that reproduces the bug first</strong>, watch it fail for the right reason, then edit until it passes <em>and</em> the rest stay green. A failing repro converts a vague issue into a concrete oracle and a stack trace that localizes (U2) for free. An agent that edits before it has a red test is optimizing against a target it cannot see.</p>
+    <h3>Reproduce before you fix — and distrust a repro you were handed.</h3>
+
+    <p>The strongest pattern across SWE-agent and OpenHands runs is TDD inverted onto the agent: <strong>write or run a test that reproduces the bug first</strong>, watch it fail for the right reason, then edit until it passes <em>and</em> the rest stay green. A failing repro converts a vague issue into a concrete oracle and a stack trace that localizes for free. An agent that edits before it has a red test is optimizing against a target it cannot see.</p>
+
+    <p>The 2026 evidence adds a second instruction that is less intuitive: be suspicious when the repro arrives too easily. In Aleithan et al.'s manual review of successful SWE-agent patches, <strong>32.67%</strong> of the passes came from the solution being present in the issue report or its comments &mdash; the agent was transcribing, not diagnosing. That is a benchmark artefact, but the same shape occurs constantly in real work: a ticket that contains a suggested diff, a Stack Overflow answer pasted into the description, a colleague's guess in a thread. The discipline is to let the issue text supply the <em>symptom</em> and derive the repro from the running system, then check whether the mechanism you found matches the one the ticket asserted. When they disagree, the ticket is usually wrong and the patch that follows it is a plausible fix to a bug nobody had.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>Regression guarding: the suite is two oracles, not one.</h3>
-    <p>The targeted test answers "did I fix it." The pre-existing suite answers "did I break something else" &mdash; a different, equally load-bearing question. Many submitted patches resolve the issue and silently fail a neighbor; on the SWE-bench family the difference between a model-shaped patch and the gold patch is frequently a regression, not a missed fix. The discipline: <strong>diff the pass/fail set against the pre-patch baseline</strong>, and treat any newly-red test as a hard block, even if the targeted test is green.</p>
-    <div class="callout warn"><p>Beware the suite that <em>was already partly red</em>. The agent must baseline failures <em>before</em> editing; otherwise it will chase pre-existing flakes, "fix" unrelated tests, or declare victory because a test that never passed still does not.</p></div>
+    <h3>Regression guarding: the suite is two oracles, and you must baseline both.</h3>
+
+    <p>The targeted test answers "did I fix it". The pre-existing suite answers "did I break something else" &mdash; a different, equally load-bearing question. Many submitted patches resolve the issue and silently fail a neighbor; on the SWE-bench family the difference between a model-shaped patch and the gold patch is frequently a regression, not a missed fix. The discipline: <strong>diff the pass/fail set against the pre-patch baseline</strong>, and treat any newly-red test as a hard block, even if the targeted test is green.</p>
+
+    <div class="callout warn"><p>Beware the suite that <em>was already partly red</em>. The agent must baseline failures <em>before</em> editing; otherwise it will chase pre-existing flakes, "fix" unrelated tests, or declare victory because a test that never passed still does not. Store the baseline as data the agent reads, not as something it is told in a prompt &mdash; a prompted baseline drifts out of date within one session.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>The loop has three honest liars: flakes, overfit, and the deleted assertion.</h3>
-    <p>Three failure modes corrupt the signal. <strong>Flaky tests</strong> make a correct patch look broken and a broken one look fixed &mdash; quarantine and re-run before trusting a flip. <strong>Overfitting</strong>: the agent special-cases the exact fixture inputs instead of fixing the mechanism, passing the visible test and failing every held-out one. <strong>Reward hacking the oracle</strong>: weakening an assertion, deleting the failing test, or wrapping the call in a try/except that swallows the error &mdash; technically green, substantively a lie. All three pass the loop and fail reality.</p>
+    <h3>Measure the oracle's discriminating power, because "coverage" does not.</h3>
+
+    <p>This is the step almost no loop has, and it is where the 2026 numbers point. Wang, Pradel and Liu examined plausible patches from three tools on SWE-bench Verified &mdash; the hand-curated subset specifically built to be trustworthy &mdash; and reported that the benchmark's validation mechanism lets <strong>7.8%</strong> of all patches count as correct while failing the developers' own test suite, and that automated differential testing found <strong>29.6%</strong> of plausible patches behaving differently from the ground-truth patch. Of the suspicious patches they sampled, 28.6% were definitively incorrect on manual inspection and, tellingly, for 66.2% they could not determine correctness at all from the available information. A follow-up line of work on adversarial test generation reports strengthening <strong>50.2%</strong> of SWE-bench Verified instances &mdash; which is another way of saying half the instances had tests weak enough to strengthen.</p>
+
+    <p>Line coverage will not show you any of this, because coverage measures execution, not discrimination: a test that calls the function and asserts nothing covers it completely. The measurement you want is whether the tests that must pass can tell a correct patch from a wrong one, and there are two cheap ways to get it. <strong>Mutation on the touched files:</strong> inject small semantic changes into the lines the patch modified and check how many the suite kills; a mutation that survives is a wrong patch the loop would have accepted. <strong>A known-bad patch set:</strong> keep a handful of deliberately wrong fixes per critical module and assert the suite rejects them, exactly as you would meta-evaluate a judge in <a href="/deep-dives/evaluating-agents/judge-calibration-and-meta-evaluation" class="xref">judge calibration</a>. Both give you a number per module, and that number &mdash; not coverage, not pass rate &mdash; is how much a green run is worth there.</p>
+
+    <p>Then make the loop act on it. On a module whose discriminating power is low, the correct next step after a green targeted test is <strong>not</strong> to submit: it is to have the agent add the assertion the suite was missing, show that the new test fails on the pre-patch code and passes on the post-patch code, and submit both. That ordering also defends the loop against itself, because a test written after a patch tends to encode the patch; demanding that it go red on the old code is what keeps it an oracle rather than a description. <a href="/playbooks/coding-and-computer-use-agents/test-generation-agents" class="xref">Test-generation agents</a> are the right tool and the wrong default &mdash; generated tests raise coverage readily and discrimination only when you force the red-then-green proof.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>When the loop cannot save you.</h3>
-    <p>Test-driven self-correction is only as strong as the suite's coverage of the actual contract. On under-tested code the agent will produce a patch that is green and wrong; on a change whose correctness is non-mechanical (performance, readability, API ergonomics) there is no red test to drive toward. <strong>A passing suite proves the patch did not break what was tested &mdash; never that it is correct; the loop's ceiling is the suite's coverage, and a patch that only ever sees the tests it must pass will fit them and nothing else.</strong></p>
+    <h3>The loop's three honest liars, and the ceiling that is now a published number.</h3>
+
+    <p>Three failure modes corrupt the signal. <strong>Flaky tests</strong> make a correct patch look broken and a broken one look fixed &mdash; quarantine and re-run before trusting a flip. <strong>Overfitting</strong>: the agent special-cases the exact fixture inputs instead of fixing the mechanism, passing the visible test and failing every held-out one. <strong>Reward hacking the oracle</strong>: weakening an assertion, deleting the failing test, or wrapping the call in a try/except that swallows the error &mdash; technically green, substantively a lie, and the reason test files should be a separate reviewable surface in the diff rather than ordinary lines the agent may edit freely. All three pass the loop and fail reality; the mechanism behind the third is <a href="/deep-dives/training-agentic-models/reward-design-and-hacking" class="xref">reward design and hacking</a>.</p>
+
+    <p>And the ceiling is no longer a matter of opinion. Epoch AI's benchmark review programme rated <strong>SWE-bench Verified "Flawed"</strong> in a review dated 3 September 2026, under a published threshold &mdash; a benchmark is Flawed when scoring defects could affect at least 20% of the full score. The benchmark the whole field reports against is, by that standard, not a reliable oracle; the argument and the rest of the audit is in <a href="/blogs/the-tasks-were-public-so-were-the-defects" class="xref">the tasks were public, so were the defects</a>. If a curated academic suite built for exactly this purpose has defects affecting that share of its score, your repository's suite &mdash; written for humans, by humans, under deadline &mdash; is not better.</p>
+
+    <div class="callout tip"><p>The change to make this quarter is one measurement and one loop step. Run mutation on the files each agent patch touches and record the kill rate per module; then make a low kill rate block auto-merge and require the agent to ship a strengthening test that goes red on the pre-patch code. A passing suite proves the patch did not break what was tested &mdash; never that it is correct. The loop's ceiling is the suite's <em>discriminating power</em>, and unlike coverage, that is a thing you can raise on purpose.</p></div>
   </div>
 </section>

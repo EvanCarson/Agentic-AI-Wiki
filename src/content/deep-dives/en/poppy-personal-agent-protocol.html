@@ -1,0 +1,88 @@
+<section class="phase">
+  <div class="phase-num">P14</div>
+  <div class="week">Deep Dive · Protocols &amp; Interop</div>
+  <h2>Poppy inverts who the agent belongs to — and the whole cost of that inversion lands on your session model, not on your JSON file.</h2>
+  <p class="goal">Every agent protocol that shipped in the last eighteen months asks how a buyer's agent pays you. The Personal Agent Protocol — "Poppy", announced by Sierra and Meta on 6 October 2026 — asks something no merchant integration has had to answer before: how does a stranger's agent sign in <em>as one of your customers</em>? Answering it costs you a session that begins with nobody in it and acquires an identity mid-flight, a pseudonym you are structurally forbidden from joining with anyone else's, and an authorization check that can no longer live where you put it. The discovery file takes an afternoon. The session model is the project.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What actually shipped, and how fast it is still moving.</h3>
+
+    <p>Sierra and Meta announced Poppy on <strong>6 October 2026</strong> and published a draft of the specification on <strong>9 October</strong>, alongside a set of design partners that third-party trackers counted at roughly 35 companies. It is a draft, and it is moving at draft speed: SDK releases dated <strong>18 October</strong> describe themselves as targeting draft <strong>0.2</strong>, while published examples have already carried a <code class="inline">protocol_version</code> of <code class="inline">0.3</code>. All of those numbers are a month old as of late October 2026, and at least one of them will be wrong by the time you read this.</p>
+
+    <p>That is not a complaint, it is the first engineering instruction. A protocol in its first month has no stable version number to code against, so do not code against one. Poppy's own answer — and the reason this essay treats it as a well-designed draft rather than an unfinished one — is that the authoritative statement of what a company supports is the discovery document it serves, not the revision string in the spec you happened to read. Read the document at request time, branch on the fields it contains, and treat an unrecognised <code class="inline">protocol_version</code> as a reason to re-read rather than to abort. That is the same feature-test discipline covered in <a href="/deep-dives/protocols-and-interop/capability-discovery" class="xref">capability discovery and negotiation</a>, and Poppy is the strongest argument for it yet: this is a protocol where the version bumped twice in nine days.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The well-known file points the other way round.</h3>
+
+    <p>A company that supports Poppy publishes a JSON document at <code class="inline">/.well-known/poppy.json</code>. It declares how an agent starts a session, which sign-in methods and scopes the company offers, and which routes are available — a conversational endpoint, a set of APIs, or a website session the agent drives directly.</p>
+
+    <p>Compare that with the well-known file the agent ecosystem already had. A2A's agent card at <code class="inline">/.well-known/agent.json</code> says <em>I am an agent, here is what I can be asked to do</em> — see <a href="/deep-dives/protocols-and-interop/agent-cards-and-discovery" class="xref">agent cards and discovery</a>. Poppy's document says <em>I am a company, here is how someone else's agent may act here on behalf of one of my users</em>. The direction of the advertisement is reversed, and that single reversal is what makes Poppy a different kind of standard rather than another dialect of the same one. An agent card is a service description. A <code class="inline">poppy.json</code> is an admissions policy.</p>
+
+    <p>The practical consequence shows up immediately in how you version it. A service description can afford to be generous, because the worst case of over-advertising a capability is a failed call. An admissions policy that over-advertises is a security finding: every route you list is a route a third party will drive with your own customer's authority attached. List the narrowest set you have actually hardened, and treat adding a route to that file as a change that needs the same review as shipping a public API — which, as of the moment you publish it, is what it is.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The session starts signed out, and that is the load-bearing decision.</h3>
+
+    <p>Here is the mechanic that reorganises your backend. In Poppy an agent opens a session <em>before</em> anyone has proved who they are, and sign-in attaches a company account to that already-running session afterwards. The agent can browse, ask, price and plan as an anonymous visitor, and then — if the user approves it — become a known customer in the middle of the same conversation.</p>
+
+    <p>Almost every authenticated API you have ever built does the opposite. It authenticates at connection setup, mints a token that encodes the principal, and then lets every downstream handler assume a principal exists because the connection could not have been established without one. Poppy breaks that assumption at the only place it was ever load-bearing: your authorization check cannot live at session construction, because at session construction there is no one to authorize.</p>
+
+<pre class="standalone"><span class="c-cm"># the shape Poppy forces: principal is a property of the turn, not the socket</span>
+session = poppy.<span class="c-fn">open</span>(company=<span class="c-st">"acme.example"</span>)   <span class="c-cm"># no user yet. legitimately.</span>
+session.<span class="c-fn">ask</span>(<span class="c-st">"do you ship to Lisbon?"</span>)            <span class="c-cm"># anonymous route: must work</span>
+
+grant = session.<span class="c-fn">sign_in</span>(scopes=[<span class="c-st">"poppy:read"</span>])  <span class="c-cm"># identity arrives mid-session</span>
+
+<span class="c-kw">def</span> <span class="c-fn">handle</span>(action, session):
+    <span class="c-cm"># WRONG: session.user was captured when the socket opened</span>
+    <span class="c-cm"># RIGHT: re-read the principal and the grant on every action</span>
+    principal = session.<span class="c-fn">principal_now</span>()
+    <span class="c-kw">if</span> principal <span class="c-kw">is</span> <span class="c-kw">None</span> <span class="c-kw">and</span> action.<span class="c-fn">needs_identity</span>():
+        <span class="c-kw">raise</span> <span class="c-err">NeedsSignIn</span>(action.required_scopes)
+    <span class="c-kw">return</span> policy.<span class="c-fn">check</span>(principal, grant, action).<span class="c-fn">run</span>()</pre>
+
+    <p>Two bugs follow from getting this wrong, and they fail in opposite directions. Capture the principal once and an action taken after sign-out — or after a <em>different</em> account signs in on the same session — executes with a stale identity; that is the confused-deputy shape described in <a href="/concepts/confused-deputy" class="xref">confused deputy</a>. Refuse to serve anything until sign-in and you have broken the protocol's whole premise, because the anonymous phase is where a personal agent does most of its work and the user has no reason to hand over an account to ask about shipping times.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Two scopes, a reserved prefix, and why that pushes risk down to the action.</h3>
+
+    <p>Poppy's standard permission vocabulary is deliberately tiny: <code class="inline">poppy:read</code> and <code class="inline">poppy:write</code>. Sign-in grants whichever of them the user approved, and the <code class="inline">poppy:</code> prefix is reserved — you may not mint <code class="inline">poppy:refunds</code> or <code class="inline">poppy:transfer</code>. Companies express anything finer as custom scopes under their own naming, and published examples do exactly that, pairing <code class="inline">poppy:read</code> with a domain scope such as <code class="inline">addresses</code>.</p>
+
+    <p>It is worth being precise about what a two-value standard vocabulary can and cannot carry, because the temptation is to read it as an oversight. It is not. A standard scope set has to mean the same thing at every company that publishes it, and "write" is the most that can mean the same thing at a retailer, a bank and an airline simultaneously. Any attempt to standardise <code class="inline">poppy:purchase</code> across those three would either be so vague as to be unreviewable or so specific as to be wrong for two of them.</p>
+
+    <p>What it does mean is that <strong>the grant cannot express risk, so the action has to</strong>. A single <code class="inline">poppy:write</code> covers updating a delivery address and cancelling a subscription, and the user who approved it was shown one checkbox. If your policy layer reads the scope and stops, you have just given every write the ceiling of your most dangerous write. The fix is the one this site argues for throughout: score the operation, not the grant, and let the score decide whether it runs, needs a confirmation, or is refused outright — <a href="/operations/safety-and-security/risk-scored-permissions" class="xref">risk-scored permissions</a> and <a href="/concepts/auto-approval-and-allowlists" class="xref">auto-approval and allowlists</a> both work unchanged on top of a coarse grant, and a coarse grant is the only kind you are going to get.</p>
+
+    <div class="callout"><p>A useful audit question for an existing product: list every mutation your public surface exposes, then ask which of them you would be comfortable running on the strength of one checkbox labelled "allow this agent to make changes". Everything on the uncomfortable list needs its own gate <em>below</em> the scope check, and it needed one before Poppy existed.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The per-company pseudonym is a privacy property with an engineering bill.</h3>
+
+    <p>A Poppy session carries a user identifier that is stable at one company and different at every other, so two companies cannot discover that they are talking to the same person by comparing the identifiers their agents presented. That is a real and uncommon privacy design — it makes cross-company correlation a thing the protocol structurally does not supply, rather than a thing a policy document asks everyone not to do.</p>
+
+    <p>It also deletes a key you are probably using. Three systems break in predictable ways. <strong>Identity resolution:</strong> you cannot use the agent-side identifier as a global customer key, because it is not one; it joins to your own account only, and only after sign-in. <strong>Fraud and abuse scoring:</strong> cross-merchant reputation signals about a specific end user are unavailable through this channel by construction, which means your velocity checks and your device signals have to carry the weight that shared identity used to. <strong>Support and dispute handling:</strong> when a customer calls to ask why their address changed, the artefact that connects a human to an action is the sign-in event, not the session — so log the grant, its scopes, its time, and the action ids taken under it, as described in <a href="/operations/governance-compliance/delegated-access-and-consent-records" class="xref">delegated access and consent records</a>.</p>
+
+    <p>And one asymmetry worth naming, because it is easy to feel more protected than you are. The pseudonym stops <em>companies</em> correlating a user across each other. It does nothing to stop the <em>agent</em> correlating, since the agent is the one party that holds every pseudonym at once and knows which human they belong to. Poppy moves the join from the merchant side to the agent side; whether that is an improvement depends entirely on who you think should hold it, which is the question <a href="/concepts/principal-agent-problem" class="xref">the principal-agent problem</a> is about and not one a specification can settle.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>There is no payment story, and that is the tell.</h3>
+
+    <p>The draft covers identity, sign-in, sessions and scopes. Payment is named as future work. Read next to the protocols it is filed beside, that absence is the most informative thing in the document.</p>
+
+    <p>Of the four standards a commerce team is now asked to evaluate, three are about the instrument. The <strong>Agentic Commerce Protocol</strong> (OpenAI and Stripe, released under Apache 2.0 on 29 September 2025, versioned spec <code class="inline">2026-04-17</code>) carries a Delegated Payment Spec in which a one-time token is minted with a maximum chargeable amount and an expiry and handed to the merchant. The <strong>Universal Commerce Protocol</strong> (Google and Shopify, announced 11 January 2026) has the merchant publish its capabilities and reaches AP2 for mandates. <strong>AP2</strong> itself is not a commerce protocol at all but an authorization layer that models intent, cart and payment as verifiable credentials — see <a href="/deep-dives/protocols-and-interop/ap2-and-agent-commerce" class="xref">AP2 and agent commerce</a>. Each of them has to answer "who may be charged, and up to how much", because each of them assumes the agent is a buyer.</p>
+
+    <p>Poppy has no answer because it never makes that assumption. It is the only one of the four in which the agent is the user's delegate rather than the platform's buyer, and a delegate has no instrument of its own to present. The payment gap is not an unfinished chapter; it is where the protocol stops, correctly, at the edge of a question that needs an instrument holder. The four-way layer map and the decision of which to implement first is the argument in <a href="/blogs/poppy-vs-ucp-vs-acp-vs-ap2" class="xref">three of them answer how an agent pays</a>.</p>
+
+    <div class="callout tip"><p>If you are deciding what to build this quarter: publish <code class="inline">poppy.json</code> last, not first. Do the three things it exposes you to, in order — make every read route work for an unauthenticated session, move the authorization check from session setup to the individual action, and put a risk gate under <code class="inline">poppy:write</code> so a single approved checkbox cannot reach your most dangerous mutation. A company that has done those three is one file away from supporting Poppy, and is also measurably safer against the <a href="/operations/safety-and-security/third-party-agents-logging-in-as-your-users" class="xref">third-party agents already logging in as your users</a> without any protocol at all.</p></div>
+  </div>
+</section>
