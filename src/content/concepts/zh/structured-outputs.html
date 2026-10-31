@@ -2,95 +2,135 @@
   <div class="phase-num">B8</div>
   <div class="week">概念 · 核心构件</div>
   <h2>结构化输出。</h2>
-  <p class="goal">一段闲聊式的散文对调用模型的代码毫无用处。结构化输出是让模型产出机器可解析数据——通常是符合某 schema 的 JSON——可靠到能直接喂进程序的做法。本文讲解为何"直接要 JSON"不够、从提示到 schema 约束解码的谱系，以及结构化输出如何支撑工具调用和智能体流水线。</p>
+  <p class="goal">打开 schema 强制约束，会删掉你一直在测的那个失败，同时装进三个你没在测的：一次以「你的 schema 从未描述过的形状」回来的拒绝、一次产出「无效文档的有效<em>前缀</em>」的截断，以及一次在任何 token 被生成之前就触发的驳回。三者都住在 schema 之外，所以你刚刚生成的那个带类型的客户端一个都处理不了。结构化输出完全值得这些代价——它正是让模型能与软件组装起来的那件东西——但工作的重心从「哄出格式」挪到了「设计那条四分支的解析路径」，以及「设计那个决定内容多久是真的 schema」。</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>问题：散文不可组合。</h3>
+    <h3>散文无法组装，而好好地请求并不等于强制。</h3>
 
-    <p>模型被训练成产出流畅的自然语言。当消费方是软件时，这恰恰是错的。如果你给工单分类、模型回"这看起来像计费问题，鉴于他们提到支付失败，可能是高优先级"，你的代码现在得从散文里解析意图——脆弱，而且模型某天换种措辞它就崩。要把模型组合进流水线，你需要形状固定、可预测的输出：</p>
+    <p>模型被训练出来产出流畅的自然语言，而当消费者是软件时，这恰恰是错的。如果你给一张工单分类，而模型回答「这看起来像是账单问题，考虑到他们提到了支付失败，优先级大概挺高」，你的代码就得从散文里把意图解析出来——既脆弱，又会在模型换个说法的那天崩掉。</p>
 
 <pre class="trace standalone"><span class="c-err">UNUSABLE
 "This looks like a billing issue, probably high priority."</span>
 
 <span class="c-out">USABLE
 { "category": "billing", "priority": "high" }</span></pre>
+
+    <p>在提示词里要 JSON 能把你带过去大半程，而「大半程」正是问题所在：模型仍然是逐 token 采样的，所以它偶尔会把对象裹进 <code class="inline">```json</code> 围栏、加一段开场白、吐一个尾随逗号、发明一个键，或者把数字返回成字符串。在每天十万次调用上按 1% 的失败率算，那就是每天一千条坏记录。</p>
+
+    <p>走出那一步的阶梯既短又众所周知——提示词加少样本，然后是一个保证语法有效但不保证你的 schema 的 JSON 模式，再然后是 schema 约束解码：它在每一步把采样器限制在「能让输出保持为 schema 所允许之物的有效前缀」的那些 token 上。一次工具调用的参数对象，就是同一套机制瞄准了一个函数而不是你的应用；参见<a class="xref" href="/zh/concepts/tool-calling-explained">工具调用</a>，以及这个掩码究竟是怎么建出来的——<a class="xref" href="/zh/concepts/constrained-decoding">约束解码</a>。截至 2026 年 10 月，那道阶梯的顶端已是默认配置而非前沿特性——它在各大 API 上都已正式可用，在 Claude API 上是一个 <code class="inline">json_schema</code> 类型的 <code class="inline">output_config.format</code>，外加工具定义上的一个 <code class="inline">strict</code> 开关。于是有意思的问题不再是「我能不能拿到有效的 JSON」，而变成了「那份保证到底覆盖了什么」。</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>为何"直接要 JSON"不够。</h3>
+    <h3>保证覆盖的只有结构，而「可选」并不免费。</h3>
 
-    <p>在提示词里好好请求（"只用 JSON 回复，像 {...} 这样"）多数时候奏效，而"多数时候"正是问题所在。模型仍逐令牌采样，所以它偶尔会：</p>
+    <p>约束解码保证你的输出是 schema 所描述<em>形状</em>的一个语法有效的实例。它不强制 JSON Schema 中那些描述内容的部分。在各家的严格模式里，数值边界（<code class="inline">minimum</code>、<code class="inline">maximum</code>、<code class="inline">multipleOf</code>）与字符串长度边界（<code class="inline">minLength</code>、<code class="inline">maxLength</code>）都不被强制，对象普遍被要求设置 <code class="inline">additionalProperties: false</code>，而递归 schema 与部分正则构造不受支持。一个写着「1 到 5 之间的整数」的 schema，可靠地给你一个整数，而对那个 5 什么都没说。</p>
+
+    <p>第二条限制才是会改变你设计方式的那一条，因为它反直觉：<strong>在严格模式下，字段并不是你所理解的那种「可选」</strong>。</p>
+
     <ul>
-      <li>把 JSON 包进 <code class="inline">```json</code> 围栏或加一句"这是 JSON："开场白；</li>
-      <li>加一条尾注、输出尾逗号，或用单引号；</li>
-      <li>编造一个键、漏掉一个必需键，或把数字作为字符串返回；</li>
-      <li>在触及 <code class="inline">max_tokens</code> 时对象中途截断，产出无法解析的碎片。</li>
+      <li><strong>OpenAI 的严格模式根本没有可选字段。</strong>它自己的指南明确写着：要使用 Structured Outputs，每一个字段或函数参数都必须被列为 required，而表达一个可选值的方式是与 <code class="inline">null</code> 做联合类型。模型会为每一个参数返回一个值；你拿到的是一个值可能为 <code class="inline">null</code> 的键，而不是一个缺席的键。</li>
+      <li><strong>Anthropic 允许真正的可选，但对它限量。</strong>它写明的上限按请求计、并横跨该请求里的每一个严格 schema：最多 20 个严格工具、总计 24 个可选参数、以及 16 个带联合类型的参数。schema 编译有 180 秒的超时，而一个不受支持的特性会返回带细节的 400，而不是悄悄降级。</li>
     </ul>
-    <p>每天 10 万次调用里 1% 失败，就是每天 1,000 条坏记录。为结构而提示能提升可靠性；它不保证可靠性。你需要强制约束或防御性解析——最好两者都有。</p>
+
+    <p>把这两条放在一起，设计上的后果就很锋利了。你在一个严格 schema 里声明的每一个字段，都是模型在<em>每一次</em>调用上都被强迫回答的一个问题——要么因为可选根本不可用、唯一的出口是一个你必须为之立法的显式 <code class="inline">null</code>，要么因为可选是一项你会用光的限量资源。一条吐出四十个「以防万一」字段的代码生成流水线不是在尽职尽责；它是在每个请求里下发四十道必答题，而且在 Anthropic 上会直接撞穿那个 24 个可选参数的上限。</p>
+
+    <p>哪些关键字在哪家存活、以及什么能在它们之间移植，自成一个主题——<a class="xref" href="/zh/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">各家厂商的 JSON Schema 子集</a>绘出了那三种方言，而<a class="xref" href="/zh/deep-dives/tool-capability-design/structured-outputs-vs-tool-calls">结构化输出 vs 工具调用</a>讲的是怎么在这两道门之间选。</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>可靠性谱系。</h3>
+    <h3>住在 schema 之外的那三个失败。</h3>
 
-<pre class="trace standalone"><span class="c-out">WEAKEST  ->  STRONGEST
+    <p>这里是那笔没人定价的交易。强制约束之前，你有一个失败模式，而它很吵：文本解析不了。你用一个 <code class="inline">try</code> 块就抓住了。强制约束之后，那个失败消失了，而另外三个变得更要紧——而且没有一个是 schema 形状的，所以一个生成出来的带类型客户端会径直撞进这三个里。</p>
 
-1. Prompt + few-shot
-   "Reply only with JSON: {...}" plus example outputs.
-   Easy; ~95-99% valid; needs a parse-and-retry safety net.
-
-2. JSON mode
-   Provider flag forcing syntactically valid JSON.
-   Valid JSON guaranteed -- correct SCHEMA is not.
-
-3. Schema-constrained / structured outputs
-   Pass a JSON Schema; decoding is constrained so only
-   tokens that keep output schema-valid can be sampled.
-   Output is valid JSON AND matches your schema.
-
-4. Tool / function calling
-   Define a function with a typed parameter schema; the
-   model's "arguments" object is structured output by
-   another name -- same machinery, different doorway.</span></pre>
-
-    <p>第 3–4 级背后的关键思想：约束解码。在每个生成步，采样器被限制为那些能让输出保持为 schema 所允许之物的有效前缀的令牌。模型字面上无法输出缺失的大括号或拼错的键——无效性在令牌层面被排除，而非事后清理。这直接呼应工具调用篇：一次工具调用的 <code class="inline">input</code> 对象，就是对准函数而非你应用的结构化输出。</p>
-  </div>
-
-  <div class="step">
-    <div class="step-num">STEP 4</div>
-    <h3>设计模型能满足的 schema。</h3>
-
-    <p>约束解码保证<em>形状</em>，绝不保证<em>真实</em>。模型可以为一个琐碎工单返回 <code class="inline">{"priority": "high"}</code>——完全合法、语义错误。schema 设计影响内容多大概率是对的：</p>
     <ul>
-      <li><strong>枚举优于自由字符串。</strong><code class="inline">"priority": "low"|"med"|"high"</code> 胜过自由文本优先级。模型无法漂移到"有点急"，你也不必在下游做归一化。</li>
-      <li><strong>让模型先展示推理。</strong>在 <code class="inline">answer</code> 字段前放一个 <code class="inline">reasoning</code> 字符串字段，让模型在定论前先思考——顺序要紧，因为它从左到右生成，把结论放在其理由之前等于是猜。</li>
-      <li><strong>显式允许"未知"。</strong>若没有可空或"未知"选项，被强制的 schema 会逼模型编造一个值。给它一个合法的逃生口，胡编就会减少。</li>
-      <li><strong>schema 保持浅且命名清晰。</strong>深度嵌套、含糊的 schema 即便语法被强制也会降低内容质量。清晰的字段名相当于内联指令。</li>
+      <li><strong>拒绝以另一种形状抵达。</strong>如果模型拒绝，它无法在你的 schema 里表达这件事——那里没有「我不干」这个字段。各家把它带外返回，作为一个单独的拒绝字段或内容对象。那些伸手去取已解析对象的代码，看到的是一个缺失或为空的结构，通常会报一个解析错误——于是把你送去 debug schema，而不是去读那个理由。参见<a class="xref" href="/zh/concepts/refusals-and-capability-gating">拒绝与能力门控</a>。</li>
+      <li><strong>截断产出的是「无效文档的有效前缀」。</strong>约束解码保证的是「已经发出的部分<em>能够</em>被有效地续完」；它没法保证模型来得及写完。撞上 <code class="inline">max_tokens</code> 停在对象中间，你得到的就是截断处之前格式良好的 JSON，而后面什么都没有。一旦强制约束打开，这就是结构化输出损坏的首要原因，而它是一个预算缺陷而不是格式缺陷——与<a class="xref" href="/zh/concepts/streaming-and-partial-output">流式与部分输出</a>处理的是同一条边界。</li>
+      <li><strong>schema 本身被驳回，在生成之前。</strong>一个不受支持的关键字、一个递归的 <code class="inline">$ref</code>、超出上限的那一个可选字段，或者一个贵到无法在超时内编译完的语法——这些都会让请求直接失败。这个失败与模型的行为毫无关系，而与你的 schema 关系重大，所以它是确定性的：它会永远以同样的方式失败。把 400 当成瞬时模型错误的重试逻辑会永远重试它，而这正是一次一个字符的 schema 改动变成一场账单事故的方式。</li>
     </ul>
 
+    <p>所以解析路径有四个分支，而不是两个，而把它们写出来就是这件事的大半工作：</p>
+
+<pre class="trace standalone"><span class="c-out">response = call(model, schema, max_tokens)
+
+1. REFUSED        -> refusal field present
+                     surface the reason; do NOT retry blind
+
+2. TRUNCATED      -> stop_reason == max_tokens
+                     retry with a larger cap or a smaller
+                     schema; the output is a fragment
+
+3. SCHEMA 400     -> request rejected pre-generation
+                     DETERMINISTIC. fail fast, page a human,
+                     never put this in a retry loop
+
+4. OK             -> parse, then validate SEMANTICS in code</span>
+
+<span class="c-cm"># only branch 4 is the one the schema was about.</span></pre>
+
     <div class="callout warn">
-      <p>被强制的 JSON 有效性不是校验。schema 无法检查邮箱是否真实、ID 是否存在、总和是否对得上。解析后务必在代码里校验语义——符合 schema 是必要条件，绝非充分条件。</p>
+      <p>请在 CI 里、而不是在生产里抓住 schema 驳回。你的 schema 是静态制品：在构建步骤里把每一个都配一段最简提示词发给厂商一次，断言它编译通过。这把分支 3 从一次运行时故障变成了一次失败的测试，而这是这一页上单价值最高的一件事——这个失败是确定性的，所以一个测试能确定地抓住它。</p>
     </div>
   </div>
 
   <div class="step">
-    <div class="step-num">STEP 5</div>
-    <h3>即便有强制也要防御。</h3>
+    <div class="step-num">STEP 4</div>
+    <h3>因为每个字段都是必答的，schema 就是你编造率的那根杠杆。</h3>
 
-    <p>即便有强力强制，也要把解析当作一个会失败的地方：</p>
+    <p>强制约束保证形状，而永远不保证真相：<code class="inline">{"priority": "high"}</code> 完全有效，也完全可能是错的。STEP 2 补上的那一点是：你不能靠「不写那个字段、然后指望」来降低编造——在严格模式里它一定会被填上。因此 schema 是你对「内容多久是对的」所拥有的主要控制手段，而有四个决定承担了其中大部分。</p>
+
     <ul>
-      <li><strong>预留输出令牌。</strong>截断是结构化输出损坏的头号原因。按最大的合法对象设定 <code class="inline">max_tokens</code>，并核实它装得进上下文预算。</li>
-      <li><strong>解析并重试。</strong>解析或校验失败时，把错误发回并请模型修正。一次重试能挽回大多数失败。</li>
-      <li><strong>无论如何在代码里对照 schema 校验。</strong>双保险：绝不轻信上游约束在每个边界情况都成立。</li>
-      <li><strong>降低温度。</strong>结构化任务很少受益于创造性；温度 0–0.3 减少格式漂移。</li>
+      <li><strong>永远为逃生口立法。</strong>这现在是第一条规则，而不是一点讲究。没有可空分支、也没有 <code class="inline">"unknown"</code> 枚举成员，一个被强制的 schema 就会强制出一个编造的值——模型没有任何合法途径去回避某个字段。给它一个，编造就会下降；这是<a class="xref" href="/zh/concepts/uncertainty-and-calibration">校准</a>在结构化输出上的那张脸，也是<a class="xref" href="/zh/concepts/unsatisfiable-tasks">不可满足任务</a>的一般情形。</li>
+      <li><strong>把字段排成「推理先于裁决」。</strong>生成是从左到右的，所以一个放在它的 <code class="inline">justification</code> 之前的 <code class="inline">decision</code> 字段，是一个猜测、而模型随后为它编理由。把那个短推理字段放在最前面。这是唯一一条背后有文献支撑的 schema 设计建议，也是「强制约束是否损害质量」之争会那样落地的原因——见 STEP 5。</li>
+      <li><strong>枚举胜过自由字符串。</strong><code class="inline">"low" | "med" | "high"</code> 不可能漂移成「有点急」。枚举是被强制的，而自由字符串上的 <code class="inline">pattern</code> 基本上不是，所以它在做那个正则没在做的实事。</li>
+      <li><strong>保持浅、有名、且小。</strong>字段名起着行内指令的作用，深层嵌套即便语法有保证也会降低内容质量，而每个字段都是一道必答题——把 schema 收窄到模型有资格去填的那些东西上，这正是<a class="xref" href="/zh/deep-dives/tool-capability-design/tool-schemas-and-contracts">schema 与契约</a>在工具那一侧所主张的纪律。</li>
     </ul>
+
+<pre class="trace standalone"><span class="c-err">FORCES A GUESS -- 6 compulsory answers, no escape
+{ "category": enum[billing|technical|account],
+  "priority": enum[low|med|high],
+  "customer_sentiment": enum[happy|neutral|angry],
+  "root_cause": string,
+  "estimated_fix_minutes": integer,
+  "decision": enum[refund|escalate|close] }</span>
+
+<span class="c-out">ASKS WHAT IT CAN ANSWER -- reasoning first, outs everywhere
+{ "evidence": string,
+  "category": enum[billing|technical|account|unclear],
+  "priority": enum[low|med|high|unclear],
+  "decision": enum[refund|escalate|close|needs_human] }</span>
+
+<span class="c-cm"># estimated_fix_minutes had no basis in the ticket, so it</span>
+<span class="c-cm"># was a compulsory invention on every single call.</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>强制约束会损害质量吗？是排序，不是约束。</h3>
+
+    <p>这场争论有一段真实的历史，而值得知道它最后落在哪里，因为民间说法比证据落后了一个版本。2024 年那篇 <em>Let Me Speak Freely?</em>（EMNLP Industry）报告说，格式限制会降低推理表现、却有助于分类，其中 JSON 模式在推理任务上表现最差——而这个结果至今仍被广泛引用为「约束解码让模型变笨」。后来的工作把它复杂化了，而且是朝着有用的方向：一篇 2026 年的论文在提示词与输出格式都对齐的条件下重跑了这个比较，发现约束解码稳定地追平或胜过无约束，同时仍指出在 JSON <em>内部</em>做推理不如在自由文本里做推理。另一篇 2026 年的预印本把最初那个效应归因于过早序列化——模型在还没想完之前就被迫吐出符合 schema 的 token。</p>
+
+    <p>这是一个可操作的结论，而不是一场平局：代价附着在<em>推理放在哪里</em>，而不附着在那个掩码上。所以请保留强制约束，并给推理一个落脚处——schema 内部的第一个字符串字段，或者一次单独的无约束调用、其输出再喂给一次受约束的抽取。你不该做的是：把一个光秃秃的裁决字段放在严格 schema 的最前面，然后断言模型不会推理。</p>
+
+    <p>然后，无论有没有强制约束，都要保持防御：</p>
+
+    <ul>
+      <li><strong>给输出留出 token。</strong>按最大的有效对象来设 <code class="inline">max_tokens</code>——包括你刚加上的那个推理字段，它正是「某人改进了 schema 的那天出现的截断」的惯常成因。</li>
+      <li><strong>在代码里校验语义。</strong>schema 查不出一个邮箱是否存在、一个 ID 能否解析、或者一笔总额是否对得上；而既然边界关键字不被强制，范围检查就是你的活。</li>
+      <li><strong>解析并重试，带预算也带理由。</strong>把校验错误喂回去让它修；一次重试能救回大多数失败。请按 STEP 3 对失败的<em>原因</em>分支，并且永远不要重试分支 3。</li>
+      <li><strong>数一数你拿到了多少次逃生口。</strong>如果 <code class="inline">"unclear"</code> 在生产里从未出现过，那要么你的输入比你想的干净，要么模型学到了这个出口不受欢迎——这个比率是一个监控信号。参见<a class="xref" href="/zh/concepts/agent-evaluation">智能体评估</a>。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>把严格模式打开——它免费，而且删掉了一整类真实的失败。然后把它省下来的那个下午，花在它没覆盖的那三个失败上：加一个 CI 步骤，把每个 schema 对着厂商编译一遍，让驳回成为一次失败的测试、而不是重试循环里的一个 400；在你伸手去取那个对象之前，把解析路径按拒绝、截断、schema 驳回分别分支；并逐个字段审一遍「模型到底能不能从输入里答出它」，因为严格模式反正会让它答。如果你只改一件事：给每个枚举加上 <code class="inline">"unknown"</code>，并在每个裁决之上加一个推理字段。</p>
+    </div>
   </div>
 
   <div class="deliverable">
     <div class="tag">要点</div>
     <h3>交付物</h3>
-    <p>你知道散文无法组合进软件，且为 JSON 而提示能提升但不保证可靠性。你能把一项技术放到谱系上——提示、JSON 模式、schema 约束解码、工具调用——并理解约束解码在生成时排除无效令牌、而非事后清理。你设计能改善内容的 schema（枚举、先推理后答案、显式未知、浅且命名的字段），并无论如何保持防御：预留输出空间、在代码里校验语义、解析并重试。这与工具调用是同一套机制，只是对准你的应用而非一个函数。</p>
+    <p>你知道散文无法组装，也知道 schema 约束解码是在生成时就排除掉无效 token、而不是事后再清理。你知道截至 2026 年 10 月这份保证覆盖了什么——结构，而非内容，数值与字符串边界都不被强制——也知道严格模式要么彻底禁掉可选字段、要么对它限量，所以你声明的每一个字段都是一道必答题。你能叫出住在 schema 之外的那三个失败（拒绝、截断，以及那个绝不该进入重试循环的、确定性的生成前驳回），你会写一条四分支的解析路径，并且在 CI 里编译你的 schema。而你会用显式的 unknown 与「推理置于裁决之前」来对抗被强制的编造——这也正是「强制约束是否损害质量」的那个诚实答案，因为代价附着于过早序列化，而不是附着于那个掩码。</p>
   </div>
 </section>

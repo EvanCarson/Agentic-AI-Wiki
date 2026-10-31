@@ -1,0 +1,145 @@
+<section class="phase">
+  <div class="phase-num">R14</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>权限感知检索。</h2>
+  <p class="goal">检索里的权限缺陷几乎从不以「权限缺陷」的面目出现——它表现为「搜索变差了」，于是团队把它当成相关性问题debug一整周。原因在于：实施 ACL 最省事的那条路——等检索返回之后再过滤 top-k——根本不会失败，它只是悄悄返回更少、更差的分块，而差到什么程度，取决于提问的这个用户恰好被允许看到语料库的多少。把过滤放进检索内部，top-k 就重新是 top-k；放在它之后，你造的就是一台召回彩票机，而每个用户的中奖概率都不一样。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>让后置过滤站不住脚的那道算术。</h3>
+
+    <p>先看那个显而易见的设计：把查询嵌入，向索引要最近的十个分块，然后把用户无权阅读的丢掉。如果这个用户能看到语料库的比例是 <code class="inline">v</code>，而权限与相关性大致独立，那么存活下来的分块数大约是 <code class="inline">k × v</code>。</p>
+
+    <pre class="standalone"><span class="c-cm"># post-filter: ask for k, keep what the user may read</span>
+
+visible fraction v    k=10 -> expected survivors
+1.0    (admin)                     10.0
+0.30   (whole-department reader)    3.0
+0.05   (one project)                0.5
+0.002  (external contractor)        0.02
+
+<span class="c-cm"># to land n allowed chunks you must over-fetch k ~ n/v</span>
+
+n=10 allowed, v=0.05   ->  k ~    200
+n=10 allowed, v=0.002  ->  k ~  5,000</pre>
+
+    <p>你需要的超额抓取倍数是 <code class="inline">1/v</code>，而 <code class="inline">v</code> 是<em>用户</em>的属性，不是你系统的属性。于是一个固定的超额抓取量，恰好只为你租户里的某一个人校准过，对其他所有人都是错的——对那位做测试的管理员过于宽裕，对那位提单的外部承包商则是灾难性的。</p>
+
+    <p>而且情况比「独立性假设」暗示的更糟，因为恰恰在最要紧的那些场合，相关性与权限是正相关的：关于某个项目的问题，最切题的分块通常就住在那个项目的受限空间里。所以 <code class="inline">v</code> 最小的那些用户，正是最好的结果被过滤掉的那些人，而存活下来的是对所有人可见的公司级样板话。答案不会是空的，它会是自信而含糊的——这更难被注意到。</p>
+
+    <div class="callout warn">
+      <p>后置过滤没有错误状态。没人收到 403，没有计数器自增，而追踪里显示的是「成功检索十个分块」后面接着「成功生成」。唯一的症状是答案质量，而唯一看得见它的是权限最少的那批用户——也就是最不可能在你分诊时在场的那批人。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>只有前置过滤这一种位置能保住 top-k。</h3>
+
+    <p>解法是让权限谓词成为检索的一部分，而不是检索之后的一道工序：把访问元数据与向量一起入索引，并让引擎把遍历限制在满足过滤条件的候选上。这样「前十」就意味着<em>这个用户有权阅读的</em>最好的十个分块——这才是你真正想要的东西——而超额抓取倍数也随之消失，因为排序之后不再有任何东西被丢掉。</p>
+
+    <p>让这件事成为一个真正的工程决策而非一个开关的，是带过滤的向量检索确实很难。HNSW 图之所以可导航，是因为它的边是在整个语料库上建起来的；在遍历过程中施加一个选择性很强的过滤，你本该跳过去的那些邻居被排除了，于是这趟游走在图的某个区域里走进死胡同，返回一份又短又差的列表。各家引擎的应对方式不同——维护可过滤的 payload 索引、并在选择性低于某个阈值时回落到暴力扫描；或者给每个租户一块独立的物理分区或命名空间，使得「过滤」其实是在选择索引。你的存储用的是哪种策略，是<a class="xref" href="/zh/deep-dives/retrieval-and-rag/choosing-a-vector-database">选向量数据库</a>里的一条轴，而且是被这项需求从「偏好」变成「约束」的那条轴。</p>
+
+    <p>在信任这一切之前，先确定你的引擎是在排序的哪一侧施加过滤，因为一个接受了过滤参数却在事后才施加它的引擎，在你动手测量之前与真正前置过滤的引擎是无法区分的。这个测试只有三行，值得写下来：</p>
+
+    <pre class="standalone"><span class="c-cm"># does your engine pre-filter or post-filter?</span>
+
+1. index 10,000 chunks; tag exactly 20 of them tenant=A
+2. query with filter tenant=A, k=10
+3. count the results
+
+<span class="c-out">10 results  -> the filter ran inside the search (pre-filter)
+0-2 results -> the filter ran after top-k (post-filter)</span>
+
+<span class="c-cm"># run it again at k=100 on the post-filtering engine and you</span>
+<span class="c-cm"># will get a few more. that is the lottery, not a fix.</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>索引里的元数据是 ACL 的一份缓存，而撤权才是危险的那个方向。</h3>
+
+    <p>前置过滤买来了正确的排序，而它买单的方式是把授权状态复制进检索层。那份副本是缓存，所以它有一个等于你同步延迟的陈旧窗口，而漂移的两个方向并不对称。</p>
+
+    <ul>
+      <li><strong>一次尚未传播的授权</strong>意味着某人找不到一份他本来有权看的文档。那是一张支持工单。它令人烦躁，而且是可见的——因为那个人知道这份文档存在，并且会说出来。</li>
+      <li><strong>一次尚未传播的撤权</strong>意味着某人检索到了一份他已经无权阅读的文档，而模型把它引用进了答案。那是一次信息披露，它是无声的，而你的同步延迟就是这个窗口的长度。</li>
+    </ul>
+
+    <p>所以要把权限变更当作一次失效事件来处理，而不是某个夜间任务迟早会追上的东西——这与<a class="xref" href="/zh/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">索引新鲜度与失效</a>是同一套纪律，区别在于这里那条陈旧记录是一项安全控制，而不是一段过时的文字。然后，在存活者进入提示词之前，拿它们去权威服务那边复核一遍，把窗口关掉。这道最终检查之所以负担得起，恰恰是因为它跑在至多 <code class="inline">k</code> 个文档 id 上、而不是跑在语料库上：向持有真相的那一方发一次批量授权调用——比如 OpenFGA 或 SpiceDB 这类基于关系的服务，或者你自己应用的策略层——代价是一个往返，却彻底消掉了陈旧窗口。</p>
+
+    <p>最终的形状是两个执行点在做两件不同的事，而这两个你都需要：</p>
+
+    <pre class="standalone"><span class="c-out">pre-filter   (in the index)  -> correct RANKING
+                                cheap, stale, approximate
+
+final check  (vs. authority)  -> correct DISCLOSURE
+                                authoritative, fresh, k ids only</span>
+
+<span class="c-cm"># the pre-filter is a performance structure that happens to</span>
+<span class="c-cm"># be a permission hint. the final check is the control.</span>
+<span class="c-cm"># if the final check drops a chunk, LOG IT -- that is your</span>
+<span class="c-cm"># sync lag reporting itself as a number.</span></pre>
+
+    <p>最后那一行是你这个季度会加上的最便宜的可观测性。被最终检查丢掉的分块比率不为零，是对「你索引里那份 ACL 副本到底有多陈旧」唯一的直接测量，而它只要一个计数器。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>索引组，而不是用户，然后盯住过滤条件的宽度。</h3>
+
+    <p>那个天真的元数据 schema 会在每个分块上存一份「可阅读用户列表」，这让索引变成一份被物化的笛卡尔积：一百万个分块乘一万个用户塞不进一个 payload 字段，而且每一次组织架构调整都会把它整个重写。要存的是<em>组</em>——角色、项目 id、租户 id、安全标签——然后在查询时把提问的用户解析成他的组集合。</p>
+
+    <p>这把爆炸从索引挪到了查询侧，在那里它更小，但并不免费。一个属于四百个组的用户，会在过滤条件里产生一个四百项的析取，而各家引擎对过滤条件大小都有上限，并且远在触到上限之前就开始变慢。有三件事能把它约束住：</p>
+
+    <ul>
+      <li><strong>每个请求解析一次组集合，而不是每个分块一次。</strong>对每个候选来说它都是同一个集合；把它放进打分循环里去取，正是这个缺陷的经典版本。</li>
+      <li><strong>在写入时把层级压平。</strong>如果属于 <code class="inline">eng-platform</code> 就意味着对 <code class="inline">eng</code> 下的一切有读权限，那就把闭包入索引，而不是在查询时解析这棵树。你为此付出的代价落在组织架构调整上——那很罕见——而不是落在每一次查询上，那可不罕见。</li>
+      <li><strong>先按租户收窄，再做过滤。</strong>一条强制的租户谓词——更好的是一块按租户划分的分区——会在那个组析取被求值之前，把候选集砍掉几个数量级，而且它是那条你绝不能让任何相关性阈值去放松的谓词。</li>
+    </ul>
+
+    <p>这里的多租户那一半会推广到检索之外：<a class="xref" href="/zh/operations/agentops/multi-tenancy-for-agents">智能体的多租户</a>处理的是贯穿整个循环的隔离问题，而<a class="xref" href="/zh/deep-dives/memory-and-context/memory-scopes-and-tenancy">记忆作用域与租户隔离</a>处理的是当智能体自己的写入也带上同样的标签时会发生什么。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>把谓词放在应用代码忘不掉的地方。</h3>
+
+    <p>上面每一种设计都依赖于「那个过滤参数被传了进去」，也就是说，都依赖于「没有任何一条代码路径曾漏掉它」。这是一件很糟糕的依赖：漏掉它只是少写一个关键字参数，它产出的结果比正确版本<em>更好看</em>，而任何检查答案质量的测试都抓不到它。批量重建索引的任务、管理员用的调试工具、以及评测框架，正是谓词最容易丢失的地方——而这三者跑起来用的凭据都能看到一切。</p>
+
+    <p>在能做到的地方，让存储层去执行它，而不是要求调用方。Postgres 的行级安全配合 <code class="inline">pgvector</code> 是其中最强、也最常见的版本：策略挂在表上，于是一个忘了写 <code class="inline">WHERE</code> 子句的查询返回的是当前角色有权看到的那些行，而不是全部，检索代码在物理上就不可能过量读取。这就是<a class="xref" href="/zh/concepts/reference-monitor">引用监视器</a>的那个性质——请求必须经过、且无法绕开的唯一一处——而它值得你付出可以量化的那一点查询性能。</p>
+
+    <p>在做不到的地方，过滤条件必须由唯一一个包装器来构造：它把调用者的身份作为必填参数，并且没有任何一条代码路径能产出一个不带过滤的查询。要让那个不安全的版本根本无法被表达，而不是仅仅「不推荐」；并且让默认行为是<a class="xref" href="/zh/concepts/fail-closed-and-fail-open">失败即关闭</a>——一个解析不出来的身份什么都检索不到，那是一次可见的故障、因而会被修掉；而不是检索到一切，那是一次无声的披露、因而不会。</p>
+
+    <div class="callout">
+      <p>还要留意你过滤的到底是哪个主体的权限。一个代表用户去检索、却使用着能读遍整个语料库的服务账号的智能体，是一个<a class="xref" href="/zh/concepts/confused-deputy">混淆代理</a>——过滤条件是用户的问题与那个服务账号的触及范围之间唯一的屏障，而「我们好好地请求过智能体不要那样做」不算一道过滤。参见<a class="xref" href="/zh/concepts/agent-identity-and-permissions">智能体身份与权限</a>。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>两个测试，因为正确性与质量是分开失败的。</h3>
+
+    <p>权限感知检索有两种失败模式，没有任何单一数字能同时检测到它们，所以要分开测量。</p>
+
+    <p><strong>披露测试</strong>是一条正确性断言，而它应该是枯燥的。对一个固定租户里的每个角色，发出一组刻意写成「与该角色<em>无权</em>阅读的文档最相似」的查询，并断言结果里不出现任何禁止文档的 id——在生成之前、在检索边界上断言，那里既便宜又精确。这是一个单元测试，它属于 CI，而它的期望值是「永远零次禁止命中」。你每出一次事故，就往里加一个用例。</p>
+
+    <p><strong>质量测试</strong>是团队会跳过的那一个，也是能抓住 STEP 1 那种失败的那一个。针对某个给定用户，拿「只在该用户被许可的那些行上做精确检索」的 oracle 作为基准，去测量带过滤的 recall@k——而不是拿未过滤的索引作基准，那是另一个问题，而且会替后置过滤涂脂抹粉。请为一个 <code class="inline">v</code> 很低的角色去跑它，而不是管理员，因为管理员恰恰是「所有实现看起来都一模一样」的那唯一一个用户。</p>
+
+    <pre class="standalone"><span class="c-cm"># the oracle that makes the number mean something</span>
+
+for role in [admin, dept_reader, project_member, contractor]:
+    permitted = exact_scan(corpus.filter(role))      <span class="c-cm"># ground truth</span>
+    got       = retrieve(query, k=10, identity=role)
+    recall    = |got &amp; permitted[:10]| / 10
+
+<span class="c-cm"># a post-filtering stack scores ~1.0 for admin and</span>
+<span class="c-cm"># falls off a cliff as v shrinks. that shape IS the bug.</span></pre>
+
+    <p>第二个测试所需的一般性器械——把检索质量、接地与答案质量分开——在<a class="xref" href="/zh/deep-dives/retrieval-and-rag/evaluating-rag">评估 RAG</a> 里；这一页要补的是：上面每一项指标都必须按角色分别计算，因为一个汇总后的单一数字，会被你评测集恰好用到的那个角色所主导。</p>
+
+    <div class="callout tip">
+      <p>按顺序来做。把 ACL 挪进索引、把过滤挪进检索，然后用 STEP 2 那个二十分块的探针验证你的引擎真的在前置过滤。给存活下来的那些 id 加上对权威服务的批量复核，并记录丢弃率——那个计数器就是你的同步延迟。索引组 id 而不是用户 id，并让租户谓词成为强制的。然后为每个角色写披露测试，为你<em>权限最少</em>的那个角色写召回测试。如果你只有时间做其中两件，就做最终检查和低权限召回测试：第一件给你的披露窗口设了界，第二件是唯一会告诉你「检索对那些最无力反馈的人早已悄悄坏掉」的东西。</p>
+    </div>
+  </div>
+</section>
