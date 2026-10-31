@@ -1,0 +1,145 @@
+<section class="phase">
+  <div class="phase-num">R14</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Permission-aware retrieval.</h2>
+  <p class="goal">A permissions bug in retrieval almost never announces itself as a permissions bug — it arrives as "search got worse," and teams debug it as a relevance problem for a week. That is because the cheap way to enforce an ACL, filtering the top-k after the search returns, does not fail: it silently returns fewer and worse chunks, and how much worse depends on how much of the corpus the asking user happens to be allowed to see. Enforce inside the search and top-k means top-k again; enforce after it and you have built a recall lottery whose odds are different for every user.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The arithmetic that makes post-filtering indefensible.</h3>
+
+    <p>Take the obvious design. Embed the query, ask the index for the ten nearest chunks, then drop the ones the user may not read. If that user can see a fraction <code class="inline">v</code> of the corpus and permission is roughly independent of relevance, the number of chunks that survive is about <code class="inline">k × v</code>.</p>
+
+    <pre class="standalone"><span class="c-cm"># post-filter: ask for k, keep what the user may read</span>
+
+visible fraction v    k=10 -> expected survivors
+1.0    (admin)                     10.0
+0.30   (whole-department reader)    3.0
+0.05   (one project)                0.5
+0.002  (external contractor)        0.02
+
+<span class="c-cm"># to land n allowed chunks you must over-fetch k ~ n/v</span>
+
+n=10 allowed, v=0.05   ->  k ~    200
+n=10 allowed, v=0.002  ->  k ~  5,000</pre>
+
+    <p>The over-fetch factor you need is <code class="inline">1/v</code>, and <code class="inline">v</code> is a property of the <em>user</em>, not of your system. A fixed over-fetch is therefore calibrated for exactly one person in your tenant and wrong for everybody else — generous for the admin who did the testing, catastrophic for the contractor who files the ticket.</p>
+
+    <p>It is worse than the independence assumption suggests, because relevance and permission are positively correlated in exactly the cases that matter. The most on-topic chunks for a question about a project usually live in that project's restricted space. So the users with the smallest <code class="inline">v</code> are the ones whose best results get filtered out, and the surviving chunks are the generic company-wide boilerplate that was visible to everyone. The answer is not empty. It is confidently vague, which is harder to notice.</p>
+
+    <div class="callout warn">
+      <p>Post-filtering has no error state. Nobody gets a 403, no counter increments, and the trace shows a successful retrieval of ten chunks followed by a successful generation. The only symptom is answer quality, and the only people who see it are the users with the least access — which is to say the ones least likely to be in the room when you triage it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Pre-filtering is the only placement that preserves top-k.</h3>
+
+    <p>The fix is to make the permission predicate part of the search rather than a stage after it: index the access metadata alongside the vector, and have the engine restrict traversal to candidates that satisfy the filter. Then "top ten" means the ten best chunks <em>this user is allowed to read</em>, which is the thing you actually wanted, and the over-fetch factor disappears because nothing is thrown away after ranking.</p>
+
+    <p>What makes this a real engineering decision rather than a flag is that filtered vector search is genuinely hard. An HNSW graph is navigable because its edges were built over the whole corpus; apply a selective filter during traversal and the neighbours you would hop through are excluded, so the walk dead-ends in a region of the graph and returns a short, poor list. Engines answer this differently — maintaining filterable payload indices and falling back to a brute-force scan below a selectivity threshold, or giving each tenant its own physical partition or namespace so that the "filter" is really a choice of index. Which strategy your store uses is one of the axes in <a class="xref" href="/deep-dives/retrieval-and-rag/choosing-a-vector-database">choosing a vector database</a>, and it is the axis that this requirement turns from a preference into a constraint.</p>
+
+    <p>Before you trust any of it, establish which side of the ranking your engine applies the filter on, because an engine that accepts the filter argument and applies it afterwards is indistinguishable from one that pre-filters until you measure. The test is three lines and worth writing down:</p>
+
+    <pre class="standalone"><span class="c-cm"># does your engine pre-filter or post-filter?</span>
+
+1. index 10,000 chunks; tag exactly 20 of them tenant=A
+2. query with filter tenant=A, k=10
+3. count the results
+
+<span class="c-out">10 results  -> the filter ran inside the search (pre-filter)
+0-2 results -> the filter ran after top-k (post-filter)</span>
+
+<span class="c-cm"># run it again at k=100 on the post-filtering engine and you</span>
+<span class="c-cm"># will get a few more. that is the lottery, not a fix.</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The metadata in your index is a cache of the ACL, and revocation is the dangerous direction.</h3>
+
+    <p>Pre-filtering buys correct ranking, and it buys it by copying authorization state into the retrieval layer. That copy is a cache, so it has a staleness window equal to your sync lag, and the two directions of drift are not symmetric.</p>
+
+    <ul>
+      <li><strong>A grant that has not propagated</strong> means someone cannot find a document they are entitled to. That is a support ticket. It is annoying and it is visible, because the person knows the document exists and says so.</li>
+      <li><strong>A revocation that has not propagated</strong> means someone retrieves a document they are no longer entitled to, and the model quotes it into an answer. That is a disclosure, it is silent, and your sync lag is the length of the window.</li>
+    </ul>
+
+    <p>So treat permission changes as an invalidation event rather than something a nightly job catches up on — the same discipline as <a class="xref" href="/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">index freshness and invalidation</a>, with the difference that here the stale record is a security control rather than a stale paragraph. Then close the window by re-checking the survivors against the authoritative service before they enter the prompt. That final check is affordable precisely because it runs over at most <code class="inline">k</code> document ids rather than the corpus: a batch authorization call to whatever owns the truth — a relationship-based service such as OpenFGA or SpiceDB, or your application's own policy layer — costs one round trip and removes the staleness window entirely.</p>
+
+    <p>The resulting shape is two enforcement points doing two different jobs, and you need both:</p>
+
+    <pre class="standalone"><span class="c-out">pre-filter   (in the index)  -> correct RANKING
+                                cheap, stale, approximate
+
+final check  (vs. authority)  -> correct DISCLOSURE
+                                authoritative, fresh, k ids only</span>
+
+<span class="c-cm"># the pre-filter is a performance structure that happens to</span>
+<span class="c-cm"># be a permission hint. the final check is the control.</span>
+<span class="c-cm"># if the final check drops a chunk, LOG IT -- that is your</span>
+<span class="c-cm"># sync lag reporting itself as a number.</span></pre>
+
+    <p>That last line is the cheapest observability you will add all quarter. A non-zero rate of chunks dropped by the final check is the only direct measurement of how stale your index's ACL copy really is, and it costs one counter.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Index groups, not users, and then watch the filter width.</h3>
+
+    <p>The naive metadata schema stores the list of users who may read each chunk, which makes the index a materialised cross product: a corpus of a million chunks and ten thousand users does not fit in a payload field, and every reorganisation rewrites it. Store the <em>groups</em> — roles, project ids, tenant ids, security labels — and resolve the asking user into their group set at query time.</p>
+
+    <p>This moves the explosion from the index to the query, where it is smaller but not free. A user who belongs to four hundred groups produces a four-hundred-term disjunction in the filter, and engines have limits on filter size and get slower well before they hit them. Three things keep it bounded:</p>
+
+    <ul>
+      <li><strong>Resolve the group set once per request, not per chunk.</strong> It is the same set for every candidate; fetching it inside the scoring loop is the classic version of this bug.</li>
+      <li><strong>Collapse the hierarchy at write time.</strong> If membership in <code class="inline">eng-platform</code> implies read on everything under <code class="inline">eng</code>, index the closure rather than resolving the tree at query time. You pay for it on reorganisation, which is rare, instead of on every query, which is not.</li>
+      <li><strong>Scope by tenant first, then filter.</strong> A mandatory tenant predicate — or better, a per-tenant partition — cuts the candidate set by orders of magnitude before the group disjunction is evaluated, and it is the predicate you must never let a relevance threshold relax.</li>
+    </ul>
+
+    <p>The multi-tenant half of this generalises beyond retrieval; <a class="xref" href="/operations/agentops/multi-tenancy-for-agents">multi-tenancy for agents</a> treats the isolation question across the whole loop, and <a class="xref" href="/deep-dives/memory-and-context/memory-scopes-and-tenancy">memory scopes and tenancy</a> treats what happens when the agent's own writes carry the same labels.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Put the predicate somewhere application code cannot forget it.</h3>
+
+    <p>Every design above depends on a filter argument being passed, which means it depends on no code path ever omitting it. That is a bad thing to depend on: the omission is one missing keyword argument, it produces better-looking results than the correct version, and no test that checks answer quality will catch it. The batch reindex job, the admin debugging tool and the eval harness are where the predicate goes missing, and all three run with credentials that can see everything.</p>
+
+    <p>Where you can, make the storage layer enforce it instead of asking callers to. Postgres row-level security with <code class="inline">pgvector</code> is the strongest commonly available version of this: the policy is attached to the table, so a query that forgets its <code class="inline">WHERE</code> clause returns the rows the current role may see rather than all of them, and the retrieval code physically cannot over-read. That is the <a class="xref" href="/concepts/reference-monitor">reference monitor</a> property — one place the request must pass through, which cannot be bypassed — and it is worth a measurable amount of query performance.</p>
+
+    <p>Where you cannot, the filter must be constructed by a single wrapper that takes the caller's identity as a required argument and has no code path that produces an unfiltered query. Make the unsafe version impossible to express rather than merely discouraged, and make the default <a class="xref" href="/concepts/fail-closed-and-fail-open">fail closed</a>: an identity you cannot resolve retrieves nothing, which is a visible outage and therefore gets fixed, rather than retrieving everything, which is a silent disclosure and therefore does not.</p>
+
+    <div class="callout">
+      <p>Note which principal's permissions you are even filtering on. An agent that retrieves on behalf of a user, using a service account that can read the whole corpus, is a <a class="xref" href="/concepts/confused-deputy">confused deputy</a> — the filter is the only thing standing between the user's question and the service account's reach, and "the agent was asked nicely not to" is not a filter. See <a class="xref" href="/concepts/agent-identity-and-permissions">agent identity and permissions</a>.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Two tests, because correctness and quality fail separately.</h3>
+
+    <p>Permission-aware retrieval has two failure modes that no single number detects, so measure them apart.</p>
+
+    <p><strong>The disclosure test</strong> is a correctness assertion and it should be boring. For each role in a fixture tenant, issue a set of queries deliberately written to be most similar to documents that role may <em>not</em> read, and assert that no forbidden document id appears in the results — before generation, at the retrieval boundary, where the assertion is cheap and exact. This is a unit test, it belongs in CI, and its expected value is zero forbidden hits forever. Add one case per incident you ever have.</p>
+
+    <p><strong>The quality test</strong> is the one teams skip, and it is the one that catches the failure in STEP 1. Measure filtered recall@k for a given user against an oracle that is an exact search over <em>only that user's permitted rows</em> — not against the unfiltered index, which is a different question and flatters post-filtering. Run it for a low-<code class="inline">v</code> role, not an admin, because the admin is the one user for whom every implementation looks identical.</p>
+
+    <pre class="standalone"><span class="c-cm"># the oracle that makes the number mean something</span>
+
+for role in [admin, dept_reader, project_member, contractor]:
+    permitted = exact_scan(corpus.filter(role))      <span class="c-cm"># ground truth</span>
+    got       = retrieve(query, k=10, identity=role)
+    recall    = |got &amp; permitted[:10]| / 10
+
+<span class="c-cm"># a post-filtering stack scores ~1.0 for admin and</span>
+<span class="c-cm"># falls off a cliff as v shrinks. that shape IS the bug.</span></pre>
+
+    <p>The general apparatus for the second test — separating retrieval quality from grounding from answer quality — is in <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">evaluating RAG</a>; what this page adds is that every one of those metrics must be computed per role, because a single aggregate figure is dominated by whichever role your eval set happens to use.</p>
+
+    <div class="callout tip">
+      <p>Do this in order. Move the ACL into the index and the filter into the search, then verify with the twenty-chunk probe in STEP 2 that your engine really pre-filters. Add the batch re-check against the authoritative service on the surviving ids, and log the drop rate — that counter is your sync lag. Index group ids rather than user ids, and make the tenant predicate mandatory. Then write the disclosure test for every role and the recall test for your <em>least</em> privileged one. If you only have time for two of these, take the final check and the low-privilege recall test: the first bounds your disclosure window, and the second is the only thing that will tell you the retrieval was quietly broken for the people least able to report it.</p>
+    </div>
+  </div>
+</section>

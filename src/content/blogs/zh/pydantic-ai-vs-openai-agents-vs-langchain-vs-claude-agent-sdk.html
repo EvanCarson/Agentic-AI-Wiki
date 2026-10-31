@@ -1,0 +1,153 @@
+<p class="lede">这四个框架每一个都会递给你一个经过校验的 Python 对象而不是字符串，而它们的差别不在这里。它们的差别在于那一行没人会去翻文档的行为：当模型的答案装不进那个类型时会发生什么。一个会在预算内重试，一个会往你的请求处理器里抛异常，而还有一个——重试与否取决于你用三种方式中的哪一种声明了 schema，而最顺手的那种声明恰恰是不重试的那一种。那个默认值就是全部的决定，因为它选定了你那条坏输出的长尾要付出的代价：第二次推理调用、一条堆栈回溯，还是一个一本正经地给出的错误答案。</p>
+
+<section>
+  <h2>一览</h2>
+  <p>声明语法是第一天的事，而所有人比较的都是它。失败语义是第三个月的事，而那才是你真正要与之共存的东西。</p>
+  <table>
+    <thead>
+      <tr><th>框架</th><th>怎么声明</th><th>输出无效时</th><th>语义层面的否决</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Pydantic AI</td>
+        <td>agent 上的 <code>output_type</code></td>
+        <td>把错误喂回去，在共享预算内重试</td>
+        <td>输出校验器里抛 <code>ModelRetry</code></td>
+      </tr>
+      <tr>
+        <td>OpenAI Agents SDK</td>
+        <td><code>output_type</code> / <code>outputType</code></td>
+        <td>默认抛 <code>ModelBehaviorError</code></td>
+        <td>可选启用的运行错误处理器，返回兜底值</td>
+      </tr>
+      <tr>
+        <td>LangChain <code>create_agent</code></td>
+        <td><code>response_format</code>，三种形式</td>
+        <td>重试处理器只作用于 <code>ToolStrategy</code></td>
+        <td>未内置</td>
+      </tr>
+      <tr>
+        <td>Claude Agent SDK</td>
+        <td>JSON Schema、Zod 或 Pydantic</td>
+        <td>倚靠厂商侧的强制约束</td>
+        <td>未内置</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/pydantic-ai-vs-openai-agents-vs-langchain-vs-claude-agent-sdk/data-failure-defaults.svg" alt="四个 SDK 在「输出无效时是否重试」、「语义否决钩子」与「默认落在哪里」三个维度上的矩阵。" width="900" height="400" loading="lazy" />
+    <figcaption>四者之中只有一个在任何配置下都默认重试，也只有一个给了你一个一等公民的方式去否决「解析通过但内容是错的」答案。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Pydantic AI：校验错误就是一段提示词</h2>
+  <p>Pydantic AI 把一次失败的校验当作「要给模型的信息」，而不是「要报给你的错误」。一个没通过校验的结构化输出——同样地，还有一次参数没通过校验的工具调用——会被带着「再试一次」的请求送回去，而这正是大多数人以为四个框架都在做、而实际上只有一个在做的事。</p>
+  <p>重试预算是共享且有限的，用光它会抛出 <code>UnexpectedModelBehavior</code>，消息里点明那个上限：<em>Exceeded maximum output retries</em>。对一个否则可能永远跑下去的循环来说，这是正确的形状；但请注意这份预算与工具调用的重试是共享的，所以一次把配额花在跟工具签名较劲上的运行，留给最终答案的就一点不剩了。</p>
+  <p>值得偷走的特性是 <code>ModelRetry</code>：输出校验器可以抛出它，来否决一个<em>已经通过</em> schema 的结果。这是四者之中唯一一个针对「实践中最要紧的那个失败」的一等钩子——对象格式良好，而内容是错的。schema 查不出一个 ID 能否解析、或一笔总额是否对得上，而在这里你能把那个判断在同一个循环里送回给模型，而不是在外面再栓上第二道流程。</p>
+</section>
+
+<section>
+  <h2>OpenAI Agents SDK：抛异常，而这站得住脚</h2>
+  <p>当一条最终消息没能通过 <code>output_type</code> 校验时，Python SDK 的默认行为是抛出 <code>ModelBehaviorError</code>。针对 <code>invalid_final_output</code> 这一情形有一个可选启用的运行错误处理器，它可以返回一个由应用自定的兜底值——而且很有用的一点是：SDK 会拿同一个 <code>output_type</code> 去校验那个兜底值，所以你没法把一个无类型的对象偷运回一条有类型的流水线里。</p>
+  <p>抛异常是一个真实的立场，不是一处遗漏。它让失败在你掌控的那道边界上变得很吵，而这恰恰是<a href="/zh/concepts/fail-closed-and-fail-open">失败即关闭</a>的论证所要求的；而且它拒绝在没被吩咐的情况下花你的钱去重试。代价是：请求路径里一个没被接住的 <code>ModelBehaviorError</code> 就是生产环境里的一个异常，而 JavaScript 版 SDK 一直有人陆续反馈——他们是在服务挂掉的时候才发现这件事的——其中包括一个在撰稿前几天针对 <code>@openai/agents-core</code> 0.21.0 提交的未关闭议题：解说性消息与最终答案的 JSON 消息被拼接在一起抵达，而校验在这一对上失败了。</p>
+  <p>请把那个处理器当成必做项，而不是可选项。这个默认值是正确的，而它同时也不是一份生产配置。</p>
+</section>
+
+<section>
+  <h2>LangChain create_agent：顺手的那条路，恰恰是会放弃的那条</h2>
+  <p>这一个值得仔细读，因为陷阱就藏在便利里。<code>create_agent</code> 的 <code>response_format</code> 接受三种东西：一个 <code>ToolStrategy</code>、一个 <code>ProviderStrategy</code>，或者一个裸的 schema 类型。而传入一个裸的 Pydantic 模型——那个显而易见、文档里也写着的一行写法——会自动选中 <code>ProviderStrategy</code>。</p>
+  <p>重试处理器作用于 <code>ToolStrategy</code>。所以那条裸 schema 路径——也就是你会最先写出来、并且大多数示例展示的那条——对一个格式错误的回复<em>不会</em>重试；修法是把同一个 schema 显式地裹进 <code>ToolStrategy</code>。这种不对称不会由类型签名宣告出来，两种形式在顺利路径上都产出一个经过校验的对象，而差别只在长尾里显形。</p>
+  <p>它底下有一笔真实的权衡，这也是为什么它不能简单算作一个 bug：厂商强制的结构化输出更便宜也更严格，而一次重试要多花一次模型调用。但这两个选项被呈现为「说同一件事的两种可互换写法」，而它们的可靠性特征并不相同，并且更短的那个是更弱的那个。如果你在用 <code>create_agent</code>，请在代码里把策略写明，哪怕默认值恰好会挑中你想要的那个——下一个读代码的人分不出你当时是哪个意思。</p>
+</section>
+
+<section>
+  <h2>Claude Agent SDK：失败挪到了上游</h2>
+  <p>Claude Agent SDK 接受一个 JSON Schema、一个 Zod schema 或一个 Pydantic 模型，并返回一个承载已校验数据的 <code>structured_output</code> 字段。它是四者之中框架层重试机制最少的那个，而在一个「厂商强制」的设计里，这更接近于自洽而不是缺失：当采样器被对着你的 schema 约束住时，「输出装不进类型」根本就不是你会拿到的那个失败。</p>
+  <p>你拿到的，是住在 schema 之外的那三个失败——一次拒绝，它以你的 schema 从未描述过的形状抵达；一次在 token 上限处的截断，它产出「无效文档的有效前缀」；以及一次对 schema 本身的生成前驳回，它是确定性的、且绝不该进入重试循环。Anthropic 写明的严格模式上限正是第三个的来源：截至 2026 年 10 月，每请求最多 20 个严格工具、横跨该请求里每一个严格 schema 总计 24 个可选参数、16 个带联合类型的参数，以及 180 秒的 schema 编译超时，而一个不受支持的特性会返回 400，而不是悄悄降级。</p>
+  <p>所以这组比较不是「这个没有重试」。而是：其他 SDK 给你的那个框架层重试，瞄准的是这种设计基本消除掉的那个失败，同时留下三个它碰不到的。无论用哪一个，那三个都是你的活；<a href="/zh/concepts/structured-outputs">结构化输出</a>把它们所隐含的那条四分支解析路径走了一遍。</p>
+</section>
+
+<section>
+  <h2>横向：一次重试是一次推理调用，而一次抛出是一个被你推迟的决定</h2>
+  <figure>
+    <img src="/blogs/pydantic-ai-vs-openai-agents-vs-langchain-vs-claude-agent-sdk/arch-where-the-failure-lands.svg" alt="一个无效输出分成三条通道：把错误喂回去换来第二次推理调用、往调用方的异常处理器里抛出、以及把问题原样递给你的代码或用户。" width="900" height="500" loading="lazy" />
+    <figcaption>这三个出口的代价分别是一次重试、一条堆栈回溯、一个无声的错误答案——偏好顺序正是如此，而这些框架不让你在不读源码的情况下做出选择。</figcaption>
+  </figure>
+  <p>横着读完这四个，一个不合规的答案只有三个去处，而每个框架的默认值都替你挑了一个。把错误喂回去买到的是最好的结果，而每次发生都给你记一次额外调用的账——在 1% 的失败率下无所谓，在 15% 下就是一个预算条目。抛异常什么都不花，而它把一个模型问题转换成了一个可用性问题——只有在有人写了那个处理器时，这笔交易才是对的。把对象原样递下去什么都不花，而它是三者中唯一一个能在用户面前产出「自信的错误答案」的；这也正是为什么它是最糟糕的「意外继承来的默认值」——而它恰恰就是你会意外继承到的那一个，在 LangChain 的裸 schema 路径上。</p>
+  <p>横着读还能读出第二件事：除了 Pydantic AI 的 <code>ModelRetry</code>，这四个框架对「输出是不是<em>错的</em>」都没有意见。schema 合规是它们任何一个默认施加的唯一检验，而合规是必要却永不充分的：底下那些严格模式并不强制数值边界与字符串长度关键字，所以一个通过校验的对象完全可以携带一个你的类型标注声称不可能存在的越界数字。这些技术栈每一个都需要你在自己的代码里做语义校验，而四者中有三个没给你一个自然的地方去放它。</p>
+  <p>这就引出了在你选型之前真正值得测量的那件事：给你现有的技术栈装一周的仪器，拿到那个比率——最终答案有多频繁地校验失败？在百分之一左右以下，「默认抛出」这个立场没问题，而重试无论如何都是舍入误差。在百分之几以上，重试能靠「用户可见的成功」赚回自己，而你应该知道它花了多少钱——而且你还应该回去看看那个 schema，因为一个两位数的无效率，通常意味着那个 schema 在问模型它答不出的问题，而不是意味着那个框架重试得太少。</p>
+</section>
+
+<section>
+  <h2>什么时候选哪个</h2>
+  <table>
+    <thead>
+      <tr><th>情形</th><th>选</th><th>因为</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>抽取流水线、批处理、正确性优先于成本</td>
+        <td>Pydantic AI</td>
+        <td>默认就重试，而 <code>ModelRetry</code> 让你能否决「解析通过但内容是错的」。</td>
+      </tr>
+      <tr>
+        <td>同步请求路径，延迟预算很紧</td>
+        <td>OpenAI Agents SDK</td>
+        <td>它抛异常，而不是悄悄把你的 p99 翻倍——写好那个错误处理器，你就有了一条明确的策略。</td>
+      </tr>
+      <tr>
+        <td>为了持久化执行已经在用 LangGraph</td>
+        <td>LangChain <code>create_agent</code></td>
+        <td>可以，但请显式传 <code>ToolStrategy</code>；裸 schema 不会重试。</td>
+      </tr>
+      <tr>
+        <td>只用 Claude，schema 稳定且小</td>
+        <td>Claude Agent SDK</td>
+        <td>厂商强制消掉了「输出格式错误」这一情形；请改为给拒绝、截断与 schema 400 做预算。</td>
+      </tr>
+      <tr>
+        <td>schema 有 20 个以上字段、或深层的可选性</td>
+        <td>暂时都别选</td>
+        <td>先把 schema 修好——严格模式会对可选字段限量或禁用，所以每个字段都是一道必答题。</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>这四个里哪个会默认重试一个坏的结构化输出？</h3>
+  <p>Pydantic AI 会，它在一份共享的重试预算内把校验错误喂回给模型。LangChain 的 <code>create_agent</code> 只在 <code>ToolStrategy</code> 下重试，而一个裸的 Pydantic 模型会自动选中那条不重试的 provider 路径。OpenAI Agents SDK 默认抛出 <code>ModelBehaviorError</code>，而 Claude Agent SDK 改为倚靠厂商侧的强制约束。</p>
+  <h3>为什么在 LangChain 里，一个裸 Pydantic 模型的行为与 ToolStrategy 不同？</h3>
+  <p>一个裸 schema 会自动选中 <code>ProviderStrategy</code>，它用的是厂商自己的结构化输出强制；而框架的重试处理器是接在 <code>ToolStrategy</code> 上的。两者在顺利时都返回一个经过校验的对象，所以这个差别在某个回复格式出错之前是看不见的。请显式传策略。</p>
+  <h3>抛异常是个错误的默认值吗？</h3>
+  <p>不是——它站得住脚。它让失败在一道你掌控的边界上变得很吵，并且拒绝在没被要求的情况下花 token 去重试。它只是单靠自己算不上一份生产配置，所以请把那个可选启用的错误处理器当成必做项而非可选项。</p>
+  <h3>有了约束解码，框架层的重试还有必要吗？</h3>
+  <p>它消掉了「JSON 格式错误」这一情形，并留下三个它碰不到的：一次在你 schema 之外抵达的拒绝、一次在 token 上限处产出「无效文档的有效前缀」的截断，以及一次对 schema 的确定性生成前驳回。最后那个绝不该进入重试循环。</p>
+  <h3>这些里面有谁能抓住一个「格式良好但是错的」答案吗？</h3>
+  <p>只有 Pydantic AI，通过在输出校验器里抛出的 <code>ModelRetry</code>。另外三个施加的是 schema 合规、仅此而已，而合规并不检查一个 ID 能否解析、或一笔总额是否对得上——底下那些严格模式并不强制数值与字符串长度关键字。在四者之中，语义校验都是你代码的活。</p>
+  <h3>怎么在不重写技术栈的前提下做决定？</h3>
+  <p>在你现有的配置上测量最终答案校验失败的比率。在百分之一左右以下，默认值几乎无关紧要。在百分之几以上，请先看 schema 再看框架——那个比率通常意味着 schema 在问模型它无法从输入里答出的问题。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站：</h3>
+  <ul>
+    <li><a href="/zh/concepts/structured-outputs">结构化输出</a>——schema 强制约束保证了什么，以及它留给你的那条四分支解析路径。</li>
+    <li><a href="/zh/concepts/constrained-decoding">约束解码</a>——那个 token 掩码究竟是怎么建出来的。</li>
+    <li><a href="/zh/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">各家厂商的 JSON Schema 子集</a>——哪些关键字在哪家存活，以及什么能移植。</li>
+    <li><a href="/zh/deep-dives/tool-capability-design/structured-outputs-vs-tool-calls">结构化输出 vs 工具调用</a>——同一套机制，两种同意面。</li>
+    <li><a href="/zh/concepts/agent-frameworks">智能体框架</a>——按可介入面而不是按抽象层来选。</li>
+  </ul>
+  <h3>一手来源：</h3>
+  <ul>
+    <li><a href="https://ai.pydantic.dev/agent/">Pydantic AI——agent、重试与输出校验器</a></li>
+    <li><a href="https://openai.github.io/openai-agents-python/ref/agent_output/">OpenAI Agents SDK（Python）——agent 输出参考</a></li>
+    <li><a href="https://docs.langchain.com/oss/python/langchain/structured-output">LangChain——create_agent 的结构化输出策略</a></li>
+    <li><a href="https://platform.claude.com/docs/en/agent-sdk/structured-outputs">Claude Agent SDK——结构化输出</a></li>
+    <li><a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs">Claude API——结构化输出、受支持的 schema 与严格模式上限</a></li>
+  </ul>
+</section>

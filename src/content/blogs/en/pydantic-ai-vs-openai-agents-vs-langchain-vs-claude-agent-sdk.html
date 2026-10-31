@@ -1,0 +1,153 @@
+<p class="lede">Every one of these four frameworks will hand you a validated Python object instead of a string, and that is not where they differ. They differ on the one line of behaviour nobody reads the docs for: what happens when the model's answer does not fit the type. One retries on a budget, one raises into your request handler, and one retries or does not depending on which of three ways you declared the schema — where the most ergonomic declaration is the one that does not retry. That default is the whole decision, because it chooses whether your bad-output tail costs you a second inference call, a stack trace, or a wrong answer delivered with a straight face.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>The declaration syntax is a day-one concern and it is all anyone compares. The failure semantics are a month-three concern and they are what you will actually live with.</p>
+  <table>
+    <thead>
+      <tr><th>Framework</th><th>How you declare it</th><th>On invalid output</th><th>Semantic rejection</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Pydantic AI</td>
+        <td><code>output_type</code> on the agent</td>
+        <td>Feeds the error back, retries on a shared budget</td>
+        <td><code>ModelRetry</code> from an output validator</td>
+      </tr>
+      <tr>
+        <td>OpenAI Agents SDK</td>
+        <td><code>output_type</code> / <code>outputType</code></td>
+        <td>Raises <code>ModelBehaviorError</code> by default</td>
+        <td>Opt-in run error handler returning a fallback</td>
+      </tr>
+      <tr>
+        <td>LangChain <code>create_agent</code></td>
+        <td><code>response_format</code>, three forms</td>
+        <td>Retry handler applies to <code>ToolStrategy</code> only</td>
+        <td>Not built in</td>
+      </tr>
+      <tr>
+        <td>Claude Agent SDK</td>
+        <td>JSON Schema, Zod or Pydantic</td>
+        <td>Leans on provider enforcement</td>
+        <td>Not built in</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/pydantic-ai-vs-openai-agents-vs-langchain-vs-claude-agent-sdk/data-failure-defaults.svg" alt="Matrix of the four SDKs against retry on invalid output, semantic rejection hook, and where the failure lands by default." width="900" height="400" loading="lazy" />
+    <figcaption>Only one of the four retries by default in every configuration, and only one gives you a first-class way to reject an answer that parsed but was wrong.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Pydantic AI: the validation error is a prompt</h2>
+  <p>Pydantic AI treats a failed validation as information to give the model rather than an error to report to you. A structured output that does not validate — and equally a tool call whose parameters do not validate — is passed back with a request to try again, which is the behaviour most people assume they are getting from all four and are getting from one.</p>
+  <p>The retry budget is shared and finite, and exhausting it raises <code>UnexpectedModelBehavior</code> with a message naming the limit: <em>Exceeded maximum output retries</em>. That is the right shape for a loop that could otherwise run forever, but note the budget is shared with tool-call retries, so a run that spent its allowance arguing about a tool signature has none left for the final answer.</p>
+  <p>The feature worth stealing is <code>ModelRetry</code>, which an output validator can raise to reject a result that <em>passed</em> the schema. This is the only first-class hook among the four for the failure that matters most in practice — the object is well-formed and the content is wrong. A schema cannot check that an ID resolves or a total adds up, and here you get to send that judgement back to the model in the same loop rather than bolting a second pass onto the outside.</p>
+</section>
+
+<section>
+  <h2>OpenAI Agents SDK: raises, and that is defensible</h2>
+  <p>The Python SDK's default when a final message fails to validate against <code>output_type</code> is to raise <code>ModelBehaviorError</code>. There is an opt-in run error handler for the <code>invalid_final_output</code> case which can return an application-specific fallback — and usefully, the SDK validates that fallback against the same <code>output_type</code>, so you cannot smuggle an untyped object back into a typed pipeline.</p>
+  <p>Raising is a real position, not an omission. It makes the failure loud at the boundary you control, which is exactly what the <a href="/concepts/fail-closed-and-fail-open">fail-closed</a> argument asks for, and it refuses to spend your money retrying without being told to. The cost is that an unhandled <code>ModelBehaviorError</code> in a request path is an exception in production, and the JavaScript SDK has produced a steady trickle of reports from people who discovered this when a service went down — including one open issue, filed within days of writing against <code>@openai/agents-core</code> 0.21.0, where commentary and a final-answer JSON message arrive concatenated and validation fails on the pair.</p>
+  <p>Treat the handler as mandatory rather than optional. The default is correct and it is also not a production configuration.</p>
+</section>
+
+<section>
+  <h2>LangChain create_agent: the ergonomic path is the one that gives up</h2>
+  <p>This is the one worth reading carefully, because the trap is in the convenience. <code>create_agent</code>'s <code>response_format</code> accepts three things: a <code>ToolStrategy</code>, a <code>ProviderStrategy</code>, or a bare schema type. Passing a bare Pydantic model — the obvious, documented, one-line thing to do — auto-selects <code>ProviderStrategy</code>.</p>
+  <p>The retry handler applies to <code>ToolStrategy</code>. So the bare-schema path, which is what you will write first and what most examples show, does not retry a malformed reply; the fix is to wrap the same schema in <code>ToolStrategy</code> explicitly. That asymmetry is not announced by the type signature, both forms produce a validated object on the happy path, and the difference only shows up in the tail.</p>
+  <p>There is a real trade underneath, which is why it is not simply a bug: provider-enforced structured output is cheaper and stricter, and a retry costs an extra model call. But the two options are presented as interchangeable ways to say the same thing when they have different reliability characteristics, and the shorter one is the weaker one. If you use <code>create_agent</code>, make the strategy explicit in your code even when the default would pick the one you want — the next reader cannot tell which you meant.</p>
+</section>
+
+<section>
+  <h2>Claude Agent SDK: the failure moved upstream</h2>
+  <p>The Claude Agent SDK accepts a JSON Schema, a Zod schema or a Pydantic model and returns a <code>structured_output</code> field carrying validated data. It has the least framework-level retry machinery of the four, and in a provider-enforced design that is close to consistent rather than missing: when the sampler is constrained against your schema, "the output did not fit the type" is not the failure you get.</p>
+  <p>What you get instead are the three failures that live outside the schema — a refusal, which arrives in a shape your schema never described; a truncation at the token cap, which yields a valid prefix of an invalid document; and a pre-generation rejection of the schema itself, which is deterministic and must never enter a retry loop. Anthropic's documented strict-mode limits are where the third one comes from: as of October 2026, at most 20 strict tools per request, 24 optional parameters in total across every strict schema in that request, 16 parameters carrying union types, and a 180-second schema compilation timeout, with an unsupported feature returning a 400 rather than degrading quietly.</p>
+  <p>So the comparison is not "this one has no retries." It is that the framework-level retry other SDKs give you is aimed at a failure this design mostly eliminates, while leaving three it cannot touch. Those are your job either way; <a href="/concepts/structured-outputs">structured outputs</a> works through the four-branch parse path they imply.</p>
+</section>
+
+<section>
+  <h2>Cross-cutting: a retry is an inference call, and a raise is a decision you deferred</h2>
+  <figure>
+    <img src="/blogs/pydantic-ai-vs-openai-agents-vs-langchain-vs-claude-agent-sdk/arch-where-the-failure-lands.svg" alt="An invalid output branching into three lanes: feeding the error back for a second inference call, raising into the caller's exception handler, and handing the problem onward to your code or the user." width="900" height="500" loading="lazy" />
+    <figcaption>The three exits cost a retry, a stack trace, and a silent wrong answer — in that order of preference, and the frameworks do not let you pick without reading the source.</figcaption>
+  </figure>
+  <p>Read across the four and there are only three places a non-conforming answer can go, and each framework's default picks one for you. Feeding the error back buys the best outcome and bills you for a second call on every occurrence, which is fine at a 1% failure rate and a budget line item at 15%. Raising spends nothing and converts a model problem into an availability problem, which is the right trade only if someone wrote the handler. Handing the object onward unchanged costs nothing and is the only one of the three that can produce a confidently wrong answer in front of a user, which is why it is the worst default to inherit by accident — and it is precisely the one you inherit by accident, in LangChain's bare-schema path.</p>
+  <p>The second thing that reads across is that none of the four frameworks, bar Pydantic AI's <code>ModelRetry</code>, has an opinion about the output being <em>wrong</em>. Schema conformance is the only test any of them applies by default, and conformance is necessary and never sufficient: numeric bounds and string-length keywords are not enforced by the strict modes underneath, so a validated object can carry an out-of-range number that your type annotation claims is impossible. Every one of these stacks needs semantic validation in your own code, and three of the four give you nowhere natural to put it.</p>
+  <p>Which leads to the thing worth measuring before you choose. Instrument your current stack for a week and get the rate: how often does a final answer fail validation? Below a percent or so, the raise-by-default position is fine and the retry is a rounding error either way. Above a few percent, the retry pays for itself in user-visible success and you should know what it is costing — and you should also go and look at the schema, because a double-digit invalid rate is usually a schema that asks the model questions it cannot answer rather than a framework that retries too rarely.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Extraction pipeline, batch, correctness over cost</td>
+        <td>Pydantic AI</td>
+        <td>Retries by default and <code>ModelRetry</code> lets you reject content that parsed but is wrong.</td>
+      </tr>
+      <tr>
+        <td>Synchronous request path with a strict latency budget</td>
+        <td>OpenAI Agents SDK</td>
+        <td>Raises instead of silently doubling your p99 — write the error handler and you have an explicit policy.</td>
+      </tr>
+      <tr>
+        <td>Already on LangGraph for durable execution</td>
+        <td>LangChain <code>create_agent</code></td>
+        <td>Fine, but pass <code>ToolStrategy</code> explicitly; the bare schema will not retry.</td>
+      </tr>
+      <tr>
+        <td>Claude-only, schema is stable and small</td>
+        <td>Claude Agent SDK</td>
+        <td>Provider enforcement removes the malformed-output case; budget for refusal, truncation and the schema 400 instead.</td>
+      </tr>
+      <tr>
+        <td>Schema has 20+ fields or deep optionality</td>
+        <td>None of the above, yet</td>
+        <td>Fix the schema first — strict modes ration or ban optional fields, so every field is a compulsory question.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Which of these four retries a bad structured output by default?</h3>
+  <p>Pydantic AI does, feeding the validation error back to the model within a shared retry budget. LangChain's <code>create_agent</code> retries only under <code>ToolStrategy</code>, and a bare Pydantic model auto-selects the provider path that does not. The OpenAI Agents SDK raises <code>ModelBehaviorError</code> by default, and the Claude Agent SDK relies on provider-side enforcement instead.</p>
+  <h3>Why does a bare Pydantic model behave differently from ToolStrategy in LangChain?</h3>
+  <p>A bare schema auto-selects <code>ProviderStrategy</code>, which uses the provider's own structured-output enforcement, while the framework's retry handler is wired to <code>ToolStrategy</code>. Both return a validated object when things go well, so the difference is invisible until a reply is malformed. Pass the strategy explicitly.</p>
+  <h3>Is raising an exception the wrong default?</h3>
+  <p>No — it is a defensible one. It makes the failure loud at a boundary you control and refuses to spend tokens retrying without being asked. It is just not a production configuration on its own, so treat the opt-in error handler as mandatory rather than optional.</p>
+  <h3>Does constrained decoding make framework retries unnecessary?</h3>
+  <p>It removes the malformed-JSON case and leaves three it cannot touch: a refusal that arrives outside your schema, a truncation at the token cap that yields a valid prefix of an invalid document, and a deterministic pre-generation rejection of the schema. The last must never go into a retry loop.</p>
+  <h3>Will any of these catch an answer that is well-formed but wrong?</h3>
+  <p>Only Pydantic AI, via <code>ModelRetry</code> raised from an output validator. The other three apply schema conformance and nothing else, and conformance does not check that an ID resolves or a total adds up — numeric and string-length keywords are not enforced by the strict modes underneath. Semantic validation is your code's job in all four.</p>
+  <h3>How do I decide without rewriting my stack?</h3>
+  <p>Measure the rate at which final answers fail validation on your current setup. Under about one percent, the default barely matters. Above a few percent, look at the schema before you look at the framework — that rate usually means the schema is asking the model questions it cannot answer from the input.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/concepts/structured-outputs">Structured outputs</a> — what schema enforcement guarantees, and the four-branch parse path it leaves you.</li>
+    <li><a href="/concepts/constrained-decoding">Constrained decoding</a> — how the token mask is actually built.</li>
+    <li><a href="/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">JSON Schema subsets per vendor</a> — which keywords survive which provider, and what ports.</li>
+    <li><a href="/deep-dives/tool-capability-design/structured-outputs-vs-tool-calls">Structured outputs vs tool calls</a> — the same machinery, two consent surfaces.</li>
+    <li><a href="/concepts/agent-frameworks">Agent frameworks</a> — choosing on the interpose surface rather than the abstraction.</li>
+  </ul>
+  <h3>Primary sources:</h3>
+  <ul>
+    <li><a href="https://ai.pydantic.dev/agent/">Pydantic AI — agents, retries and output validators</a></li>
+    <li><a href="https://openai.github.io/openai-agents-python/ref/agent_output/">OpenAI Agents SDK (Python) — agent output reference</a></li>
+    <li><a href="https://docs.langchain.com/oss/python/langchain/structured-output">LangChain — structured output strategies for create_agent</a></li>
+    <li><a href="https://platform.claude.com/docs/en/agent-sdk/structured-outputs">Claude Agent SDK — structured outputs</a></li>
+    <li><a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs">Claude API — structured outputs, supported schemas and strict-mode limits</a></li>
+  </ul>
+</section>
