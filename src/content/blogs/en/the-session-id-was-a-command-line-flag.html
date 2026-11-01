@@ -1,0 +1,87 @@
+<p class="lede">A session ID is the most innocent string in an agent system — opaque, meaningless, the sort of value you forward without looking. In the Python Claude Agent SDK before 0.2.121 you could forward one that began with a hyphen, and the Claude CLI read it as a flag. The flag worth reaching was <code>--mcp-config</code>, and that is what makes this a 9.2 rather than a footnote: it does not run a command and finish, it mounts a tool the model can keep calling, and it does so upstream of the permission system that was supposed to approve tool use.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>One record, read from GitHub's advisory database on 1 November 2026.</p>
+  <table>
+    <thead>
+      <tr><th>Field</th><th>Value</th><th>Why it matters</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Identifiers</td><td>CVE-2026-96620 / GHSA-h4mw-j7qp-8mwm</td><td>Published 12 September 2026; reviewed and updated 16 October 2026</td></tr>
+      <tr><td>Package</td><td><code>claude-agent-sdk</code> (PyPI, Python)</td><td>The Python SDK, not the CLI itself</td></tr>
+      <tr><td>Affected / fixed</td><td>&lt; 0.2.121 / 0.2.121</td><td>A version bump, not a configuration change</td></tr>
+      <tr><td>Severity</td><td>Critical — CVSS v4.0 base 9.2</td><td><code>AV:N/AC:L/AT:P/PR:N/UI:N/VC:H/VI:H/VA:H</code></td></tr>
+      <tr><td>Weaknesses</td><td>CWE-20, CWE-78, CWE-88</td><td>Input validation, OS command injection, argument injection — in that order</td></tr>
+    </tbody>
+  </table>
+  <p>Three CWEs on one record is unusual and it is the most informative field here. The database could not pick one because the bug is a sequence: a value was not validated (CWE-20), which let it be read as an argument rather than data (CWE-88), which let it reach a command (CWE-78). Fixing the first link is the patch. Noticing that the second link exists at all is the part that generalises.</p>
+</section>
+
+<section>
+  <h2>What actually happened</h2>
+  <figure>
+    <img src="/blogs/the-session-id-was-a-command-line-flag/arch-how-the-flag-lands.svg" alt="An untrusted session identifier travels from an application through the SDK into the Claude CLI's argument vector, where a leading hyphen turns it into an --mcp-config flag that mounts a stdio MCP server, whose startup command runs before and outside the SDK's permission gate." width="900" height="500" loading="lazy" />
+    <figcaption>The permission gate sits on the path the model's tool calls take. The injected flag arrives on a different path and earlier, which is why bypassing it required no bypass.</figcaption>
+  </figure>
+  <p>The advisory's own description is three sentences long and every clause is load-bearing. The SDK "passed the resume option to the Claude CLI without validation." A value starting with <code>-</code> could be read as a separate CLI flag. An attacker who controlled that value could inject <code>--mcp-config</code> to define a stdio MCP server, which runs arbitrary commands at CLI startup — and this, in the advisory's words, "bypasses the SDK's permission controls."</p>
+  <p>Exploitation needs one thing from the application: that it passes untrusted input as the session ID for resume. That is not an exotic requirement. Resumption is how you build anything with a conversation in it, and the session handle is the natural thing to put in a URL path, a query parameter, a webhook payload or a job record. It is a handle, so you treat it as a handle: you do not parse it, you do not interpret it, you hand it back to the thing that issued it. Every instinct that makes a session ID easy to work with is the instinct that got it forwarded unexamined.</p>
+  <p>The vector's <code>AT:P</code> — attack requirements present — is the SDK's defence and the whole of it. Something in the deployment has to route attacker-influenced text into that parameter. Nothing in the SDK stopped it from being exploitable once that was true, and nothing in the SDK told you that parameter was dangerous.</p>
+</section>
+
+<section>
+  <h2>The flag is the story</h2>
+  <p>Argument injection is an old bug class and the usual reading of it is "an attacker got a command to run". That reading undersells this one, because the flags available on an agent harness are not ordinary flags. A harness's command line is where you tell it which model to use, which directory to work in, which hooks to fire, what it may do without asking, and which tool servers to mount. It is the harness's configuration channel, which is to say it is the control plane. An injected flag is not an executed command; it is an edit to the policy.</p>
+  <p><code>--mcp-config</code> is the worst entry on that surface and it is worth being precise about why. A stdio MCP server is defined by a command to launch. So defining one gets you execution at startup — that is the CWE-78 half, and it is already critical. But it also gets you something that outlives the launch: a server in the session's tool list, advertising tools, for the model to call for as long as the session lasts. The injection does not produce an event. It produces a capability.</p>
+  <p>That is also why the permission system was not in the way. The SDK's controls decide whether a tool call the model proposes may proceed. They are a gate on one path. The injected flag travelled the configuration path instead, and it arrived before the model had proposed anything — so it did not defeat the gate, it populated the thing the gate was asked to approve against. A gate that decides which of the listed tools may run has nothing to say about who wrote the list. This is the same structural failure as <a href="/concepts/ambient-authority">ambient authority</a>: the authority was already in the process, and the check was downstream of it.</p>
+</section>
+
+<section>
+  <h2>Where this generalises</h2>
+  <figure>
+    <img src="/blogs/the-session-id-was-a-command-line-flag/data-what-an-app-forwards.svg" alt="Matrix of four values an application commonly forwards into an agent harness, scored on whether it looks like data, whether it reaches the argument vector, whether it can grant a capability, and whether anything validates it by default." width="900" height="400" loading="lazy" />
+    <figcaption>The row that bit here is the one that scores "pure data" on the only axis most reviews check.</figcaption>
+  </figure>
+  <p>Go through your own integration and list every value your application hands an agent harness that originated outside it. The session or thread ID. The model name, when it comes from a user preference. The working directory, when it comes from a project record. A prompt file path. A profile or config name. Each of those is a string you forward because it is not content, and forwarding it is the point. The question to ask of each one is not "could this contain a shell metacharacter" — that is the 2005 question and the sandbox mostly answers it. The question is <em>does this reach argv, and what is the most powerful flag that lives there</em>.</p>
+  <p>Two patterns fix the class rather than the instance. Use the argument terminator: everything after <code>--</code> is positional, so a value that cannot be a flag cannot become one, and that single change would have made a hyphen-leading session ID an invalid session ID instead of a configuration edit. Better still, keep untrusted values out of argv entirely — pass them on stdin, in an environment variable you set yourself, or through a file whose path you control — and reserve the command line for values your own code chose. The patch in 0.2.121 validates the resume value, which is correct and narrower: it closes the one parameter that was reported.</p>
+  <p>Then separate the two reviews you are now doing at once. "May this tool call proceed" is the question your permission system answers. "Which tools exist in this session, and who decided" is a different question, it is answered at startup, and in most harnesses nothing logs the answer. <a href="/concepts/blast-radius">Blast radius</a> is set by the second one.</p>
+</section>
+
+<section>
+  <h2>The two dates</h2>
+  <p>The record carries two: published 12 September 2026, reviewed and updated 16 October 2026. Which of those is the day you heard about it depends entirely on which one your tooling keys off, and the gap is thirty-four days. If you learned about this from a dependency scanner in the second half of October, the advisory had existed for a month; if you read release notes, you had it in September. That is not a criticism of anyone — curation takes time and curated data is why scanners are usable at all — but it is worth knowing which clock you are on before you conclude you are current.</p>
+  <p>The practical check takes a minute: <code>pip show claude-agent-sdk</code>, and if the version is below 0.2.121, upgrade. Then grep your own code for where the resume or session parameter comes from, because the upgrade closes the flag and does not change the fact that you were forwarding attacker-reachable text into a harness's command line.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>What is CVE-2026-96620?</h3>
+  <p>An argument-injection flaw in the Python <code>claude-agent-sdk</code> package before version 0.2.121. The SDK passed its <code>resume</code> option to the Claude CLI without validating it, so a value beginning with a hyphen could be interpreted as a command-line flag. GitHub tracks it as GHSA-h4mw-j7qp-8mwm with a CVSS v4.0 base score of 9.2.</p>
+  <h3>Am I affected?</h3>
+  <p>Only if you use the Python SDK at a version below 0.2.121 <em>and</em> your application passes input you do not control as the session ID for resume. The advisory states that requirement explicitly, and the CVSS vector records it as attack requirements present. Upgrading removes the exposure regardless.</p>
+  <h3>Why is the score so high if an application has to cooperate?</h3>
+  <p>Because of what the reachable flag does. Injecting <code>--mcp-config</code> defines a stdio MCP server, which runs a command at CLI startup and then stays in the session as a tool the model can call. The impact metrics are high across confidentiality, integrity and availability, and the advisory notes it bypasses the SDK's permission controls.</p>
+  <h3>Does this mean MCP is insecure?</h3>
+  <p>No. MCP servers are meant to be configured by whoever runs the agent; that is the feature. The flaw is that a value from outside reached the configuration channel. Any flag that mounts a tool is equally dangerous to hand to an attacker, and the problem is the path the value took, not the protocol at the end of it.</p>
+  <h3>Would a sandbox have contained it?</h3>
+  <p>Partly, and not in the way you would hope. A sandbox limits what the injected startup command can touch, which is real mitigation. It does nothing about the mounted server remaining in the tool list for the rest of the session, because that is the agent doing exactly what its configuration says.</p>
+  <h3>What is the one-line fix for my own code?</h3>
+  <p>Stop putting untrusted strings in argv. Pass them on stdin, in an environment variable, or in a file you control; where you must use a command line, put the value after <code>--</code> so it cannot be read as a flag.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/deep-dives/agent-security/harness-configuration-injection">Harness configuration as an injection target</a> — the general case, and the other flags on that surface.</li>
+    <li><a href="/concepts/ambient-authority">Ambient authority</a> — why a downstream check cannot fix an upstream grant.</li>
+    <li><a href="/concepts/auto-approval-and-allowlists">Auto-approval and command allowlists</a> — the argv-versus-string lesson from the other direction.</li>
+    <li><a href="/operations/safety-and-security/lifecycle-hooks-and-harness-config">Lifecycle hooks and harness config</a> — the configuration surface as an operational problem.</li>
+    <li><a href="/concepts/blast-radius">Blast radius</a> — what a mounted tool changes about the size of a mistake.</li>
+  </ul>
+  <h3>Primary sources:</h3>
+  <ul>
+    <li><a href="https://github.com/advisories/GHSA-h4mw-j7qp-8mwm">GitHub Advisory Database — GHSA-h4mw-j7qp-8mwm (CVE-2026-96620)</a></li>
+    <li><a href="https://nvd.nist.gov/vuln/detail/CVE-2026-96620">NVD — CVE-2026-96620</a></li>
+  </ul>
+</section>

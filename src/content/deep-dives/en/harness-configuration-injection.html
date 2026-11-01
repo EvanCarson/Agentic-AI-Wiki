@@ -1,0 +1,120 @@
+<section class="phase">
+  <div class="phase-num">S15</div>
+  <div class="week">Deep Dive · Agent Security</div>
+  <h2>Harness configuration as an injection target: the channel that decides which tools exist is the one nobody treats as untrusted.</h2>
+  <p class="goal">An agent harness takes input on two channels and you review one of them. The conversation is untrusted by assumption and wrapped in a permission system; the configuration — argv, config files, environment, skill directories — is trusted by assumption because developers write it, and it is the channel that decides which tools exist at all. Anything that carries request-shaped data onto that second channel is a privilege escalation that arrives upstream of the gate, so the gate never sees it: CVE-2026-96620 scored 9.2 by turning a session ID into <code class="inline">--mcp-config</code>, and the fix that generalises is keeping untrusted values out of argv and separating a requirement from a preference.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Two channels in, and the threat model only covers one.</h3>
+
+    <p>Draw the inputs to a running agent and there are exactly two kinds.</p>
+
+    <ul>
+      <li><strong>The content channel.</strong> Prompts, tool results, retrieved documents, web pages, emails. Everybody knows this one is hostile. It has a literature, a permission gate, an <a class="xref" href="/concepts/instruction-hierarchy">instruction hierarchy</a> and a decade of injection research pointed at it.</li>
+      <li><strong>The configuration channel.</strong> Command-line arguments, config files and the paths to them, environment variables, hook definitions, MCP server declarations, skill directories, profile names. Nobody models this one as hostile, because the mental image is a developer typing a flag.</li>
+    </ul>
+
+    <p>That asymmetry is the whole vulnerability class. The content channel is where the model's <em>intentions</em> come from, and the gate exists to second-guess them. The configuration channel is where the model's <em>capabilities</em> come from, and there is no gate, because configuration is supposed to be the thing doing the gating. <a class="xref" href="/deep-dives/agent-security/configuration-as-reconnaissance">Configuration as reconnaissance</a> covers what an attacker learns by <em>reading</em> this channel; this page is about what happens when they can write to it.</p>
+
+    <div class="callout warn">
+      <p>The distinction that matters is not "data versus code". It is <em>which question the value answers</em>. A value on the content channel answers "what should I do?" — and may be refused. A value on the configuration channel answers "what am I able to do?" — and refusal is not a concept that applies.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Enumerate what actually lives on the configuration channel.</h3>
+
+    <p>Before arguing about injection, list the surface. For a current coding or agent harness, configuration decides at least:</p>
+
+    <ul>
+      <li><strong>Which tool servers are mounted</strong> — MCP server declarations, each defined by a command to launch or a URL to reach.</li>
+      <li><strong>Which filesystem is reachable</strong> — working directory, additional directories, mount points.</li>
+      <li><strong>What proceeds without asking</strong> — permission modes, approval policies, allowlists.</li>
+      <li><strong>What runs around the model's turns</strong> — lifecycle hooks, which are shell commands bound to events and fire where the model never observes them.</li>
+      <li><strong>Which instructions are in force</strong> — system-prompt fragments, project instruction files, skill folders.</li>
+      <li><strong>Which model and which budget</strong> — the cheap-looking entries, and the ones that turn into a cost incident rather than a breach.</li>
+    </ul>
+
+    <p>Read that list as a capability grant and the ordering becomes obvious: the first entry is the worst, because it does not constrain behaviour, it <em>adds</em> it. Everything else on the list narrows or widens what the agent may do with tools it already has. A mounted server changes the set of tools that exist. <a class="xref" href="/concepts/agent-harness">The agent harness</a> is the general argument that this surface, not the weights, is where observed behaviour lives; here it is also where authority lives.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Three paths by which request data reaches it, and a worked example.</h3>
+
+    <p>Request-shaped data gets onto the configuration channel in three ways, in descending order of how often it is reviewed:</p>
+
+    <ul>
+      <li><strong>Into argv.</strong> Your application forwards a value — a session ID, a model name, a working directory, a profile name — into the command line of the process that enforces your controls. If the value can begin with <code class="inline">-</code>, it is not a value any more.</li>
+      <li><strong>Into a config file, or its path.</strong> A tenant-supplied project name becomes a directory name becomes a path to the settings file the harness reads. Nothing was injected into a string; the harness simply read a different file than you meant.</li>
+      <li><strong>Into a store the harness re-reads.</strong> The newest and the least studied: the configuration lives in a bucket or a directory, and the harness reloads it while running.</li>
+    </ul>
+
+    <p>The worked example for the first path is CVE-2026-96620 (GHSA-h4mw-j7qp-8mwm), a critical argument-injection flaw in the Python <code class="inline">claude-agent-sdk</code> before 0.2.121, published 12 September 2026 and reviewed into GitHub's database on 16 October 2026 with a CVSS v4.0 base score of 9.2. The advisory's description is four clauses and each is a step:</p>
+
+<pre class="standalone"><span class="c-cm"># the chain, as the advisory describes it</span>
+<span class="c-st">1.</span> the SDK passed the <span class="c-kw">resume</span> option to the Claude CLI without validation
+<span class="c-st">2.</span> a value starting with <span class="c-st">"-"</span> could be read as a separate CLI flag
+<span class="c-st">3.</span> an attacker controlling it could inject <span class="c-kw">--mcp-config</span> to define a stdio MCP server
+<span class="c-st">4.</span> which runs arbitrary commands at CLI startup  <span class="c-cm"># -&gt; bypasses the SDK's permission controls</span>
+
+<span class="c-cm"># CWE-20 (validation) -&gt; CWE-88 (argument injection) -&gt; CWE-78 (command injection)</span>
+<span class="c-cm"># three weaknesses on one record because the bug is a sequence, not a category</span></pre>
+
+    <p>Note which parameter it was. A session ID is the most opaque value in the system — you do not parse it, you do not interpret it, you hand it back to whoever issued it, and that discipline is exactly why it travelled unexamined. The exploitability requirement, recorded in the vector as <code class="inline">AT:P</code>, is that some application routes attacker-influenced text into that parameter; resumption is how anything with a conversation in it works, so the session handle lives in URLs, webhook payloads and job records by default. We work through the single incident in <a class="xref" href="/blogs/the-session-id-was-a-command-line-flag">the session ID was a command-line flag</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>A flag that mounts a tool is categorically worse than a flag that runs a command.</h3>
+
+    <p>Argument injection is normally scored as execution: an attacker got a process to run something. That undersells an agent harness, and the difference is worth stating precisely, because it changes what mitigation means.</p>
+
+    <p>A stdio MCP server is <em>defined by a command to launch</em>. So declaring one buys the attacker two things, not one. The first is execution at startup, which is the ordinary command-injection half and is already critical. The second is a server sitting in the session's tool list, advertising tools, available for the model to call for as long as the session lives. The injection does not produce an event that your incident timeline can bracket. It produces a capability with a duration.</p>
+
+    <p>This is why the permission system was not in the way, and it is the part most often described as a "bypass" when nothing was bypassed. The gate answers one question: may this proposed tool call proceed? It is a check on the content channel's output. The injected declaration travelled the configuration channel, and it arrived before the model had proposed anything — so it did not defeat the gate, it <em>populated the list the gate was asked to approve against</em>. A gate that decides which listed tool may run has no opinion about who wrote the list. That is the same structure as <a class="xref" href="/concepts/ambient-authority">ambient authority</a>, and the same reason <a class="xref" href="/deep-dives/agent-security/policy-as-code-for-agents">policy-as-code</a> has to evaluate the tool inventory and not just each call.</p>
+
+    <p>Two practical consequences follow. A sandbox is real mitigation for the first half and does nothing for the second, because a mounted server being callable is the agent obeying its configuration correctly. And <a class="xref" href="/concepts/blast-radius">blast radius</a> for this class is set at startup, not at approval time — which means the question "what tools existed in that session, and which component put them there" is a forensic question most harnesses currently cannot answer.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The third path is now a product feature, and its validator warns rather than refuses.</h3>
+
+    <p>Configuration used to be a build artefact: written at deploy, read at startup, unchanged until the next deploy. That is no longer the shape. Cloudflare's Agents SDK 0.32.0, released 29 October 2026, loads agent skills from three sources — a Computer Workspace, an R2 bucket, or code — and its documentation is explicit that the workspace case exists so that skills can "be files the agent, a user, or your code can add and edit at runtime". Workspace skills live in <code class="inline">/workspace/.agents/skills/</code>, one folder with a <code class="inline">SKILL.md</code> each, and the runtime lists every source again before each turn, so a skill written during a conversation takes effect on the next one.</p>
+
+    <p>Read that as a configuration channel and three properties stack up. It is writable by the agent itself, which means a successful content-channel injection can write a persistent capability instead of taking a single action. It is re-read at every turn boundary, which means "which skills does this agent have" has no stable answer for the duration of a session. And its validation fails open: a <code class="inline">SKILL.md</code> that breaks a spec rule still loads, with a logged warning, while only a skill that cannot be used at all — one with no description — is skipped.</p>
+
+    <div class="callout">
+      <p>None of this is a vulnerability, and that is the point worth sitting with. Every one of those three properties is a deliberate, defensible design decision — runtime-editable skills are genuinely useful, re-listing per turn is the only way to make them useful, and a warning rather than a refusal is the right default for a spec still in motion. The consequence is structural anyway: the artefact you reviewed at deploy is not the artefact that runs, and <a class="xref" href="/concepts/fail-closed-and-fail-open">fail-open</a> validation means the deviation does not announce itself. <a class="xref" href="/deep-dives/agent-security/vetting-a-third-party-skill">Vetting a third-party skill</a> covers reviewing the folder; this is the problem that the folder is no longer where you left it.</p>
+    </div>
+
+    <p>So treat a re-read configuration store as untrusted input with a permission model, not as configuration. Make the write path narrower than the read path: the agent may read the skill directory and may not write it, or may write only to a staging prefix a separate job promotes. Log the catalog, not the config file — a hash of the resolved tool and skill list per turn is small, diffable, and is the only artefact that lets you answer what the agent could do at 14:32. <a class="xref" href="/operations/agentops/tool-catalog-lifecycle">Tool catalog lifecycle</a> has the operational machinery for that inventory.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Two structural fixes, and the distinction most harnesses get wrong.</h3>
+
+    <p>The first fix is argv hygiene, and it is almost free. Everything after <code class="inline">--</code> is positional, so a value placed there cannot be read as a flag; a hyphen-leading session ID becomes an invalid session ID rather than a configuration edit. Better still, keep untrusted values off the command line entirely — stdin, an environment variable your own code sets, or a file whose path you chose — and reserve argv for values your code picked. Patching the one reported parameter is correct and narrower; the class fix is the channel.</p>
+
+<pre class="standalone"><span class="c-cm"># the class fix, not the instance fix</span>
+<span class="c-err">bad </span>: run([<span class="c-st">"agent"</span>, <span class="c-st">"--resume"</span>, session_id])          <span class="c-cm"># session_id can be a flag</span>
+<span class="c-kw">ok  </span>: run([<span class="c-st">"agent"</span>, <span class="c-st">"--resume"</span>, <span class="c-st">"--"</span>, session_id])    <span class="c-cm"># cannot be a flag</span>
+<span class="c-fn">best</span>: run([<span class="c-st">"agent"</span>], env={<span class="c-st">"AGENT_SESSION"</span>: session_id})
+
+<span class="c-cm"># and validate shape at the boundary, because a session ID has one</span>
+<span class="c-kw">if</span> <span class="c-kw">not</span> re.fullmatch(<span class="c-st">r"[0-9a-f-]{36}"</span>, session_id): <span class="c-kw">raise</span>
+<span class="c-out"># an opaque handle is still a handle with a grammar. Enforce the grammar.</span></pre>
+
+    <p>The second fix is the one that is conceptually load-bearing: <strong>separate a requirement from a preference, and put them in different files</strong>. A preference is a setting the operator may change; a requirement is a setting they may not. If both live in the same file, the layer you intended as a control is writable by the party it constrains — and in an agent system that party includes the agent, which can edit files.</p>
+
+    <p>OpenAI's Codex CLI documents this split and is worth copying precisely because it is pedantic about it: an administrator can set <code class="inline">allow_managed_hooks_only = true</code> in <code class="inline">requirements.toml</code> to ignore user, project and session hook configs while still allowing hooks from the requirements and managed-config layers — and the documentation states that this setting is supported <em>only</em> in <code class="inline">requirements.toml</code>, so putting it in <code class="inline">config.toml</code> does not enable managed-hooks-only mode. The same key is a control in one file and a no-op in another. That is not an inconsistency; it is the whole mechanism, and it is what "a setting is only a control if the constrained party cannot write it" looks like in a real product. <a class="xref" href="/operations/safety-and-security/lifecycle-hooks-and-harness-config">Lifecycle hooks and harness config</a> covers running that split in practice.</p>
+
+    <div class="callout tip">
+      <p>Do it in this order. List every value your application forwards into a harness that originated outside your code — session and thread IDs first, they are the ones nobody flags — and for each one ask only whether it reaches argv and what the most powerful flag on that surface does. Put <code class="inline">--</code> in front of every such value today, then move them off argv entirely and validate their grammar at the boundary. Separate requirements from preferences into different files and confirm the agent's own write access cannot reach the requirement file. For any configuration store the harness re-reads at runtime, make the write path narrower than the read path and treat a fail-open validator as a detection gap, not a safety feature. Then log a hash of the resolved tool and skill catalog per turn, and alarm on a change you did not deploy — because for this class the only question that matters after an incident is which tools existed, and that is the one your traces currently do not record. If you keep one sentence: the permission gate decides which listed tool may run, and injection into configuration decides what is on the list.</p>
+    </div>
+  </div>
+</section>
