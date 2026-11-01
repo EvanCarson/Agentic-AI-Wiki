@@ -1,80 +1,133 @@
 <section class="phase">
   <div class="phase-num">V3</div>
   <div class="week">实战手册 · 语音与实时智能体</div>
-  <h2>轮次与打断：决定谁说话，以及被打断时停下。</h2>
-  <p class="goal">人类在对话中不假思索地协商轮次——他们听出一个念头的结尾、对打断让步、容忍短暂的叠音。语音智能体必须把这一切显式地、实时地、从一条音频流里、且没有共享社交模型地做出来。做错了，智能体要么碾压来电者，要么僵坐着等一句早已说完的话。这是语音里最难的交互问题，而它大体上不是模型问题。</p>
+  <h2>轮次与打断：难的不是检测到那次打断，而是你的对话状态从此与来电者听到的内容不一致了。</h2>
+  <p class="goal">语音栈里其余每一个组件都是你可以单独调优的流处理器；而轮次管理器是唯一持有可变状态的那一个，而一次打断会在它写到一半时把这份状态作废。那一瞬间有三个位置发生分叉——模型生成了什么、合成器产出了什么、以及真正抵达来电者耳朵的是什么——而如果你的历史记录的是第一个，那么这通电话接下来的时间里，智能体都会自信地引用一些根本没人听到过的句子。这就是为什么大多数「这智能体让人犯迷糊」的工单，是披着检测 bug 外衣的状态 bug；也是为什么修法是一条不对称的截断规则，而不是一个更好的阈值。</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>VAD 不是端点检测，把二者混淆是根因 bug。</h3>
+    <h3>VAD 不是端点检测，而把两者混为一谈，是那个状态 bug 底下的根因 bug。</h3>
 
-    <p>两件不同的活，却被不断混为一谈：</p>
+    <p>两件互不相同的工作，却总被塞进同一个配置值里：</p>
 
     <ul>
-      <li><strong>VAD（语音活动检测）</strong>回答"此刻这一音频帧里有语音吗？"——一个低层、亚 100 ms 的信号。它不知道一个<em>轮次</em>是否结束；思考停顿同样是静音。</li>
-      <li><strong>端点检测（轮次结束检测）</strong>回答"来电者<em>说完了</em>吗，以至于智能体现在该回应了？"——一个建在 VAD <em>之上</em>、并且理想情况下加上转写文本与含义的决策。</li>
+      <li><strong>VAD（语音活动检测）</strong>回答「这一帧里有语音吗？」——一个低层、百毫秒以下的信号。它不可能知道一个<em>轮次</em>有没有结束，因为思考时的停顿也是静音。</li>
+      <li><strong>端点检测</strong>回答「来电者<em>说完了</em>吗，以至于我现在该回应？」——这是一个建在 VAD 之上、并且最好还用上词语与其含义的决定。</li>
     </ul>
 
-    <div class="callout warn">
-      <p>仅靠原始 VAD 静音做端点检测，是语音智能体的经典失效。600 ms 静音阈值会切断任何停下来想的人（"我的账号是… 4 4 7…"），1500 ms 的又让智能体像睡着了。没有一个固定静音值能同时既有响应又有耐心——这正是固定超时落败的原因。</p>
-    </div>
+    <p>基于纯静音做端点检测是那个标志性的失效：600 ms 的阈值会切掉任何一个停下来想的人（「我的账号是……4 4 7……」），而 1,500 ms 又让智能体像睡着了。不存在哪个固定取值既灵敏又耐心，因为轮次内停顿与轮次末间隔来自两个重叠的分布，而且还会随说话人移动。<a class="xref" href="/zh/concepts/end-of-turn-detection">轮次结束检测</a>给出了完整论证，以及阈值为何是个错误旋钮；而在这里，其运维后果是：<strong>一个轮次边界是一次预测，这意味着它有时会错，这意味着你的状态模型必须能熬过「它错了」。</strong></p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>语义端点检测：用词语，不只是用静音。</h3>
+    <h3>用模型来定边界，并把它的输出当作概率、而不是当作事件。</h3>
 
-    <p>2025 年代的答案——由 LiveKit、AssemblyAI 与 OpenAI 的语义 VAD 轮次检测交付——是把部分转写文本喂进一个小模型，问它"这听起来像一句完整话语吗？"——再据答案调制静音阈值。</p>
+    <p>2026 年的答案是一个预测话语完整性、并据此调节等待的模型。生产环境里有三种形态，而它们之间的差别在于各自消费什么。OpenAI 的 Realtime API 在更早的 <code class="inline">server_vad</code> 之外，提供了一个带 eagerness 设置的 <code class="inline">semantic_vad</code> 轮次检测模式。LiveKit 的轮次检测器直接跑在音频上，融合声学与语义线索，而不是等一份转写。Deepgram 的 Flux 把轮次结束检测折进识别本身、阈值可配，文档给出约 260 ms 的轮次结束判定、多语种低于 400 ms。</p>
 
-<pre class="standalone"><span class="c-cm"># turn/endpoint.py — silence threshold is dynamic</span>
+<pre class="standalone"><span class="c-cm"># turn/endpoint.py — the threshold is an output, not a setting</span>
 <span class="c-kw">def</span> <span class="c-fn">end_of_turn</span>(partial, silence_ms):
-    p = complete_utterance_prob(partial)   <span class="c-cm"># small model</span>
+    p = complete_utterance_prob(partial)   <span class="c-cm"># acoustic + semantic</span>
     <span class="c-kw">if</span> p &gt; <span class="c-st">0.85</span>:
-        <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">120</span>    <span class="c-cm"># sounds done: fire fast</span>
+        <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">120</span>    <span class="c-cm"># sounds finished: fire fast</span>
     <span class="c-kw">if</span> p &lt; <span class="c-st">0.30</span>:
-        <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">1400</span>   <span class="c-cm"># "uh, my number is..." wait</span>
-    <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">600</span>        <span class="c-cm"># unsure: middle ground</span></pre>
+        <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">1400</span>   <span class="c-cm"># "uh, my number is..." — wait</span>
+    <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">600</span>        <span class="c-cm"># unsure: middle ground</span>
 
-    <p>降调的"今天天气怎样"约 120 ms 就结束一个轮次；带上扬尾音的"我的卡号是"则该给来电者一秒多的思考余地。同样的静音，相反的决策——因为词语承载了静音单独无法承载的意图。</p>
+<span class="c-cm"># what this buys you is not accuracy, it is a KNOB WITH A UNIT:</span>
+<span class="c-out">#   raise the p cut-offs  -> lower false cutoffs, higher response latency
+#   lower them            -> snappier, and you clip people mid-account-number
+# Pick the operating point from your own false-cutoff budget, not from a default.</span></pre>
+
+    <p>「天气怎么样」配上下降语调，大约 120 ms 就结束了一个轮次；而「我的卡号是」配上尾部上扬，应该为来电者买到一秒多的思考余地。同样的静音，相反的决定，因为词语承载着静音无法承载的意图。请注意这个模型<em>没有</em>买到什么：它并不消除错误的边界，它把边界挪到了一条你可以自己挑选工作点的曲线上。<a class="xref" href="/zh/playbooks/voice-realtime-agents/latency-budget">延迟预算</a>就是为那个工作点付账的地方。</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>打断：来电者随时可以打断，智能体必须让位。</h3>
+    <h3>打断不可妥协，而音频那一半是容易的一半。</h3>
 
-    <p>若来电者在智能体说话时开口，智能体必须<strong>在两三百毫秒内停下</strong>——而不是说完它那句。一个压着打断继续说的智能体被体验为无礼，更糟的是坏掉了；人们会挂断。在任何严肃的语音产品里，打断不可妥协。</p>
+    <p>如果来电者在智能体说话时开口，智能体必须在两百来毫秒内停下，而不是把这句话说完。一个压着打断继续说的智能体，先被体验为无礼、然后被体验为坏了，而人们会挂断。那套机械流程已经被理解得很清楚：</p>
 
 <pre class="trace"><span class="c-out">agent speaking ............ caller starts talking
                             |
                             +-- detect speech (VAD, &lt;100ms)
                             +-- STOP agent audio immediately
-                            +-- FLUSH unsent TTS / cancel response
-                            +-- discard the killed turn from state
+                            +-- FLUSH unsent TTS / cancel the LLM stream
+                            +-- RECONCILE state to what was actually heard   &lt;-- the hard one
                             +-- listen; the caller now has the floor</span></pre>
 
-    <p>微妙之处在状态：智能体说了十句中的三句，然后被打断。它实际<em>说出口</em>的——而不是它<em>生成</em>的——才是来电者听到的。你的对话状态必须反映这个被截断的现实，否则智能体会引用它从未真正出声说过的东西。</p>
+    <p>这五行里有四行是你只写一次的管道。第五行才是接下来两个季度里不断产出 bug 工单的那一行，而原因是：在打断发生的那一刻，「智能体说了什么」有三个不同的答案，它们之间隔着真实的缓冲区：</p>
+
+    <ul>
+      <li><strong>已生成。</strong>模型产出的每一个 token。LLM 的流远远跑在播放之前，所以这一项通常就是整段回复。</li>
+      <li><strong>已合成。</strong>TTS 已经变成音频的部分。它比播放超前的量，就是你为避免播放欠载而缓冲的那个量。</li>
+      <li><strong>已送出并被听到。</strong>在停止生效之前真正离开扬声器的部分——再减去仍坐在抖动缓冲与网络里的那些，那些来电者从未收到。</li>
+    </ul>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>回声消除是轮次的前提，而非音频的锦上添花。</h3>
+    <h3>对齐到「被听到的内容」，并给估计值加偏——两种错误的代价并不对称。</h3>
 
-    <p>智能体自己的声音会经由来电者的麦克风返回（尤其在免提时）。没有声学回声消除，VAD 会把智能体自己的语音看成"来电者在说话"，触发一次假打断，于是智能体把自己打断进一个结巴循环。稳健的 AEC 对轮次是承重的——一份轮次 bug 报告很常常就是一个回声 bug。</p>
+    <p>给这个差距装上数字，因为它比感觉上大得多。会话式语音约为每分钟 150 词，也就是每秒 2.5 词：</p>
+
+<pre class="standalone"><span class="c-cm"># how far "generated" runs ahead of "heard" at a barge-in</span>
+speech_rate   = <span class="c-st">2.5</span>      <span class="c-cm"># words/second</span>
+detect_stop   = <span class="c-st">400</span>      <span class="c-cm"># ms to notice and silence the output</span>
+playout_buf   = <span class="c-st">200</span>      <span class="c-cm"># ms of audio already in flight, never heard</span>
+tts_lookahead = <span class="c-st">1500</span>     <span class="c-cm"># ms synthesised but not yet played</span>
+
+uncertain_words = speech_rate * (detect_stop + playout_buf) / <span class="c-st">1000</span>   <span class="c-cm"># = 1.5</span>
+unheard_words   = speech_rate * tts_lookahead / <span class="c-st">1000</span>               <span class="c-cm"># = 3.75</span>
+
+<span class="c-cm"># and the LLM is further ahead still: if it streamed 10 sentences while</span>
+<span class="c-cm"># playback reached sentence 3, SEVEN sentences are in `generated` and were</span>
+<span class="c-cm"># never heard. Store `generated` as history and the agent now believes it</span>
+<span class="c-cm"># explained something it did not.</span></pre>
+
+    <p>对齐规则来自一个不对称。把一个词记成「听到了」而其实没有，智能体就会引用来电者毫无记忆的素材——这不是一个小瑕疵，这是智能体看起来在幻想自己那一侧的通话，而它会污染之后的每一个轮次。把一个词记成「没听到」而其实听到了，智能体只是稍微重复一下。两者之中，一个让人无法理解，另一个只是略显冗余，所以<strong>请把估计量朝「没听到」加偏</strong>：截断到你有正面确认的最后一个播放位置，丢掉那个不完整的词，并把所有「已合成但未播放」的内容全部扔掉。然后在历史里把这次截断显式标出来、而不是悄悄处理，好让模型知道这个轮次是被切断的：</p>
+
+<pre class="standalone"><span class="c-cm"># what goes in the transcript after a barge-in</span>
+{<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>,
+ <span class="c-st">"content"</span>: <span class="c-st">"Sure — your balance is $412.60 and the payment that"</span>,
+ <span class="c-st">"truncated"</span>: <span class="c-kw">True</span>,                 <span class="c-cm"># the model must see that it was cut</span>
+ <span class="c-st">"heard_ms"</span>: <span class="c-st">2140</span>}                   <span class="c-cm"># confirmed playback, not synthesis</span>
+
+<span class="c-cm"># the `truncated` flag is load-bearing: without it the model reads a</span>
+<span class="c-cm"># mid-sentence stop as its own choice and will not offer to finish.</span></pre>
+
+    <p>趁还在这儿，有两个副作用要处理。模型在那段被丢弃的尾巴里发出的工具调用绝不能执行——请在它抵达工具执行器<em>之前</em>取消这条流，而不是之后。而如果那个被截断的轮次里含有你有义务做出的某项告知，那么这项义务就没有被履行：<a class="xref" href="/zh/playbooks/voice-realtime-agents/disclosing-the-agent-on-a-call">在通话中披露智能体身份</a>与<a class="xref" href="/zh/playbooks/voice-realtime-agents/recording-consent-and-redaction">录音同意</a>里都有可能被一次打断切成两半的话术，而一段合规话术需要的是重新完整播报，而不是从中间接着说。</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>叠音、附和与全双工。</h3>
+    <h3>并非每一声响动都是在争夺话语权，而回声消除是前提、不是音频上的锦上添花。</h3>
 
-    <p>真实对话并非严格半双工。人们在对方说话时说"嗯哼""对"——<strong>附和（backchannel）</strong>——这些<em>不是</em>打断；把每一声"嗯哼"当作打断会让智能体不停停下。一个好的轮次管理器会区分一个延续信号（"嗯哼"，继续）与一次真正争夺话语权（"等等——其实…"，现在让位）。</p>
+    <p>真实的对话并不严格半双工。人们会在对方说话时发出「嗯」「对」——<strong>附和</strong>——而这些不是打断；把每一声「嗯哼」都当成打断，会让智能体不停地停下来，而这也是一套语音栈让人感觉「神经紧张」最常见的成因之一。一个好的轮次管理器会区分「续谈信号」（「嗯哼」，你继续）与一次真正的话语权争夺（「等等——其实……」，让位）。而便宜的一阶近似是时长加能量：短于 300 ms、低能量、非词汇性的事件，在被证明不是之前都算续谈信号。</p>
 
-    <p>较新的原生模型正走向真正的全双工：像人类那样同时听与说。它更自然，也相当难做对；在它稳健之前，多数生产栈跑一个有纪律的半双工轮次管理器，配快速打断与显式附和处理，因为一个可预测的智能体胜过一个不可预测的。</p>
+    <p>在这之下，智能体自己的声音会经由来电者的麦克风返回，在免手持扬声器上尤其明显。没有声学回声消除，VAD 会把智能体听成来电者，触发一次假打断，而智能体就会把自己打断成一个结巴循环。一份轮次相关的 bug 报告，很多时候其实是一个回声 bug；而在一条窄带 PSTN 链路上，声学条件比你的测试环境更差——<a class="xref" href="/zh/playbooks/voice-realtime-agents/audio-quality-and-codecs">音质与编解码</a>讲的是这条通道会对你的检测器所看到的信号做些什么。在动阈值之前，先去查 AEC。</p>
+
+    <div class="callout tip">
+      <p>两条能省下好几周的调优规则。打断灵敏度应该取决于智能体当下正在说什么：在复述一串长号码或一段法律告知时，请在让位之前要求更多证据，因为在那里一次误切的代价是整段复述重来一次——见<a class="xref" href="/zh/playbooks/voice-realtime-agents/alphanumerics-over-voice">用语音传递字母与数字</a>。以及，永远不要全局调节 eagerness：一条催收 IVR 想要快而果断，一条哀伤陪护热线想要慢而耐心，而给两者出同一套调优，是这里唯一真正的错误。</p>
+    </div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>诚实的权衡。</h3>
+    <h3>全双工移除的是那条边界，不是那个状态问题。请把一条曲线的两张脸一起测。</h3>
 
-    <p><strong>每一个轮次参数都是同一个旋钮——急切 vs 耐心——而且没有全局设置：催收 IVR 想要快且果断，哀伤抚慰热线想要慢且耐心，唯一的错误是给两者发同一套调参。</strong></p>
+    <p>原生语音到语音的模型正朝真正的全双工走：像人一样同时听与说，没有一个需要调优的显式端点检测步骤。那更自然，而运维起来难得多；而把它究竟修掉了什么说清楚是值得的。它化掉了 STEP 1 与 STEP 2——没有阈值，因为没有离散的边界。它<em>没有</em>化掉 STEP 4：仍然得有某个东西去记录来电者真正听到了什么，而现在那个截断点是连续的、而不是对齐到轮次的，所以这份账变得更难记、而不是更容易。<a class="xref" href="/zh/concepts/full-duplex-speech">全双工语音</a>讲的是模型那一侧。在它的运维故事成熟之前，大多数生产栈跑的仍是一个有纪律的半双工轮次管理器，配上快速打断与显式的附和处理，因为一个可预测的智能体胜过一个不可预测的。</p>
+
+    <p>不论你跑哪一种，请给四个数字装上度量，并把前两个当作一条曲线来读：</p>
+
+    <ul>
+      <li><strong>误切率。</strong>来电者还在说、而智能体就回应了的轮次占比。这是所有人都忘记去测的那个数字，也是静音阈值在无意之中被拿去优化的那一个。</li>
+      <li><strong>在所选工作点上的响应延迟。</strong>永远与上面那一行配对出现。一个没有误切率陪着的延迟数字是不可证伪的，因为你总能用其中一个去买另一个。</li>
+      <li><strong>假打断率。</strong>在没有真正话语权争夺时智能体停下的情况。通常来自回声或附和，而它的负责人与上面两项不是同一个。</li>
+      <li><strong>对齐缺陷数。</strong>智能体引用了来电者没听到的内容的那些轮次。做法是拿录音去对照已存历史回放并做 diff——这是没人手上有的那一项测量，而投诉正是从这里来的。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>请按这个顺序做。在代码里把 VAD 与端点检测分开，让两者有不同的负责人；然后用一个完整性模型替掉你的静音阈值，并把「工作点」而不是那个毫秒值暴露出来。在调任何东西之前先修好 AEC。接着就把对齐这条路径建起来，别留到最后：分别追踪「已生成」「已合成」「已确认播放」这三个位置，截断到已确认播放处，朝「没听到」加偏，在历史里设一个显式的 <code class="inline">truncated</code> 标记，并在被丢弃尾巴里的任何工具调用能跑起来之前就取消 LLM 的流。用时长与能量把续谈信号当作续谈信号。让打断灵敏度取决于智能体正在说什么，并按部署逐一调节 eagerness、绝不全局调。然后把误切与延迟当作一个配对的数字来测，把假打断单独测，并用回放来测对齐缺陷——<a class="xref" href="/zh/playbooks/voice-realtime-agents/evaluating-voice-agents">评估语音智能体</a>里有那套测试台。如果你只带走一句话：检测决定智能体何时停下来，而对齐决定这通电话余下的部分是否还说得通。</p>
+    </div>
   </div>
 </section>

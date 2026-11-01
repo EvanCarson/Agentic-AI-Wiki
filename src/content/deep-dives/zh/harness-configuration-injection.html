@@ -1,0 +1,120 @@
+<section class="phase">
+  <div class="phase-num">S15</div>
+  <div class="week">深入解析 · 智能体安全</div>
+  <h2>外壳配置作为注入目标：决定「有哪些工具存在」的那条通道，恰恰是没人把它当作不可信的那一条。</h2>
+  <p class="goal">一副智能体外壳从两条通道接收输入，而你只审查其中一条。对话按假设就是不可信的，并被一套权限系统包起来；而配置——argv、配置文件、环境变量、技能目录——按假设就是可信的，因为那是开发者写的；偏偏它才是决定「究竟有哪些工具存在」的那条通道。任何把「请求形状的数据」送上第二条通道的路径，都是一次抵达时机在闸门上游的权限提升，于是闸门根本看不见它：CVE-2026-96620 把一个会话 ID 变成了 <code class="inline">--mcp-config</code>，因此拿到 9.2 分；而真正可推广的修法，是把不受信的值挡在 argv 之外，并把「硬性要求」与「偏好设置」分开。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>两条通道进来，而威胁模型只覆盖了一条。</h3>
+
+    <p>把一个运行中的智能体的输入画出来，恰好只有两类。</p>
+
+    <ul>
+      <li><strong>内容通道。</strong>提示词、工具返回结果、检索到的文档、网页、邮件。所有人都知道这一条是敌对的。它有文献、有权限闸门、有一套<a class="xref" href="/zh/concepts/instruction-hierarchy">指令层级</a>，还有十年针对它的注入研究。</li>
+      <li><strong>配置通道。</strong>命令行参数、配置文件以及通往它们的路径、环境变量、钩子定义、MCP 服务器声明、技能目录、profile 名称。没人把这一条建模成敌对的，因为脑海里的画面是一个开发者在敲一个参数。</li>
+    </ul>
+
+    <p>这份不对称就是整个漏洞类别。内容通道是模型的<em>意图</em>的来源，而闸门的存在就是为了对它们存疑。配置通道是模型的<em>能力</em>的来源，而那里没有闸门，因为配置本该就是那个负责设闸的东西。<a class="xref" href="/zh/deep-dives/agent-security/configuration-as-reconnaissance">配置即侦察</a>讲的是攻击者<em>读</em>这条通道能学到什么；本页讲的是他们能往里<em>写</em>时会发生什么。</p>
+
+    <div class="callout warn">
+      <p>真正要紧的区分不是「数据还是代码」，而是<em>这个值回答的是哪一个问题</em>。内容通道上的值回答「我该做什么？」——它可以被拒绝。配置通道上的值回答「我有能力做什么？」——而「拒绝」在这里不是一个适用的概念。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>把配置通道上真正住着的东西列清楚。</h3>
+
+    <p>在争论注入之前，先把这个面列出来。对一副当下的编程或智能体外壳，配置至少决定了：</p>
+
+    <ul>
+      <li><strong>挂载了哪些工具服务器</strong>——MCP 服务器声明，每一个都由一条启动命令或一个可达的 URL 来定义。</li>
+      <li><strong>哪一部分文件系统可达</strong>——工作目录、额外目录、挂载点。</li>
+      <li><strong>什么可以不问就做</strong>——权限模式、批准策略、允许清单。</li>
+      <li><strong>模型的轮次之外有什么在跑</strong>——生命周期钩子，它们是绑定在事件上的 shell 命令，并且在模型永远观察不到的时刻触发。</li>
+      <li><strong>哪些指令正在生效</strong>——系统提示词片段、项目指令文件、技能文件夹。</li>
+      <li><strong>用哪个模型、给多少预算</strong>——看起来最便宜的那几项，也是会变成一场成本事故而不是一次入侵的那几项。</li>
+    </ul>
+
+    <p>把这份清单当作一次能力授予来读，排序就显而易见了：第一项是最糟的，因为它不是在约束行为，而是在<em>增加</em>行为。清单上其余每一项，都是在收窄或放宽「智能体可以用它已有的工具做什么」。而一台被挂上的服务器，改变的是「有哪些工具存在」这个集合。<a class="xref" href="/zh/concepts/agent-harness">智能体外壳</a>是那个一般性论证：被观察到的行为住在这个面上、而不在权重里；而在这里，权限也住在这个面上。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>请求数据抵达它的三条路径，以及一个走完的例子。</h3>
+
+    <p>请求形状的数据有三种方式登上配置通道，下面按「被审查的频率」从高到低排列：</p>
+
+    <ul>
+      <li><strong>进入 argv。</strong>你的应用把一个值——一个会话 ID、一个模型名、一个工作目录、一个 profile 名——转交进了那个负责执行你的管控的进程的命令行。如果这个值可以以 <code class="inline">-</code> 开头，那它就不再是一个值了。</li>
+      <li><strong>进入一个配置文件，或它的路径。</strong>一个由租户提供的项目名变成一个目录名，再变成外壳要读的那份设置文件的路径。没有任何东西被注入进字符串里；外壳只是读了一个与你本意不同的文件。</li>
+      <li><strong>进入一个外壳会反复读取的存储。</strong>最新、也最少被研究的一条：配置住在一个桶或一个目录里，而外壳在运行期间重新加载它。</li>
+    </ul>
+
+    <p>第一条路径走完的例子是 CVE-2026-96620（GHSA-h4mw-j7qp-8mwm），这是 Python 版 <code class="inline">claude-agent-sdk</code> 在 0.2.121 之前的一个危急级参数注入缺陷，2026 年 9 月 12 日发布，2026 年 10 月 16 日被复核进 GitHub 的数据库，CVSS v4.0 基础分 9.2。公告的描述是四个分句，而每一句都是一步：</p>
+
+<pre class="standalone"><span class="c-cm"># the chain, as the advisory describes it</span>
+<span class="c-st">1.</span> the SDK passed the <span class="c-kw">resume</span> option to the Claude CLI without validation
+<span class="c-st">2.</span> a value starting with <span class="c-st">"-"</span> could be read as a separate CLI flag
+<span class="c-st">3.</span> an attacker controlling it could inject <span class="c-kw">--mcp-config</span> to define a stdio MCP server
+<span class="c-st">4.</span> which runs arbitrary commands at CLI startup  <span class="c-cm"># -&gt; bypasses the SDK's permission controls</span>
+
+<span class="c-cm"># CWE-20 (validation) -&gt; CWE-88 (argument injection) -&gt; CWE-78 (command injection)</span>
+<span class="c-cm"># three weaknesses on one record because the bug is a sequence, not a category</span></pre>
+
+    <p>请注意是哪一个参数。会话 ID 是系统里最不透明的那个值——你不解析它、不解释它，原样递回给当初签发它的那一方；而正是这份纪律，让它一路未经审视地走了过去。可利用性的前提，在向量里记作 <code class="inline">AT:P</code>，是要有某个应用把受攻击者影响的文本接到那个参数上；而「恢复会话」是任何带对话的东西的运作方式，所以会话句柄默认就住在 URL、webhook 载荷与任务记录里。我们在<a class="xref" href="/zh/blogs/the-session-id-was-a-command-line-flag">那个会话 ID，其实是一个命令行参数</a>里把这一起事件走了一遍。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>一个挂载工具的参数，在类别上就比一个执行命令的参数更糟。</h3>
+
+    <p>参数注入通常按「执行」来定级：攻击者让一个进程跑了点什么。这把智能体外壳说轻了，而这个差别值得说准，因为它改变了「缓解」意味着什么。</p>
+
+    <p>一台 stdio MCP 服务器是<em>由一条用于启动它的命令</em>来定义的。所以声明一台，给攻击者买到的是两样东西，不是一样。第一样是启动时的执行，这是普通命令注入的那一半，而它本身已经够危急了。第二样是一台坐在会话工具清单里的服务器，对外宣告着若干工具，在整个会话存续期间都可供模型调用。这次注入产出的不是一个你的事件时间线能用括号框起来的事件，而是一项带有持续时长的能力。</p>
+
+    <p>这就是权限系统为何并不挡在路上，也正是最常被称作「绕过」、而其实什么都没被绕过的那一部分。闸门回答一个问题：这次被提出的工具调用可以放行吗？它是对内容通道输出的一道检查。而被注入的那份声明走的是配置通道，并且在模型还没提出任何东西之前就已抵达——所以它并没有击破闸门，它是<em>把闸门被要求去比对的那份清单给填好了</em>。一道只决定「清单上哪件工具可以运行」的闸门，对「这份清单是谁写的」没有意见。这与<a class="xref" href="/zh/concepts/ambient-authority">环境权限</a>是同一种结构，也是<a class="xref" href="/zh/deep-dives/agent-security/policy-as-code-for-agents">策略即代码</a>为何必须去评估工具清单、而不只是评估每一次调用的原因。</p>
+
+    <p>由此有两个实操后果。沙箱对前一半是实打实的缓解，对后一半则毫无作用，因为「一台被挂上的服务器可被调用」正是智能体在正确地服从自己的配置。而这一类的<a class="xref" href="/zh/concepts/blast-radius">爆炸半径</a>是在启动时就定下的，不是在批准时——这意味着「那个会话里存在哪些工具，又是哪个组件把它们放进去的」是一个取证问题，而大多数外壳目前回答不了。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>第三条路径如今已成为一项产品功能，而它的校验器是「告警」而非「拒绝」。</h3>
+
+    <p>配置曾经是一件构建产物：部署时写下、启动时读取、直到下次部署都不变。现在已经不是这个形状了。Cloudflare 的 Agents SDK 0.32.0 于 2026 年 10 月 29 日发布，它从三个来源加载智能体技能——一个 Computer Workspace、一个 R2 桶，或代码——而它的文档明确说明，workspace 这一档之所以存在，就是为了让技能可以「成为智能体、用户或你的代码能在运行时添加和编辑的文件」。Workspace 技能住在 <code class="inline">/workspace/.agents/skills/</code>，每个技能一个文件夹、各带一份 <code class="inline">SKILL.md</code>，而运行时会在每一轮之前把所有来源重新列一遍，所以一个在对话中途写下的技能会在下一轮生效。</p>
+
+    <p>把它当作一条配置通道来读，三个性质就叠起来了。它可被智能体自己写入，这意味着一次成功的内容通道注入可以写下一项持久的能力，而不只是采取一次动作。它在每个轮次边界被重新读取，这意味着「这个智能体有哪些技能」在一个会话的持续期间没有稳定答案。而它的校验是失败放行的：一份违反规范规则的 <code class="inline">SKILL.md</code> 仍会被加载，只记录一条警告；只有那种压根无法使用的技能——比如没有 description 的——才会被跳过。</p>
+
+    <div class="callout">
+      <p>这些都不是漏洞，而这恰恰是值得坐下来想一想的那一点。上面三个性质，每一个都是刻意且站得住脚的设计决定——运行时可编辑的技能确实有用，每轮重新列举是让它们有用的唯一办法，而对一份仍在变动中的规范来说，告警而非拒绝就是正确的默认。可后果照样是结构性的：你在部署时审过的那件制品，并不是真正在跑的那件制品；而<a class="xref" href="/zh/concepts/fail-closed-and-fail-open">失败放行</a>式的校验意味着这份偏离不会自己出来打招呼。<a class="xref" href="/zh/deep-dives/agent-security/vetting-a-third-party-skill">审查一个第三方技能</a>讲的是如何审查那个文件夹；而这里的问题是，那个文件夹已经不在你放下它的地方了。</p>
+    </div>
+
+    <p>所以请把一个会被反复读取的配置存储当作「带权限模型的不可信输入」，而不是当作配置。让写入路径比读取路径更窄：智能体可以读技能目录、不可以写它；或者只可以写进一个暂存前缀，由另一个独立的任务来晋级。要记日志的是目录清单、而不是配置文件——每一轮把解析后的工具与技能清单哈希一下，体积很小、可做 diff，而它是唯一能让你回答「14:32 时这个智能体能做什么」的那件制品。<a class="xref" href="/zh/operations/agentops/tool-catalog-lifecycle">工具目录的生命周期</a>里有做这份清点的运维机制。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>两个结构性修法，以及大多数外壳都搞错的那个区分。</h3>
+
+    <p>第一个修法是 argv 卫生，而它几乎是免费的。<code class="inline">--</code> 之后的一切都是位置参数，所以放在那儿的值无法被读成参数；一个以连字符开头的会话 ID 就会变成一个无效的会话 ID，而不是一次配置改写。更好的做法，是把不受信的值彻底挡在命令行之外——走 stdin、走一个由你自己的代码设置的环境变量、或走一个由你选定路径的文件——并把 argv 留给你的代码挑选的那些值。给报上来的那一个参数打补丁是正确的，也更窄；修这一类，靠的是修通道。</p>
+
+<pre class="standalone"><span class="c-cm"># the class fix, not the instance fix</span>
+<span class="c-err">bad </span>: run([<span class="c-st">"agent"</span>, <span class="c-st">"--resume"</span>, session_id])          <span class="c-cm"># session_id can be a flag</span>
+<span class="c-kw">ok  </span>: run([<span class="c-st">"agent"</span>, <span class="c-st">"--resume"</span>, <span class="c-st">"--"</span>, session_id])    <span class="c-cm"># cannot be a flag</span>
+<span class="c-fn">best</span>: run([<span class="c-st">"agent"</span>], env={<span class="c-st">"AGENT_SESSION"</span>: session_id})
+
+<span class="c-cm"># and validate shape at the boundary, because a session ID has one</span>
+<span class="c-kw">if</span> <span class="c-kw">not</span> re.fullmatch(<span class="c-st">r"[0-9a-f-]{36}"</span>, session_id): <span class="c-kw">raise</span>
+<span class="c-out"># an opaque handle is still a handle with a grammar. Enforce the grammar.</span></pre>
+
+    <p>第二个修法才是概念上承重的那一个：<strong>把「硬性要求」与「偏好设置」分开，并把它们放进不同的文件</strong>。偏好是运维方可以改的设置；要求是他们不可以改的设置。如果两者住在同一个文件里，那么你本意当作管控的那一层，就可以被它所约束的那一方写入——而在一套智能体系统里，「那一方」包括智能体本身，而它会编辑文件。</p>
+
+    <p>OpenAI 的 Codex CLI 把这个拆分写进了文档，而它之所以值得照抄，恰恰因为它在这件事上很较真：管理员可以在 <code class="inline">requirements.toml</code> 里设置 <code class="inline">allow_managed_hooks_only = true</code>，以忽略用户、项目与会话层的钩子配置，同时仍然允许来自 requirements 与 managed config 这两层的钩子——而文档写明，这项设置<em>只</em>在 <code class="inline">requirements.toml</code> 里受支持，所以把它放进 <code class="inline">config.toml</code> 并不会启用「仅托管钩子」模式。同一个键，在一个文件里是管控，在另一个文件里是空操作。这不是什么不一致；这就是整个机制，而它正是「只有当被约束的一方写不了它时，一项设置才算是一项管控」在一个真实产品里的样子。<a class="xref" href="/zh/operations/safety-and-security/lifecycle-hooks-and-harness-config">生命周期钩子与外壳配置</a>讲的是如何在实践中跑这个拆分。</p>
+
+    <div class="callout tip">
+      <p>请按这个顺序做。列出你的应用转交进外壳、且源自你代码之外的每一个值——会话与线程 ID 排第一，它们正是没人会标出来的那一类——然后对每一个只问两件事：它会不会抵达 argv，以及那个面上最强的参数能干什么。今天就在每一个这样的值前面加上 <code class="inline">--</code>，然后把它们彻底从 argv 挪走，并在边界处校验它们的语法。把 requirements 与 preferences 分进不同文件，并确认智能体自己的写权限摸不到那份 requirement 文件。对任何外壳会在运行时反复读取的配置存储，让写入路径比读取路径更窄，并把一个「失败放行」的校验器当作一处侦测缺口、而不是一项安全特性。然后每轮记录一次「解析后的工具与技能目录」的哈希，并对任何不是你部署出来的变化告警——因为对这一类而言，事故之后唯一要紧的问题是「当时存在哪些工具」，而这恰恰是你的链路记录目前没有记下的那一项。如果你只带走一句话：权限闸门决定清单上哪件工具可以运行，而对配置的注入决定清单上有什么。</p>
+    </div>
+  </div>
+</section>

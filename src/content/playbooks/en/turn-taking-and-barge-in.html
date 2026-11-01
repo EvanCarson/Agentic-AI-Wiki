@@ -1,80 +1,133 @@
 <section class="phase">
   <div class="phase-num">V3</div>
   <div class="week">Playbook · Voice &amp; Realtime Agents</div>
-  <h2>Turn-taking and barge-in: deciding who speaks, and stopping when interrupted.</h2>
-  <p class="goal">Humans negotiate turns in a conversation without thinking — they hear the end of a thought, they yield to an interruption, they tolerate a brief overlap. A voice agent has to do all of this explicitly, in real time, from an audio stream, with no shared social model. Get it wrong and the agent either bulldozes the caller or sits frozen waiting for a sentence that already ended. This is the hardest interaction problem in voice, and it is mostly not a model problem.</p>
+  <h2>Turn-taking and barge-in: the hard part is not detecting the interruption, it is that your conversation state now disagrees with what the caller heard.</h2>
+  <p class="goal">Every other component in a voice stack is a stream processor you can tune in isolation; the turn manager is the only one holding mutable state, and a barge-in invalidates it mid-write. Three positions diverge at that instant — what the model generated, what the synthesiser produced, and what actually reached the caller's ear — and if your history records the first, the agent will spend the rest of the call referring confidently to sentences nobody heard. That is why most "the agent is confusing" tickets are state bugs wearing a detection bug's clothes, and why the fix is an asymmetric truncation rule rather than a better threshold.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>VAD is not endpointing, and confusing them is the root bug.</h3>
+    <h3>VAD is not endpointing, and conflating them is the root bug underneath the state bug.</h3>
 
-    <p>Two distinct jobs, constantly conflated:</p>
+    <p>Two distinct jobs, constantly merged into one config value:</p>
 
     <ul>
-      <li><strong>VAD (voice activity detection)</strong> answers "is there speech in this audio frame right now?" — a low-level, sub-100 ms signal. It does not know if a <em>turn</em> is over; a thinking pause is silence too.</li>
-      <li><strong>Endpointing (end-of-turn detection)</strong> answers "is the caller <em>done</em>, such that the agent should now respond?" — a decision built <em>on top of</em> VAD plus, ideally, transcript and meaning.</li>
+      <li><strong>VAD (voice activity detection)</strong> answers "is there speech in this frame?" — a low-level, sub-100 ms signal. It cannot know whether a <em>turn</em> is over, because a thinking pause is silence too.</li>
+      <li><strong>Endpointing</strong> answers "is the caller <em>done</em>, such that I should respond now?" — a decision built on top of VAD plus, ideally, the words and their meaning.</li>
     </ul>
 
-    <div class="callout warn">
-      <p>Endpointing on raw VAD silence alone is the canonical voice-agent failure. A 600 ms silence threshold cuts off anyone who pauses to think ("my account number is… 4 4 7…"), and a 1500 ms one makes the agent feel asleep. There is no fixed silence value that is both responsive and patient — that is why fixed timeouts lose.</p>
-    </div>
+    <p>Endpointing on raw silence is the canonical failure: a 600 ms threshold cuts off anyone who pauses to think ("my account number is… 4 4 7…"), and 1,500 ms makes the agent feel asleep. There is no fixed value that is both responsive and patient, because mid-turn pauses and turn-final gaps come from two overlapping distributions that also shift per speaker. <a class="xref" href="/concepts/end-of-turn-detection">End-of-turn detection</a> has the full argument and the reason a threshold is the wrong knob; the operational consequence here is that <strong>a turn boundary is a prediction, which means it is sometimes wrong, which means your state model has to survive being wrong.</strong></p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>Semantic endpointing: use the words, not just the silence.</h3>
+    <h3>Use a model for the boundary, and treat its output as a probability rather than an event.</h3>
 
-    <p>The 2025-era answer, shipped by LiveKit, AssemblyAI, and OpenAI's semantic-VAD turn detection, is to feed the partial transcript into a small model that asks "does this sound like a complete utterance?" — and modulate the silence threshold by the answer.</p>
+    <p>The 2026 answer is a model that predicts utterance completion and modulates the wait. Three shapes ship in production, and the difference between them is what they consume. OpenAI's Realtime API exposes a <code class="inline">semantic_vad</code> turn-detection mode with an eagerness setting alongside the older <code class="inline">server_vad</code>. LiveKit's turn detector runs on the audio directly, fusing acoustic and semantic cues rather than waiting for a transcript. Deepgram's Flux folds end-of-turn detection into recognition itself with configurable thresholds, documenting end-of-turn at roughly 260 ms and under 400 ms multilingual.</p>
 
-<pre class="standalone"><span class="c-cm"># turn/endpoint.py — silence threshold is dynamic</span>
+<pre class="standalone"><span class="c-cm"># turn/endpoint.py — the threshold is an output, not a setting</span>
 <span class="c-kw">def</span> <span class="c-fn">end_of_turn</span>(partial, silence_ms):
-    p = complete_utterance_prob(partial)   <span class="c-cm"># small model</span>
+    p = complete_utterance_prob(partial)   <span class="c-cm"># acoustic + semantic</span>
     <span class="c-kw">if</span> p &gt; <span class="c-st">0.85</span>:
-        <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">120</span>    <span class="c-cm"># sounds done: fire fast</span>
+        <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">120</span>    <span class="c-cm"># sounds finished: fire fast</span>
     <span class="c-kw">if</span> p &lt; <span class="c-st">0.30</span>:
-        <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">1400</span>   <span class="c-cm"># "uh, my number is..." wait</span>
-    <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">600</span>        <span class="c-cm"># unsure: middle ground</span></pre>
+        <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">1400</span>   <span class="c-cm"># "uh, my number is..." — wait</span>
+    <span class="c-kw">return</span> silence_ms &gt; <span class="c-st">600</span>        <span class="c-cm"># unsure: middle ground</span>
 
-    <p>"What's the weather" with falling intonation ends a turn in ~120 ms; "my card number is" with a trailing rise should buy the caller over a second of thinking room. Same silence, opposite decision — because the words carry the intent that silence alone cannot.</p>
+<span class="c-cm"># what this buys you is not accuracy, it is a KNOB WITH A UNIT:</span>
+<span class="c-out">#   raise the p cut-offs  -> lower false cutoffs, higher response latency
+#   lower them            -> snappier, and you clip people mid-account-number
+# Pick the operating point from your own false-cutoff budget, not from a default.</span></pre>
+
+    <p>"What's the weather" with falling intonation ends a turn in about 120 ms; "my card number is" with a trailing rise should buy the caller over a second of thinking room. Same silence, opposite decision, because the words carry intent that silence cannot. Note what the model does <em>not</em> buy: it does not eliminate wrong boundaries, it moves them onto a curve you can choose a point on. <a class="xref" href="/playbooks/voice-realtime-agents/latency-budget">The latency budget</a> is where that point gets paid for.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>Barge-in: the caller can always interrupt, and the agent must yield.</h3>
+    <h3>Barge-in is non-negotiable, and the audio part is the easy half.</h3>
 
-    <p>If the caller starts talking while the agent is speaking, the agent must <strong>stop within a couple hundred milliseconds</strong> — not finish its sentence. An agent that talks over an interruption is experienced as rude and, worse, broken; people will hang up. Barge-in is non-negotiable in any serious voice product.</p>
+    <p>If the caller starts talking while the agent is speaking, the agent must stop within a couple of hundred milliseconds rather than finish its sentence. An agent that talks over an interruption is experienced as rude and then as broken, and people hang up. The mechanical sequence is well understood:</p>
 
 <pre class="trace"><span class="c-out">agent speaking ............ caller starts talking
                             |
                             +-- detect speech (VAD, &lt;100ms)
                             +-- STOP agent audio immediately
-                            +-- FLUSH unsent TTS / cancel response
-                            +-- discard the killed turn from state
+                            +-- FLUSH unsent TTS / cancel the LLM stream
+                            +-- RECONCILE state to what was actually heard   &lt;-- the hard one
                             +-- listen; the caller now has the floor</span></pre>
 
-    <p>The subtle part is state: the agent said three of ten sentences, then got cut off. What it actually <em>spoke</em> — not what it <em>generated</em> — is what the caller heard. Your conversation state must reflect the truncated reality, or the agent will reference things it never actually said aloud.</p>
+    <p>Four of those five lines are plumbing you write once. The fifth is the one that generates bug reports for the next two quarters, and the reason is that at the moment of the barge-in there are three different answers to "what did the agent say?", separated by real buffers:</p>
+
+    <ul>
+      <li><strong>Generated.</strong> Every token the model produced. The LLM streams far ahead of playback, so this is routinely the whole reply.</li>
+      <li><strong>Synthesised.</strong> What TTS has turned into audio. Ahead of playback by whatever you buffer to avoid underruns.</li>
+      <li><strong>Emitted and heard.</strong> What left the speaker before the stop took effect — minus whatever is still sitting in the jitter buffer and the network, which the caller never got.</li>
+    </ul>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>Echo cancellation is a turn-taking prerequisite, not an audio nicety.</h3>
+    <h3>Reconcile to what was heard, and bias the estimate — the error costs are not symmetric.</h3>
 
-    <p>The agent's own voice comes back through the caller's microphone (especially on speakerphone). Without acoustic echo cancellation, VAD sees the agent's own speech as "the caller is talking," triggers a false barge-in, and the agent interrupts itself into a stuttering loop. Robust AEC is load-bearing for turn-taking — a turn-taking bug report is very often an echo bug.</p>
+    <p>Put numbers on the gap, because it is much larger than it feels. Conversational speech runs around 150 words per minute, or 2.5 words per second:</p>
+
+<pre class="standalone"><span class="c-cm"># how far "generated" runs ahead of "heard" at a barge-in</span>
+speech_rate   = <span class="c-st">2.5</span>      <span class="c-cm"># words/second</span>
+detect_stop   = <span class="c-st">400</span>      <span class="c-cm"># ms to notice and silence the output</span>
+playout_buf   = <span class="c-st">200</span>      <span class="c-cm"># ms of audio already in flight, never heard</span>
+tts_lookahead = <span class="c-st">1500</span>     <span class="c-cm"># ms synthesised but not yet played</span>
+
+uncertain_words = speech_rate * (detect_stop + playout_buf) / <span class="c-st">1000</span>   <span class="c-cm"># = 1.5</span>
+unheard_words   = speech_rate * tts_lookahead / <span class="c-st">1000</span>               <span class="c-cm"># = 3.75</span>
+
+<span class="c-cm"># and the LLM is further ahead still: if it streamed 10 sentences while</span>
+<span class="c-cm"># playback reached sentence 3, SEVEN sentences are in `generated` and were</span>
+<span class="c-cm"># never heard. Store `generated` as history and the agent now believes it</span>
+<span class="c-cm"># explained something it did not.</span></pre>
+
+    <p>The reconciliation rule follows from an asymmetry. Record a word as heard when it was not, and the agent references material the caller has no memory of — which is not a small glitch, it is the agent appearing to hallucinate its own side of the call, and it poisons every later turn. Record a word as unheard when it was, and the agent repeats itself slightly. One of those is incomprehensible and the other is mildly redundant, so <strong>bias the estimator toward "not heard"</strong>: truncate at the last playback position you have positive confirmation of, drop the partial word, and throw away everything synthesised-but-unplayed. Then mark the truncation in the history explicitly rather than silently, so the model knows the turn was cut:</p>
+
+<pre class="standalone"><span class="c-cm"># what goes in the transcript after a barge-in</span>
+{<span class="c-st">"role"</span>: <span class="c-st">"assistant"</span>,
+ <span class="c-st">"content"</span>: <span class="c-st">"Sure — your balance is $412.60 and the payment that"</span>,
+ <span class="c-st">"truncated"</span>: <span class="c-kw">True</span>,                 <span class="c-cm"># the model must see that it was cut</span>
+ <span class="c-st">"heard_ms"</span>: <span class="c-st">2140</span>}                   <span class="c-cm"># confirmed playback, not synthesis</span>
+
+<span class="c-cm"># the `truncated` flag is load-bearing: without it the model reads a</span>
+<span class="c-cm"># mid-sentence stop as its own choice and will not offer to finish.</span></pre>
+
+    <p>Two side effects to handle while you are in here. A tool call the model emitted in the discarded tail must not execute — cancel the stream before it reaches the tool runner, not after. And if the truncated turn contained a disclosure you are obliged to make, the obligation is unmet: <a class="xref" href="/playbooks/voice-realtime-agents/disclosing-the-agent-on-a-call">disclosing the agent on a call</a> and <a class="xref" href="/playbooks/voice-realtime-agents/recording-consent-and-redaction">recording consent</a> both have scripts that a barge-in can cut in half, and a compliance script needs re-delivery rather than a resumption.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>Overlap, backchannels, and full-duplex.</h3>
+    <h3>Not every noise is a bid for the floor, and echo cancellation is a prerequisite rather than an audio nicety.</h3>
 
-    <p>Real conversation is not strictly half-duplex. People say "mm-hm" and "right" while the other is talking — <strong>backchannels</strong> — and these are <em>not</em> barge-ins; treating every "uh-huh" as an interruption makes the agent stop constantly. A good turn manager distinguishes a continuer ("mm-hm", keep going) from a real bid for the floor ("wait — actually…", yield now).</p>
+    <p>Real conversation is not strictly half-duplex. People say "mm-hm" and "right" while the other is talking — <strong>backchannels</strong> — and these are not barge-ins; treating every "uh-huh" as an interruption makes the agent stop constantly and is one of the most common causes of a stack that feels twitchy. A good turn manager distinguishes a continuer ("mm-hm", keep going) from a genuine bid for the floor ("wait — actually…", yield now), and the cheap first approximation is duration plus energy: sub-300 ms, low-energy, non-lexical events are continuers until proven otherwise.</p>
 
-    <p>Newer native models move toward genuine full-duplex: listening and speaking simultaneously, the way humans do. It is more natural and considerably harder to get right; until it is robust, most production stacks run a disciplined half-duplex turn manager with fast barge-in and explicit backchannel handling, because a predictable agent beats an unpredictable one.</p>
+    <p>Underneath that, the agent's own voice returns through the caller's microphone, especially on speakerphone. Without acoustic echo cancellation, VAD hears the agent as the caller, fires a false barge-in, and the agent interrupts itself into a stutter loop. A turn-taking bug report is very often an echo bug, and on a narrowband PSTN leg the acoustics are worse than your tests — <a class="xref" href="/playbooks/voice-realtime-agents/audio-quality-and-codecs">audio quality and codecs</a> covers what the channel does to the signal your detector sees. Check AEC before you touch a threshold.</p>
+
+    <div class="callout tip">
+      <p>Two tuning rules that save weeks. Barge-in sensitivity should depend on what the agent is currently saying: while reading back a long number or a legal disclosure, require more evidence before yielding, because a false cutoff there costs a restart of the whole read-back — see <a class="xref" href="/playbooks/voice-realtime-agents/alphanumerics-over-voice">alphanumerics over voice</a>. And never tune eagerness globally: a debt-collection IVR wants fast and decisive, a grief-support line wants slow and patient, and shipping one tuning for both is the only real mistake available.</p>
+    </div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>The honest tradeoff.</h3>
+    <h3>Full-duplex removes the boundary and not the state problem. Measure both faces of one curve.</h3>
 
-    <p><strong>Every turn-taking parameter is the same single dial — eagerness vs patience — and there is no global setting: a debt-collection IVR wants fast and decisive, a grief-support line wants slow and patient, and the only mistake is shipping one tuning for both.</strong></p>
+    <p>Native speech-to-speech models move toward genuine full-duplex: listening and speaking at once, the way people do, with no explicit endpointing step to tune. That is more natural and considerably harder to operate, and it is worth being clear about what it fixes. It dissolves STEP 1 and STEP 2 — there is no threshold, because there is no discrete boundary. It does <em>not</em> dissolve STEP 4: something still has to record what the caller actually heard, and now the truncation point is continuous rather than turn-aligned, so the bookkeeping gets harder rather than easier. <a class="xref" href="/concepts/full-duplex-speech">Full-duplex speech</a> covers the model side. Until the operational story matures, most production stacks run a disciplined half-duplex turn manager with fast barge-in and explicit backchannel handling, because a predictable agent beats an unpredictable one.</p>
+
+    <p>Whichever you run, instrument four numbers and read the first two as one curve:</p>
+
+    <ul>
+      <li><strong>False-cutoff rate.</strong> Share of turns where the agent responded while the caller was still speaking. The number everyone forgets to measure, and the one that silence thresholds are optimised against by accident.</li>
+      <li><strong>Response latency at the chosen operating point.</strong> Paired with the line above, always. A latency figure without a false-cutoff figure is unfalsifiable, because you can always buy one with the other.</li>
+      <li><strong>False barge-in rate.</strong> Agent stops with no real bid for the floor. Usually echo or backchannels, and it has a different owner than the two above.</li>
+      <li><strong>Reconciliation defects.</strong> Turns where the agent referenced content the caller did not hear. Find them by replaying recordings against stored history and diffing — this is the measurement nobody has, and it is where the complaints come from.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do it in this order. Separate VAD from endpointing in your code so the two have different owners, then replace your silence threshold with a completion model and expose the operating point rather than the millisecond value. Fix AEC before tuning anything. Build the reconciliation path next, not last: track generated, synthesised and confirmed-played positions separately, truncate to confirmed playback, bias toward "not heard", set an explicit <code class="inline">truncated</code> flag in the history, and cancel the LLM stream before any tool call in the discarded tail can run. Treat continuers as continuers by duration and energy. Make barge-in sensitivity depend on what the agent is saying, and tune eagerness per deployment, never globally. Then measure false cutoffs and latency as one paired number, false barge-ins separately, and reconciliation defects by replay — <a class="xref" href="/playbooks/voice-realtime-agents/evaluating-voice-agents">evaluating voice agents</a> has the harness. If you keep one sentence: detection decides when the agent stops talking, and reconciliation decides whether the rest of the call makes sense.</p>
+    </div>
   </div>
 </section>
