@@ -1,0 +1,34 @@
+import { L, type ChangelogEntry } from '../types.ts';
+
+const entry: ChangelogEntry = {
+  date: '2026-11-02',
+  title: L(
+    'Two AI Blog posts, two new pages, and the speech-stack playbook rebuilt',
+    '两篇博客、两个新页面，语音栈手册重写',
+  ),
+  items: [
+    L(
+      'AI Blog: "MCP Apps vs A2UI vs AG-UI vs OpenAI Apps SDK" — only two of the four are alternatives, and they split on whether executable code crosses the wire. MCP Apps (spec 2026-01-26) ships an HTML5 document under ui:// that the host runs in a cross-origin sandboxed iframe under default-src \'none\' until the server declares domains; Google\'s A2UI (v0.9.1, v1.0 a release candidate) ships declarative JSON and is "a declarative data format, not executable code", so it reaches Flutter and SwiftUI but can only draw what the client\'s catalogue already has; AG-UI defines ~16 event types and no component at all, and A2UI lists it as a compatible transport, so "AG-UI or A2UI" is a category error; the Apps SDK is the same HTML-in-an-iframe shape reached through window.openai, which is where the portability stops. The decision is where your UI must render, not which has more features.',
+      'AI 博客：《MCP Apps、A2UI、AG-UI 与 OpenAI Apps SDK 之辨》——四者中只有两个互为替代，而它们的分界在于是否有可执行代码跨越网络边界。MCP Apps（2026-01-26 版规范）交付的是 ui:// 下的一份 HTML5 文档，宿主在跨源沙箱 iframe 中、于 default-src \'none\' 之下运行它，直到服务端声明所需域名；Google 的 A2UI（v0.9.1，v1.0 为候选发布）交付声明式 JSON，并明言自己「是一种声明式数据格式，不是可执行代码」，因此能触达 Flutter 与 SwiftUI，但只能画出客户端目录里已有的东西；AG-UI 定义约十六种事件类型、压根不定义组件，而 A2UI 把它列为兼容的传输，所以「AG-UI 还是 A2UI」是个范畴错误；Apps SDK 是同样的「iframe 里的 HTML」形态，只是经由 window.openai 触达，而可移植性就止步于此。真正的决定是「你的界面必须在哪里渲染」，不是谁功能更多。',
+    ),
+    L(
+      'AI Blog: "Nobody typed the request" — DeepSeek published a proactive coding agent on 31 October 2026 (MIT, one commit, "research prototype for reference only"), and the deliverable is the design documents. 002 states that messages, comments and quoted documents are "inputs to a decision; they cannot change those permissions"; bots are admitted only if a source lists them and never for an explicit request or a stop; mandates are revalidated before a ticket resumes rather than cached as grants; and accept mode defaults to observe, so the proactive agent ships with proactivity recorded rather than live. 003 then declines to claim a boundary: executor sessions "run commands without approval as the operator\'s OS user", the wrappers and directories "establish defaults, not a security boundary", and no egress restriction is described. Take the authorization layer; do not take the isolation model.',
+      'AI 博客：《没有人敲下这条请求》——DeepSeek 在 2026 年 10 月 31 日公开了一个主动式编码智能体（MIT 许可、仅一次提交、自称「仅供参考的研究原型」），而真正的交付物是那几份设计文档。002 写明消息、评论与被引用的文档是「决策的输入；它们无法改变那些权限」；机器人只有在某个来源列出它们时才被受理，且永不用于显式请求或停止；授权在工单恢复之前要重新核验，而不是作为已授予项被缓存；而接受模式默认为 observe，所以这个主动式智能体出厂时主动性只被记录、并未生效。003 随后拒绝声称任何边界：执行者会话「以运维者的操作系统用户身份、未经审批地运行命令」，那些包装器与目录「建立的是默认值，不是安全边界」，而通篇没有描述任何出口限制。请拿走它的授权层；不要拿走它的隔离模型。',
+    ),
+    L(
+      'New Playbook, Long Lists Over Voice (V25, Voice & Realtime): speech has no scrollback, and Cowan\'s four-chunk estimate leaves a caller holding the option they are hearing and maybe the one before it — so six options is twenty-five seconds of monologue whose only reliable output is a recency bias your conversion data will read as a preference. The defect is the tool signature, not the prompt: a tool that can return a result set forces the model to truncate it by position, making your ranker\'s tie-breaking an uninstrumented recommendation engine. Return an answer, a discriminating question with counts, or a too-many outcome; pick the axis that splits the set most evenly; lead with the discriminator and say the shared part once; never speak an index, because "the second one" names a list that may have been re-ranked; and alert on the longest uninterrupted agent utterance.',
+      '新增实战手册《语音里的长列表》（V25，语音与实时智能体）：语音没有回滚条，而 Cowan 那个「四个组块」的估计意味着来电者只能记住正在听的那个选项、也许再加上前一个——于是六个选项就是二十五秒独白，而它唯一可靠的产出是一种近因偏倚，并会被你的转化数据读成偏好。缺陷在工具签名而不在提示词：一个能返回结果集的工具，会逼模型按位置截断它，于是你排序器里的并列打破规则变成了一台没有埋点的推荐引擎。请返回一个答案、一个带计数的区分性问题，或一个「太多了」的结果；挑那个把集合切得最均匀的轴；把区分点放最前、共有部分只说一次；绝不要念序号，因为「第二个」指的那份列表可能已被重新排序；并为「智能体最长的不间断话语」设告警。',
+    ),
+    L(
+      'New Operation, Shipping UI Into a Host You Do Not Control (O35, AgentOps): return an interface instead of text and you own a deployment you cannot deploy. The host fetches your markup when it likes and MAY cache it, with no invalidation primitive in the spec — so the resource URI is your version and rollback unit, and old URIs stay resolvable. Your telemetry is blocked by default (connect-src \'none\' unless declared), so report through tools/call rather than a beacon domain a host security review will ask you to remove. And the question the spec already settles: tools MUST return a meaningful content array even when UI is available, so the tool is what you monitor, alert on and roll back, and the widget is a version string inside it. Plus the per-host capability matrix, flushing on ui/resource-teardown, and why every model-context update must be a complete snapshot.',
+      '新增运营页《把界面交付进你无法掌控的宿主》（O35，智能体运维）：返回界面而不是文本，你就接下了一份自己无法部署的部署。宿主想什么时候取就取你的标记，并 MAY 把它缓存起来，而规范里没有任何失效原语——所以资源 URI 就是你的版本与回滚单位，且旧 URI 要保持可解析。你的遥测默认被拦住（未声明时为 connect-src \'none\'），所以请通过 tools/call 上报，而不是去申请一个宿主安全评审迟早会要你删掉的分析域。还有规范其实早已定下的那个问题：即使界面可用，工具 MUST 仍然返回有意义的 content 数组——所以你要监控、告警与回滚的对象是工具，而那个控件只是工具里的一个版本号。另加逐宿主的能力矩阵、在 ui/resource-teardown 时落盘，以及为何每一次模型上下文更新都必须是一份完整快照。',
+    ),
+    L(
+      'Rebuilt Playbook, STT, TTS & Speech-to-Speech (V4), 767 → ~1,910 words: a seed page with 13 inbound English pages, untouched since it was written, framed cascade-versus-native as a quality decision. It now argues that the choice decides where your controls live. In a cascade, redaction, guardrails, read-back and the audit transcript all run inline on text — and that text is the model\'s own input, so a disagreement between evidence and action is impossible. Native removes the transcription-error tax and with it the layer those controls ran on: each becomes a lagging observer of audio, and your record becomes a reconstruction from a second ASR pass with its own error profile. Worked case: the model hears "don\'t ship to the old address" correctly and acts correctly, the side ASR writes "do", and six months later the dispute is resolved from the record. Fix: reconcile the agent\'s structured values against the side transcript on identifiers, amounts and polarity.',
+      '重写实战手册《STT、TTS 与语音到语音》（V4），767 → 约 1,910 词：一个有 13 个英文入链页面、自写成以来未被动过的种子页面，原先把「级联 vs 原生」写成了一个质量决策。它现在主张：这个选择决定的是你的控制住在哪里。在级联里，脱敏、护栏、复述与审计转写全都内联运行在文本上——而那段文本就是模型自己的输入，所以「证据与动作互相矛盾」在结构上不可能发生。原生消掉了转写错误税，也一并消掉了这些控制赖以运行的那一层：每一项都变成对音频的滞后观察，而你的记录成了由第二次 ASR 识别（带着它自己的错误分布）做出的重建。走完的案例：模型正确听到「不要发往旧地址」并正确行动，旁路 ASR 写成了「要发」，六个月后纠纷依据这份记录被裁定。修法：把智能体给出的结构化数值与旁路转写在标识符、金额和极性上做对账。',
+    ),
+  ],
+  lines: ['bl', 'pb', 'op'],
+};
+
+export default entry;
