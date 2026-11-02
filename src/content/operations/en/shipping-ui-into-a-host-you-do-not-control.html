@@ -1,0 +1,105 @@
+<section class="phase">
+  <div class="phase-num">O35</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Shipping UI into a host you do not control.</h2>
+  <p class="goal">The moment your tool server returns an interface instead of text, you have taken on a deployment you cannot deploy: a host fetches your markup when it likes, may cache it, builds the security policy from a declaration you wrote weeks earlier, and renders it in a sandbox where your error reporter cannot reach the network. The operational consequence is fixed by the specification and most teams read past it — the text result is the contract and the interface is an enhancement, so the thing you monitor, alert on and roll back is the tool, and the widget is a version string inside it.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>You are not deploying a page. You are publishing an artefact somebody else fetches.</h3>
+
+    <p>In the MCP Apps extension, a tool points at a UI resource with <code class="inline">_meta.ui.resourceUri</code>; the resource MUST use the <code class="inline">ui://</code> scheme with MIME type <code class="inline">text/html;profile=mcp-app</code>, and the host MUST read it with <code class="inline">resources/read</code>. The spec also says the host MAY prefetch and cache that content, and may preload templates before the tool ever runs.</p>
+
+    <p>Read those two sentences together and the operational shape appears. There is no cache-invalidation primitive. No purge call, no ETag discipline the spec obliges a host to honour, no way to tell a host that the markup it holds is now wrong. Which means the thing you can change and the thing a user sees are separated by a cache whose policy is a per-host implementation detail — and the only handle you have on it is the URI.</p>
+
+<pre class="standalone"><span class="c-cm"># fragile: the host may be holding last week's markup</span>
+ui://acme/invoice-table
+
+<span class="c-cm"># operable: the URI is the version, so a rollout is a pointer change</span>
+ui://acme/invoice-table@2026-11-02.3
+  <span class="c-cm"># old URIs stay resolvable; a stale cache serves a</span>
+  <span class="c-cm"># consistent old view instead of a broken new one</span></pre>
+
+    <ul>
+      <li><strong>Put a build identifier in the resource URI</strong> and change it on every markup change. The tool's <code class="inline">_meta</code> is what moves; the resource itself is immutable once published.</li>
+      <li><strong>Keep the previous two or three URIs resolvable.</strong> A host holding a cached template will fetch the resource it remembers, and you want that fetch to succeed.</li>
+      <li><strong>Make rollback a pointer change,</strong> not a redeploy — the same discipline as <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout and versioning</a>, with the extra constraint that you cannot drain the old version.</li>
+      <li><strong>Never put secrets or tenant data in the markup.</strong> It is a cacheable static artefact in somebody else's store. Data arrives separately, in the tool result.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The text result is the contract. Monitor that.</h3>
+
+    <p>This is the sentence to put in your runbook: tools MUST return a meaningful content array even when UI is available, and servers SHOULD provide text-only fallback behaviour for every UI-enabled tool. The extension itself is optional and negotiated under <code class="inline">io.modelcontextprotocol/ui</code>, with clients declaring supported <code class="inline">mimeTypes</code>; servers SHOULD check client capabilities before registering UI-enabled tools. A host that has not adopted the extension treats your tool as an ordinary tool and nothing breaks.</p>
+
+    <p>So the interface is not your product surface. It is a presentation layer over a tool whose contract is text, and that inverts the monitoring you were about to build. Your availability target belongs on the tool call. Your correctness evals run against the content array. The widget gets a much weaker guarantee — rendered, or not — because in a meaningful share of sessions it will not render at all and the task must still complete.</p>
+
+    <div class="callout warn">
+      <p>The failure this prevents is specific and common: a team builds the widget first, lets the text result degrade into <code class="inline">"See the table above."</code>, and ships a tool that is useless in every host without the extension — and useless to the model even in hosts that have it, because the model reads the content array, not your pixels. A text result that only makes sense alongside the UI is a broken tool with a nice screenshot.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Your telemetry is blocked by default, and that is the right default.</h3>
+
+    <p>Hosts render MCP Apps in a sandboxed iframe under a deny-by-default content policy. If you omit <code class="inline">ui.csp</code> entirely the host applies <code class="inline">default-src 'none'</code> with <code class="inline">connect-src 'none'</code>. An empty or absent <code class="inline">connectDomains</code> means no external connections; an empty <code class="inline">frameDomains</code> means no nested iframes; <code class="inline">baseUriDomains</code> defaults to <code class="inline">base-uri 'self'</code>. The host MUST build the policy from what you declared, MAY restrict further, and MUST NOT allow a domain you did not declare. For a web host, your view also runs through a sandbox proxy on a different origin from the host.</p>
+
+    <p>Three consequences for operations, in order of how much time they will cost you:</p>
+
+    <ul>
+      <li><strong>Inline the bundle.</strong> Every origin counts, including wherever your JavaScript and CSS are served from. A single remote <code class="inline">&lt;script src&gt;</code> you forgot to declare is a blank widget in a host that reports nothing to you.</li>
+      <li><strong>Report through the tool, not through a beacon.</strong> The view can call <code class="inline">tools/call</code>, proxied by the host to your server. That path already exists, already works under the default policy, and already carries your auth. An analytics domain in <code class="inline">connectDomains</code> is a line item in somebody's host security review, and it is the first one they will ask you to remove.</li>
+      <li><strong>Assume you will never see a client-side exception.</strong> No error-reporting SDK will phone home. Your observability is the tool-call stream: emit a structured <code class="inline">view_error</code> tool call with the build identifier from Step 1, and treat a build whose error calls spike as a rollback candidate. Everything in <a class="xref" href="/operations/evaluation-and-observability/tracing-and-observability">tracing and observability</a> still applies; the span just has to start on your side of the proxy.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Capability is a per-host fact, so your rollout unit is host × version.</h3>
+
+    <p>At the extension's announcement in January 2026 the supporting hosts were Claude on web and desktop, Goose, VS Code Insiders, and ChatGPT rolling out that week. The <code class="inline">ext-apps</code> repository is candid that it ships no production host implementation beyond a basic example, and several hosts implement the extension via the MCP-UI client SDK. On the wire, SDK versioning is deliberately forgiving — the protocol is unchanged between <code class="inline">ext-apps</code> 1.x and 2.x, a 2.x view works in a 1.x host and a 2.x host renders 1.x views — which is a gift and also the reason a host-specific bug will not announce itself as a version mismatch.</p>
+
+    <p>Treat it the way you would treat browsers in 2010, because operationally that is what it is.</p>
+
+    <ul>
+      <li><strong>Keep an explicit host matrix</strong> — host, version where you can get it, renders / renders with defects / falls back to text — and date every row. It is the same artefact as the vendor matrix in <a class="xref" href="/operations/agentops/third-party-tool-drift">third-party tool drift</a>, and it decays just as fast.</li>
+      <li><strong>Negotiate, do not sniff.</strong> Check declared capabilities and <code class="inline">mimeTypes</code> before registering UI-enabled tools; branch on the declaration rather than on a host name string. <a class="xref" href="/deep-dives/protocols-and-interop/capability-discovery">Capability discovery</a> is the pattern and this extension is an instance of it.</li>
+      <li><strong>Expect silent asymmetry.</strong> The spec's sandbox handshake notifications are MUST in the <code class="inline">2026-01-26</code> version and SHOULD in the draft. A host targeting the draft can behave differently from one targeting the stable spec without either being wrong, which is exactly the class of change <a class="xref" href="/operations/agentops/protocol-revisions-and-deprecation-windows">protocol revisions and deprecation windows</a> exists to manage.</li>
+      <li><strong>One host's outage is not your outage.</strong> If a host stops rendering, your tool still returns text and your task still completes — provided you did Step 2. That is the whole value of having done it.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Use the lifecycle notifications as the only clock you have.</h3>
+
+    <p>The handshake is <code class="inline">ui/initialize</code> then <code class="inline">ui/notifications/initialized</code>, and the host MUST NOT send the view any request or notification before that notification arrives. Then <code class="inline">ui/notifications/tool-input</code> arrives at most once and is required before <code class="inline">ui/notifications/tool-result</code>; <code class="inline">tool-input-partial</code> MAY arrive zero or more times during streaming and the view MUST NOT rely on partial arguments for critical operations; <code class="inline">tool-cancelled</code> arrives if execution is cancelled; and the host MUST send <code class="inline">ui/resource-teardown</code> before tearing the resource down, and SHOULD wait for a response.</p>
+
+    <p>Those are your lifecycle hooks and each one maps to an operational rule.</p>
+
+    <ul>
+      <li><strong>Flush on teardown.</strong> It is the one point at which you are told the view is ending and the host is asked to wait for you. Anything you want recorded — a draft, a duration, an unsent error — goes out there, as a tool call.</li>
+      <li><strong>Never act on a partial.</strong> The spec forbids relying on partial arguments for critical operations, which in practice means: no writes, no charges, no navigation on a streamed argument. The same rule as gating side effects on a finalised transcript in a voice stack.</li>
+      <li><strong>Handle cancellation as a normal path.</strong> A cancelled tool leaves a view holding an input and no result. Decide what that view shows, or your users will find out for you.</li>
+      <li><strong>Report size, do not assume it.</strong> The view SHOULD send <code class="inline">ui/notifications/size-changed</code> on content size changes and hosts MUST listen when dimensions are flexible. A widget that never reports its size is a widget cropped differently in every host.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Treat the model's context as a write you version, because it overwrites.</h3>
+
+    <p>The view can tell the model what happened in it, via <code class="inline">ui/update-model-context</code>. The semantics are last-write-wins: each request overwrites the previous context sent by that view, and if several arrive before the next user message the host SHOULD send only the last. The host also proxies <code class="inline">tools/call</code> from the view and MUST reject calls to tools whose visibility does not include <code class="inline">"app"</code>; tools whose visibility excludes <code class="inline">"model"</code> MUST NOT appear in the agent's tool list at all.</p>
+
+    <p>Two things fall out of that, and the first is a production incident waiting to happen. Because context updates overwrite rather than append, a view that writes partial state on every keystroke and then stops will leave the model holding whatever it happened to write last. The model will then describe the form confidently and wrongly. Make each update a complete, self-describing snapshot of the view's state, never a delta, and write it at the moments that matter — on commit, on teardown — rather than continuously.</p>
+
+    <p>The second is a design affordance worth using. App-only tools are the right home for anything the interface needs and the model should not be able to trigger on its own: a pagination fetch, a preview render, a validation call. Keeping those out of the model's tool list reduces both the token cost of your catalogue and the ways an agent can surprise you, which is the same argument made in <a class="xref" href="/deep-dives/mcp/mcp-tool-design">MCP tool design</a> about not exposing a tool just because it exists.</p>
+
+    <div class="callout tip">
+      <p><strong>Run the stranger's-host drill before you ship.</strong> Disable the UI extension in your own client and use the tool for a day with text results only — if the task is harder than it was, Step 2 is not done. Then set <code class="inline">ui.csp</code> to nothing, load the widget, and confirm it still renders and still reports errors; if it goes blank, you have a remote dependency you did not declare. Both take an afternoon and both failures are otherwise discovered by a user in a host you have never run.</p>
+    </div>
+  </div>
+</section>
