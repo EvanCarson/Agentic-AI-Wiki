@@ -1,0 +1,123 @@
+<section class="phase">
+  <div class="phase-num">E14</div>
+  <div class="week">Deep Dive · Evaluating Agents</div>
+  <h2>When the check has to act.</h2>
+  <p class="goal">Open any desktop-agent benchmark and you will find that the grader does not read the machine, it operates it — OSWorld's spreadsheet tasks press Ctrl+S through <code class="inline">pyautogui</code> and wait half a second before comparing the file, after first demanding that a window titled <code class="inline">MaturityDate.xlsx - LibreOffice Calc</code> be focused with <code class="inline">strict: true</code>. Every one of those steps can fail on a machine where the agent did its job. A verifier that acts has its own failure rate, that rate is reported as your agent's failure rate, and the fix is not a better check but a third outcome.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Two kinds of verifier, and only one of them is passive.</h3>
+
+    <p>A passive verifier reads state that already exists. It opens a database, hashes a file, parses the response body — operations with no side effects and essentially no failure mode of their own beyond "the artifact is missing," which is itself a legitimate fail. Unit tests are passive. So is scoring a model's final text against a gold answer.</p>
+
+    <p>An active verifier has to change the system before it can observe it. It must focus a window to read the title bar, flush an application's in-memory buffer to disk before the bytes exist, re-run a query because the result was never persisted, or navigate to a settings page to see whether a toggle moved. The moment your environment is a real desktop, browser, or phone rather than a function call, most interesting checks are active ones, because applications hold state in memory that the filesystem does not have yet.</p>
+
+    <p>Here is a real one, from OSWorld's LibreOffice Calc suite — a task that asks the agent to add a <em>Maturity Date</em> column. The <code class="inline">evaluator</code> block runs before any comparison happens:</p>
+
+    <pre class="standalone"><span class="c-cm"># OSWorld task 4172ea6e — the evaluator's postconfig, in order</span>
+activate_window  window_name: <span class="c-st">"MaturityDate.xlsx - LibreOffice Calc"</span>, strict: <span class="c-kw">true</span>
+sleep            0.5
+execute          python -c <span class="c-st">'import pyautogui; pyautogui.hotkey("ctrl","s")'</span>
+sleep            0.5
+<span class="c-cm"># only now:</span>
+func             compare_table
+expected         cloud_file  <span class="c-cm"># fetched from a HuggingFace dataset repo</span>
+result           vm_file     /home/user/MaturityDate.xlsx</pre>
+
+    <p>Four things must go right before the agent's work is even looked at. The window title must match exactly — and the agent may have legitimately renamed or re-saved the file. The save dialog must not appear, or the keystroke lands in it. Half a second must be enough for LibreOffice to finish writing. And the gold file must download. A correct agent fails this task on any one of them.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The failure rate is invisible because it is reported in the agent's column.</h3>
+
+    <p>This is the part that costs teams months. An active verifier's failures are not logged as infrastructure errors; they are logged as task failures, which is the same thing a genuine agent mistake produces. A score of 38% contains three populations — tasks the agent got right, tasks the agent got wrong, and tasks nobody can speak to — and the third is silently folded into the second.</p>
+
+    <p>The direction of the bias is worth being precise about, because it is not simply "scores are too low." Active-verifier noise is <strong>anti-correlated with agent capability</strong> in a way that flatters bad agents and punishes good ones. A verifier step only runs if the harness reaches it, and an agent that crashes out at step three never gets to the postconfig at all — it fails cleanly, for a real reason. The agent that actually completes the spreadsheet is the one exposed to the Ctrl+S race, the focus check, and the download. The closer a system gets to finishing tasks, the larger the share of its remaining failures belong to the grader.</p>
+
+    <p>Scale matters here too, because the per-step risks compound. Across OSWorld's task files the setup and evaluator stages use <code class="inline">execute</code> 358 times, <code class="inline">sleep</code> 307 times, <code class="inline">launch</code> 303 times, <code class="inline">download</code> 293 times and <code class="inline">activate_window</code> 200 times, against 368 tasks in <code class="inline">test_all.json</code>. That is not an exotic edge of the suite; it is the suite. A benchmark whose grading path issues several hundred timed GUI operations and several hundred network fetches has a floor on its own reliability, and no published score tells you where that floor is.</p>
+
+    <div class="callout warn">
+      <p>Two fixed <code class="inline">sleep</code> values in a grading path are a measurement instrument calibrated to whichever machine the task was authored on. On a slower VM the save has not landed; on a faster one an application has already reclaimed focus. This is the single most common reason a suite that passed in CI fails on a colleague's hardware with no code change, and it is why <a class="xref" href="/deep-dives/evaluating-agents/eval-variance-and-statistical-power">variance budgets</a> computed from agent sampling alone understate the real spread.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The gold-state self-test: run the check against a known-good machine.</h3>
+
+    <p>The fix is cheap and almost nobody ships it. For every task, you need a recorded end state that is definitionally correct — the saved <code class="inline">.xlsx</code>, the configured app, the submitted form — and a mode that restores that state and then runs the verifier against it, with no agent in the loop at all.</p>
+
+    <p>The verifier must pass. If it does not, the task is broken, and you have learned that <em>before</em> attributing anything to a model.</p>
+
+    <pre class="standalone"><span class="c-cm"># one task, two runs, three outcomes</span>
+
+run_agent(task)    -> artifact_A
+restore(task.gold) -> artifact_G   <span class="c-cm"># the known-good end state</span>
+
+verify(artifact_G) == FAIL  -&gt; <span class="c-err">INDETERMINATE</span>   <span class="c-cm"># the check is broken; drop the task</span>
+verify(artifact_G) == PASS  -&gt; trust the check, then:
+    verify(artifact_A) == PASS -&gt; <span class="c-out">PASS</span>
+    verify(artifact_A) == FAIL -&gt; <span class="c-out">FAIL</span>              <span class="c-cm"># now attributable to the agent</span>
+
+<span class="c-cm"># report all three. denominator = PASS + FAIL, never PASS + FAIL + INDETERMINATE.</span></pre>
+
+    <p>Two properties make this worth the engineering. First, it is a <em>per-run</em> check, not a one-off audit: the gold replay happens on the same VM image, the same day, behind the same network as the scored run, so it catches the CDN that went down this morning and the image update that changed a window title last week. Second, it localises blame without needing a human. A task whose gold replay fails is removed from the denominator and filed as a bug against the suite — which is how an eval set stays a measurement instead of slowly becoming a <a class="xref" href="/deep-dives/evaluating-agents/human-baselines-in-agent-evals">pessimistic constant</a>.</p>
+
+    <p>The cost is one extra environment-run per task per sweep, which roughly doubles the infrastructure bill of the cheapest sweep you run and is a rounding error on an expensive one. Amortise it: the gold replay does not need to run on every model you compare, only once per environment image per day, because it is testing the environment and not the model. Account for it the way you account for sampling in <a class="xref" href="/deep-dives/evaluating-agents/budget-matched-evaluation">budget-matched evaluation</a> — as a fixed cost of getting a number you can defend.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Three outcomes, not two — and the third one goes in the report.</h3>
+
+    <p>The reason most harnesses have two outcomes is that <code class="inline">reward</code> is a float and there is nowhere to put "unknown." BrowserGym's task interface is explicit about this: <code class="inline">validate(page, chat_messages)</code> returns <code class="inline">(reward, done, message, info)</code>, and a verifier that cannot decide has exactly one way to say so, which is to return 0.0 and look identical to a failure. AndroidWorld has the same shape — <code class="inline">is_successful(env) -&gt; float</code>. Neither is badly designed; a scalar reward is the right interface for training. It is the wrong interface for reporting, and the two get conflated because the same function serves both.</p>
+
+    <p>So carry the third state out of band, in the <code class="inline">info</code> dictionary that is already there, and surface it in the summary. A defensible agent result looks like this:</p>
+
+    <pre class="standalone">Suite: osworld-verified      Image: ubuntu-2026-10-14      Sweep: 3 seeds
+
+  attempted            368
+  indeterminate         17   <span class="c-cm"># gold replay failed; excluded</span>
+  scored               351
+    pass               134
+    fail               217
+
+  success rate       38.2%   (134/351, 95% CI 33.1-43.5)
+  NOT               36.4%   (134/368) — the number a two-outcome harness prints</pre>
+
+    <p>Those two percentages differ by 1.8 points on a 4.6% indeterminate rate, which sounds survivable until you compare two systems measured a week apart on different image builds. The reported gap between them then includes the difference in <em>their graders'</em> health, and that difference has no reason to be small or stable. This is the same identification problem as an unreported user simulator in <a class="xref" href="/deep-dives/evaluating-agents/evaluating-multi-turn-agents">multi-turn evaluation</a>: the measurement contains a second system you did not intend to evaluate, and omitting it does not make it absent, only unnamed.</p>
+
+    <div class="callout">
+      <p><strong>Distinguish this from scorer gaming.</strong> <a class="xref" href="/deep-dives/evaluating-agents/eval-integrity-and-scorer-gaming">Eval integrity</a> asks whether the agent can reach the grader and influence it. This page asks whether the grader works at all on a machine the agent never touched. They demand opposite remedies — isolation for the first, a self-test for the second — and a suite can be flawless on one and broken on the other.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>What transfers to your own product, where there is no benchmark.</h3>
+
+    <p>Nothing above is specific to desktop benchmarks; they are just where the problem is legible because the code is public. The same structure appears the moment your own definition of done requires an action to observe. "Did the invoice get posted?" is answered by a query against a ledger whose read replica lags. "Did the ticket get escalated?" is answered by an API that rate-limits your checker before it rate-limits your agent. "Did the file get written?" is answered by a storage layer that is eventually consistent, so a check that runs 200 ms after the agent finishes is measuring propagation delay and calling it agent failure.</p>
+
+    <p>Three rules carry over cleanly:</p>
+
+    <ul>
+      <li><strong>Write the checker before the agent, and test it against a hand-made success.</strong> If you cannot produce the correct end state by hand and have your checker confirm it, you do not yet have a definition of done — you have a hope. This is the single highest-return half-day in setting up an agent evaluation, and it is almost always skipped because the checker feels like test infrastructure rather than product.</li>
+      <li><strong>Prefer the passive read, even when it is weaker.</strong> A check that reads an append-only audit log is less expressive than one that re-runs the agent's query, and it is worth the loss: it has no side effects, no focus, no timing, and no failure mode that isn't also a real failure. Where you can arrange for the agent's own action to leave a durable artifact, you convert an active verifier into a passive one, which is the cheapest reliability win available in agent evaluation.</li>
+      <li><strong>Never let an indeterminate run silently become a failure.</strong> Emit it as its own class and alert on its rate. A rising indeterminate rate is the earliest signal that your environment drifted, and it arrives weeks before anyone notices the quality regression it will be mistaken for — which is exactly the misattribution a <a class="xref" href="/operations/evaluation-and-observability/failure-taxonomy-and-triage">failure taxonomy</a> exists to prevent.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The honest trade-off.</h3>
+
+    <p>Active verification is not a mistake to be designed away. Some tasks genuinely cannot be scored without touching the machine, and refusing to write those checks means refusing to measure the work agents are actually sent to do — which is worse than measuring it noisily. The error is not the active check; it is the two-outcome report that hides its failures inside the agent's.</p>
+
+    <p>The open question nobody has answered well is how to price an indeterminate run against a wrong one. A suite that drops 5% of tasks for grader failure and a suite that scores them all with 5% grader noise produce different numbers, and the first is more honest while the second is better powered. Published agent benchmarks mostly do neither; they report one rate over all attempted tasks and leave you to assume the grader was perfect. Until that changes, assume a floor of a few points of grader noise under any desktop or browser agent figure you read, and treat differences smaller than that as unresolved — the same discipline <a class="xref" href="/concepts/reading-benchmarks">reading benchmarks</a> asks for, applied one layer lower than usual.</p>
+
+    <div class="callout tip">
+      <p><strong>Do this week:</strong> take the ten tasks in your suite with the highest failure rate, construct each one's correct end state by hand, and run your verifier against it. Every verifier that fails on a hand-made success is a task you have been scoring as a model defect. Then add an <code class="inline">INDETERMINATE</code> outcome to your harness, exclude it from the denominator, and put its rate next to the success rate in every report. If you only do one of these, do the first — in most suites it finds something on the first afternoon.</p>
+    </div>
+  </div>
+</section>
