@@ -1,0 +1,104 @@
+<section class="phase">
+  <div class="phase-num">N12</div>
+  <div class="week">深入解析 · 推理与测试时计算</div>
+  <h2>摘要与密封块：你的 API 真正交回来的那份「推理」。</h2>
+  <p class="goal">模型产生的那段推理，你存不下来；你能存的是两个替代品之一，而它们的性质恰好相反——一份可读的摘要，它是关于那段推理的一次全新生成；一个密封块，它忠于那段推理，而你读不了。团队把忠实性审计、过程评分与事故复盘建在可读的那一个上，而它恰恰是两者中唯一撑不起这些的。与此同时，密封的那一个是一项协议义务：按字节原样传回去，否则你的工具循环会停。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>两种产物，而它们不是同一样东西的两个视图。</h3>
+
+    <p>当一个推理模型跑完一个轮次，它用来推理的那些 token 在你这一侧的线缆上已经不存在了。截至 2026 年 11 月，三家主要厂商回传给你的，是两个几乎没有共同点的对象的某种组合。</p>
+
+    <ul>
+      <li><strong>一份摘要。</strong>由厂商生成、关于那段推理的、人类可读的散文。在 OpenAI 的 Responses API 上它以自己的事件类型流式返回——<code class="inline">response.reasoning_summary_text.delta</code> 与 <code class="inline">.done</code>——与答案分开。它的存在是为了给用户看。</li>
+      <li><strong>一个密封产物。</strong>一个不透明字段，代替那段推理，以便模型在下一次请求里把线头接回去。Anthropic 把它叫作每个 thinking 块上的 <code class="inline">signature</code>，并在文档里把它描述为完整推理的一份加密副本。OpenAI 在你把 <code class="inline">reasoning.encrypted_content</code> 加进请求的 <code class="inline">include</code> 列表时返回一个。Gemini 则把 <code class="inline">thought_signature</code> 挂在 part 上。它的存在是为了被传回去。</li>
+    </ul>
+
+    <p>分工干净利落，而几乎所有人都搞反了。你能读的那份产物，是没有证据效力的那一个，因为它出自一次独立的生成，那次生成可能压缩、重排、省略或加以修饰，而 API 里没有任何东西告诉你它做了哪一样。有证据效力的那一个——厂商自己把它当作忠实替身、甚至到了你一改动它就拒绝请求的程度——偏偏是你完全读不了的那个。不存在第三种选项让你两样都拿到，而把设计建立在「仿佛存在」之上，正是下面大部分麻烦的源头。</p>
+
+    <div class="callout">
+      <p>这个问题的形状，你在<a class="xref" href="/zh/deep-dives/reasoning-and-test-time-compute/reasoning-token-accounting">推理 token 的记账</a>里见过：你为一个在日志里没有对应对象的东西付钱。而在这里你还额外<em>为它负责</em>——这个对象对你是惰性的，对下一次请求却是承重的。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>密封产物是一项协议义务，而且它对字节极其脆弱。</h3>
+
+    <p>把那个不透明字段当成「你可以顺手整理一下」的元数据，循环就会断——不是退化，是断。Anthropic 的文档明确写着：thinking 块要在多轮与工具使用的会话里原样回传，而只要先前的内容（包括 thinking 块）被改动过，API 就会拒绝那次请求。Gemini 更进一步，把它变成了智能体天天都在做的那件事上的硬性要求：传回 thought signature 对函数调用是强制的，而 Gemini 3 上少了一个就是一个 400，错误信息就这么写着——<em>Function call is missing a thought_signature</em>。</p>
+
+    <p>有两个后果，不会在顺利路径的测试里露头。第一，放置规则因厂商而异，而且不直观。Google 的文档写明：在一批并行函数调用里只有第一个 <code class="inline">functionCall</code> part 带 signature，而跨多步的顺序调用里每一次调用各带一个；signature 必须在它原本那个 part 里回传，响应上的函数调用 <code class="inline">id</code> 必须对得上，带 signature 的 part 不得被合并。一个把消息列表「规范化」为合并相邻 part 的框架，已经悄悄毁掉了一个必填字段。</p>
+
+    <p>第二，Anthropic 为被安全标记的推理还发了<em>第二种</em>块类型：<code class="inline">redacted_thinking</code>，它的内容放在一个 <code class="inline">data</code> 字段里、没有可读文本，并且跟其他块一样必须原样传回。文档里点名的那个陷阱，是几乎每个人都会写的一行代码：</p>
+
+<pre class="standalone"><span class="c-cm"># Looks like a filter for "the thinking parts". Drops redacted_thinking,</span>
+<span class="c-cm"># so the next request is missing a block the API requires.</span>
+blocks = [b <span class="c-kw">for</span> b <span class="c-kw">in</span> msg.content <span class="c-kw">if</span> b.type == <span class="c-st">"thinking"</span>]   <span class="c-err"># wrong</span>
+
+<span class="c-cm"># Both reasoning block types, in order, untouched.</span>
+blocks = [b <span class="c-kw">for</span> b <span class="c-kw">in</span> msg.content
+          <span class="c-kw">if</span> b.type <span class="c-kw">in</span> (<span class="c-st">"thinking"</span>, <span class="c-st">"redacted_thinking"</span>)]   <span class="c-out">ok</span>
+
+<span class="c-cm"># And never do this to a signed field — any rewrite invalidates it:</span>
+b.thinking = sanitize(b.thinking)                        <span class="c-err"># breaks the signature</span></pre>
+
+    <p>最后那一行不是假想。一份 OpenClaw 的缺陷报告（issue #24612）把长会话里反复出现的 <em>thinking blocks cannot be modified</em> 拒绝，追到了一个依赖项：它在重发之前，对已签名的 thinking 文本套用了一个清理 Unicode 代理对的函数。一次纯属外观的字符串规范化——每一层日志与序列化都会不请自来地做的那种——让那个密码学签名失效了。那个字段不是一个你的技术栈可以碰的字符串；它是一张你替别人捎着的票。</p>
+
+    <p>在 OpenAI 一侧，同一项义务换了一身行头出现，成了无状态化的后果。只要你让 Responses API 替你存住会话，它就会替你捎着推理；如果你不能这么做，你就要求 <code class="inline">reasoning.encrypted_content</code> 并自己重发。零数据保留的组织没有选择权——OpenAI 自家的 cookbook 指出，对它们 <code class="inline">store=false</code> 是被强制的，于是加密内容那条路从可选变成了必需。被报告出来的故障聚集的位置恰如你所料：一份 openai-agents-python 的 issue（#919）报告推理模型在 <code class="inline">store=False</code> 下失败，原因是请求里没带上 <code class="inline">reasoning.encrypted_content</code>；而一份 JetBrains Koog 的 issue（#2287）报告某条流式路径丢掉了「带加密内容但没有摘要」的推理项——而这个组合，在摘要设成 <code class="inline">auto</code> 而模型决定不发一份时你立刻就会撞上。还有一个值得在围着它做设计之前先知道的模式冲突：有开发者报告后台模式要求 <code class="inline">store=true</code>，而那恰恰是加密内容唯一不能与之并用的东西。</p>
+
+    <div class="callout warn">
+      <p>如果你的智能体框架坐在你与厂商之间，真正要紧的集成测试不是「一次推理调用能不能跑通」，而是「一次推理调用<em>后面接一个工具结果</em>、到第三个轮次、中间还夹着一次 redaction，能不能跑通」。上面每一种故障，在第一个轮次都看不见。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>摘要是第二次生成，不是一份逐字记录。</h3>
+
+    <p>可读的那份产物才是招来错误的那一个，因为它读起来恰好就像你想要的东西。它是散文、第一人称、按顺序描述着那些考量。它不是的那样东西，是一份记录：它是在那段推理之上的一次独立摘要生成的输出，自带压缩、自带失败模式，而 API 不给你任何办法判断什么被丢掉了。Meta 的 Responses 协议文档把这道分界写得很直白——摘要以 summary-text 事件流式返回，而原始的思维链只以加密形式存在、供跨轮次重放。</p>
+
+    <p>于是有三个推断是你用不了的，无论那份摘要写得多仔细：</p>
+
+    <ul>
+      <li><strong>摘要里没有的考量，在推理里也没有。</strong>摘要会省略；此处的「没出现」不构成证据。</li>
+      <li><strong>摘要里有的考量，驱动了那个答案。</strong>这是隔了一层的<a class="xref" href="/zh/concepts/chain-of-thought-faithfulness">忠实性</a>问题——那份摘要可能是对一段不忠实的事后合理化的忠实摘要，而两层都不透明。</li>
+      <li><strong>两次运行的摘要不同，意味着它们推理得不同。</strong>你把摘要器也采样了两次，不只是模型。</li>
+    </ul>
+
+    <p>这一切并不让摘要变得毫无价值。对一个需要知道智能体在干什么的用户来说，它正是该给他看的东西，而<a class="xref" href="/zh/playbooks/agent-ux-and-human-interaction/transparency-and-explainability">把它展示出来的那套 UX 理由</a>很硬。错误在于：仅仅因为它是响应里你唯一读得懂的东西，就把一份 UX 产物提拔成了证据产物。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>团队建在错那一个产物上的三样东西。</h3>
+
+    <p><strong>忠实性与安全审计。</strong>一位靠读摘要来判断「智能体有没有考虑过那条政策」的审核者，量的是摘要器对那条政策的覆盖程度；对一个从未考虑过它的模型，他会给出干净的结论，而对一个考虑过的模型，他会给出不干净的结论。更糟的是，这个结论在厂商那一侧改动摘要生成时并不稳定，而那种改动永远不会通知你。如果一项控制依赖「模型考虑过什么」，那么这项控制根本无法用这个输入搭起来；它必须被改造成一项针对模型<em>做了什么</em>的检查。</p>
+
+    <p><strong>评测里的过程评分。</strong><a class="xref" href="/zh/deep-dives/evaluating-agents/trajectory-and-process-evaluation">轨迹与过程评估</a>想要的是中间步骤，而摘要是手头唯一的中间文本，于是评判者就被指向了它。后果是一个奖励「叙述得清楚」的打分器。请注意这件事以一种很具体的方式破坏了过程监督惯常的论证：<a class="xref" href="/zh/deep-dives/training-agentic-models/process-reward-models">过程奖励模型</a>是在推理步骤上训练出来的，而一份摘要不是一个步骤——它是一份关于步骤的报告，分布不同，而且中间还夹着一家厂商。去给工具调用、参数、检索与状态转移打分吧，那些是你自己的、可观测的，而且跨运行可比。</p>
+
+    <p><strong>事故复盘。</strong>这是代价最贵的那一个，因为它的欠缺会在最糟的时刻浮上来。一份「为什么」那一栏里装着摘要的<a class="xref" href="/zh/deep-dives/agent-security/decision-receipts-and-audit">决策收据</a>，是在一份你打算倚赖的文件里记下了一个厂商产物。如果你的审计义务是复盘一个决定——参见<a class="xref" href="/zh/operations/governance-compliance/audit-trails">审计轨迹</a>——那么可复盘的部分是输入上下文、工具调用与效果，而一份诚实的收据会把这点说出来，而不是暗示更多。</p>
+
+    <p>还有第四个、更安静的版本：保留策略。那个密封块是在你的提示词之上的一份推理的加密副本，所以它继承的是输入的敏感度，而不是它外观上的那份无害。为重放而存着它，就是在以一种你的<a class="xref" href="/zh/operations/evaluation-and-observability/pii-redaction-in-agent-traces">脱敏管道无法查看</a>的形式存着客户数据——这也正是你绝不能让那条管道去改写它的原因。把它的生命期收窄到需要它的那次会话，别让它进入那些长期保存的 trace 存储，那里的<a class="xref" href="/zh/operations/evaluation-and-observability/trace-sampling-and-retention">采样与保留</a>规则假定载荷是可读的。对处在<a class="xref" href="/zh/operations/governance-compliance/zero-data-retention-and-abuse-monitoring">零数据保留</a>之下的组织，这个块正是让无状态推理循环成为可能的那样东西，而它现在住在你的存储里，而不是厂商的。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>让循环继续工作的几条规矩。</h3>
+
+    <ul>
+      <li><strong>把密封产物按字节原样、端到端地捎过去。</strong>不裁剪、不做 Unicode 规范化、不重新编码、不做「无害的」空白修正。如果你栈里某一层无法作出这个承诺，那这个字段必须绕过它。</li>
+      <li><strong>把推理块的类型逐一列出，不要去匹配其中一个。</strong>把 <code class="inline">redacted_thinking</code> 包进来，并写下那个把一个 redacted 块放进工具使用会话中间的测试。</li>
+      <li><strong>把「没有摘要」当成正常情况。</strong>摘要是可选输出；假定一个推理项带有摘要文本的代码，会把那个带着 signature 的项丢掉——而那正是要紧的那一个。</li>
+      <li><strong>有意识地、一次性地选定有状态还是无状态。</strong>厂商侧的会话状态与你自管的加密内容解决的是同一个问题，但保留、延迟与失败模式各不相同，而模式冲突（后台执行、存储开关）围着它做设计要比撞上去再发现容易得多。任务层面的后果在<a class="xref" href="/zh/deep-dives/reasoning-and-test-time-compute/carrying-reasoning-across-tool-calls">把推理带过工具调用</a>里。</li>
+      <li><strong>永远不要拿摘要当缓存键。</strong>它是关于请求的、不确定的文本。请<a class="xref" href="/zh/concepts/prompt-caching">按你真正发出去的前缀做缓存</a>。</li>
+      <li><strong>记那一对，别记那段散文。</strong>一步一行、装着工具调用、它的参数、结果与效果，就能复现一个决定。摘要是你可以为读者留着的一列；它不是这一行存在的理由。</li>
+    </ul>
+
+    <p>更深一层的设计要点是：<a class="xref" href="/zh/deep-dives/reasoning-and-test-time-compute/chain-of-thought">思维链</a>在大约两年里，从「响应里一段你可以读、可以打分的文本」，搬成了「一个厂商持有、你可以重放的对象，加上一份厂商撰写、你可以展示的提要」。一切建在第一种理解之上的东西都得移植，而这次移植不是一轮重构：它是一个关于「你哪些控制一直在读叙述、现在必须改成读行为」的决定。<a class="xref" href="/zh/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">努力预算</a>让这件事更锋利而不是更缓和，因为一个给定答案背后有多少推理，如今是一个你来设定、却无法查看的旋钮。</p>
+
+    <div class="callout tip">
+      <p>做两件事。先把那个会失败的测试写出来：三个轮次、一次工具调用、一个被 redact 或没有摘要的推理项，断言它在传回去时按字节完全一致——今天在多数技术栈上它都会失败，而往后每一次意外都是这个 bug。然后在你的评测、审计查询与事故模板里 grep 一遍，找出任何在读摘要文本的东西，并逐一决定它是面向读者的体贴，还是一项控制。控制要针对工具调用与效果重写；体贴可以留下，只是重新贴上它本来的标签。</p>
+    </div>
+  </div>
+</section>
