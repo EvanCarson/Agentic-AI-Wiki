@@ -1,0 +1,92 @@
+<section class="phase">
+  <div class="phase-num">V26</div>
+  <div class="week">Playbook · Voice &amp; Realtime Agents</div>
+  <h2>Appointment scheduling over voice: the defect is in the write, not the listen.</h2>
+  <p class="goal">A voice agent that books appointments will double-book before it mishears anything, because the ten to fifteen seconds between offering a slot and hearing &#8220;yes&#8221; is a window in which the calendar moves. Scheduling is a concurrency problem wearing a speech-recognition costume: hold one slot before you speak it, confirm it with a conditional write, and have the recovery sentence written before you need it.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Measure the gap between the offer and the acceptance.</h3>
+    <p>Every scheduling turn has the same shape: the agent reads availability, speaks one or more options, the caller decides, the agent writes. Three of those four steps take real time, and nothing holds the inventory during them.</p>
+    <p>Count it out. &#8220;I have Tuesday the eleventh at two fifteen, Wednesday the twelfth at nine thirty, or Thursday at four o'clock&#8221; is about twenty-four words — roughly <strong>9.6 seconds</strong> at a natural 150 words per minute. Add the caller's deliberation, which is two to five seconds when they are choosing between three times and longer when they are checking their own calendar, plus 500–800 ms for <a class="xref" href="/concepts/end-of-turn-detection">end-of-turn detection</a> and the round trip to write. The realistic window from <em>read availability</em> to <em>write accepted</em> is <strong>12 to 18 seconds</strong>, and none of it is under your control once the agent starts talking.</p>
+    <p>Now put volume against it. A line handling 40 scheduling offers an hour has, in any given 15-second window, an expected 40 &#215; 15 / 3600 = <strong>0.17 other live offers</strong> — about one in six. That sounds survivable until you notice the distribution: every agent on every line offers the <em>earliest</em> available slots first, because that is what callers want and what every prompt tells the model to do. The overlapping offers are not spread across the calendar. They are concentrated on the same one or two slots, so the one-in-six collision rate is close to the double-booking rate rather than being diluted by it.</p>
+    <div class="callout warn"><p>This failure does not show up in an ASR evaluation, a barge-in test, or a latency budget, which is why teams ship it. It shows up as &#8220;the agent booked someone into a taken slot&#8221; in a support ticket, and gets misfiled as a hallucination.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Reserve before you speak — and reserve exactly one slot.</h3>
+    <p>The fix is to take the slot off the shelf <em>before</em> the words leave the agent's mouth, not after the caller agrees. A tentative reservation with a short time-to-live converts a race into a lease: whoever holds the lease can confirm, everyone else is told the truth immediately instead of ten seconds later.</p>
+    <p>The instinct is to hold every option you are about to offer. Resist it, because holds are inventory you have removed from circulation, and at scale the holds themselves cause the shortage. For a busy line at 400 offers an hour with a 20-second TTL:</p>
+    <ul>
+      <li><strong>Holding three options per call</strong> — 400 &#215; 3 &#215; 20 / 3600 = <strong>6.7 slots</strong> held at any instant. Against a same-day pool with eight slots left, two thirds of the remaining capacity is invisible to everyone, including your web booking page.</li>
+      <li><strong>Holding one option per call</strong> — 400 &#215; 1 &#215; 20 / 3600 = <strong>2.2 slots</strong>. The same protection on the slot that matters, at a third of the cost.</li>
+    </ul>
+    <p>So hold the one you are recommending — the first option, the one most callers take — and offer the others unheld, as candidates you will have to re-check. That asymmetry is honest and it is cheap: the recommended slot is protected, and the alternatives carry the risk they always carried.</p>
+    <p>Three properties make a hold safe rather than a new leak: a TTL on the order of <strong>20–30 seconds</strong> (one utterance plus one turn, not one call); release on hangup, on topic change, and on confirmation of a different slot; and a per-call cap so a long, meandering call cannot accumulate holds. Treat an un-released hold as a resource leak with a dashboard, in the sense of <a class="xref" href="/operations/agentops/durable-state-and-resumability">durable state and resumability</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Confirm with a conditional write, never a blind one.</h3>
+    <p>A hold narrows the window; it does not close it. Holds expire, a human at the front desk can book over you, and a second agent on another line may have a hold the first system never learned about. The write itself has to be the thing that fails safely, which means it carries a precondition describing the world the agent spoke about.</p>
+    <p>The HTTP mechanism is standard and widely implemented: read the resource with its entity tag, then write with <code class="inline">If-Match</code> set to that tag. If the resource changed, the server returns <strong>412 Precondition Failed</strong> and your write does not land. Google Calendar's v3 API carries an <code class="inline">etag</code> on every event resource, and most booking back-ends expose either an etag or a version column you can use the same way. Pair it with an idempotency key so that a retry after a timeout cannot produce a second appointment — the classic double-booking bug is not two callers, it is one caller and one retried request.</p>
+<pre class="standalone"><span class="c-cm"># Offer -> hold -> speak -> confirm. The precondition is the whole design.</span>
+hold = calendar.<span class="c-fn">hold</span>(slot=best, ttl_s=<span class="c-st">25</span>, call_id=call.id)
+<span class="c-kw">if</span> <span class="c-kw">not</span> hold.granted:
+    best = <span class="c-fn">next_candidate</span>()            <span class="c-cm"># never speak an unheld recommendation</span>
+
+<span class="c-fn">speak</span>(<span class="c-st">f"I can do {best.spoken}. Does that work?"</span>)
+answer = <span class="c-fn">listen</span>()
+
+<span class="c-kw">try</span>:
+    booking = calendar.<span class="c-fn">confirm</span>(
+        hold_id=hold.id,
+        if_match=hold.etag,              <span class="c-cm"># 412 if the world moved</span>
+        idempotency_key=<span class="c-st">f"{call.id}:{best.id}"</span>,
+    )
+<span class="c-kw">except</span> PreconditionFailed:             <span class="c-cm"># expired or taken: STEP 4</span>
+    <span class="c-fn">recover</span>(call, reason=<span class="c-st">"slot_gone"</span>)
+<span class="c-kw">else</span>:
+    <span class="c-fn">speak</span>(<span class="c-st">f"Booked: {booking.spoken}. You'll get a text."</span>)</pre>
+    <div class="callout"><p>Note what the <code class="inline">if not hold.granted</code> branch prevents. Without it the agent speaks a slot it does not have, which is the single highest-cost sentence in the whole interaction — the caller now believes something false, and every later correction reads as incompetence rather than as diligence.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>When the hold expires mid-sentence, have the sentence ready.</h3>
+    <p>A 412 on confirm is not an error to log and retry silently. It is a conversational event, and the agent has roughly one turn to handle it before the caller decides the system is broken. Write the recovery utterance in advance and test it, because a model improvising under a tool failure will either apologise at length or — much worse — book something else and describe it as what the caller asked for.</p>
+    <p>The shape that works names the change, offers the nearest alternative, and asks one question: <em>&#8220;That one just went — the next I have is Tuesday at three. Shall I take it?&#8221;</em> Three properties matter. It is one sentence, so the caller does not lose the thread. It contains exactly one new time, not a fresh list. And it does not explain the concurrency model, which no caller wants.</p>
+    <p>Two failure modes to prohibit explicitly in the system prompt and verify in evaluation:</p>
+    <ul>
+      <li><strong>Silent substitution.</strong> Booking an adjacent slot and reporting success. This is the one that generates complaints and, in healthcare and legal contexts, real harm; it is a <a class="xref" href="/concepts/goal-drift">goal-drift</a> failure with a tool result as the trigger.</li>
+      <li><strong>Unbounded retry.</strong> Looping on confirm while the caller waits in silence. Cap at one automatic re-attempt within the same turn, then speak. The deadline discipline is the same one in <a class="xref" href="/operations/agentops/timeouts-and-deadline-budgets">timeouts and deadline budgets</a>, except that here the budget is measured in how long a human will tolerate dead air — about two seconds.</li>
+    </ul>
+    <p>Where the caller cannot be served at all, the handoff is a <a class="xref" href="/playbooks/voice-realtime-agents/escalation-and-warm-transfer">warm transfer</a> that carries the attempted slot with it, so the human does not restart the conversation.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Ask the discriminator before you offer anything.</h3>
+    <p>The timing arithmetic in STEP 1 has a second implication: the longer the offer, the wider the window. Reading three options costs about ten seconds of exposure; reading one costs three. So the cheapest way to shrink the race is to ask one narrowing question first and then offer a single held slot.</p>
+    <p>The discriminator is almost always a day part or a day, because that is what callers actually have constraints about: <em>&#8220;Mornings or afternoons?&#8221;</em> then <em>&#8220;I can do Wednesday at nine thirty — does that work?&#8221;</em> Two short turns beat one long one on every axis that matters here — exposure window, recall, and the recency bias that makes callers accept whichever option they heard last. The general case is in <a class="xref" href="/playbooks/voice-realtime-agents/long-lists-over-voice">long lists over voice</a>; scheduling is its most common instance and the one where the cost of the list is a wrong booking rather than a confused caller.</p>
+    <p>Two rules that follow directly:</p>
+    <ul>
+      <li><strong>Never speak an index.</strong> &#8220;Press or say one for Tuesday&#8221; invites a caller to say &#8220;one&#8221; when they meant the first thing they remembered, which is usually the last thing you said.</li>
+      <li><strong>Speak times the way the caller will repeat them.</strong> &#8220;Half past nine on Wednesday&#8221; is confirmable; &#8220;09:30 on 2026-11-11&#8221; is not. The spelling-out discipline is in <a class="xref" href="/playbooks/voice-realtime-agents/alphanumerics-over-voice">alphanumerics over voice</a>.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Instrument the three failures that look like one.</h3>
+    <p>&#8220;The agent booked it wrong&#8221; is three different defects with three different fixes, and an aggregate booking-accuracy number hides which one you have. Emit all three separately:</p>
+    <ul>
+      <li><strong>Hold-expiry rate</strong> — holds that timed out before confirm, as a fraction of holds granted. Rising means your offers are too long or your TTL is too short. This is the metric that tells you STEP 5 is not being followed.</li>
+      <li><strong>Precondition-failure rate</strong> — 412s on confirm, as a fraction of confirms attempted. Rising means genuine contention: more concurrency than the pool supports, or a channel writing without holds (the front desk, the web form, a second agent).</li>
+      <li><strong>Mismatch rate</strong> — appointments whose booked time differs from the time the transcript shows the agent speaking. This is the only one that catches silent substitution, and it requires joining the booking record to the transcript rather than trusting the agent's own report of success.</li>
+    </ul>
+    <p>The end-to-end check that catches everything the three metrics miss is reconciliation: after each call, re-read the calendar and compare what is there against what the agent said. Disagreement is a defect regardless of which component caused it — the same &#8220;check the effect, not the intent&#8221; principle as <a class="xref" href="/operations/evaluation-and-observability/replay-testing-with-recorded-traces">replay testing with recorded traces</a>, and the reason <a class="xref" href="/playbooks/voice-realtime-agents/evaluating-voice-agents">evaluating voice agents</a> has to include a write-side assertion and not only a transcript score.</p>
+    <div class="callout tip"><p>Do this today, before any prompt work: take one week of bookings, join each to its call transcript, and count the rows where the spoken time and the booked time disagree. That number is your real scheduling accuracy. If it is not zero, the fix is a hold and an <code class="inline">If-Match</code> — not a better model, not a longer prompt, and not more examples.</p></div>
+  </div>
+</section>
