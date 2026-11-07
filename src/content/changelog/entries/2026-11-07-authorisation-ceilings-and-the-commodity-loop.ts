@@ -1,0 +1,34 @@
+import { L, type ChangelogEntry } from '../types.ts';
+
+const entry: ChangelogEntry = {
+  date: '2026-11-07',
+  title: L(
+    'Two AI Blog posts, two new pages, and the build-vs-buy page rebuilt',
+    '两篇博客、两个新页面，自建对外购一文重写',
+  ),
+  items: [
+    L(
+      'AI Blog: "The timestamps matched, the authorisation did not" — WorkOS compared a security researcher\'s timestamps against its own logs, an independent forensics firm agreed, and the account matched, which settled who ran the agent and nothing beyond that. First confirmed unauthorised request on 25 October, bulk retrieval and detection on 30 October; the bulletin says the tool "should not have been reachable from the internet" and that "the API accepted a weak credential intended for local development". The three claims a defender would most want checked — that the agent escaped its test environment, that the access was unintended, that the copied data is deleted — have no log line and no forensic artefact, and the researcher is unnamed. Note too that ARTEX was named by the CEO, not the bulletin, and that WorkOS began testing itself with the same framework on 3 November while its published indicators are user-agent strings, which any client can send or omit.',
+      'AI 博客：《时间戳对上了，授权没有》——WorkOS 把一位安全研究者给出的时间戳与自己的日志作了比对，一家独立取证公司也认同，两边对上了；而这只敲定了「是谁在跑这个智能体」，别的什么都没有。首次已确认的未授权请求在 10 月 25 日，批量取走与检测都在 10 月 30 日；公告称该工具「本不应能从互联网触达」，且「该 API 接受了一个本意用于本地开发的弱凭据」。防御方最想核实的那三条——智能体逃出了测试环境、这次访问并非有意、拷走的数据已删除——既无一行日志，也无一件取证痕迹，而那位研究者未被具名。另请注意：ARTEX 这个名字出自 CEO、而非公告；而 WorkOS 从 11 月 3 日起用同一套框架测试自己，可它公布的指标是 user-agent 字符串——任何客户端都能发它、也都能不发它。',
+    ),
+    L(
+      'AI Blog: "SWE-bench Verified vs SWE-bench Pro vs Terminal-Bench 2.1 vs SWE-rebench" — each defends against a different decay and none defends against all three. Verified screened 1,699 candidates down to 500 once, in August 2024, and an outside audit found the solution visible in about 7% of them; Pro holds 858 tasks back privately and picks copyleft repositories as a stated legal deterrent, while its live public split has already moved from 731 tasks to 642; SWE-rebench re-mines monthly from a 21,336-task corpus and flags items created before a model\'s release rather than excluding them. The number that travels is Terminal-Bench\'s: six months after shipping 89 expert-reviewed tasks, its maintainers repaired 26 to 28 of them — nine for changed dependencies, eight for resource budgets too small for a valid approach.',
+      'AI 博客：《SWE-bench Verified、SWE-bench Pro、Terminal-Bench 2.1 与 SWE-rebench 之辨》——四者各防一种腐坏，而没有一个防得住全部三种。Verified 在 2024 年 8 月把 1,699 个候选筛到 500 个，只筛过一次，而一项外部审计发现其中约 7% 的题面里就看得见解法；Pro 私下留住 858 个任务、并以「法律抑制」为由选用传染性许可的仓库，而它线上的公开分支已经从 731 个任务变成了 642 个；SWE-rebench 从一个 21,336 题的语料里按月重新挖掘，并给「创建时间早于模型发布」的条目打标、而不是排除。真正能带走的那个数字属于 Terminal-Bench：89 个经专家评审的任务发布半年后，维护者修掉了其中 26 到 28 个——九个因为依赖变了，八个因为资源额度小到容不下一条有效解法。',
+    ),
+    L(
+      'New Operation: Authorised Agentic Testing (Safety, Alignment & Agentic Security, S32). When a third party points a security agent at you, the only evidence it was ever authorised is the operator\'s word, and a rules-of-engagement template written for people has no field for identity, for rate, or for the tester\'s own containment — nor has any regulator published one. So mint the credential yourself, client certificate or signed header rather than a user-agent string, and write the clause that unmarked traffic from the engagement is contained as an intrusion without consultation. Cap requests and records separately at your edge and make the limit page someone rather than throttle silently, pre-authorise one named person to revoke in one action, and negotiate the named deletion signatory and its evidence standard before the test, when it is still free.',
+      '新增运维：《获授权的智能体测试》（安全、对齐与智能体安全，S32）。当某个第三方把一个安全智能体指向你，「它曾获授权」的唯一证据就是操作者的说法；而一份为人写的交战规则模板，没有关于身份、关于速率、关于测试方自身收容的任何一栏——也没有任何监管机构发布过这样一份。所以：凭据由你来铸，用客户端证书或签名请求头，而不是一个 user-agent 字符串；并写下那句「本次委托产生的未标记流量将按入侵隔离，不作咨询」。请在你的边缘把请求数与记录数分开设限，并让上限去呼人、而不是静默节流；事先授权一个具名的人用一个动作完成吊销；并在测试之前、它还免费的时候，谈好那位具名的删除声明签署人与其证据标准。',
+    ),
+    L(
+      'New Deep-Dive: Gold Runs & the Unsolvable Task (Evaluating Agents, E15). Every score is a fraction whose denominator you assumed. On a worked 180-task suite, twelve tasks dying of ordinary rot turn an unchanged agent\'s 62.2% into 57.8% — a 4.4-point "regression" that is 61.9% against the achievable denominator, meaning nothing moved at all. Dead tasks only ever subtract, so the drift carries a sign and always reads as a model regression; a weakened test biases the other way while leaving the reference run green, which is why the suite needs two sentinels — the reference solution for the ceiling and a no-op solver, which must pass zero, for the floor. Report pass, fail and unavailable, alarm on the unavailable rate rather than the score, and never let a missing reference run default to assuming the ceiling is intact.',
+      '新增深入解析：《参考解运行与不可解任务》（评估智能体，E15）。每一个分数都是一个分母靠假定的分数。在一套算过的 180 题题目上，十二个因寻常腐坏而死掉的任务，把一个未经改动的智能体从 62.2% 变成 57.8%——那 4.4 个百分点的「退步」，按本可达成的分母算其实是 61.9%，也就是什么都没动。死任务只会做减法，所以这个漂移带符号，而且总被读成模型退步；而一个被削弱的测试偏向另一侧，同时让参考解运行保持全绿——这就是为什么这套题需要两个哨兵：参考解测天花板，而必须零通过的空操作求解器测地板。请汇报「通过/失败/不可用」三种状态，对不可用率、而不是对分数设告警，并且绝不要让一次缺失的参考解运行默认成「天花板完好」。',
+    ),
+    L(
+      'Rebuilt Operation: Build vs Buy vs Orchestrate (Economics & ROI, B1), 822 → ~2,250 words. It now argues that the decision line moved down the stack: six of the seven major frameworks ship MIT or Apache-2.0 and OpenAI retires its own Agent Builder on 30 November 2026 in favour of its SDK, so "build" no longer means writing the loop. The prices are new and dated — AgentCore at $0.0895 per vCPU-hour across roughly eight separate meters against Cloudflare\'s two, Vertex folding memory operations into vCPU-hours, Foundry-native agents free; Copilot Business at $19 with 1,900 one-cent credits that do not roll over, Fin at $0.99 a resolution, Agentforce at $0.10 an action, Sierra publishing nothing. The sharp edge is Epoch AI\'s deflation curve: a capability gets 66% cheaper per quarter while it is new and only 32% two years on, so the model layer never passes through a window where building it pays — and the one layer with no vendor is the eval set, the labels and the verifier.',
+      '重写运维：《自建 vs 采购 vs 编排》（经济性与投资回报，B1），822 → 约 2,250 词。它现在主张：那条决策线已经往栈下方挪了——七个主要框架里有六个以 MIT 或 Apache-2.0 发布，而 OpenAI 将在 2026 年 11 月 30 日下线自家的 Agent Builder、转而推荐它的 SDK，于是「自建」已不再意味着写那个回路。价格是新的、也带了日期——AgentCore 每 vCPU 小时 0.0895 美元，摊在大约八个彼此独立的计量表上，而 Cloudflare 只有两个；Vertex 把记忆操作折算进 vCPU 小时；Foundry 原生智能体免费；Copilot Business 19 美元含 1,900 个一分钱且不结转的额度，Fin 一次解决 0.99 美元，Agentforce 一次动作 0.10 美元，Sierra 什么都不公布。最锋利的那一刀是 Epoch AI 的贬值曲线：一项能力还新的时候每季度便宜 66%，两年之后只有 32%——所以模型层从来不会经过一个「自建划算」的窗口；而那唯一没有供应商的层，是评测集、标注与校验器。',
+    ),
+  ],
+  lines: ['op', 'dd', 'bl'],
+};
+
+export default entry;

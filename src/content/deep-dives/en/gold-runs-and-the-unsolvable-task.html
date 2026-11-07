@@ -1,0 +1,133 @@
+<section class="phase">
+  <div class="phase-num">E15</div>
+  <div class="week">Deep Dive &middot; Evaluating Agents</div>
+  <h2>Your eval set has a ceiling you have never measured, it drifts downward on its own, and the drift looks exactly like a model regression.</h2>
+  <p class="goal">Every score you report is a fraction whose denominator you assumed and whose numerator you measured. Tasks die quietly &mdash; a transitive dependency stops resolving, a base image tag moves, a timeout that used to fit no longer does &mdash; and because a dead task can only ever subtract, six weeks of ordinary rot produces a four-point "regression" in a model that did not change. The fix is one extra run that costs container time and no model tokens: put the reference solution through the same harness, every cycle, and report your score against what was achievable rather than against what you shipped.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Three ways a task dies while you are not looking.</h3>
+
+    <p>These are not exotic failures. They are the ordinary consequence of building an eval set out of real software, and they have different detection signatures.</p>
+
+    <ul>
+      <li><strong>The environment rots.</strong> A dependency resolver picks a newer transitive version that breaks an import. A registry mirror goes slow. A base image tag you pinned moves underneath you. An external service the task touches changes a response shape. None of this produces an error that says "this task is now invalid" &mdash; it produces a failing test, which is indistinguishable from an agent that got the answer wrong.</li>
+      <li><strong>The budget stops fitting.</strong> The task is still solvable, but not inside the wall-clock limit, token ceiling, memory cap or step count the harness grants. This is the most insidious of the three because the task <em>passes</em> for a sufficiently fast agent and fails for a slower one, so it reads as a capability difference. It is the category Terminal-Bench's maintainers counted separately, and they found eight such tasks in eighty-nine.</li>
+      <li><strong>The specification drifts out of alignment with the check.</strong> The instructions and the tests agreed when the task was written. Then someone tightened a test, or the upstream project renamed an interface the instructions still describe, and now the only way to pass is to do something the prompt does not ask for. Nothing in the repository records this divergence.</li>
+    </ul>
+
+    <div class="callout">
+      <p>All three are invisible to the metric you are watching, and all three bias it in the same direction. That is the whole problem: your eval set is a measuring instrument that loses accuracy monotonically and does not report its own calibration.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The reference run is the only measurement that finds them &mdash; and it costs compute, not tokens.</h3>
+
+    <p>A <strong>gold run</strong> (or reference run) is a pass over the whole suite in which the known-correct answer is applied in place of the agent: the reference patch for a code task, the recorded correct tool sequence for an agentic one, the labelled answer for a classification task. Everything else is identical &mdash; same container, same limits, same scorer, same day. The gold run answers one question: <em>of my N tasks, how many are currently passable at all?</em></p>
+
+    <p>Three properties make this affordable, and they are why the practice is underused rather than expensive.</p>
+
+    <ul>
+      <li><strong>No model is in the loop.</strong> The reference solution is a fixed artefact, so a gold run bills container seconds and zero inference. On a suite where an agent run costs tens of dollars in tokens, the gold run is a rounding error &mdash; see <a class="xref" href="/operations/economics-roi/cost-of-evaluation">the cost of evaluation</a> for where the money actually goes.</li>
+      <li><strong>It is deterministic,</strong> which means a gold failure is a real signal rather than a sample. If the reference patch failed, the task is broken; there is no "try five times" question to argue about, unlike the agent-side variance discussed in <a class="xref" href="/deep-dives/evaluating-agents/eval-variance-and-statistical-power">eval variance and statistical power</a>.</li>
+      <li><strong>It parallelises perfectly</strong> and can be scoped. A full gold run on a schedule, plus a targeted gold run on any task whose image digest, lockfile or scorer changed since the last green pass, gets you most of the coverage for a fraction of the time.</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># one cycle, two sentinels, one measurement</span>
+gold   = run(suite, solver=reference_patch)   <span class="c-cm"># upper bound: what is passable</span>
+null   = run(suite, solver=no_op)             <span class="c-cm"># lower bound: what passes for free</span>
+agent  = run(suite, solver=system_under_test)
+
+achievable = gold.passed <span class="c-kw">-</span> null.passed      <span class="c-cm"># tasks that both work AND discriminate</span>
+score      = agent.passed <span class="c-kw">/</span> achievable        <span class="c-cm"># the only fraction worth reporting</span>
+
+<span class="c-cm"># gold costs container time and no model tokens — it is the cheapest run you make</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What the denominator does to your numbers.</h3>
+
+    <p>Work it through once with concrete figures, because the size of the effect is the argument.</p>
+
+    <p>A suite of <strong>180</strong> tasks. On the day you build it, the gold run passes 180 of 180, and your candidate agent passes <strong>112</strong> &mdash; a score of <strong>62.2%</strong>, which goes on the dashboard.</p>
+
+    <p>Six weeks later you re-run the same agent, unchanged, on the same suite. It passes <strong>104</strong>, which is <strong>57.8%</strong>. That is a 4.4-point drop, and in most organisations it triggers a model-regression investigation, a rollback conversation, or a vendor email.</p>
+
+    <p>Now run gold. It passes <strong>168</strong> of 180. Twelve tasks have died: nine where a transitive dependency stopped resolving, two where a base image tag moved, one where a 600-second cap no longer fits a slower registry mirror. Your agent had been passing eight of those twelve, which is exactly the eight passes it lost.</p>
+
+    <p>Against the achievable denominator, the agent scored <strong>104 / 168 = 61.9%</strong> &mdash; three tenths of a point from where it started. <strong>Nothing regressed.</strong> You spent a week investigating a measuring instrument.</p>
+
+    <div class="callout tip">
+      <p>The diagnostic is cheap and conclusive: if the gold-run pass count fell by roughly the same number as your agent's, the change is in the harness. If gold held steady and the agent fell, the change is in the system under test. Without gold, those two cases produce identical dashboards.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The bias is one-way, so one sentinel is not enough.</h3>
+
+    <p>This is the part that is genuinely non-obvious. Environment rot can only remove passes, never add them, so it is not noise &mdash; it is a drift with a sign. Over a year of unmeasured maintenance, an eval set reports a slow decline that no model caused, and every real improvement is netted against it. Teams that live with this long enough learn to distrust their own evals, which is a worse outcome than having none.</p>
+
+    <p>A gold run catches that direction and is blind to the other one. The opposite failure &mdash; a task that becomes passable without doing the work &mdash; inflates your score and leaves the gold run perfectly green, because the reference patch still passes too. It happens when a test is weakened to unblock a flaky build, when the fix lands in the base image so the repository already contains it, or when a scorer change makes a substring match sufficient. The adversarial version of this is the subject of <a class="xref" href="/deep-dives/evaluating-agents/eval-integrity-and-scorer-gaming">eval integrity and scorer gaming</a>; the accidental version is more common and nobody is looking for it.</p>
+
+    <p>So run a <strong>null run</strong> as well: the same suite with a solver that does nothing &mdash; an empty patch, a no-op tool sequence, a refusal. The invariant is that a null run passes <strong>zero</strong> tasks. Any task it passes is a task that has stopped discriminating, and it should be quarantined rather than counted. Two sentinels bound your suite from both sides, and the arithmetic in STEP 2 subtracts the null passes out of the denominator so a broken-open task cannot flatter you.</p>
+
+    <ul>
+      <li><strong>A cheap third sentinel,</strong> if you can afford it: a deliberately wrong solver &mdash; the reference patch with one line inverted, or the correct tool call with a wrong argument. It should fail everywhere. Where it passes, your scorer is too loose for that task specifically.</li>
+      <li><strong>Pin by digest, not by tag.</strong> Most environment rot enters through a tag that resolved to something new; this is the same hazard <a class="xref" href="/operations/agentops/unpinned-vendor-defaults">unpinned vendor defaults</a> describes on the production side, and the remedy is identical.</li>
+      <li><strong>Treat the resource budget as part of the task specification</strong> and version it with the task. A timeout you tuned on fast hardware is a hidden parameter of your benchmark; changing the runner changes the score. See <a class="xref" href="/deep-dives/evaluating-agents/budget-matched-evaluation">budget-matched evaluation</a> for the comparison side of the same point.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Roughly three in ten is the published rate, not a worst case.</h3>
+
+    <p>The only maintainer team that has published a measurement of its own task validity is Terminal-Bench's, and the number is the reason to take this seriously rather than file it as hygiene.</p>
+
+    <p>Terminal-Bench 2.0 shipped in November 2025 with 89 tasks, selected from 229 candidates contributed by 93 people and reviewed by three experienced humans &mdash; a 39% acceptance rate, which is about as careful as hand-built eval sets get. Six months later the maintainers released 2.1 to fix issues in <strong>28 of those 89 tasks</strong> (the 2.1 repository's own README says 26 were modified, so the honest figure is a 26&ndash;28 range from two maintainer sources). Nine had external dependencies that changed after the benchmark was built. Eight had resource budgets too small for at least one valid approach. A third group, uncounted in the announcement, had instructions that were no longer aligned to their tests.</p>
+
+    <p>Three details are worth extracting:</p>
+
+    <ul>
+      <li><strong>The categories match STEP 1 exactly,</strong> which is evidence that the taxonomy is the real one rather than a tidy invention. Dependency drift, budget drift, specification drift.</li>
+      <li><strong>Expert curation did not prevent it.</strong> A 39% acceptance rate and three human reviewers per task bought a better set, not a durable one. Decay is a function of elapsed time and external change, not of how carefully you wrote the task.</li>
+      <li><strong>The claim they could then make is the valuable artefact.</strong> After the repairs, the maintainers stated that no task in 2.1 is unsolved. That is a sentence about the ceiling, and it is the sentence your own dashboard should be able to produce. Note also that it makes 2.0 and 2.1 scores non-comparable &mdash; repairing broken tasks raises most agents &mdash; which is the price of honesty about a denominator and worth paying.</li>
+    </ul>
+
+    <p>The infrastructure the field has built around this points the same way. SWE-bench moved to a fully containerised Docker harness in mid-2024 and now recommends roughly 120&nbsp;GB of free storage to run locally; SWE-rebench ships a pre-built image per instance. Both are expensive answers to the question "why did this task stop working", and both are cheaper than the alternative. The broader lifecycle &mdash; replacement rates, holdouts, re-baselining &mdash; is <a class="xref" href="/operations/evaluation-and-observability/eval-set-maintenance">eval-set maintenance</a>; this page is about the one measurement that tells you when the lifecycle has fallen behind.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Report three states, and alarm on the third.</h3>
+
+    <p>The reporting change is small and it is where the value lands. A task has three outcomes, not two.</p>
+
+    <ul>
+      <li><strong>Pass</strong> &mdash; the agent solved it and the task was passable.</li>
+      <li><strong>Fail</strong> &mdash; the agent did not solve it and the task was passable.</li>
+      <li><strong>Unavailable</strong> &mdash; the reference solution did not pass, or the null solver did. The task is excluded from both numerator and denominator for this cycle.</li>
+    </ul>
+
+    <p>The third state is not a new idea &mdash; <a class="xref" href="/deep-dives/evaluating-agents/when-the-check-has-to-act">when the check has to act</a> argues for exactly the same escape hatch when the <em>verifier</em> is the thing that failed. The point here is that it needs a second trigger: a task can be unavailable because the grader broke, and it can be unavailable because the task itself is dead, and only a reference run distinguishes them.</p>
+
+    <p>Then publish three numbers together: the score against the achievable denominator, the achievable count itself, and the unavailable rate. A score of 61.9% over 168 of 180 tasks with 12 unavailable is a legible result. "57.8%" is a number that has silently merged a model measurement with an infrastructure fault.</p>
+
+    <ul>
+      <li><strong>Alarm on the unavailable rate crossing a threshold,</strong> not on the score. A suite that goes from 2% to 9% unavailable in a week has had an infrastructure event, and it will show up as a quality regression if you let it.</li>
+      <li><strong>Alarm on the absence of a gold run.</strong> A missing or stale gold result must not default to "assume 100% achievable" &mdash; that silently restores the original bug. A frozen ceiling looks exactly like a healthy one.</li>
+      <li><strong>Never silently drop an unavailable task.</strong> Dropping it from the denominator without recording it is how a suite shrinks from 180 to 120 over two years while the headline score drifts upward, which is a real and common failure.</li>
+      <li><strong>Re-baseline after a repair.</strong> Fixing twelve tasks changes the denominator, so the series before and after is not continuous. Record the version, as <a class="xref" href="/concepts/reproducibility-and-determinism">reproducibility and determinism</a> would for any other measurement, and compare within a version.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do this one first, this week: take your existing eval suite, run the reference solutions through the live harness, and count how many pass. If the answer is not N of N, you now know your last reported score was wrong, you know by how much, and you have a denominator you can defend. If it is N of N, you have established a baseline and the run cost you container time and no tokens.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/deep-dives/evaluating-agents/benchmark-contamination">benchmark contamination</a> for the leak that inflates the numerator rather than shrinking the denominator, <a class="xref" href="/deep-dives/evaluating-agents/evaluating-against-live-systems">evaluating against live systems</a> for the case where the environment is not yours to pin, and <a class="xref" href="/concepts/unsatisfiable-tasks">unsatisfiable tasks</a> for the agent-facing version of the same problem.</p>
+  </div>
+</section>
