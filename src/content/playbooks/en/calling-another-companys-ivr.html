@@ -1,0 +1,119 @@
+<section class="phase">
+  <div class="phase-num">V27</div>
+  <div class="week">Playbook · Voice &amp; Realtime Agents</div>
+  <h2>Calling another company's IVR.</h2>
+  <p class="goal">When your agent dials a supplier's phone tree instead of answering your own, speech stops being the hard part: you are now a client of a system built to resist exactly what you are doing, and most of the call is spent in states where nobody is talking. Build a state classifier that distinguishes menu from hold from human from voicemail, send digits as signalling rather than as audio, and treat unbounded hold time as the cost centre it is.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>You are not having a conversation — you are navigating a state machine.</h3>
+
+    <p>An inbound voice agent answers a human who wants something. An outbound agent calling an institution — an insurer to check a claim, a carrier to trace a shipment, a utility to confirm a meter reading — faces a deterministic menu tree, a hold queue, and eventually a person who may transfer it back to another menu. The conversational layer that <a class="xref" href="/playbooks/voice-realtime-agents/outbound-voice-agents">outbound voice agents</a> covers applies only to the last of those.</p>
+
+    <p>The practical consequence is that your top-level loop is a classifier, not a dialogue policy. At any instant the far end is in one of a small number of states, and acting in the wrong one is the dominant failure:</p>
+
+    <ul>
+      <li><strong>Menu prompt.</strong> Speech is playing and expects a DTMF digit or a spoken keyword. Acting early truncates the option you needed; acting late drops you into the default branch.</li>
+      <li><strong>Hold.</strong> Music, a repeating apology, or periodic position announcements. Indistinguishable from a menu by audio energy alone, and the single largest consumer of call minutes.</li>
+      <li><strong>Human.</strong> Live, unscripted, and usually opening with a question. This is the only state where your language model earns its keep.</li>
+      <li><strong>Voicemail or recorded notice.</strong> "Our offices are closed" — the call should end, not wait. Detection overlaps with the machine-detection problem in <a class="xref" href="/playbooks/voice-realtime-agents/voicemail-and-machine-detection">voicemail &amp; machine detection</a>.</li>
+      <li><strong>Dead air.</strong> Transfer in progress, or the call already dropped and nobody told you.</li>
+    </ul>
+
+    <div class="callout">
+      <p>Do not infer these states from a transcript alone. Hold music transcribes to nothing or to hallucinated lyrics, and a menu whose prompt you joined halfway through transcribes as a fragment. Classify on audio features and timing — energy, periodicity, speech-versus-music — and use the transcript to decide <em>which</em> menu option, not <em>whether</em> you are in a menu.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Send digits as signalling, not as sound.</h3>
+
+    <p>The most common implementation bug here is to synthesise DTMF tones as audio and play them down the media path. It appears to work on a clean test call and fails intermittently in production, because a lossy voice codec is designed to carry speech and will smear a dual-tone pair — and because packet loss turns one tone into zero or two digits at the far end.</p>
+
+    <p>Carry them out-of-band instead. <strong>RFC 4733</strong> ("RTP Payload for DTMF Digits, Telephony Tones, and Telephony Signals", a Proposed Standard from December 2006 that obsoletes RFC 2833 and is updated by RFC 4734 and RFC 5244) defines a named-telephone-event payload: the digit travels as a discrete event with an explicit duration, not as a waveform to be re-encoded. Every serious telephony provider exposes this, usually as a "send digits" primitive.</p>
+
+<pre class="standalone"><span class="c-cm"># WRONG: a tone rendered into the audio stream</span>
+tone = <span class="c-fn">synthesize_dtmf</span>(<span class="c-st">"3"</span>)        <span class="c-cm"># 697 Hz + 1477 Hz</span>
+media.<span class="c-fn">play</span>(tone)                     <span class="c-cm"># codec smears it; loss duplicates it</span>
+
+<span class="c-cm"># RIGHT: a named telephone-event per RFC 4733</span>
+call.<span class="c-fn">send_digits</span>(<span class="c-st">"3"</span>, duration_ms=160)
+<span class="c-fn">sleep</span>(0.4)                          <span class="c-cm"># inter-digit gap; many IVRs need &gt;100ms</span>
+call.<span class="c-fn">send_digits</span>(<span class="c-st">"#"</span>, duration_ms=160)</pre>
+
+    <p>Two further details bite. Some trunks negotiate DTMF via SIP INFO rather than RTP events, so your provider's abstraction may change behaviour per destination carrier — test per route, not once. And digit length matters: too short and the far-end detector misses it, too long and a repeat-detection heuristic reads one press as two. Start at roughly 160 ms with a gap of at least 100 ms and tune against the specific tree.</p>
+
+    <p>For account numbers and reference codes read aloud to a human rather than keyed, the error modes are different again and covered in <a class="xref" href="/playbooks/voice-realtime-agents/alphanumerics-over-voice">alphanumerics over voice</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Learn the tree once, then replay it — and detect when it changes.</h3>
+
+    <p>Phone trees are stable for months and then are not. Treating every call as a fresh exploration means paying a model to re-listen to the same four menus each time, with a fresh chance of a wrong turn. Treating the tree as immutable means silently taking the wrong branch the week they reorganise it.</p>
+
+    <ul>
+      <li><strong>Record a route as a stored path.</strong> A map from destination intent to a digit sequence with expected prompt fingerprints at each level: <code class="inline">claims_status → ["2","1","4"]</code>, each step carrying a short hash or keyword set from the prompt it expects to hear.</li>
+      <li><strong>Verify the fingerprint before pressing.</strong> If the prompt at level two no longer mentions the expected keywords, stop replaying and fall back to listening. A mismatch is the signal to re-explore, and it is worth an alert — it is the same class of problem as <a class="xref" href="/operations/agentops/third-party-tool-drift">third-party tool drift</a>, with the same cause: an interface you depend on and do not control.</li>
+      <li><strong>Prefer the zero-out path when it exists.</strong> Pressing 0 or saying "representative" often shortcuts several levels. It usually costs more hold time and far less navigation risk, which is the right trade when the task is high-value and low-volume.</li>
+      <li><strong>Cache per phone number, not per company.</strong> Large organisations route different numbers to different trees, and a tree learned from the main line will mislead on the claims line.</li>
+    </ul>
+
+    <p>The stored path also makes the run auditable: a replayed sequence with verified fingerprints is a record of what the agent heard and chose, which is what you will want when a call went somewhere expensive.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Hold time is unbounded, not under your control, and the dominant cost.</h3>
+
+    <p>The economics of this workload are unlike an inbound agent's. An inbound call is as long as the customer makes it; an outbound call into a queue is as long as the other company's staffing decides, and you pay for every second of it twice over — telephony minutes, plus the model's audio metering if you are running a native speech-to-speech stack, where <strong>silence and hold music cost exactly what speech costs</strong> because audio is billed per second of wall-clock. A forty-minute hold is a forty-minute bill for listening to a saxophone.</p>
+
+    <p>So the architecture has to let you stop paying for attention you do not need:</p>
+
+    <ul>
+      <li><strong>Do not keep a frontier model in the loop while on hold.</strong> Detect the hold state and hand the call to a cheap classifier that does one thing: notice when hold ends. Re-attach the reasoning model when a human speaks.</li>
+      <li><strong>Cap the hold, and make the cap a policy decision.</strong> An explicit per-call ceiling with a defined action on expiry — hang up and requeue, or escalate to a human operator — is the same fail-closed control as any other budget ceiling; see <a class="xref" href="/operations/agentops/timeouts-and-deadline-budgets">timeouts &amp; deadline budgets</a>.</li>
+      <li><strong>Call when the queue is short.</strong> Hold time varies by hour of day far more than anything in your stack does. Scheduling the batch against observed queue length is usually a larger saving than any model or codec choice — the scheduling machinery is in <a class="xref" href="/operations/agentops/scheduled-and-triggered-agents">scheduled &amp; triggered agents</a>.</li>
+      <li><strong>Never abandon a queue position silently at scale.</strong> Dialling, holding and dropping repeatedly is indistinguishable from an attack on the other company's contact centre, and will get your numbers blocked.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>The cost model here inverts the usual advice. On an inbound agent you optimise response latency because a slow reply reads as broken; on hold, latency is free and <em>duration</em> is the whole bill. Do not spend engineering effort shaving 200 ms off a turn in a workload whose p50 is eleven minutes of saxophone.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The person who picks up did not agree to talk to a machine.</h3>
+
+    <p>This is the step teams skip and the one that generates the complaint. When the hold ends, a human employee of another company answers — someone who has no relationship with you, did not opt in, and whose employer may prohibit automated callers outright.</p>
+
+    <ul>
+      <li><strong>Disclose immediately and without being asked.</strong> First turn, before the request: what you are, who you are calling for, and why. The regulatory picture and the wording are in <a class="xref" href="/playbooks/voice-realtime-agents/disclosing-the-agent-on-a-call">disclosing the agent on a call</a>; the short version is that disclosure after a question about it is already too late.</li>
+      <li><strong>Check the terms before you build.</strong> Many service agreements and acceptable-use policies forbid automated access to support channels, and a phone line is a support channel. This is a contractual question, not a technical one — the framing is in <a class="xref" href="/operations/governance-compliance/platform-terms-for-agent-access">platform terms for agent access</a>.</li>
+      <li><strong>Honour a refusal on the first attempt.</strong> If the agent is told to put a human on the line, the call ends or transfers. Re-dialling to reach a different representative who might not object is the behaviour that gets a whole deployment banned.</li>
+      <li><strong>Do not let the agent authenticate as the customer unless it may.</strong> Reading out a date of birth and the last four digits of an account to pass someone else's identity check is an impersonation decision, and it needs a recorded authorisation from the person whose account it is — see <a class="xref" href="/operations/governance-compliance/delegated-access-and-consent-records">delegated access &amp; consent records</a>.</li>
+      <li><strong>Expect the far end to be an agent too.</strong> Increasingly the voice that answers is also automated, which removes the courtesy constraints and adds a new one: two agents can loop politely forever. A turn cap on the human-conversation phase is cheap insurance.</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What to build, in order.</h3>
+
+    <p>The capability ladder here is unusually steep at the bottom and flat at the top, so build in this order and stop when the task is served:</p>
+
+    <ul>
+      <li><strong>First, the state classifier.</strong> Menu / hold / human / voicemail / dead air, from audio features plus timing. Everything else depends on it, and it is the component you cannot buy.</li>
+      <li><strong>Second, out-of-band digits with per-route testing.</strong> RFC 4733 events, tuned duration and gap, verified against each destination carrier.</li>
+      <li><strong>Third, stored routes with fingerprint verification</strong> and an alert when a fingerprint stops matching.</li>
+      <li><strong>Fourth, hold-state cost control</strong> — demote the model, cap the wait, schedule the batch.</li>
+      <li><strong>Last, the conversation.</strong> It is the part that looks like the product and the smallest part of the engineering, and it only runs in one of five states.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Instrument three numbers from the first call and let them drive everything: the fraction of calls that reached the intended endpoint, mean and p95 hold seconds per successful call, and digit-send failures per hundred presses. The first tells you whether your routes are still valid, the second is your bill, and the third is the one that silently reads as "the IVR is confusing" when it is actually a codec mangling your tones. If you take one thing: classify the state before you act, and never render DTMF into the audio path.</p>
+    </div>
+  </div>
+</section>

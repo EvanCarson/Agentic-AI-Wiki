@@ -1,0 +1,114 @@
+<section class="phase">
+  <div class="phase-num">G13</div>
+  <div class="week">Deep Dive · Multi-Agent Systems</div>
+  <h2>Isolating parallel agents does not remove the write conflict — it defers it to a merge that reports success.</h2>
+  <p class="goal">Give each of six agents its own branch and the obvious collision disappears: nobody overwrites anybody, every worker's tests pass, every merge is clean. The conflict did not go away — it changed detector. Git compares text, and two edits that never touch the same line can still be semantically incompatible, so the failure arrives after integration, with no conflict marker and no agent to blame. Partition by interface, not by task, and make the merge a verification step rather than a formality.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Parallelism is bounded by the write set, not the token budget.</h3>
+
+    <p>The usual way to size a fan-out is cost: how many workers can I afford, how much wall-clock do I save. That calculation — and its unpleasant arithmetic — belongs to <a class="xref" href="/deep-dives/multi-agent-systems/the-fan-out-tax">the fan-out tax</a>. It is also not the binding constraint for agents that change things.</p>
+
+    <p>The binding constraint is the <strong>write set</strong>: the collection of mutable objects each worker will touch. Read-only fan-out scales almost arbitrarily, which is why parallel search, triage and per-file analysis work so well. The moment two workers can write the same object, the fan-out stops being N independent tasks and becomes one concurrent system — and concurrent systems have exactly three failure modes, all of them old:</p>
+
+    <ul>
+      <li><strong>Lost update.</strong> Both workers read state <code class="inline">v1</code>, both write; the second write erases the first, and neither worker observes anything wrong.</li>
+      <li><strong>Stale read.</strong> A worker plans against state that another worker has already invalidated, then executes a correct plan for a world that no longer exists.</li>
+      <li><strong>Write skew.</strong> Each worker's write is individually valid; together they violate an invariant neither was checking. This is the one that survives isolation, and the rest of this essay is about it.</li>
+    </ul>
+
+    <p>For an internal shared store — a blackboard, a scratchpad, a shared memory table — these are the hazards covered in <a class="xref" href="/deep-dives/multi-agent-systems/shared-memory-and-blackboard">shared memory &amp; the blackboard</a>. What follows is the harder case: writes to the world outside the agent system, where you do not own the concurrency primitives.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The standard fix converts a loud failure into a quiet one.</h3>
+
+    <p>The accepted answer is isolation: one git worktree or branch per agent, one sandbox per worker, so nobody shares a filesystem. It is the right first move and it genuinely eliminates lost updates and stale reads — each worker gets a consistent snapshot and a private place to write.</p>
+
+    <p>What it cannot eliminate is write skew, because the detector you have inherited is textual. Git declares a conflict when two diffs touch overlapping lines. It declares success when they do not. Semantic compatibility is not a thing git can see:</p>
+
+<pre class="standalone"><span class="c-cm"># Agent A, branch a/rename-helper — task: tidy the helper's name</span>
+<span class="c-cm"># file: utils.py</span>
+-<span class="c-kw">def</span> <span class="c-fn">fmt</span>(x):
++<span class="c-kw">def</span> <span class="c-fn">format_amount</span>(x):
+
+<span class="c-cm"># Agent B, branch b/add-receipt — task: add a receipt line</span>
+<span class="c-cm"># file: receipt.py  (never opens utils.py)</span>
++<span class="c-kw">from</span> utils <span class="c-kw">import</span> fmt
++total_line = <span class="c-fn">fmt</span>(order.total)
+
+<span class="c-cm"># Both test suites pass in isolation. Both diffs are clean.</span>
+<span class="c-cm"># git merge: no conflict. Result: ImportError at runtime.</span></pre>
+
+    <p>Neither agent did anything wrong, and neither had the information to do better: A could not know that a branch created after its snapshot would import the old name, and B's snapshot contained <code class="inline">fmt</code>. The defect is a property of the <em>pair</em>, and no per-worker review finds it. Rename-plus-new-caller is the clearest illustration; the same shape covers a narrowed function signature with a new call site, a tightened database constraint with a new insert path, a deleted feature flag with a new read of it, and two workers each adding a dependency that resolves to incompatible versions.</p>
+
+    <div class="callout warn">
+      <p>A clean merge is not evidence of compatibility — it is evidence that two text ranges did not overlap. The moment you run agents in parallel on a shared codebase, "all branches merged without conflict" stops being a status and becomes an unverified claim. Worse, each worker's green test run makes the claim feel checked: the suite that passed was the suite for a repository state that no longer exists after the merge.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Partition by interface boundary, not by task list.</h3>
+
+    <p>Most fan-outs are partitioned the way the work was described — one agent per ticket, one per file, one per test failure. That partition is about the <em>tasks</em> and says nothing about whether their write sets are disjoint, which is the only property that matters.</p>
+
+    <p>Partition by what the workers can reach instead. Concretely, before dispatch, derive each worker's write set and check it against the others:</p>
+
+    <ul>
+      <li><strong>Disjoint modules, shared nothing.</strong> Two workers in different services with no common interface can run in parallel safely. Fan out freely.</li>
+      <li><strong>Disjoint files, shared interface.</strong> The dangerous middle — the case above. Either assign the interface to exactly one worker and give the others the signature as a fixed contract they may not change, or serialise the two.</li>
+      <li><strong>Shared file or shared schema.</strong> Do not parallelise. Put both changes in one worker's context, where the model can at least see the interaction. One agent with two tasks beats two agents with half a picture.</li>
+    </ul>
+
+    <p>The practical form of this is a declared contract rather than a hope. If a worker is allowed to change a public signature, that is a privilege the supervisor grants to one worker per round, and the other workers are told the signature is frozen. A write set you cannot enumerate before dispatch is a write set you are about to discover at merge time — which is the general lesson of <a class="xref" href="/deep-dives/multi-agent-systems/multi-agent-topologies">multi-agent topologies</a>: keep coupled writes inside one agent.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Serialise integration, and gate it on the whole, not the parts.</h3>
+
+    <p>Parallel work does not require parallel integration, and conflating the two is the root error. Workers run concurrently; merges happen one at a time through a single lane, and each merge is followed by a verification of the <em>integrated</em> state:</p>
+
+<pre class="standalone"><span class="c-cm"># Integration lane: one merge in flight, verified against the result</span>
+<span class="c-kw">for</span> branch <span class="c-kw">in</span> <span class="c-fn">ready_queue</span>():          <span class="c-cm"># serialised, not parallel</span>
+    <span class="c-fn">merge</span>(branch, into=integration)
+    <span class="c-kw">if</span> <span class="c-kw">not</span> <span class="c-fn">full_suite</span>(integration):     <span class="c-cm"># the whole suite, post-merge</span>
+        <span class="c-fn">revert</span>(branch)
+        <span class="c-fn">requeue</span>(branch, context=<span class="c-fn">failure_diff</span>())
+<span class="c-cm"># N workers, 1 integration point, N verifications of the real state.</span></pre>
+
+    <p>Two details carry the weight. The suite must run <strong>after</strong> the merge, on the merged tree — a pre-merge green run on a branch tests a state that will not ship. And the queue must be serialised, because testing two merges concurrently reintroduces the same skew one level up. This is exactly what a merge queue does, and it is why the pattern transfers directly from human teams; the agent-specific mechanics are in <a class="xref" href="/playbooks/coding-and-computer-use-agents/merge-queues-for-agent-changes">merge queues for agent changes</a>.</p>
+
+    <p>Reverting is also cheaper than repairing here. A failed integration has an identified culprit — the branch just merged — and requeuing it with the integration failure as added context gives the worker the one piece of information it structurally lacked. Trying instead to fix forward on the integration branch destroys that attribution, which is the problem <a class="xref" href="/deep-dives/multi-agent-systems/credit-assignment-in-multi-agent-systems">credit assignment</a> warns about.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Outside a repository, you get no merge step at all.</h3>
+
+    <p>Git at least offers a place to catch the problem. Most write targets do not. When parallel agents write to a ticket tracker, a CRM, a spreadsheet, a message channel or a production database, there is no isolation to grant and no integration lane to serialise — the write lands immediately and the "merge" is whatever the system does with two concurrent updates.</p>
+
+    <ul>
+      <li><strong>Use the target's own concurrency control if it has one.</strong> Conditional writes — compare-and-set on an ETag, version column or <code class="inline">If-Match</code> header — turn a silent lost update into a loud 409 you can retry. Most REST APIs expose this and most agent tool wrappers discard it.</li>
+      <li><strong>Make effects idempotent and keyed by intent.</strong> A write keyed on a hash of the intended change collapses duplicate attempts into one effect, which matters because retries are stacked in agent systems — see <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency, retries &amp; side-effect safety</a>.</li>
+      <li><strong>Give each worker a disjoint key range, not a shared table.</strong> Namespacing writes per worker is the cheapest real isolation available outside a filesystem, and it also prevents the fleet-scale version of this problem described in <a class="xref" href="/deep-dives/multi-agent-systems/unintended-coordination-between-agents">isolated runs that find each other</a>.</li>
+      <li><strong>Where none of that is possible, hold a lease.</strong> One worker may write this customer record at a time; the others queue. A lease is slower and correct, and the alternative is not faster — it is wrong at a rate you cannot measure.</li>
+    </ul>
+
+    <p>The irreversibility matters too: a bad repository merge is a revert, while a bad CRM write is a support ticket. That asymmetry should change how wide you fan out, not just how you merge — the blast-radius framing is in <a class="xref" href="/concepts/blast-radius">blast radius</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The honest trade-off.</h3>
+
+    <p><strong>Isolation buys you independent workers and charges you a verification you now have to build yourself: the merge that used to fail loudly now succeeds quietly, and the only place the truth exists is a test run on the integrated state.</strong> Fan out as wide as your write sets are disjoint, and no wider. Where they overlap, the choice is one agent holding both changes or a serialised lane holding both merges — and both of those are cheaper than the week spent bisecting a conflict that no tool reported.</p>
+
+    <div class="callout tip">
+      <p>Before you widen a fan-out on anything mutable: enumerate each worker's write set and refuse to dispatch two workers whose sets intersect on an interface. Grant signature-changing privileges to one worker per round and freeze the signature for the rest. Run merges through a single serialised lane and the full suite <em>after</em> each merge, not before. Outside a repository, use conditional writes with version checks, key effects by intent, and namespace per worker. Then instrument the one number that tells you whether any of this is working: integration failures per merged branch. If it is not zero, your partition is wrong — fix the partition, not the merge.</p>
+    </div>
+  </div>
+</section>
