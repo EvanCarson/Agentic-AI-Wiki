@@ -1,0 +1,119 @@
+<section class="phase">
+  <div class="phase-num">V27</div>
+  <div class="week">实战手册 · 语音与实时智能体</div>
+  <h2>打给另一家公司的 IVR。</h2>
+  <p class="goal">当你的智能体是去拨供应商的电话树、而不是接自家的电话时，语音就不再是难点了：你现在是一套"专为抵挡你正在做的这件事而建"的系统的客户，而通话的大部分时间都耗在没人说话的状态里。请造一个能区分菜单、等待、真人与语音留言的状态分类器，把按键作为信令而不是音频发出去，并把无上界的等待时长当成它本来就是的那个成本中心来对待。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>你不是在对话——你是在走一台状态机。</h3>
+
+    <p>一个呼入型语音智能体，接的是一个有所求的人。而一个打给机构的呼出型智能体——打给保险公司查理赔、打给承运商追货、打给公用事业确认抄表——面对的是一棵确定性的菜单树、一个等待队列，最后是一个可能又把它转回另一个菜单的人。<a class="xref" href="/zh/playbooks/voice-realtime-agents/outbound-voice-agents">外呼语音智能体</a>所讲的那个对话层，只适用于其中最后一项。</p>
+
+    <p>实际后果是：你的顶层循环是一个分类器，而不是一套对话策略。在任一瞬间，对端都处在少数几个状态之一，而在错误的状态里行动是最主要的失效：</p>
+
+    <ul>
+      <li><strong>菜单提示。</strong>语音正在播放，并期待一个 DTMF 按键或一个口述关键词。动得太早会把你需要的那个选项截断；动得太晚会把你丢进默认分支。</li>
+      <li><strong>等待。</strong>音乐、一句循环的致歉，或周期性的排位播报。单凭音频能量根本无法与菜单区分，而它是通话分钟数最大的消耗者。</li>
+      <li><strong>真人。</strong>活的、没有脚本的，而且通常开口就是一个问题。这是唯一一个你那个语言模型能挣回饭钱的状态。</li>
+      <li><strong>语音留言或录音通知。</strong>"我们已经下班"——这时该挂断，而不是等。它的识别与<a class="xref" href="/zh/playbooks/voice-realtime-agents/voicemail-and-machine-detection">语音留言与应答机识别</a>里那个问题有重叠。</li>
+      <li><strong>空气死寂。</strong>转接正在进行中，或者通话早已掉线而没人告诉你。</li>
+    </ul>
+
+    <div class="callout">
+      <p>不要仅凭文字记录去推断这些状态。等待音乐转写出来是空的，或者是幻想出来的歌词；而一段你从中途才接上的菜单提示，转写出来就是个片段。请基于音频特征与时序来分类——能量、周期性、语音还是音乐——并用文字记录去判定该选<em>哪一个</em>菜单选项，而不是判定你<em>是否</em>身处菜单之中。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>把按键作为信令发出去，而不是作为声音。</h3>
+
+    <p>这里最常见的实现 bug，是把 DTMF 音调合成成音频、顺着媒体通道播出去。它在一通干净的测试通话里看起来能用，到了生产上则时好时坏——因为有损语音编解码器是为承载语音而设计的，会把一对双音涂抹掉；也因为丢包会让一个音调在对端变成零个或两个按键。</p>
+
+    <p>请改成带外传输。<strong>RFC 4733</strong>（《RTP Payload for DTMF Digits, Telephony Tones, and Telephony Signals》，2006 年 12 月的 Proposed Standard，废止了 RFC 2833，并由 RFC 4734 与 RFC 5244 更新）定义了一种"命名电话事件"载荷：按键是作为一个带显式时长的离散事件传输的，而不是作为一段还要被重新编码的波形。每一家正经的电信服务商都暴露了这个能力，通常是一个"发送按键"原语。</p>
+
+<pre class="standalone"><span class="c-cm"># WRONG: a tone rendered into the audio stream</span>
+tone = <span class="c-fn">synthesize_dtmf</span>(<span class="c-st">"3"</span>)        <span class="c-cm"># 697 Hz + 1477 Hz</span>
+media.<span class="c-fn">play</span>(tone)                     <span class="c-cm"># codec smears it; loss duplicates it</span>
+
+<span class="c-cm"># RIGHT: a named telephone-event per RFC 4733</span>
+call.<span class="c-fn">send_digits</span>(<span class="c-st">"3"</span>, duration_ms=160)
+<span class="c-fn">sleep</span>(0.4)                          <span class="c-cm"># inter-digit gap; many IVRs need &gt;100ms</span>
+call.<span class="c-fn">send_digits</span>(<span class="c-st">"#"</span>, duration_ms=160)</pre>
+
+    <p>还有两个细节会咬人。有些中继是通过 SIP INFO 而不是 RTP 事件来协商 DTMF 的，所以你服务商那层抽象的行为可能随目的地运营商而变——要按路由逐一测试，而不是只测一次。另外按键时长很要紧：太短对端检测器会漏掉，太长则会让一套"重复检测"启发式把一次按压读成两次。从大约 160 ms 起步、间隔至少 100 ms，再对着那棵具体的树去调。</p>
+
+    <p>至于那些要念给真人听、而不是按进去的账号与参考编号，其错误模式又是另一回事，收在<a class="xref" href="/zh/playbooks/voice-realtime-agents/alphanumerics-over-voice">用语音传字母数字</a>里。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>把树学一次，然后重放——并察觉它何时变了。</h3>
+
+    <p>电话树会稳定好几个月，然后就不稳定了。把每通电话都当成一次全新的探索，意味着每次都付钱让模型把同样那四层菜单重听一遍，并且每次都新得一次走错岔路的机会。而把这棵树当作一成不变，则意味着在他们重组它的那一周里，你会无声地走错分支。</p>
+
+    <ul>
+      <li><strong>把一条路线记成一条存好的路径。</strong>一张从"目的意图"到"按键序列"的映射，并在每一层带上所期待的提示语指纹：<code class="inline">claims_status → ["2","1","4"]</code>，每一步都带着它预期会听到的那句提示的一小段哈希或关键词集合。</li>
+      <li><strong>按下去之前先核对指纹。</strong>如果第二层的提示已经不再提到预期的那些关键词，就停止重放、退回去听。不匹配就是该重新探索的信号，而且值得一条告警——它与<a class="xref" href="/zh/operations/agentops/third-party-tool-drift">第三方工具漂移</a>是同一类问题，成因也相同：一个你依赖、却不受你控制的接口。</li>
+      <li><strong>有"转人工"直通路径时优先用它。</strong>按 0 或说"人工"，往往能跳过好几层。它通常会多花等待时间、而大幅减少导航风险；当任务高价值、低频次时，这正是对的那笔交易。</li>
+      <li><strong>按电话号码缓存，而不是按公司缓存。</strong>大机构会把不同号码路由到不同的树，而从总机学来的树，到了理赔专线上会把你带偏。</li>
+    </ul>
+
+    <p>这条存好的路径还让整次运行可审计：一段带已核验指纹的重放序列，就是一份"智能体听到了什么、选了什么"的记录——而当某通电话跑到了花钱的地方去，这正是你会想要的东西。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>等待时长无上界、不受你控制，而且是最主要的成本。</h3>
+
+    <p>这类工作负载的经济学与呼入型智能体完全不同。一通呼入电话的长度由客户决定；而一通打进队列的呼出电话，其长度由对方公司的人员配置决定，并且你为它的每一秒都付了两道钱——电信分钟费，外加你若跑的是原生语音到语音技术栈时模型那笔按音频计的费用，在那里<strong>沉默与等待音乐的价钱，和说话一模一样</strong>，因为音频是按挂钟秒数计费的。一次四十分钟的等待，就是一张为听四十分钟萨克斯风而付的账单。</p>
+
+    <p>所以架构必须让你能停止为不需要的注意力付费：</p>
+
+    <ul>
+      <li><strong>等待期间不要把前沿模型留在循环里。</strong>识别出等待状态，把这通电话交给一个只做一件事的廉价分类器：察觉等待何时结束。等真人开口时再把推理模型接回来。</li>
+      <li><strong>给等待封顶，并让这个上限成为一项政策决定。</strong>一个显式的按通话上限，加上到点之后的既定动作——挂断并重新入队，或升级给人工话务员——与任何别的预算上限是同一种 fail-closed 控制；见<a class="xref" href="/zh/operations/agentops/timeouts-and-deadline-budgets">超时与截止预算</a>。</li>
+      <li><strong>在队列短的时候打。</strong>等待时长随一天中的小时变化，远远大于你技术栈里任何东西带来的变化。照实测的队列长度去排这一批电话，通常比任何模型或编解码器的选择省得更多——排程机制在<a class="xref" href="/zh/operations/agentops/scheduled-and-triggered-agents">定时与触发式智能体</a>里。</li>
+      <li><strong>规模化之下，绝不要默默地放弃排队位置。</strong>反复地拨号、等待、掉线，与对另一家公司客服中心发起攻击毫无区别，并且会让你的号码被封。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>这里的成本模型把通常那套建议反转了。在呼入型智能体上你优化响应延迟，因为慢一拍的回答读起来就是"坏了"；而在等待里，延迟是免费的，<em>时长</em>才是全部账单。不要在一个 p50 是十一分钟萨克斯风的工作负载上，花工程精力去给一个轮次削掉 200 ms。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>接起电话的那个人，没有同意跟一台机器讲话。</h3>
+
+    <p>这是团队会跳过、而且正是会招来投诉的那一步。等待结束时，接起来的是另一家公司的一名人类员工——一个与你没有任何关系、没有选择加入、而且其雇主可能干脆禁止自动化来电者的人。</p>
+
+    <ul>
+      <li><strong>立刻披露，不要等人问。</strong>第一个轮次、在提出请求之前：你是什么、你替谁打、以及为什么。监管图景与措辞在<a class="xref" href="/zh/playbooks/voice-realtime-agents/disclosing-the-agent-on-a-call">在通话中披露智能体身份</a>里；一句话版本是：等人问起之后才披露，已经太晚了。</li>
+      <li><strong>动工之前先查条款。</strong>许多服务协议与可接受使用政策禁止以自动化方式接入支持渠道，而一条电话线就是一条支持渠道。这是个合同问题，不是技术问题——这套框架在<a class="xref" href="/zh/operations/governance-compliance/platform-terms-for-agent-access">智能体接入的平台条款</a>里。</li>
+      <li><strong>第一次被拒绝就照办。</strong>如果智能体被要求换真人上线，这通电话就该结束或转接。再拨一次去找一个也许不会反对的别的话务员，正是会让整套部署被封禁的那种行为。</li>
+      <li><strong>除非获得许可，不要让智能体以客户身份过验证。</strong>念出出生日期与账号后四位去通过别人的身份核验，是一个冒用身份的决定，它需要一份来自账户本人的、被记录下来的授权——见<a class="xref" href="/zh/operations/governance-compliance/delegated-access-and-consent-records">委托访问与同意记录</a>。</li>
+      <li><strong>要预期对端也是一个智能体。</strong>接起来的那个声音越来越多也是自动的，这既去掉了那些礼节上的约束，也添了一条新的：两个智能体可以客客气气地无限循环下去。给"与真人对话"这个阶段设一个轮次上限，是便宜的保险。</li>
+    </ul>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>该造什么，按顺序。</h3>
+
+    <p>这里的能力阶梯在底部格外陡、在顶部格外平，所以请按这个顺序造，并在任务够用时停手：</p>
+
+    <ul>
+      <li><strong>第一，状态分类器。</strong>菜单/等待/真人/语音留言/空气死寂，基于音频特征加时序。其余一切都依赖它，而它是你买不到的那个组件。</li>
+      <li><strong>第二，带外按键，并按路由逐一测试。</strong>RFC 4733 事件、调好的时长与间隔，对每一个目的地运营商都核验过。</li>
+      <li><strong>第三，存好的路线加指纹核对</strong>，并在某个指纹不再匹配时发出告警。</li>
+      <li><strong>第四，等待状态的成本控制</strong>——给模型降级、给等待封顶、给这批电话排程。</li>
+      <li><strong>最后，才是对话。</strong>它是看起来最像产品的那部分，也是工程里最小的那部分，而且它只在五个状态中的一个里运行。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>从第一通电话起就给三个数字上仪表，并让它们驱动一切：抵达了预期终点的通话占比、每通成功通话的等待秒数均值与 p95，以及每一百次按压中的按键发送失败数。第一个告诉你你的路线是否还有效，第二个就是你的账单，而第三个正是那个会被无声地读成"这个 IVR 太绕"、实际上却是编解码器把你的音调搅坏了的那一个。如果只带走一句：行动之前先分类状态，并且永远不要把 DTMF 渲染进音频通道。</p>
+    </div>
+  </div>
+</section>
