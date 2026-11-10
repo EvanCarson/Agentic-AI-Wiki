@@ -1,72 +1,103 @@
 <section class="phase">
   <div class="phase-num">V1</div>
   <div class="week">Playbook · Voice &amp; Realtime Agents</div>
-  <h2>Realtime agent architecture: the cascade, the native model, and where the loop lives.</h2>
-  <p class="goal">A voice agent is the same agent loop you already know, wrapped in a hard real-time audio contract. The architectural choice is binary and consequential: chain three models in a pipeline (STT → LLM → TTS), or run one model that hears and speaks directly. Everything else in this group — latency, turn-taking, tooling, failure — is downstream of which one you picked and where you put the reasoning.</p>
+  <h2>Realtime agent architecture: the session's context window is a clock, and it runs out before your call does.</h2>
+  <p class="goal">A voice agent's hardest constraint is not latency — it is that audio fills the model's context at a fixed rate, so a realtime session has a maximum length measured in minutes and set by arithmetic you can do in advance. Google documents about 25 tokens per second for streamed audio against a 32k window on most Live models, which is why the published session caps land where they do. Pick the speech boundary — full cascade, half-cascade, or native audio — only after you know which of the three clocks your call hits first.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
     <h3>The cascade: three models in a streaming pipeline.</h3>
 
-    <p>The classic architecture is a <strong>cascade</strong>: a streaming speech-to-text model transcribes the caller, the transcript drives a normal text LLM agent loop, and a text-to-speech model voices the reply. It is the same architecture as a chat agent with a microphone on the front and a speaker on the back.</p>
+    <p>The classic architecture is a <strong>cascade</strong>: a streaming speech-to-text model transcribes the caller, the transcript drives a normal text LLM agent loop, and a text-to-speech model voices the reply. It is the same architecture as a chat agent with a microphone on the front and a speaker on the back, and it still wins more production arguments than the newer options.</p>
 
     <ul>
-      <li><strong>Transparent.</strong> The transcript and the text turn are both inspectable — you can log, eval, and guardrail them with the exact tooling you already have for text agents.</li>
-      <li><strong>Composable.</strong> Swap STT vendor, LLM, or TTS voice independently. Best-of-breed at each stage.</li>
-      <li><strong>Lossy at the seams.</strong> Prosody, emotion, hesitation, and overlap are flattened to text and gone. The model never <em>heard</em> the caller; it read a transcript of them.</li>
+      <li><strong>Transparent.</strong> The transcript and the text turn are both inspectable — you can log, eval and guardrail them with the exact tooling you already have for text agents.</li>
+      <li><strong>Composable.</strong> Swap STT vendor, LLM or TTS voice independently. Best-of-breed at each stage, and a bad vendor is a config change rather than a rewrite. <a class="xref" href="/playbooks/voice-realtime-agents/speech-stack">The speech stack</a> prices each hop.</li>
+      <li><strong>Lossy at the seams.</strong> Prosody, emotion, hesitation and overlap are flattened to text and gone. The model never <em>heard</em> the caller; it read a transcript of them, and whatever the words did not carry is unrecoverable downstream — the general form of that trade is in <a class="xref" href="/concepts/modalities">modalities and multimodal models</a>.</li>
+      <li><strong>Additive latency.</strong> Three hops, three queues. The budget arithmetic is in <a class="xref" href="/playbooks/voice-realtime-agents/latency-budget">the latency budget</a>; the short version is that a cascade spends its time on serialisation and a native model spends its on the model.</li>
     </ul>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>The native model: one speech-to-speech model.</h3>
+    <h3>There are three places to put the speech boundary, not two.</h3>
 
-    <p>A <strong>speech-to-speech</strong> model (OpenAI's Realtime API with <code class="inline">gpt-realtime</code>, Google's Gemini Live) takes audio in and emits audio out through a single model. There is no intermediate transcript on the critical path. It hears tone, interruption, and pacing directly, and can respond expressively because it was never reduced to text.</p>
+    <p>The familiar framing is cascade versus a single <strong>speech-to-speech</strong> model that takes audio in and emits audio out. The vendors have since split the middle, and the middle option is the one most production stacks end up on.</p>
 
-<pre class="standalone"><span class="c-cm"># cascade: three hops, three failure points</span>
+<pre class="standalone"><span class="c-cm"># full cascade: three hops, three failure points, yours to swap</span>
 mic &rarr; STT &rarr; <span class="c-kw">LLM</span> (agent loop) &rarr; TTS &rarr; speaker
 
-<span class="c-cm"># native: one model, audio in / audio out</span>
+<span class="c-cm"># half-cascade: provider-hosted, audio in / text reasoning / audio out</span>
+mic &rarr; <span class="c-kw">realtime session</span> [ audio-in &rarr; text core &rarr; TTS ] &rarr; speaker
+
+<span class="c-cm"># native audio: one model, audio in / audio out, no text on the path</span>
 mic &rarr; <span class="c-kw">speech-to-speech model</span> (loop inside) &rarr; speaker</pre>
 
+    <p>The choice between the last two is not a preference, and the clearest statement of the trade comes from the provider. Google's own Live API guidance recommends half-cascade "for applications prioritizing tool execution reliability or needing text output", and native audio "for natural conversation with emotional awareness" — and notes that native-audio models must output audio, while half-cascade models support both modalities. Native audio gets the expressive features (tone matching the user's expression; the model choosing when to speak) that half-cascade lacks.</p>
+
+    <p>Read that as the vendor telling you that the expressive path is the less reliable one at calling your functions. If your agent's job is mostly to look things up and write things down, that is the whole decision; see <a class="xref" href="/playbooks/voice-realtime-agents/voice-tooling-and-state">voice tooling and state</a> for what tool calls do to a turn.</p>
+
     <div class="callout warn">
-      <p>Native does not mean transcript-free in practice. You still want a transcript for logging, eval, and compliance — most realtime APIs emit one as a side channel. The difference is that it is <em>observability</em>, not the reasoning substrate. Do not put a guardrail on a transcript and assume it gates audio the model already spoke.</p>
+      <p>Native does not mean transcript-free in practice. You still want a transcript for logging, eval and compliance — most realtime APIs emit one as a side channel. The difference is that it is <em>observability</em>, not the reasoning substrate. Do not put a guardrail on a transcript and assume it gates audio the model already spoke.</p>
     </div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>Where the agent loop lives.</h3>
+    <h3>Audio fills the context window at a fixed rate, so the session cap is arithmetic.</h3>
 
-    <p>This is the question that decides your architecture. The agent loop — plan, call tool, observe, continue — has to run <em>somewhere</em>, and voice makes its placement load-bearing.</p>
+    <p>This is the constraint that has no analogue in a text agent, and the one that decides whether your architecture survives a long call. A realtime session accumulates the conversation's audio in the model's context window, and it accumulates at a rate set by the medium rather than by the speaker. Google documents roughly <strong>25 tokens per second for streamed audio and 258 for video</strong>, against a context window of <strong>128k tokens for native-audio-output models and 32k for other Live models</strong>.</p>
 
-    <ul>
-      <li><strong>Cascade:</strong> the loop is yours, in your orchestrator, between STT and TTS. Full control of tools, memory, and policy; you own the latency too.</li>
-      <li><strong>Native, model-driven:</strong> the loop runs inside the realtime model — it decides when to call your tools via function calling over the session. Lowest latency, least control.</li>
-      <li><strong>Native, externally-driven:</strong> the model handles speech and turn-taking, but hands reasoning-heavy steps to an external text agent. A hybrid that keeps audio quality and reclaims tool/policy control — at the cost of a round-trip you must hide.</li>
-    </ul>
+    <p>Divide one by the other and the documented session limits stop looking like policy:</p>
+
+<pre class="trace"><span class="c-out">32k window  &divide; 258 TPS (audio+video)  &asymp; 124 s   &rarr; documented cap: ~2 min
+32k window  &divide;  25 TPS (audio in)     &asymp; 1280 s  &rarr; documented cap: ~15 min
+                                                  (the agent's own speech
+                                                   consumes the window too)
+128k window &divide;  25 TPS (audio in)      &asymp; 5120 s  &rarr; ~85 min of one-way talk</span></pre>
+
+    <p>The two-minute audio-plus-video cap is almost exactly 32k divided by the video rate. The fifteen-minute audio cap is consistent with the same window once you account for both sides of the conversation landing in it. Treat the cap as a <em>context budget</em> rather than a timer, because that is what tells you what the remedies buy: context-window compression lifts the session cap because it reclaims window, not because it relaxes a rule.</p>
+
+    <p>Three consequences follow immediately. A call that can run long needs compression enabled from the start, not added after a truncation incident. A native-audio model buys you four times the window as well as the prosody, which is a second and rarely-cited reason to pick it. And an agent that streams video — screen share, camera — has a session measured in a couple of minutes, so video is a burst input you open and close, never a thing you leave running.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>The transport is part of the architecture.</h3>
+    <h3>The transport expires before the session does.</h3>
 
-    <p>Text agents move JSON over HTTP. Voice agents move continuous audio frames over a persistent connection — WebRTC or a WebSocket — for the entire call. The session is stateful and long-lived, not request/response.</p>
+    <p>Text agents move JSON over HTTP. Voice agents move continuous audio frames over a persistent connection for the entire call, and there are three shapes of that connection — WebRTC for browser and app clients, a WebSocket for server-to-server, and SIP for the phone network. OpenAI's Realtime API accepts all three, and its audio rates do not change with the transport, so the choice is an engineering one: WebRTC brings jitter buffering, echo cancellation and packet-loss concealment that you would otherwise write yourself, which is why a WebSocket is the wrong default for anything with a microphone on the far end.</p>
 
-<pre class="trace"><span class="c-out">SESSION  open WebRTC/WS ----------------------------- hang up
+<pre class="trace"><span class="c-out">SESSION  open WebRTC/WS/SIP ---------------------- hang up
          |  audio frames in (20ms)  audio frames out  |
          |  events: speech_started, transcript, ...    |
          |  function_call / function_result           |
-         |  one connection, one conversation state     |</span></pre>
+         |  one conversation state, several connections |</span></pre>
 
-    <p>Telephony adds another hop: a SIP/PSTN gateway (Twilio, Telnyx, LiveKit SIP) bridges the phone network to your media stream, usually as 8 kHz μ-law. The architecture now spans carrier → gateway → your media server → model, and every hop is latency and a failure domain.</p>
+    <p>The last line is the change from the naive picture. The connection and the session have different lifetimes: Google documents individual WebSocket connections timing out at around ten minutes while a compressed session can run far longer, and session resumption is <strong>disabled by default</strong> — you enable it in the setup message, keep the latest token from the resumption-update messages, and pass it as the handle when you reconnect. Ship without that and your first ten-minute call ends as a dropped conversation with no state to return to.</p>
+
+    <p>OpenAI's cap is a session cap rather than a connection cap: its documentation puts the maximum duration of a Realtime session at 60 minutes, raised from an earlier 30. Either way the architectural conclusion is the same — a call longer than the vendor's cap is a <em>requirement</em> to be designed for, with a handoff or a re-established session carrying summarised state, not an edge case to discover in production. Telephony adds its own hop: a SIP/PSTN gateway bridges the carrier to your media stream, usually as 8 kHz &micro;-law, and <a class="xref" href="/playbooks/voice-realtime-agents/telephony-and-pstn-integration">telephony and PSTN integration</a> covers what that costs you in fidelity.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>The reference shape most production stacks converge on.</h3>
+    <h3>Where the agent loop lives.</h3>
 
-    <p>In practice, robust 2025-era stacks look like a media server holding the call, a turn detector deciding who speaks, the model (native or cascade) producing the reply, and a side channel doing transcript logging and async guardrails.</p>
+    <p>With the clocks established, loop placement is a real decision rather than a taste. The loop — plan, call tool, observe, continue — has to run somewhere, and voice makes its placement load-bearing because every tool call happens inside a conversation that is still being billed by the second.</p>
+
+    <ul>
+      <li><strong>Cascade:</strong> the loop is yours, in your orchestrator, between STT and TTS. Full control of tools, memory and policy; you own the latency and the context accounting too.</li>
+      <li><strong>Native, model-driven:</strong> the loop runs inside the realtime model, which decides when to call your tools via function calling over the session. Lowest latency, least control — and the configuration the provider itself flags as the weaker one for tool reliability.</li>
+      <li><strong>Native, externally-driven:</strong> the model handles speech and turn-taking, but hands reasoning-heavy steps to an external text agent. This keeps audio quality and reclaims tool and policy control, at the cost of a round-trip you must hide behind a filler turn — see <a class="xref" href="/playbooks/voice-realtime-agents/turn-taking-and-barge-in">turn-taking and barge-in</a>.</li>
+    </ul>
+
+    <p>One asymmetry is easy to miss: in the two native shapes, the audio history occupying the context is not yours to prune. In a cascade, the text turns are yours — you can summarise, drop and re-order them with ordinary context-engineering tools, which means the session-length clock in STEP 3 is a clock you control. That, and not transcript visibility, is the strongest reason a long-running or heavily-tooled voice agent still ends up as a cascade.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The reference shape, and when not to build one.</h3>
+
+    <p>Robust stacks converge on five load-bearing components regardless of which boundary you picked: a media server holding the call, a turn detector deciding who speaks, the model producing the reply, a tool runtime off the audio path, and a side channel for transcript, recording and async checks.</p>
 
 <pre class="standalone"><span class="c-cm"># the load-bearing components, not a framework</span>
 media_server   <span class="c-cm"># holds WebRTC/SIP, jitter buffer, echo cancel</span>
@@ -75,15 +106,12 @@ brain          <span class="c-cm"># native S2S model OR cascade orchestrator</sp
 tool_runtime   <span class="c-cm"># your functions, run off the audio path (V5)</span>
 side_channel   <span class="c-cm"># transcript, eval, recording, async checks</span></pre>
 
+    <p>Turn detection is worth one note here because it is the component most often left on its default. Voice activity detection is enabled by default on the major realtime APIs, and the newer semantic variants endpoint on what the caller has <em>said</em> rather than on how long they have been quiet — which is the difference between interrupting someone mid-sentence and waiting through a pause. <a class="xref" href="/playbooks/voice-realtime-agents/turn-taking-and-barge-in">Turn-taking and barge-in</a> is the whole essay; <a class="xref" href="/playbooks/voice-realtime-agents/voice-failure-modes">voice failure modes</a> is what each component looks like when it breaks.</p>
+
+    <p><strong>And if the task tolerates a typed turn, voice buys you nothing and costs you a real-time deadline, an audio failure surface, a per-second bill that runs through silence, and worse observability.</strong> Text-first; voice only when the channel is the requirement. The per-second arithmetic is in <a class="xref" href="/operations/economics-roi/cost-of-a-voice-minute">the cost of a voice minute</a>.</p>
+
     <div class="callout tip">
-      <p>Decide brain placement first, then everything else follows. Cascade when you need transcript-level control, eval parity with text agents, or heavy tool/policy logic. Native when conversational quality and sub-second response are the product. Hybrid when you genuinely need both — but only then; the round-trip is real.</p>
+      <p>Decide in this order, not the usual one. First work out your maximum call length and divide your target model's context window by the audio token rate — if the answer is shorter than your calls, you need compression or a native-audio window before anything else matters. Second, enable session resumption and test a reconnect mid-call, because the transport will expire before the session. Only then choose the speech boundary: cascade when you need transcript-level control, eval parity with text agents, heavy tooling, or a context window you can prune yourself; half-cascade when you want the provider's realtime loop and your functions to be called reliably; native audio when conversational quality is the product and the tool surface is small.</p>
     </div>
-  </div>
-
-  <div class="step">
-    <div class="step-num">STEP 6</div>
-    <h3>When NOT to build a voice agent.</h3>
-
-    <p><strong>If the task tolerates a typed turn, voice buys you nothing and costs you a real-time deadline, an audio failure surface, and worse observability — text-first, voice only when the channel is the requirement.</strong></p>
   </div>
 </section>

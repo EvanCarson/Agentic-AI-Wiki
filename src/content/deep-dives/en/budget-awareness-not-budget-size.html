@@ -1,0 +1,87 @@
+<section class="phase">
+  <div class="phase-num">N13</div>
+  <div class="week">Deep Dive · Reasoning &amp; Test-Time Compute</div>
+  <h2>Raising the ceiling is not the lever — telling the agent how much is left is.</h2>
+  <p class="goal">The two dials everyone reaches for when an agent fails a hard task — think longer, call more tools — both plateau, and they plateau for the same reason: the model has no representation of its remaining allowance, so extra budget gets spent widening whatever it was already doing. The measured gain comes from allocation, not allowance. One 2025 study put a budget counter in the context and lifted resolve rate from 36.8% to 55.4% at roughly the same number of tool calls.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Both knobs fail, and the failures rhyme.</h3>
+
+    <p>Scaling test-time compute has two shapes. You can spend more tokens inside a single turn — longer chains of thought, higher effort levels, more samples — or you can spend more turns, letting the agent call tools, read results and try again. The first is the subject of <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/inference-time-scaling">inference-time scaling</a>; the second is what most people mean by "give the agent a bigger step budget".</p>
+
+    <p>Each has a published failure. On the thinking side, <em>Inverse Scaling in Test-Time Compute</em> (Gema et al., arXiv 2507.14417, July 2025; accepted at TMLR in December 2025) constructed tasks on which accuracy <em>falls</em> as reasoning traces grow. In the controlled setup Claude Opus 4's accuracy declined with longer traces while DeepSeek R1 showed no significant change, and the failure modes were model-specific: Claude models became more distracted by irrelevant information the longer they reasoned, while OpenAI o-series models resisted distractors but overfit to the problem's framing. On constraint-satisfaction tasks every model tested degraded with extended reasoning. The paper's own conclusion is that naively scaling test-time compute is not the answer, and that the open problem is how models <em>allocate</em> reasoning. We treat that result on its own terms in <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/inverse-scaling-in-test-time-compute">inverse scaling in test-time compute</a>.</p>
+
+    <p>On the acting side, <em>Budget-Aware Tool Use Enables Effective Agent Scaling</em> (arXiv 2511.17006) reports the same shape with a different unit: simply increasing the tool-call budget fails to improve performance, because agents lack budget awareness and quickly hit a performance ceiling. Two papers, two knobs, one diagnosis — the model does not know where it is in its own budget, so a larger budget buys more of the same behaviour rather than different behaviour.</p>
+
+    <div class="callout warn">
+      <p>If raising a limit is your fix, you have not identified a failure — you have identified that you do not know which failure it is. A plateau under more budget is diagnostic: it says the marginal token or step is being spent on the part of the task the agent had already finished.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The gain is in allocation, and it is measurable.</h3>
+
+    <p>The useful part of the budget-aware result is not that bigger budgets disappoint. It is the counterfactual. The paper's Budget Tracker gives the agent a running sense of its remaining budget — a number in the context, decremented as the run proceeds — and in one comparison that single addition raised the resolve rate by 18.6 percentage points, from 36.8% to 55.4%, at a budget of 50 while using a similar number of tool calls.</p>
+
+    <p>Read that last clause twice. The tool-call count barely moved. Nothing about the model, the tools, the scaffold or the allowance changed. What changed is that the agent could tell the difference between step 5 of 50 and step 45 of 50, and behaved differently in each. Breadth-first exploration is correct early and ruinous late; committing to the best current hypothesis is correct late and premature early. An agent with no clock cannot pick, so it picks one policy and runs it everywhere.</p>
+
+<pre class="standalone"><span class="c-cm"># what a budget-unaware agent sees on every step</span>
+<span class="c-out">[tool results]</span>
+<span class="c-cm"># ...and that is all. Step 3 and step 47 are indistinguishable.</span>
+
+<span class="c-cm"># what a budget-aware agent sees</span>
+<span class="c-out">[tool results]</span>
+<span class="c-out">budget: 12 of 50 tool calls remain; ~18k of 200k context tokens used</span>
+<span class="c-cm"># the model can now trade breadth for commitment, and does.</span></pre>
+
+    <p>This is cheap to implement and almost never implemented. The counter lives in your harness, not in the model: you already decrement it to enforce the cap, so the only work is rendering it into the context on each turn and writing one or two lines of guidance about what a low remainder implies. See <a class="xref" href="/deep-dives/tool-capability-design/shaping-tool-results">shaping tool results</a> for where in the turn this belongs.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>A budget the model cannot see is a budget it will spend wrongly at the end.</h3>
+
+    <p>Truncation is the sharpest version of the problem. When a hard cap fires — max steps, max thinking tokens, a deadline from <a class="xref" href="/operations/agentops/timeouts-and-deadline-budgets">timeouts and deadline budgets</a> — the agent does not land the plane. It is cut off mid-exploration and whatever partial state exists gets returned as an answer. The <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/adaptive-thinking-and-effort-budgets">effort-level APIs</a> that replaced numeric token dials fixed the easy half of this (the model now sizes its own spend per query) and left the agentic half untouched: no vendor effort level knows how many tool calls your harness will still permit.</p>
+
+    <p>The fix is to reserve, not just to cap. Split the budget explicitly and tell the model about both halves:</p>
+
+    <ul>
+      <li><strong>An exploration budget</strong> the agent may spend freely on search, reads and dead ends.</li>
+      <li><strong>A landing reserve</strong> — typically 10–20% — that exists only to produce an answer from whatever was found, and which the agent is told about from the first turn.</li>
+    </ul>
+
+    <p>With the reserve declared, the transition is a decision the model makes rather than an interrupt it suffers. Without it, your tail of runs is dominated by an answer assembled from the wrong half of the trace. This is the same structure as the compute-optimal policy argument in <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/inference-time-scaling">inference-time scaling</a>, moved from tokens to steps.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Unmatched budgets are why topology results do not replicate.</h3>
+
+    <p>Once you accept that budget is the variable, a whole genre of published comparison becomes unreadable. Two agent designs differ in topology, prompting, tool set <em>and</em> what they are allowed to spend, and the headline is attributed to the topology. Hold the spend constant and the attribution often collapses: one 2026 study reports that single-agent systems consistently match or outperform multi-agent systems on multi-hop reasoning when reasoning tokens are held constant (arXiv 2604.02460).</p>
+
+    <p>That finding does not say multi-agent is useless — <a class="xref" href="/deep-dives/multi-agent-systems/multi-agent-when-and-why">when and why to go multi-agent</a> has the cases where it earns its keep. It says that fan-out's most-cited advantage is partly an accounting artefact, because a supervisor with five workers is quietly a five-times-larger budget. <a class="xref" href="/deep-dives/multi-agent-systems/the-fan-out-tax">The fan-out tax</a> prices that out.</p>
+
+    <p>The same discipline applies to security and tool-use claims. A cost-aware evaluation of offensive and defensive security agents (arXiv 2607.15263) argues that budget-scaling claims are credible only when the comparison is paired — the same model, the same benchmark, the same completed trace — and reports that in its own run, additional budget and tool volume did not buy a meaningful defensive improvement, and that high tool volume is not a proxy for score. Treat tool-call count as a cost, never as evidence of effort. <a class="xref" href="/deep-dives/evaluating-agents/budget-matched-evaluation">Budget-matched evaluation</a> is the method; this is why it is not optional.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>What to instrument.</h3>
+
+    <p>Budget awareness is only auditable if the budget is in the trace. Three signals, all cheap, and all missing from most agent telemetry (see <a class="xref" href="/concepts/agent-observability">agent observability</a> for where they live):</p>
+
+    <ul>
+      <li><strong>Remaining budget at every step</strong>, as a number, alongside the step itself. Without it you cannot tell a run that solved the task in 8 steps from a run that happened to stop at 8.</li>
+      <li><strong>Terminal reason</strong>, separated into <em>finished</em>, <em>gave up</em> and <em>truncated</em>. Collapsing these into "failed" hides the only distinction that tells you whether to raise the cap. A rising share of truncations is the one case where more budget is genuinely the answer.</li>
+      <li><strong>Marginal value of the last decile.</strong> Re-run a sample at 70% and at 100% of the budget and compare resolve rates. If the last 30% buys under a point, your cap is already past the knee and the spend is pure cost — the lever moves to <a class="xref" href="/operations/agentops/cost-control-in-the-loop">cost control in the loop</a>.</li>
+    </ul>
+
+    <p>Reported token counts are their own trap: thinking tokens are billed but often not returned verbatim, so a "budget" measured from visible output undercounts the spend. <a class="xref" href="/deep-dives/reasoning-and-test-time-compute/reasoning-token-accounting">Reasoning-token accounting</a> covers the arithmetic, and <a class="xref" href="/concepts/agent-cost-control">agent cost control</a> the enforcement.</p>
+
+    <div class="callout tip">
+      <p>Do this in order. First, render the remaining budget into the context on every turn as a plain number — it is a few lines of harness code and it is the only change in this essay with a published double-digit effect size. Second, declare a landing reserve of 10–20% and say so in the system prompt, so truncation becomes a decision rather than an interrupt. Third, split terminal reasons into finished, gave up and truncated, and only raise a cap when truncations are rising. Do not raise a limit before you have done the first three; a plateau under a larger budget is not a resourcing problem, it is an allocation problem wearing a resourcing problem's clothes.</p>
+    </div>
+  </div>
+</section>
