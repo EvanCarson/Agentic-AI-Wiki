@@ -1,0 +1,134 @@
+<section class="phase">
+  <div class="phase-num">O36</div>
+  <div class="week">运维 · 智能体运维：部署与运营</div>
+  <h2>跨越模型调用的事务：你持有的那把锁，是按推理延迟计价的。</h2>
+  <p class="goal">一次在 Web 处理函数里根本看不见的「读—改—写」，只要那个「改」变成一次模型调用，就会立刻成为你的吞吐上限——因为行锁现在持有的时长是 p99 生成延迟，而不是你的代码所花的那几微秒。持锁时长乘以到达速率就是并发量，所以在一个有争用的行上持锁二十秒，等于把那一行限制在每分钟三次写入，而连接池会在它限制住任何别的东西之前先被耗尽。由此得出的规则绝对而廉价：永远不要让一笔数据库事务跨越一次模型调用——带版本号读出、关闭事务、让模型决定，再用 compare-and-swap 写入——并且把版本冲突当作新的一轮，而不是旧那一轮的重试。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>那道没人算过的算术题，因为在 Web 处理函数里它从来无关紧要。</h3>
+
+    <p>悲观锁是每一个事务系统里「正确代码」的默认形状，而它之所以正确，靠的是一个可靠到从没被写下来的假设：从取得锁到提交之间的那段时间，<em>由你写的代码决定其上界</em>。一个处理函数读出一行、加个数字、写回去。持锁几百微秒，争用只是理论上的，没人去量它。</p>
+
+    <p>智能体只用一行就打破了这个假设。把一次模型调用放到读与写之间——因为整件事的要点本来就是「由模型决定新值该是多少」——持锁时长就变成了一次带工具调用的生成所需的延迟。不是你面板上那个首 token 时延，而是完整的一轮：提示拼装、长上下文的 prefill、思考 token、补全，以及模型在回答之前所做的任何一次工具往返。在一次大量用工具的轮次上，这是数秒；若思考预算开得高，或者在一次 429 之后重试，那就是数十秒。</p>
+
+    <p>接下来 Little 定律把剩下的事办完，而数字之所以残酷，正因为它是线性的：</p>
+
+<pre class="standalone"><span class="c-cm"># concurrency = arrival rate x hold time</span>
+hold  = <span class="c-st">20</span>s        <span class="c-cm"># p99 of one tool-using turn, measured end to end</span>
+rate  = <span class="c-st">3</span>/s        <span class="c-cm"># agent turns that touch the same account row</span>
+<span class="c-fn">waiters</span> = <span class="c-st">20</span> * <span class="c-st">3</span> = <span class="c-st">60</span>   <span class="c-cm"># transactions queued on one row, steady state</span>
+
+<span class="c-cm"># and the ceiling on that row, regardless of how many workers you add:</span>
+<span class="c-out">1 / 20s = 3 writes per minute</span>
+</pre>
+
+    <p>有两个后果值得分开讲，因为团队通常先遇到第二个、却把它误诊成第一个。行级上限是一种保持正确性的变慢：写入串行化，什么都没丢，延迟上升。真正把你呼起来的是连接池。在 PgBouncer 这类以 <code class="inline">transaction</code> 模式工作的事务池代理之下，一条服务端连接会在整笔事务期间被占住，于是六十个在飞的智能体轮次就占住六十条服务端连接——而那个池通常只配了几十条，因为它是按「持有连接一毫秒的处理函数」来定规格的。症状是<em>毫不相干</em>的查询开始超时，而数据库本身几乎空闲——这正是为什么这件事会被归档成一次数据库事故，而它其实是一个智能体设计缺陷。<a class="xref" href="/zh/operations/agentops/concurrency-and-scaling">并发、队列与扩缩容</a>讲的是大形状；这里讲的是它里头那件「智能体会做、而普通服务不会做」的具体事。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>出厂默认值并不为此兜底，而现存的两个超时由两个不同的团队掌管。</h3>
+
+    <p>条件反射是假设有个超时会把它接住。先去看默认值，再决定是否依赖它。PostgreSQL 出厂时 <code class="inline">idle_in_transaction_session_timeout</code> 与 <code class="inline">lock_timeout</code> 都是 <code class="inline">0</code>，也就是关闭——于是一笔事务打开后，卡在一次发往模型厂商的 HTTPS 调用上、再也没听到回音，它就会一直持着锁，直到连接本身死掉。MySQL 的 InnoDB 则是另一个极端，而且好不了多少：<code class="inline">innodb_lock_wait_timeout</code> 默认五十秒，之后把那条等待中的语句回滚。那就把一个延迟问题变成了负载之下的正确性问题，而且它是在一次工具调用中途以回滚的形式到来，而不是以一条慢查询出现在某块面板上。</p>
+
+    <p>现在把模型自己的超时摆在旁边。厂商 SDK 的默认请求超时通常以分钟而不是秒计，恰恰因为长生成是合法的。所以在一套默认部署里，你实际拥有的顺序是：要么锁等待先放弃，要么根本没人放弃；而无论哪种情况，知道截止时间的那个组件都不会告诉持锁的那个组件。</p>
+
+    <div class="callout warn">
+      <p>数据库超时与推理超时是两份独立的配置，通常由两个不同的团队掌管，而且谁都不是谁的上界。任何地方都没有一个开关写着「不要让 LLM 调用发生在事务里」。这条约束只能写在你的代码里，而唯一可靠的落点是边界上的一次检查——见 STEP 6。</p>
+    </div>
+
+    <p>还有一个默认值值得点名，因为它会在开发期把问题藏起来：一个超时宽松的连接池加上一位开发者，争用等于零，于是这个缺陷一直隐形，直到那一行在生产里被争用。这正是<a class="xref" href="/zh/operations/agentops/load-testing-agents">智能体压测</a>存在的目的所要抓的缺陷类别，而具体的测法是「在单个实体上的并发」，不是「总体吞吐」。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>乐观并发更适合智能体，原因是两个假设同时被反转了。</h3>
+
+    <p>当决定很快、冲突很常见时，悲观锁是对的选择。当决定很慢、冲突很少见时，乐观并发是对的选择。智能体把这两个输入一次性反转了——决定是系统里最慢的那件事，而任一单个实体上的冲突率通常很低——所以答案不是一个调参问题。</p>
+
+    <p>形状是与数据库进行三次短交互，而不是一次长交互，并且模型待在三次之外：</p>
+
+<pre class="standalone"><span class="c-cm"># 1. read, with the version, and COMMIT before you call the model</span>
+row = db.<span class="c-fn">query_one</span>(<span class="c-st">"SELECT id, balance, version FROM account WHERE id = %s"</span>, aid)
+db.<span class="c-fn">commit</span>()                      <span class="c-cm"># transaction is over; no locks held</span>
+
+<span class="c-cm"># 2. the model decides, holding nothing</span>
+plan = agent.<span class="c-fn">decide</span>(row)           <span class="c-cm"># seconds to tens of seconds</span>
+
+<span class="c-cm"># 3. write under a compare-and-swap on the version you read</span>
+n = db.<span class="c-fn">execute</span>(
+    <span class="c-st">"UPDATE account SET balance = %s, version = version + 1 "</span>
+    <span class="c-st">"WHERE id = %s AND version = %s"</span>,
+    plan.new_balance, aid, row.version)
+<span class="c-kw">if</span> n == <span class="c-st">0</span>:
+    <span class="c-kw">raise</span> <span class="c-err">StaleDecision</span>(row.version)   <span class="c-cm"># somebody else wrote. NOT a retry.</span>
+</pre>
+
+    <p>有三个细节撑着这个模式。版本列必须由执行写入的那同一条语句来递增，否则这个检查就是一个<a class="xref" href="/zh/deep-dives/agent-security/time-of-check-to-time-of-use">检查时刻与使用时刻</a>之间的窗口，而不是一道防线。零行结果就是全部的冲突信号，所以调用处必须去看受影响行数，而不是只看「没有抛异常」——一条什么都没匹配上的 <code class="inline">UPDATE</code>，在驱动看来是成功的。而版本必须与「模型将会看到的那份数据」在同一条语句里读出，否则你是在拿一个版本去比对一个基于不同快照所做的决定。</p>
+
+    <p>如果你的表结构没有版本列，<code class="inline">updated_at</code> 可以当一个弱一些的版本用，而「模型被展示过的那些字段的哈希」可以当一个更强的版本用：这个检查最强的形式是「只有当我展示给模型的内容仍然成立时才落盘」，而这也是在「多个写入方各自改同一行的不同列」的表结构下仍然活得下去的形式。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>版本冲突是新的一轮，不是一次重试——而大多数实现正是在这里走错。</h3>
+
+    <p>compare-and-swap 失败时的条件反射是循环：重读、重新套用、重试。对一个「把数字加一」的处理函数来说，这完全正确，因为该操作是那一行的纯函数，拿新状态重跑一遍会得到正确答案。对智能体来说这是错的，而且错在那个会悄悄亏钱的方向上。</p>
+
+    <p>模型的输出是<em>以它读到的那一行为条件</em>的。如果余额在读与写之间变了，那么把基于旧余额算出来的 <code class="inline">plan.new_balance</code> 重新套用一遍，并不能解决冲突——它是用一个过期的决定覆盖掉一个并发的决定，而且是用一条看起来成功的 <code class="inline">UPDATE</code> 做到的。乐观并发本来要抓的那个「丢失更新」异常，被那个本该处理它的重试又请了回来。</p>
+
+    <p>所以遇到冲突，回到模型那里去。重读那一行，告诉智能体发生了什么变化，让它重新决定一次。这并不免费——这是完整的第二轮，有它自己的 token 和它自己的延迟——而这个价格的坦诚恰恰是重点：智能体写路径上的争用成本是以推理计价的，单次发生的代价大约比一个普通服务的重试贵四个数量级。这个数字应当把你推向「减少争用」，而不是「吸收争用」。</p>
+
+    <div class="callout">
+      <p>这与<a class="xref" href="/zh/operations/agentops/idempotency-and-retries">幂等与重试</a>解决的问题不是同一个，而你两个都需要。幂等键回答的是「这个意图是否已经被落实过？」，防的是重复。版本检查回答的是「这个意图是否仍然有效？」，防的是过期。一条有幂等、没版本检查的写路径，会恰好落实一份错误的决定；一条有版本检查、没幂等的写路径，会把正确的决定落实未知多少次。</p>
+    </div>
+
+    <p>给重新决定的次数设上界——二是一个站得住的上限——并且选择上报而不是循环。一行若真的被争用，会把一个永远重新决定下去的智能体饿死，而每一圈都要花掉一轮，所以无界循环就是一条挂着推理账单的<a class="xref" href="/zh/concepts/retry-amplification">重试放大</a>通道。在第二次冲突之后，这个任务就不再关于那一行了；它关于「有两个写入方都想要它」这个事实，而那是一个<a class="xref" href="/zh/operations/safety-and-security/human-in-the-loop">人在环中</a>的决定或者一个队列，不是第三次尝试。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>当写入确实必须跨行原子时，把决定移出去——而不是把事务圈进来。</h3>
+
+    <p>有时候一次 compare-and-swap 不够：动作要从一个账户扣款、给另一个账户入账，或者既订座又刷卡，而不变式跨越多行。错误的修法是把事务撑大到把模型装进去。有三种模式能让事务保持短小、让模型留在外面，按构建成本递增排列。</p>
+
+    <ul>
+      <li><strong>先提议，再确定性地落实。</strong>模型产出一份结构化方案——金额用整数、账户 ID、以及一份对当前状态的明确预期——由一个确定性函数校验它，并在一笔短事务里落实每一行；若那份明示的预期已不再成立，就直接拒绝。事务又回到了「你自己代码的毫秒级」。这与<a class="xref" href="/zh/deep-dives/architectures-and-patterns/deterministic-boundary-for-finance-agents">金融智能体的确定性边界</a>所论证的边界是同一个，具体实现见<a class="xref" href="/zh/deep-dives/architectures-and-patterns/deterministic-finance-workflow-in-code">用代码写成的确定性金融工作流</a>。</li>
+      <li><strong>先预留，再确认。</strong>两笔短事务，中间夹一条带过期时间的预留记录：第一笔占住资源并记下截止时刻，模型去斟酌，第二笔把预留转为正式或者让它失效。每一个订座系统本来就是这么做的，而且只要「有人类也可能正握着智能体想要的那个东西」，它就是正确的形状。那个清理过期预留的收割进程不是可选项——它正是让这个模式安全的那个组件。</li>
+      <li><strong>在队列里按实体串行化。</strong>把工作队列按「被写入的实体」分键，于是任一账户永远只被一个 worker 持有，并发就成了队列的属性而不是数据库的属性。这放弃了跨实体的原子性，所以它更适合「在很多互不相干的实体上写得很重」的智能体，而不是一个共用总账上的智能体。<a class="xref" href="/zh/deep-dives/multi-agent-systems/parallel-writes-and-silent-merges">并行写入与静默合并</a>是同一论证的多智能体版本，而队列机制在<a class="xref" href="/zh/operations/agentops/serving-agent-traffic">承载智能体流量</a>里。</li>
+    </ul>
+
+    <p>在这三种做法里，请注意模型不再是什么了。它不再是一笔事务的参与者，而成了一项变更的提议者——而那项变更由一段短小、确定、可审计的代码来决定落实还是拒绝。这也正是当某次写入事后被发现是错的时候，能给你东西去重放的那个形状——见<a class="xref" href="/zh/operations/agentops/repairing-agent-side-effects">修补智能体的副作用</a>，在那里你需要的工件是那份方案对象，而不是事务日志。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>把它运营起来：一条断言，四个数字。</h3>
+
+    <p>那条断言是防止回退的东西，因为这个缺陷在评审里看不见——一个藏在 <code class="inline">with transaction():</code> 块下面三层栈帧里的模型调用，看起来就是普通代码。在事务打开时置一个标志，在每个智能体用来访问模型的客户端包装里检查它，并在开发与测试环境抛错：</p>
+
+<pre class="standalone"><span class="c-cm"># the guard that makes the rule enforceable rather than aspirational</span>
+<span class="c-kw">def</span> <span class="c-fn">complete</span>(messages, **kw):
+    <span class="c-kw">if</span> tx_depth.<span class="c-fn">get</span>() &gt; <span class="c-st">0</span>:
+        <span class="c-kw">raise</span> <span class="c-err">RuntimeError</span>(<span class="c-st">"model call inside an open transaction"</span>)
+    <span class="c-kw">return</span> provider.<span class="c-fn">complete</span>(messages, **kw)
+
+<span class="c-cm"># in production, log-and-proceed is the safer rollout: you want the</span>
+<span class="c-cm"># inventory of violations before you start failing requests on them.</span>
+</pre>
+
+    <p>然后是四个数字，而第四个是大多数团队手上没有的：</p>
+
+    <ul>
+      <li><strong>智能体写路径上的 p99 事务时长。</strong>超过一秒就告警。这是「是否有模型调用溜进了事务」的代理指标，并且能抓住那条「没人测过、断言也漏掉了」的路径上的回退。</li>
+      <li><strong>每一百次写入的冲突数。</strong>争用率，也是「STEP 5 的队列值不值得建」的输入。流量平稳而冲突上升，通常意味着有两个智能体被给了互相重叠的作用域。</li>
+      <li><strong>每完成一个任务的重新决定次数。</strong>花在争用而不是工作上的推理。这个数高于约 0.1，就说明实体划分错了。</li>
+      <li><strong>按调用方切分的连接池等待时长。</strong>这个数字本可以在几分钟而不是几小时内定位 STEP 1 里那场事故，而它通常被整个服务汇总在一起，于是智能体的贡献隐形了。把它切分开。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>按这个顺序做。先 grep 出每一处在词法上或动态上落在事务作用域内的模型调用，优先修这些路径——它们已经在把所触及的那一行的吞吐压住了。给每一条智能体写路径加上版本列与受影响行数检查，并让零行那一支抛错而不是放过。然后把冲突处理器接成「带新状态回到模型」，把它封顶在两次重新决定，第三次上报。把「事务未关闭」断言以记录并继续的模式加进模型客户端，读一周它产出的清单，再在 CI 里把它翻成抛错。在你需要它之前，就先把连接池等待时长按调用方切分好。而如果你只留一句话：版本检查是让写入正确的那个东西，而「回到模型而不是重试写入」才是让版本检查有意义的那个东西。</p>
+    </div>
+  </div>
+</section>
