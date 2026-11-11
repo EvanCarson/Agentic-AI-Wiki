@@ -1,0 +1,134 @@
+<section class="phase">
+  <div class="phase-num">O36</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Transactions across a model call: the lock you hold is priced in inference latency.</h2>
+  <p class="goal">A read-modify-write that is invisible in a web handler becomes your throughput ceiling the moment the "modify" is a model call, because the row lock is now held for p99 generation latency rather than for the microseconds your code takes. Lock-hold time multiplied by arrival rate is concurrency, so a twenty-second hold on a contended row caps that row at three writes a minute and exhausts the connection pool well before it caps anything else. The rule that follows is absolute and cheap: never hold a database transaction across a model call — read with a version, close the transaction, let the model decide, then write under a compare-and-swap — and treat a version conflict as a new turn rather than a retry of the old one.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The arithmetic nobody does, because in a web handler it never mattered.</h3>
+
+    <p>Pessimistic locking is the default shape of correct code in every transactional system, and it is correct because of an assumption so reliable that it is never written down: the interval between acquiring a lock and committing is <em>bounded by code you wrote</em>. A handler reads a row, adds a number, writes it back. The hold is a few hundred microseconds, contention is theoretical, and nobody measures it.</p>
+
+    <p>An agent breaks the assumption in one line. Put a model call between the read and the write — because the whole point is that the model decides what the new value should be — and the hold time becomes the latency of a tool-using generation. Not the time-to-first-token your dashboard shows, but the full turn: prompt assembly, prefill over a long context, thinking tokens, the completion, and any tool round-trip the model makes before it answers. On a heavily tooled turn that is seconds; with a high thinking budget, or a retry after a 429, it is tens of seconds.</p>
+
+    <p>Little's law then does the rest, and the numbers are brutal because they are linear:</p>
+
+<pre class="standalone"><span class="c-cm"># concurrency = arrival rate x hold time</span>
+hold  = <span class="c-st">20</span>s        <span class="c-cm"># p99 of one tool-using turn, measured end to end</span>
+rate  = <span class="c-st">3</span>/s        <span class="c-cm"># agent turns that touch the same account row</span>
+<span class="c-fn">waiters</span> = <span class="c-st">20</span> * <span class="c-st">3</span> = <span class="c-st">60</span>   <span class="c-cm"># transactions queued on one row, steady state</span>
+
+<span class="c-cm"># and the ceiling on that row, regardless of how many workers you add:</span>
+<span class="c-out">1 / 20s = 3 writes per minute</span>
+</pre>
+
+    <p>Two consequences are worth separating, because teams usually discover the second one first and misdiagnose it as the first. The row-level ceiling is a correctness-preserving slowdown: writes serialise, nothing is lost, latency climbs. The pool is the one that actually pages you. Under a transaction-pooling proxy such as PgBouncer in <code class="inline">transaction</code> mode, a server connection is held for the duration of the transaction, so sixty in-flight agent turns pin sixty server connections — against a pool that is typically sized in the tens, because it was sized for handlers that hold a connection for a millisecond. The symptom is that <em>unrelated</em> queries start timing out while the database itself is almost idle, which is why this gets filed as a database incident when it is an agent design bug. <a class="xref" href="/operations/agentops/concurrency-and-scaling">Concurrency, queues and scaling</a> is the general shape; this is the specific thing inside it that an agent does and a service does not.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The shipped defaults do not bound this, and the two timeouts that exist are owned by different teams.</h3>
+
+    <p>The reflex is to assume a timeout catches it. Check the defaults before relying on that. PostgreSQL ships both <code class="inline">idle_in_transaction_session_timeout</code> and <code class="inline">lock_timeout</code> at <code class="inline">0</code>, which means disabled — so a transaction that opens, stalls on an HTTPS call to a model provider, and never hears back holds its locks until the connection itself dies. MySQL's InnoDB is the opposite extreme and barely better: <code class="inline">innodb_lock_wait_timeout</code> defaults to 50 seconds, after which the waiting statement is rolled back. That turns a latency problem into a correctness problem under load, and it arrives as a rollback in the middle of a tool call rather than as a slow query in a dashboard.</p>
+
+    <p>Now put the model's own timeout beside those. A provider SDK's default request timeout is typically minutes, not seconds, precisely because long generations are legitimate. So the ordering you actually have, in a default deployment, is: the lock wait gives up first, or nothing gives up at all, and in neither case does the component that knows about the deadline tell the component holding the lock.</p>
+
+    <div class="callout warn">
+      <p>The database timeout and the inference timeout are two independent configurations, usually owned by two different teams, and neither is a bound on the other. There is no setting anywhere that says "do not let an LLM call happen inside a transaction." That constraint has to be written in your code, and the only reliable place is a check at the boundary — see STEP 6.</p>
+    </div>
+
+    <p>One more default is worth naming because it hides the problem in development: a connection pool with a generous timeout and a single developer produces zero contention, so the bug is invisible until the row is contended in production. This is the class of defect that <a class="xref" href="/operations/agentops/load-testing-agents">load testing agents</a> exists to find, and the specific test is concurrency on one entity, not throughput in aggregate.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Optimistic concurrency fits an agent better, and the reason is a reversal of two assumptions.</h3>
+
+    <p>Pessimistic locking is the right choice when the decision is fast and conflicts are common. Optimistic concurrency is the right choice when the decision is slow and conflicts are rare. An agent inverts both inputs at once — the decision is the slowest thing in the system, and the conflict rate on any single entity is normally low — so the answer is not a tuning question.</p>
+
+    <p>The shape is three short interactions with the database instead of one long one, with the model outside all of them:</p>
+
+<pre class="standalone"><span class="c-cm"># 1. read, with the version, and COMMIT before you call the model</span>
+row = db.<span class="c-fn">query_one</span>(<span class="c-st">"SELECT id, balance, version FROM account WHERE id = %s"</span>, aid)
+db.<span class="c-fn">commit</span>()                      <span class="c-cm"># transaction is over; no locks held</span>
+
+<span class="c-cm"># 2. the model decides, holding nothing</span>
+plan = agent.<span class="c-fn">decide</span>(row)           <span class="c-cm"># seconds to tens of seconds</span>
+
+<span class="c-cm"># 3. write under a compare-and-swap on the version you read</span>
+n = db.<span class="c-fn">execute</span>(
+    <span class="c-st">"UPDATE account SET balance = %s, version = version + 1 "</span>
+    <span class="c-st">"WHERE id = %s AND version = %s"</span>,
+    plan.new_balance, aid, row.version)
+<span class="c-kw">if</span> n == <span class="c-st">0</span>:
+    <span class="c-kw">raise</span> <span class="c-err">StaleDecision</span>(row.version)   <span class="c-cm"># somebody else wrote. NOT a retry.</span>
+</pre>
+
+    <p>Three details carry the pattern. The version column must be incremented by the same statement that writes, or the check is a <a class="xref" href="/deep-dives/agent-security/time-of-check-to-time-of-use">time-of-check-to-time-of-use</a> window rather than a guard. The zero-row result is the entire conflict signal, so the call site must inspect the affected-row count and not merely the absence of an exception — an <code class="inline">UPDATE</code> that matches nothing is a success as far as the driver is concerned. And the version must be read in the same statement as the data the model will see, otherwise you are comparing a version against a decision made from a different snapshot.</p>
+
+    <p>If your schema has no version column, <code class="inline">updated_at</code> works as a weaker one, and a hash of the fields the model was shown works as a stronger one: the strongest form of the check is "re-apply only if what I showed the model is still true", which is also the form that survives a schema where several writers touch different columns of the same row.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>A version conflict is a new turn, not a retry — and this is where most implementations go wrong.</h3>
+
+    <p>The reflex on a failed compare-and-swap is to loop: re-read, re-apply, retry. For a handler that adds a number, that is exactly right, because the operation is a pure function of the row and re-running it against fresh state produces the correct answer. For an agent it is wrong, and wrong in the direction that loses money quietly.</p>
+
+    <p>The model's output was <em>conditioned on the row it read</em>. If the balance changed between the read and the write, re-applying <code class="inline">plan.new_balance</code> computed against the old balance does not resolve the conflict — it overwrites a concurrent decision with a stale one, and it does so with a successful-looking <code class="inline">UPDATE</code>. The lost-update anomaly that optimistic concurrency exists to catch is reintroduced by the retry that was supposed to handle it.</p>
+
+    <p>So on conflict, go back to the model. Re-read the row, tell the agent what changed, and let it decide again. This is not free — it is a second full turn, with its own tokens and its own latency — and the honesty of that price is the point: the cost of contention on an agent write path is denominated in inference, which is roughly four orders of magnitude more expensive per occurrence than the retry a service would do. That is the number that should drive you to reduce contention rather than to absorb it.</p>
+
+    <div class="callout">
+      <p>This is a different problem from the one <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a> solves, and you need both. An idempotency key answers "has this intent already been applied?" and prevents a duplicate. A version check answers "is this intent still valid?" and prevents a stale one. A write path with idempotency and no version check applies exactly one copy of the wrong decision; a write path with a version check and no idempotency applies the right decision an unknown number of times.</p>
+    </div>
+
+    <p>Bound the re-decision count — two is a defensible ceiling — and escalate rather than loop. A row under genuine contention will starve an agent that re-decides forever, and each lap costs a turn, so an unbounded loop is a <a class="xref" href="/concepts/retry-amplification">retry amplification</a> channel with an inference bill attached. After the second conflict the task is no longer about the row; it is about the fact that two writers want it, which is a <a class="xref" href="/operations/safety-and-security/human-in-the-loop">human-in-the-loop</a> decision or a queue, not a third attempt.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>When the write genuinely must be atomic across rows, move the decision out — not the transaction in.</h3>
+
+    <p>Sometimes a single compare-and-swap is not enough: the action debits one account and credits another, or it books a seat and charges a card, and the invariant spans rows. The wrong fix is to widen the transaction until it contains the model. Three patterns keep the transaction short and the model outside it, in increasing order of how much they cost to build.</p>
+
+    <ul>
+      <li><strong>Propose, then apply deterministically.</strong> The model emits a structured plan — amounts as integers, account IDs, a stated expectation of current state — and a deterministic function validates it and applies every row in one short transaction, rejecting it outright if the stated expectation no longer holds. The transaction is now milliseconds of your own code again. This is the same boundary argued in <a class="xref" href="/deep-dives/architectures-and-patterns/deterministic-boundary-for-finance-agents">the deterministic boundary for finance agents</a>, with the worked implementation in <a class="xref" href="/deep-dives/architectures-and-patterns/deterministic-finance-workflow-in-code">deterministic finance workflow in code</a>.</li>
+      <li><strong>Reserve, then confirm.</strong> Two short transactions with a reservation row and an expiry between them: the first claims the resource and records a deadline, the model deliberates, the second converts the reservation or lets it lapse. This is what every booking system already does, and it is the correct shape whenever a human might also be holding the thing the agent wants. The reaper that expires stale reservations is not optional — it is the component that makes the pattern safe.</li>
+      <li><strong>Serialise by entity in a queue.</strong> Key the work queue by the entity being written so exactly one worker ever holds a given account, and concurrency becomes a property of the queue rather than of the database. This gives up cross-entity atomicity, so it fits a write-heavy agent on many independent entities far better than one on a shared ledger. <a class="xref" href="/deep-dives/multi-agent-systems/parallel-writes-and-silent-merges">Parallel writes and silent merges</a> is the multi-agent version of the same argument, and <a class="xref" href="/operations/agentops/serving-agent-traffic">serving agent traffic</a> has the queue mechanics.</li>
+    </ul>
+
+    <p>Across all three, notice what the model stopped being. It stopped being a participant in a transaction and became a proposer of a change that a short, deterministic, auditable piece of code either applies or refuses. That is also the shape that gives you something to replay when a write turns out to be wrong — see <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a>, where the plan object is the artefact you need and the transaction log is not.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Operate it: one assertion, four numbers.</h3>
+
+    <p>The assertion is what keeps this from regressing, because the defect is not visible in review — a model call three stack frames below a <code class="inline">with transaction():</code> block looks like ordinary code. Set a flag when a transaction opens, check it in the client wrapper every agent uses to reach a model, and raise in development and test:</p>
+
+<pre class="standalone"><span class="c-cm"># the guard that makes the rule enforceable rather than aspirational</span>
+<span class="c-kw">def</span> <span class="c-fn">complete</span>(messages, **kw):
+    <span class="c-kw">if</span> tx_depth.<span class="c-fn">get</span>() &gt; <span class="c-st">0</span>:
+        <span class="c-kw">raise</span> <span class="c-err">RuntimeError</span>(<span class="c-st">"model call inside an open transaction"</span>)
+    <span class="c-kw">return</span> provider.<span class="c-fn">complete</span>(messages, **kw)
+
+<span class="c-cm"># in production, log-and-proceed is the safer rollout: you want the</span>
+<span class="c-cm"># inventory of violations before you start failing requests on them.</span>
+</pre>
+
+    <p>Then four numbers, and the fourth is the one most teams do not have:</p>
+
+    <ul>
+      <li><strong>p99 transaction duration on agent write paths.</strong> Alarm above one second. This is a proxy for "did a model call get inside a transaction", and it catches the regression the assertion missed in a path nobody tested.</li>
+      <li><strong>Conflicts per hundred writes.</strong> The contention rate, and the input to whether STEP 5's queue is worth building. Rising conflicts with flat traffic usually means two agents were given overlapping scopes.</li>
+      <li><strong>Re-decisions per completed task.</strong> Inference spent on contention rather than on work. A number above about 0.1 says the entity partition is wrong.</li>
+      <li><strong>Connection-pool wait time, segmented by caller.</strong> The number that would have identified the incident in STEP 1 in minutes rather than hours, and the one that is usually aggregated across the whole service so the agent's contribution is invisible. Segment it.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do it in this order. Grep for every model call that is lexically or dynamically inside a transaction scope and fix those paths first — they are already capping throughput on whatever row they touch. Add the version column and the affected-row-count check to every agent write path, and make the zero-row case raise rather than pass. Then wire the conflict handler to go back to the model with the new state, cap it at two re-decisions, and escalate on the third. Add the open-transaction assertion to the model client in log-and-proceed mode, read the inventory it produces for a week, then flip it to raise in CI. Segment pool wait time by caller before you need it. And if you keep one sentence: the version check is what makes the write correct, and going back to the model instead of retrying the write is what makes the version check mean anything.</p>
+    </div>
+  </div>
+</section>
