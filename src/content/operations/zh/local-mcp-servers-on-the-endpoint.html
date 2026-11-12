@@ -1,0 +1,104 @@
+<section class="phase">
+  <div class="phase-num">S33</div>
+  <div class="week">运营 · 安全与防护</div>
+  <h2>本地 MCP 服务器自身没有任何身份认证边界。</h2>
+  <p class="goal">开发者装上的每一个本地 MCP 服务器，都是一个以他们的身份运行的高权限进程，而协议提供的两种传输方式都没有给它一个可供核验的身份：stdio 按构造就没有认证；而一个监听回环地址的 HTTP 服务器，本机上任何进程都能调用它——并且，经由 DNS 重绑定，用户访问的任何网页也能调用它，除非该服务器校验 <code class="inline">Origin</code> 头。而主流 SDK 默认把这项校验关着。所以真正有效的控制手段是一份机群清单加一份安装白名单，因为服务器内部不会有任何东西去问「你是谁」。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>两种传输方式的失效方向正好相反。</h3>
+
+    <p>MCP 给本地服务器两种被访问的方式，它们的安全性质并不可比——而这一点很要紧，因为这个选择通常是由打包该服务器的人做的，不是由你做的。</p>
+
+    <ul>
+      <li><strong>stdio。</strong>客户端把服务器作为子进程启动，通过管道通信。没有监听端口，所以网络上没有任何东西能触达它。代价是没有认证，而且根本不可能有：服务器绝对信任它的父进程，继承用户的环境变量、用户的文件系统权限，以及用户主目录里躺着的任何令牌。它的安全边界就是那个操作系统用户账户，没有比这更窄的了。</li>
+      <li><strong>回环 HTTP。</strong>服务器在本机绑定一个端口并接受请求。现在它有了监听器，而这个监听器分辨不出调用方：该主机上的其他每一个进程都能调用它。协议自身的指引是：本地服务器 SHOULD 只绑定 <code class="inline">127.0.0.1</code> 而非 <code class="inline">0.0.0.0</code>，SHOULD 对连接做认证，并且 MUST 校验所有入站连接的 <code class="inline">Origin</code> 头，以防御 DNS 重绑定攻击。</li>
+    </ul>
+
+    <p>最后那条要求请读两遍，因为它正是被跳过的那一条。绑定回环地址让端口不出现在局域网上；它对一个<em>源自</em>本机的请求毫无作用。MCP 的传输模型与它的信任假设在<a class="xref" href="/zh/deep-dives/mcp/mcp-streamable-http-deep-dive">streamable HTTP 深入解析</a>里；而运营上新出现的事情是：这类服务器的分布已经从你的集群里搬到了笔记本电脑上。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>DNS 重绑定把一个本地服务器变成了远程服务器。</h3>
+
+    <p>这是多数团队没有纳入模型的攻击，所以值得机械地陈述一遍。用户访问一个页面。该页面的域名先短暂解析到攻击者控制的主机，随后重新解析到 <code class="inline">127.0.0.1</code>。浏览器的同源策略比较的是<em>域名</em>，而不是它们当下解析到的 IP 地址——所以在浏览器看来，那个页面上的脚本仍然在和自己的源通信，于是它愉快地向你的本地 MCP 服务器发出请求。请求从回环地址抵达，来自用户自己的浏览器，源头是用户自己的机器。</p>
+
+    <p>这就是为什么 <code class="inline">Origin</code> 校验是 MUST、而绑定回环只是 SHOULD。在那次交互里，服务器是唯一能分辨真伪的一方，而它唯一的分辨办法，就是查看浏览器必须发送的那个头，并拒绝它不认识的值——规范给出的补救措施是：对于存在但无效的 <code class="inline">Origin</code>，返回 HTTP 403。</p>
+
+<pre class="standalone"><span class="c-cm"># what each control actually stops</span>
+bind 127.0.0.1      &rarr; another host on the LAN         <span class="c-out">blocked</span>
+bind 127.0.0.1      &rarr; another process on this laptop  <span class="c-err">not blocked</span>
+bind 127.0.0.1      &rarr; a web page via DNS rebinding    <span class="c-err">not blocked</span>
+validate Origin     &rarr; a web page via DNS rebinding    <span class="c-out">blocked</span>
+validate Origin     &rarr; another process on this laptop  <span class="c-err">not blocked</span>
+<span class="c-cm"># nothing in the transport stops a local process. that is the design.</span></pre>
+
+    <div class="callout warn">
+      <p>2026 年间的公开报道称，TypeScript、Python 与 Go 的 SDK 在其 localhost HTTP 传输上都把重绑定防护<em>默认关闭</em>，除非作者主动开启；相关 CVE 已被分配，TypeScript SDK 自 1.24.0 起修复。我们无法把这些编号追溯到公告本身，所以请把这些版本号当作一个「去检查你自己的依赖」的提示，而不是一条引证。真正稳定的那部分不需要任何 CVE：一项默认关闭的安全控制，出现在被数千个单作者服务器所使用的库里，就意味着大多数已部署的服务器并没有它。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>危险的那些服务器，恰恰是完全不碰网络的那些。</h3>
+
+    <p>关于 HTTP 说了这么多之后要补充的是：影响更大的暴露面通常是 stdio 服务器，恰恰因为它看起来是惰性的。它没有端口可供扫描，不出现在任何网络资产清单里，因此也就缺席于你安全团队维护的资产列表——而它同时握着对文件系统、shell、某个云凭证助手或某个生产数据库的工具访问权，并且以一个拥有广泛权限的人类的身份持有。</p>
+
+    <p>这对「怎么运营它们」有两个推论：</p>
+
+    <ul>
+      <li><strong>服务器是一项软件供应链资产，不是一行配置。</strong>它通常是一条在启动时解析软件包的 <code class="inline">npx</code> 或 <code class="inline">uvx</code> 调用，这意味着在你用户会话里执行的代码可以改变，而你审过的那份配置没有任何变化。把它钉住。<a class="xref" href="/zh/concepts/pinning-and-verification">钉版本与校验</a>是其一般形式，而<a class="xref" href="/zh/deep-dives/agent-security/vetting-a-third-party-skill">审查第三方 skill</a>里的那份评审清单几乎可以原样搬过来。</li>
+      <li><strong>它的工具描述是喂给你模型的输入。</strong>你安装的服务器有权写下一段文字，而这段文字会在每一个回合落入智能体的上下文——这正是<a class="xref" href="/zh/deep-dives/mcp/mcp-tool-poisoning">MCP 工具投毒</a>里的那条路径。一次更新可以改掉这些描述，而工具的名字和签名毫发无损。</li>
+    </ul>
+
+    <p>这两点合起来意味着：安装这个决定，就是全部的安全决定——而目前它正被一个又一个开发者各自做掉。与之相邻的端点侧问题——这些客户端留在可预测路径下的凭证与会话记录——见<a class="xref" href="/zh/operations/safety-and-security/agent-artifacts-on-the-endpoint">端点上的智能体残留物</a>。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>桌面应用正在变成 MCP 服务器，而它的作用对象是那份打开着的文档。</h3>
+
+    <p>这个群体的形态即将改变。2026 年 11 月 10 日，Adobe 在 MAX 上预览了面向 Photoshop、Illustrator、Premiere 与 After Effects 的本地 MCP 集成，让外部智能体对用户自己机器上的原生工程文件进行操作；Adobe 把可用时间定在 2027 年初的私有测试版，所以今天没有任何东西可装。请把它当作方向、而不是一次部署来看待：一个持有未保存状态的 GUI 应用变成了 MCP 服务器，而智能体作用的对象，是恰好打开着的那份文档。</p>
+
+    <p>这打破了多数智能体威胁模型里的两个假设。目标不是一条你可以列入白名单的路径——它是一个选区、一条时间线、一叠图层，存在于一个运行中的进程里，所以用目录写出来的作用域规则根本表达不了它。而权限是<a class="xref" href="/zh/concepts/ambient-authority">环境性的</a>：智能体获得的是该应用当下能做的一切，包括对用户几分钟前从网络共享打开、还没保存的文件。它们到来的那一天就把它们登记入册，并且用文档、而不是用目录，去问<a class="xref" href="/zh/concepts/blast-radius">影响半径</a>这个问题。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>四项控制，按收益排序。</h3>
+
+    <p>这些都不需要那些服务器配合，而这正是重点——你没法给一千个单作者服务器打补丁，但你可以决定哪些能跑。</p>
+
+    <ul>
+      <li><strong>清单。</strong>在受管端点上枚举客户端配置文件，报告每台主机上配置了哪些服务器、版本或包声明是什么。这是一项你现有端点工具链本来就在做的文件采集工作；它是其他一切都依赖的那一项控制，并且与<a class="xref" href="/zh/operations/governance-compliance/agent-inventory-and-registry">智能体清单与注册</a>是同一套登记纪律，只是下移了一层。</li>
+      <li><strong>白名单，并钉住版本。</strong>集中决定哪些服务器可以安装、以什么版本安装，然后把配置分发下去，而不是让每个开发者各自拼装。一条没钉版本的条目，就是一个带 shell 权限的<a class="xref" href="/zh/operations/agentops/unpinned-vendor-defaults">未钉住的厂商默认值</a>。</li>
+      <li><strong>一条传输方式规则。</strong>凡是不需要在多个客户端之间共享的，优先用 stdio，因为一个没有监听器的服务器，网页根本就触达不到。在确实需要回环 HTTP 的地方，要求提供证据表明该服务器校验 <code class="inline">Origin</code> 并绑定 <code class="inline">127.0.0.1</code>——这件事用一条带伪造头的 <code class="inline">curl</code> 就能测，所以把它做成一项验收检查，而不是一句政策文字。</li>
+      <li><strong>出口管控，而不只是安装管控。</strong>一个有网络访问权的本地服务器，就是它所能读到的一切的外泄通道，这正是为什么<a class="xref" href="/zh/operations/safety-and-security/egress-control-for-agents">出口管控</a>该落在端点上，而不只是落在沙箱里。至于凭证问题——服务器用躺在它旁边的那些令牌能够到哪里——见<a class="xref" href="/zh/operations/safety-and-security/scoped-credentials-for-agents">为智能体收窄凭证</a>。</li>
+    </ul>
+
+<pre class="trace"><span class="c-out">acceptance check for a loopback MCP server
+
+$ curl -s -o /dev/null -w '%{http_code}\n' \
+    -H 'Origin: https://evil.example' \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+    http://127.0.0.1:PORT/mcp
+
+403   -> Origin validation present. ship it.
+200   -> any web page the user visits can call this server.</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>事后你能查到什么，又查不到什么。</h3>
+
+    <p>假设其中一个服务器被用来对付某位用户，然后问问你手上会有什么。MCP 客户端在本地留有一份会话记录；服务器可能什么都没记；工具调用从未经过你的网络，所以没有代理日志；而那些动作在下游系统里以该用户的身份出现，因为它们就是该用户。这与<a class="xref" href="/zh/operations/safety-and-security/third-party-agents-logging-in-as-your-users">第三方智能体以你的用户身份登录</a>是同一个归因问题，只是额外多了一重困难：动作的执行进程在一台你不控制的笔记本上。</p>
+
+    <p>所以取证必须提前安排好，而且要便宜。把客户端自己的会话记录当作端点遥测采集，与其他一切同一套节奏——同时记住一份会话记录既是不可信内容、也是隐私负担：在它落入 SIEM 之前，<a class="xref" href="/zh/operations/evaluation-and-observability/pii-redaction-in-agent-traces">智能体 trace 中的 PII 脱敏</a>先适用。凡是服务器碰到了要紧的东西，就把审计放在远端那一侧：数据库自己的日志、仓库的推送记录、云厂商的审计轨迹。这些是你控制的，也正是<a class="xref" href="/zh/operations/governance-compliance/audit-trails">智能体动作的审计轨迹</a>所依托的东西。</p>
+
+    <div class="callout tip">
+      <p>这个季度就做这三件事。从受管端点收齐每一份 MCP 客户端配置，数一数有多少个不同的服务器——多数团队会发现一个出乎意料的数字，而光是这个数字通常就能结束「这到底需不需要一项政策」的争论。发布一份简短的、钉住版本的白名单，并作为受管配置下发，让「装不装」不再是每个开发者各自的决定。然后对白名单上每一个监听端口的服务器跑一遍上面那条 <code class="inline">curl</code> 检查，把任何返回 200 的剔掉。而说 stdio 的那些服务器不需要测试——它们需要的是评审，因为评审是它们拥有的唯一控制。</p>
+    </div>
+  </div>
+</section>
