@@ -1,0 +1,104 @@
+<section class="phase">
+  <div class="phase-num">S33</div>
+  <div class="week">Operation · Safety &amp; Security</div>
+  <h2>A local MCP server has no authentication boundary of its own.</h2>
+  <p class="goal">Every local MCP server your developers install is a privileged process running as them, and neither transport the protocol offers gives it an identity to check: stdio has no authentication by construction, and a loopback HTTP server is reachable by any process on the box &mdash; and, via DNS rebinding, by any web page they visit, unless the server validates the <code class="inline">Origin</code> header. The major SDKs shipped that check off by default. So the control that works is a fleet inventory and an install allowlist, because nothing inside the server is going to ask who is calling.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The two transports fail in opposite directions.</h3>
+
+    <p>MCP gives a local server two ways to be reached, and the security properties are not comparable &mdash; which matters because the choice is usually made by whoever packaged the server, not by you.</p>
+
+    <ul>
+      <li><strong>stdio.</strong> The client launches the server as a child process and talks over pipes. There is no listener, so nothing on the network can reach it. In exchange there is no authentication and none is possible: the server trusts its parent absolutely, inherits the user's environment, their filesystem rights and whatever tokens sit in their home directory. Its security boundary is the OS user account, and nothing narrower.</li>
+      <li><strong>Loopback HTTP.</strong> The server binds a port on the machine and accepts requests. Now it has a listener, and the listener cannot tell callers apart: every other process on that host can call it, and the protocol's own guidance is that a local server SHOULD bind only to <code class="inline">127.0.0.1</code> rather than <code class="inline">0.0.0.0</code>, SHOULD authenticate connections, and MUST validate the <code class="inline">Origin</code> header on all incoming connections to prevent DNS rebinding attacks.</li>
+    </ul>
+
+    <p>Read that last requirement twice, because it is the one that gets skipped. Binding to loopback keeps the port off the LAN; it does nothing about a request that <em>originates</em> on the machine. The MCP transport model and its trust assumptions are laid out in <a class="xref" href="/deep-dives/mcp/mcp-streamable-http-deep-dive">the streamable HTTP deep-dive</a>; what is operationally new is that the population of these servers is now on laptops rather than in your cluster.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>DNS rebinding turns a localhost server into a remote one.</h3>
+
+    <p>This is the attack most teams do not model, so it is worth stating mechanically. The user visits a page. The page's domain resolves, briefly, to a host the attacker controls, and then re-resolves to <code class="inline">127.0.0.1</code>. The browser's same-origin policy compares <em>domain names</em>, not the IP addresses they currently resolve to &mdash; so as far as the browser is concerned, script on that page is still talking to its own origin, and it happily issues requests to your local MCP server. The request arrives on loopback, from the user's own browser, with the user's own machine as its source.</p>
+
+    <p>Which is why the <code class="inline">Origin</code> check is a MUST and loopback binding is only a SHOULD. The server is the only party in that exchange that can tell the difference, and it can only do so by looking at the header the browser is obliged to send and reject what it does not recognise &mdash; the specification's remedy is an HTTP 403 for a present-but-invalid <code class="inline">Origin</code>.</p>
+
+<pre class="standalone"><span class="c-cm"># what each control actually stops</span>
+bind 127.0.0.1      &rarr; another host on the LAN         <span class="c-out">blocked</span>
+bind 127.0.0.1      &rarr; another process on this laptop  <span class="c-err">not blocked</span>
+bind 127.0.0.1      &rarr; a web page via DNS rebinding    <span class="c-err">not blocked</span>
+validate Origin     &rarr; a web page via DNS rebinding    <span class="c-out">blocked</span>
+validate Origin     &rarr; another process on this laptop  <span class="c-err">not blocked</span>
+<span class="c-cm"># nothing in the transport stops a local process. that is the design.</span></pre>
+
+    <div class="callout warn">
+      <p>Public reporting through 2026 says the TypeScript, Python and Go SDKs all shipped their localhost HTTP transport with rebinding protection <em>off</em> unless the author opted in, with CVEs assigned and a fix in the TypeScript SDK from 1.24.0. We could not trace those identifiers to the advisories themselves, so treat the version numbers as a prompt to check your own dependency rather than as a citation. The durable part needs no CVE: a default-off security control in a library used by thousands of single-author servers means most deployed servers do not have it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The dangerous servers are the ones with no network at all.</h3>
+
+    <p>Having said all that about HTTP, the higher-impact exposure is usually the stdio server, precisely because it looks inert. It has no port to scan, shows up in no network inventory, and is therefore absent from the asset list your security team maintains &mdash; while holding tool access to the filesystem, the shell, a cloud credential helper or a production database, under the identity of a human with broad rights.</p>
+
+    <p>Two consequences follow for how you run them:</p>
+
+    <ul>
+      <li><strong>The server is a software supply-chain item, not a configuration line.</strong> It is usually an <code class="inline">npx</code> or <code class="inline">uvx</code> invocation that resolves a package at launch, which means the code executing inside your user's session can change without any change to the config you reviewed. Pin it. <a class="xref" href="/concepts/pinning-and-verification">Pinning and verification</a> is the general form, and <a class="xref" href="/deep-dives/agent-security/vetting-a-third-party-skill">vetting a third-party skill</a> is the review checklist that transfers almost unchanged.</li>
+      <li><strong>Its tool descriptions are inputs to your model.</strong> A server you install gets to write text that lands in the agent's context on every turn, which is the tool-poisoning path in <a class="xref" href="/deep-dives/mcp/mcp-tool-poisoning">MCP tool poisoning</a>. An update can change those descriptions without changing the tool's name or signature.</li>
+    </ul>
+
+    <p>Together those mean the install decision is the whole security decision, and it is currently being made one developer at a time. The related endpoint-side problem &mdash; the credentials and transcripts these clients leave in predictable paths &mdash; is <a class="xref" href="/operations/safety-and-security/agent-artifacts-on-the-endpoint">agent artifacts on the endpoint</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Desktop applications are becoming MCP servers, and the subject is the open document.</h3>
+
+    <p>The population is about to change shape. At MAX on 10 November 2026 Adobe previewed local MCP integrations for Photoshop, Illustrator, Premiere and After Effects, letting an outside agent act on native project files on the user's own machine; Adobe put availability at private beta in early 2027, so there is nothing to install today. Treat it as the direction rather than a deployment: a GUI application that holds unsaved state becomes an MCP server, and the thing the agent acts on is whatever document happens to be open.</p>
+
+    <p>That breaks two assumptions in most agent threat models. The target is not a path you can allowlist &mdash; it is a selection, a timeline, a layer stack held in a running process, so a scope rule written in terms of directories does not express it. And the authority is <a class="xref" href="/concepts/ambient-authority">ambient</a>: the agent gets whatever the application can currently do, including to files the user opened from a network share minutes ago and has not saved. Inventory these the day they arrive, and ask the <a class="xref" href="/concepts/blast-radius">blast-radius</a> question in terms of documents rather than directories.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Four controls, in the order they pay off.</h3>
+
+    <p>None of these requires the servers to cooperate, which is the point &mdash; you cannot patch a thousand single-author servers, but you can decide which ones run.</p>
+
+    <ul>
+      <li><strong>Inventory.</strong> Enumerate the client config files on managed endpoints and report which servers are configured, at which version or package spec, per host. This is a file-collection job your existing endpoint tooling already does; it is the one control nothing else works without, and it is the same registry discipline as <a class="xref" href="/operations/governance-compliance/agent-inventory-and-registry">agent inventory and registry</a>, applied one layer down.</li>
+      <li><strong>Allowlist, with pinned versions.</strong> Decide centrally which servers may be installed and at what version, and distribute the config rather than letting each developer assemble it. An unpinned entry is an <a class="xref" href="/operations/agentops/unpinned-vendor-defaults">unpinned vendor default</a> with shell access.</li>
+      <li><strong>A transport rule.</strong> Prefer stdio for anything that does not need to be shared between clients, because a server with no listener cannot be reached by a web page at all. Where loopback HTTP is required, require evidence that the server validates <code class="inline">Origin</code> and binds <code class="inline">127.0.0.1</code> &mdash; this is testable in one <code class="inline">curl</code> with a forged header, so make it an acceptance check rather than a policy sentence.</li>
+      <li><strong>Egress, not just install.</strong> A local server with network access is the exfiltration path for everything it can read, which is why <a class="xref" href="/operations/safety-and-security/egress-control-for-agents">egress control</a> belongs on the endpoint and not only in the sandbox. The credential question &mdash; what the server can reach with the tokens lying next to it &mdash; is <a class="xref" href="/operations/safety-and-security/scoped-credentials-for-agents">scoped credentials for agents</a>.</li>
+    </ul>
+
+<pre class="trace"><span class="c-out">acceptance check for a loopback MCP server
+
+$ curl -s -o /dev/null -w '%{http_code}\n' \
+    -H 'Origin: https://evil.example' \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+    http://127.0.0.1:PORT/mcp
+
+403   -> Origin validation present. ship it.
+200   -> any web page the user visits can call this server.</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>What you can and cannot learn after the fact.</h3>
+
+    <p>Assume one of these servers is used against a user and ask what you would have. The MCP client holds a local record of the session; the server may log nothing; the tool calls never traversed your network, so there is no proxy log; and the actions appear in downstream systems as the user, because they were the user. That is the same attribution problem as <a class="xref" href="/operations/safety-and-security/third-party-agents-logging-in-as-your-users">third-party agents logging in as your users</a>, with the added difficulty that the acting process was on a laptop you do not control.</p>
+
+    <p>So the forensics has to be arranged in advance, and cheaply. Collect the client's own session records as endpoint telemetry on the same schedule as everything else, keeping in mind that a transcript is untrusted content and a privacy liability &mdash; <a class="xref" href="/operations/evaluation-and-observability/pii-redaction-in-agent-traces">PII redaction in agent traces</a> applies before it lands in a SIEM. Where a server touches something that matters, put the audit on the far side: the database's own log, the repository's push record, the cloud provider's trail. Those you control, and they are what <a class="xref" href="/operations/governance-compliance/audit-trails">audit trails for agent actions</a> is built on.</p>
+
+    <div class="callout tip">
+      <p>Do these three this quarter. Collect every MCP client config from managed endpoints and count the distinct servers &mdash; most teams discover a number they did not expect, and the count alone usually settles the argument about whether this needs a policy. Publish a short allowlist with pinned versions and ship it as managed configuration, so the install decision stops being per-developer. Then run the <code class="inline">curl</code> check above against each allowlisted server that listens on a port, and drop any that answers 200. The servers that speak stdio need no test &mdash; they need the review, because the review is the only control they have.</p>
+    </div>
+  </div>
+</section>

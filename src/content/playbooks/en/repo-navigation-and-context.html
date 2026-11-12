@@ -2,48 +2,111 @@
   <div class="phase-num">U2</div>
   <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
   <h2>On a large repo the agent's hard problem is not generation &mdash; it is finding the twelve lines that matter.</h2>
-  <p class="goal">A real codebase is millions of tokens; the context window is not. Every coding agent is therefore a retrieval system first and a generator second: it must navigate from a vague issue to the precise call site, hold just enough of the repo in working memory to be correct, and not poison its own context with the other 99.99%. This essay covers code search vs. embedding retrieval, symbol-level indexing, context budgeting over a large tree, and why retrieval for code is its own discipline.</p>
+  <p class="goal">The code-retrieval question got settled in 2026, and not in favour of the thing most teams built: Cursor removed the semantic index it had shipped for years and replaced it with local grep, and Claude Code never had one. The reason is not that embeddings stopped working &mdash; it is that <em>how a search result enters the context</em> turned out to matter more than which retriever produced it. Build your agent's navigation around cheap, exact, inline search it can iterate on, and spend your context budget on reading, not indexing.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>Code is not prose; lexical search usually beats embeddings here.</h3>
-    <p>Naive RAG on code &mdash; chunk files, embed, cosine-retrieve &mdash; underperforms on the operations agents actually need: "where is this symbol defined," "who calls this function," "what does this import resolve to." Those are <em>exact</em> queries, and <code class="inline">grep</code>/<code class="inline">ripgrep</code> plus a symbol index answer them precisely and verifiably, while embeddings answer them <em>fuzzily</em>. The strongest navigation stacks are hybrid: lexical and structural search for identifiers and call graphs, embeddings reserved for the genuinely semantic query ("the code that handles retry backoff") where the agent does not know the name yet.</p>
+    <h3>The frontier harnesses converged on search without an index.</h3>
+
+    <p>This is worth stating as fact rather than preference, because it reverses the architecture a lot of internal coding agents were built on.</p>
+
+    <ul>
+      <li><strong>Claude Code has no codebase index.</strong> Its navigation primitives are glob, regex content search and file reads, executed on demand against the working tree. There is no embedding store and no sync job, so the agent always sees the file as it is on disk right now.</li>
+      <li><strong>Cursor removed its semantic index during 2026.</strong> The indexing settings &mdash; including resync and delete-index &mdash; came out of the UI, and retrieval moved to a locally built, locally queried exact-match index that Cursor markets as instant grep. Cursor's stated reason, posted to its own community forum, is that models got good enough at using grep and indexed search that the dedicated semantic path had stopped helping in a meaningful way. Because that index is keyed to a git commit, a non-git directory falls back to plain <code class="inline">ripgrep</code>.</li>
+    </ul>
+
+    <p>Two caveats so you don't over-read this. Which regex binary a given release shells out to has changed more than once and is not a durable fact worth designing around. And at least one comparison claims Cursor still computes server-side encrypted embeddings for purposes other than search, which is contested; the durable, repeatedly stated claim is narrower &mdash; <em>search</em> is grep-shaped and local.</p>
+
+    <div class="callout">
+      <p>What follows describes the state as of November 2026. The direction of travel has reversed once already, in the pro-index direction, and it can reverse again &mdash; so the point of this essay is the mechanism, not the scoreboard.</p>
+    </div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
+    <h3>The delivery channel decided it, not the retriever.</h3>
+
+    <p>The most useful published result here is also the least intuitive. <em>Is Grep All You Need? How Agent Harnesses Reshape Agentic Search</em> (arXiv:2605.15184, May 2026) held the retrievers fixed and varied how their output reached the model. With search results returned <strong>inline</strong> in the tool response, grep beat vector retrieval on <em>all ten</em> harness-and-model pairs tested. With the same results written to <strong>files</strong> the agent then had to open, vector retrieval won five of ten.</p>
+
+    <p>Read that as a statement about the loop rather than about similarity math. An inline result is something the model can judge and immediately refine &mdash; a bad regex costs one cheap turn and a better regex. A result delivered as a file is a read the model must pay for before it can tell whether the retrieval was any good, which rewards a retriever that is right on the first attempt and punishes iteration. Exact search is the better partner for iteration because its failures are legible: zero hits means the symbol is spelled differently, and four hundred hits means the term is too generic. Embedding search always returns its <em>k</em> nearest neighbours, confidently, whether or not any of them is the answer.</p>
+
+<pre class="standalone"><span class="c-cm"># the loop that makes exact search win</span>
+hits = <span class="c-fn">grep</span>(<span class="c-st">"refresh_token"</span>)        <span class="c-cm"># 0 hits -&gt; the name is wrong, cost: 1 turn</span>
+hits = <span class="c-fn">grep</span>(<span class="c-st">"refreshToken"</span>)         <span class="c-cm"># 41 hits -&gt; too broad, still cheap</span>
+hits = <span class="c-fn">grep</span>(<span class="c-st">"refreshToken.*expir"</span>)   <span class="c-cm"># 3 hits -&gt; now read those</span>
+
+<span class="c-cm"># the loop that makes similarity search expensive</span>
+docs = <span class="c-fn">vector_search</span>(<span class="c-st">"token refresh expiry"</span>, k=<span class="c-st">8</span>)
+<span class="c-cm"># 8 plausible neighbours, no signal about whether any is right,</span>
+<span class="c-cm"># and you must spend 8 reads to find out.</span></pre>
+
+    <p>So the design question for your harness is not which index to build. It is whether your search tool returns enough of each hit &mdash; path, line, and a few lines of surrounding context &mdash; for the model to decide what to open next without opening anything. That one choice is worth more than the retriever swap.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>What the index still buys, and why the gain evaporated.</h3>
+
+    <p>The semantic gain was real and measured. Cursor's own earlier research reported roughly a 12.5% average accuracy improvement from semantic search over grep alone &mdash; which is exactly why the removal is interesting. The gain did not get disproven; it got eaten, by models that learned to drive search tools well enough to reach the same answers with regex and more turns.</p>
+
+    <p>That leaves a residual where an index still earns its keep, and it is narrower than it looks:</p>
+
+    <ul>
+      <li><strong>The query where the reader cannot name the thing.</strong> "Where do we handle retry backoff" has no shared identifier if the code calls it <code class="inline">jitteredDelay</code>. Exact search cannot find a name nobody wrote.</li>
+      <li><strong>Undocumented legacy and poor naming</strong>, where structure has stopped telling the truth &mdash; metaprogramming, dynamic dispatch, generated code, a monorepo where <code class="inline">Handler</code> appears in nine unrelated services.</li>
+      <li><strong>Latency against a very large tree</strong>, which is a product concern rather than a recall one. This is the quiet reason index-based products kept their index: a human waiting on autocomplete has a budget an agent doing a four-minute task does not.</li>
+    </ul>
+
+    <p>Note what all three have in common: none of them is "the agent cannot find the code." They are cases where the <em>cheap</em> path needs more turns than you want to pay for. Treat an index as a latency and naming optimisation with a sync job attached, priced accordingly &mdash; the same hybrid logic as <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a>, with the balance much further toward lexical than it sits for prose. If you run one, the invalidation problem is the real cost: <a class="xref" href="/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">index freshness and invalidation</a> covers why a stale code index is worse than none, because it returns a line number that no longer exists with full confidence.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
     <h3>Index symbols and the graph, not just text.</h3>
+
     <p>A flat text index cannot answer "find references." A <strong>symbol index</strong> built from a parser or LSP/<code class="inline">ctags</code>/tree-sitter gives the agent <em>go-to-definition</em> and <em>find-references</em> as primitive tools &mdash; the same affordances a human engineer uses to move through code. This converts navigation from "read files and hope" into graph traversal: from the issue's surface symbol, hop to its definition, then to its callers, narrowing the candidate edit set with each hop instead of flooding context with whole files.</p>
+
+    <p>Structural search is the complement to STEP 2's argument rather than an exception to it, because it has the same property that made grep win: its answers are exact and its failures are legible. One published study of a structural codebase index found that it did not duplicate what competent agentic grep already reaches &mdash; and, importantly, did not regress the agent either. That is the honest summary of the structural tier as of late 2026: a real affordance on statically analysable code, not a step change.</p>
+
 <pre class="standalone"><span class="c-cm"># navigation as graph traversal, not file dumping</span>
 hits  = repo.<span class="c-fn">grep</span>(symbol)                 <span class="c-cm"># lexical: exact, cheap, verifiable</span>
 defn  = repo.<span class="c-fn">goto_def</span>(hits[<span class="c-st">0</span>])           <span class="c-cm"># structural: one true site</span>
 calls = repo.<span class="c-fn">refs</span>(defn)                  <span class="c-cm"># who depends on this?</span>
 ctx   = budget.<span class="c-fn">select</span>(defn, calls, k=<span class="c-st">12</span>)  <span class="c-cm"># keep ~12 spans, not 12 files</span></pre>
-    <div class="callout tip"><p>Prefer windowed views over whole files. An <code class="inline">open(path, line, ±40)</code> viewport keeps the agent on the relevant span and leaves budget for the call graph; dumping a 1500-line module spends the window on noise the agent must then re-skim every turn.</p></div>
-  </div>
 
-  <div class="step">
-    <div class="step-num">STEP 3</div>
-    <h3>Context budgeting is an allocation problem with a hard ceiling.</h3>
-    <p>Treat the window as a fixed budget split across four competing claimants: the <strong>task</strong> (issue + repro), the <strong>code under edit</strong> (the spans you will change), the <strong>evidence</strong> (callers, tests, traces that justify the change), and the <strong>scratchpad</strong> (the agent's own reasoning and history). Every token spent on an irrelevant file is a token stolen from evidence. The discipline is ruthless eviction: a file read to test a hypothesis that was refuted should be <em>summarized to one line and dropped</em>, not carried forever.</p>
-  </div>
-
-  <div class="step">
-    <div class="step-num">STEP 4</div>
-    <h3>Retrieval for code has a precision problem the agent must police.</h3>
-    <p>A symbol like <code class="inline">handler</code> or <code class="inline">config</code> matches hundreds of irrelevant sites; semantic retrieval returns plausible-but-wrong neighbors. Unfiltered, this is <em>context poisoning</em> &mdash; the model anchors on a confidently-retrieved wrong file and edits it. Mitigations: rank by structural proximity to the failing stack frame, not just match count; prefer the file the traceback names; and make the agent <strong>state its localization hypothesis and confirm it by reproducing the bug</strong> before editing, so a bad retrieval is caught by the oracle, not by the diff.</p>
-    <div class="callout warn"><p>The most expensive failure in U2 is a <em>confident wrong localization</em>: the retrieved file looks right, the patch is clean, the targeted test even passes &mdash; and an untested call path elsewhere now breaks. High retrieval recall without structural grounding manufactures exactly this.</p></div>
+    <div class="callout tip"><p>Prefer windowed views over whole files. An <code class="inline">open(path, line, &plusmn;40)</code> viewport keeps the agent on the relevant span and leaves budget for the call graph; dumping a 1500-line module spends the window on noise the agent must then re-skim every turn.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>The repo map: a cheap, persistent skeleton beats re-exploring.</h3>
-    <p>Re-discovering the project layout every task is pure waste. A <strong>repo map</strong> &mdash; a compact, ranked outline of top packages, key modules, and their public symbols (the technique Aider popularized) &mdash; gives the agent a persistent mental model for a few hundred tokens, so navigation starts from "I know roughly where the auth code lives" instead of from zero. It is regenerated on repo change, pinned in working memory across compaction, and is the single highest-leverage piece of non-task context.</p>
+    <h3>Searching is cheap; reading is the bill.</h3>
+
+    <p>Once search is free the binding constraint moves, and most teams aim their optimisation at the wrong half. A regex sweep over a large repository costs a few hundred tokens of output. Opening the six files it pointed at costs tens of thousands, permanently, in every subsequent turn of the run &mdash; and a window that is nominally large degrades well before it is full, which is the subject of <a class="xref" href="/deep-dives/memory-and-context/long-context-effective-vs-advertised">effective versus advertised context</a>.</p>
+
+    <p>Treat the window as a fixed budget split across four competing claimants: the <strong>task</strong> (issue + repro), the <strong>code under edit</strong> (the spans you will change), the <strong>evidence</strong> (callers, tests, traces that justify the change), and the <strong>scratchpad</strong> (the agent's own reasoning and history). Every token spent on an irrelevant file is a token stolen from evidence. The discipline is ruthless eviction: a file read to test a hypothesis that was refuted should be <em>summarized to one line and dropped</em>, not carried forever.</p>
+
+    <p>The structural fix that actually works is to put the expensive reads somewhere else. Claude Code's pattern is a read-only exploration subagent on a smaller model with its own context window: it does the searching and reading, and returns a summary, so the main loop pays for the conclusion rather than the transcript. The trade-offs &mdash; what the delegate can and cannot see, and when the summary loses the detail you needed &mdash; are in <a class="xref" href="/deep-dives/multi-agent-systems/what-a-subagent-inherits">what a subagent inherits</a> and <a class="xref" href="/deep-dives/tool-capability-design/shaping-tool-results">shaping tool results</a>. When the main window fills anyway, <a class="xref" href="/deep-dives/memory-and-context/context-compaction">context compaction</a> is the fallback, and it is lossy by construction: pin the repo map and the task statement so compaction never eats them.</p>
+
+<pre class="trace"><span class="c-out">one navigation turn, order of magnitude:
+  grep across 40k files, 12 hits with context     ~   700 tokens
+  read the 3 files those hits sit in              ~ 24,000 tokens
+  read 40-line windows around the 12 hits instead ~ 3,100 tokens
+
+the search was never the expense.</span></pre>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>When the cheap path is wrong.</h3>
-    <p>Lexical-plus-symbol search dominates for well-structured, statically analyzable code with meaningful names. It degrades on dynamic dispatch, metaprogramming, codegen, monorepos with reused identifiers, and undocumented legacy where the name tells you nothing &mdash; there, embeddings and reading the tests as documentation earn their cost. <strong>Default to exact, structural navigation and add semantic retrieval only where the code's structure stops telling the truth; the failure mode of code RAG is not missing the answer, it is confidently retrieving the wrong one.</strong></p>
+    <h3>The failure mode is a confident wrong localization, not a missed file.</h3>
+
+    <p>A symbol like <code class="inline">handler</code> or <code class="inline">config</code> matches hundreds of irrelevant sites; semantic retrieval returns plausible-but-wrong neighbours. Unfiltered, this is <em>context poisoning</em> &mdash; the model anchors on a confidently-retrieved wrong file and edits it. Mitigations: rank by structural proximity to the failing stack frame, not just match count; prefer the file the traceback names; and make the agent <strong>state its localization hypothesis and confirm it by reproducing the bug</strong> before editing, so a bad retrieval is caught by the oracle rather than by the diff. That handoff into <a class="xref" href="/playbooks/coding-and-computer-use-agents/patch-generation-and-tests">patch generation and tests</a> is where navigation quality actually gets measured.</p>
+
+    <div class="callout warn"><p>The most expensive failure in U2 is a <em>confident wrong localization</em>: the retrieved file looks right, the patch is clean, the targeted test even passes &mdash; and an untested call path elsewhere now breaks. High retrieval recall without structural grounding manufactures exactly this, and it is invisible to any eval that only checks whether the named test went green.</p></div>
+
+    <p>Two cheap habits reduce it more than a retriever change. First, a <strong>repo map</strong> &mdash; a compact ranked outline of top packages, key modules and their public symbols, the technique Aider popularised &mdash; gives the agent a persistent skeleton for a few hundred tokens, so navigation starts from "the auth code lives roughly here" instead of from zero. Second, force the agent to cite path and line for every claim about the code, which converts an unfalsifiable assertion into something a reviewer can check in one click.</p>
+
+    <div class="callout tip">
+      <p>If you are building this today: make search results inline and rich (path, line, surrounding lines) before you build any index &mdash; that is the change the May 2026 harness result says is largest. Add a symbol tier via LSP or tree-sitter for go-to-definition and find-references, because its answers are exact. Give exploration its own subagent and context window so reads do not accumulate in the main loop. Keep the repo map pinned across compaction. And add a semantic index only after you can point at a logged class of queries that exact and structural search failed on &mdash; by name, with counts &mdash; because its real price is not the embeddings, it is the invalidation.</p>
+    </div>
   </div>
 </section>
