@@ -1,0 +1,122 @@
+<section class="phase">
+  <div class="phase-num">R15</div>
+  <div class="week">深入解析 · 检索与 RAG</div>
+  <h2>对表格与电子表格的检索。</h2>
+  <p class="goal">你把电子表格切成分块的那一刻，就已经删掉了让它可被回答的唯一属性。一个单元格之所以表示「EMEA 第三季度收入」，全靠它所在的位置；把它切进一个 400 token 的窗口，它就变成了 48,210 这个数字和一些词挨在一起，而没有任何重排器能把那层关系找回来。表格数据需要两层检索，而不是一层——用嵌入找出是<em>哪张表</em>，用查询引擎找出是<em>哪个单元格</em>——而代价高昂的意外在于：难点既不在前者也不在后者。难点是一张电子表格在有人决定「表头在哪一行」之前根本没有模式（schema），而下游的每一个答案都继承了那个决定。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>分块到底毁掉了什么，说精确些。</h3>
+
+    <p>散文被切开时退化得很优雅。从文档里撕下来的一段话仍然是一段话；它失去了上下文，但保住了意思。表格不是这样运作的，因为一个单元格的含义完全由两个坐标承载，而这两个坐标位于文件的别处——一个列表头（可能在上方 300 行处），以及最左列的一个行标签。</p>
+
+    <p>把一张工作表序列化成分块，存活下来的东西可以这样算。一个 5,000 行的财务模型，按每块 50 行切，得到 100 个分块，其中恰好只有一个包含表头行。另外 99 个是裸数字的矩阵：</p>
+
+    <pre class="standalone"><span class="c-cm"># chunk 1 of 100 — the only one that knows what the columns are</span>
+Region,Segment,Q1_2026,Q2_2026,Q3_2026,FX_rate
+EMEA,Enterprise,41200,44800,48210,1.0850
+...
+
+<span class="c-cm"># chunk 47 of 100 — what retrieval actually hands the model</span>
+APAC,Mid-Market,18400,17950,19100,0.6720
+APAC,SMB,9100,8840,9330,0.6720
+...
+
+<span class="c-err"># ask "what was EMEA enterprise revenue in Q3?" and the embedding
+# for chunk 47 is a perfectly good match for the *words* in the
+# question. the number it contains is for a different region,
+# a different segment, and it is reported in a different currency.</span></pre>
+
+    <p>这比「没找到」更糟。没找到是可挽回的——模型会说它找不到这个数字。而这种失败返回的是一个自信、格式漂亮、错误的数字，而让它显得可信的正是那个格式。这恰恰是<a class="xref" href="/zh/concepts/hallucination-and-grounding">接地</a>本该防止的病症，却通过接地机制本身发作了。</p>
+
+    <div class="callout warn">
+      <p>把表头重复进每一个分块，是标准的第一道补救，而它只是把失败挪了个位置。现在你有 100 个嵌入近乎一致的分块，因为它们共享那段主导了向量的表头文本，彼此只在数字上不同——而数字恰恰是嵌入表示得很差的东西。你用一个「答错」问题换来了一个「每个分块对每个问题看起来都一样相关」的检索问题。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>两层：用嵌入找表，用查询找单元格。</h3>
+
+    <p>行得通的架构，在数据类型发生变化的那个点上把工作一分为二。语义相似度是「拿一个含糊的问题去搜一批候选表」的正确工具；它是「在某一张表内部做精确查找」的错误工具。所以把各自用在它强的地方：</p>
+
+    <ul>
+      <li><strong>第一层——表的发现，针对描述而非数据。</strong>每张表索引一份文档：标题、来源、带含义与单位的列名、行数、时间覆盖范围，以及少量样例行。嵌入<em>那个</em>。这份文档很小、语义丰富、而且稳定，这正是<a class="xref" href="/zh/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">混合检索与重排</a>这一套擅长的全部。「哪张表里有按季度的 EMEA 收入？」是一个关于描述的问题。</li>
+      <li><strong>第二层——单元格查找，靠查询。</strong>把选中的表装进某个可被查询的东西里——SQLite、DuckDB、一个 dataframe——让智能体针对你交给它的模式生成 SQL 或 dataframe 代码。「EMEA 企业客群第三季度收入是多少？」就是一个 <code class="inline">WHERE</code> 子句，而 <code class="inline">WHERE</code> 子句要么对，要么报错。这个二值属性，正是这一层不是嵌入问题的全部理由。</li>
+    </ul>
+
+    <p>这个分工还有第二个容易被忽略的回报：聚合变得可能了。再多的分块检索也无法正确回答「APAC 全年总收入是多少」，因为答案不存在于任何一个分块里——它必须被算出来。一旦第二层是查询引擎，<code class="inline">SUM</code> 就是免费的，于是你能回答的问题<em>类别</em>扩大了，而不只是答得更准。这与<a class="xref" href="/zh/deep-dives/tool-capability-design/code-as-action">代码即动作</a>是同一招，只是用在了检索边界上。</p>
+
+    <p>让这两层对失败保持诚实。第一层应当<em>连分数一起</em>返回候选表，而智能体要能说「这些都覆盖不了这个问题」——这远好于成功地查错了一张表。这就是<a class="xref" href="/zh/deep-dives/retrieval-and-rag/agentic-retrieval">智能体式检索</a>的循环，只多一条规则：智能体可以重新选表，而不只是重新措辞。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>表头就是模式，而真实工作簿里没人把它写下来过。</h3>
+
+    <p>第二层需要一个模式。数据库会给你一个；电子表格不会，而这正是大多数实现悄悄崩掉的地方。「一张表」和「某人导出的一个 CSV」之间的差距，是一堆承载着含义、却没有任何机器表示的人类惯例：</p>
+
+    <ul>
+      <li><strong>表头不在第 1 行。</strong>真实工作表开头是标题、一个空行、一行「最后更新于」，还有一个 logo。表头在第 6 行，而一个假定第 1 行的解析器会悄悄把你的列命名为 <code class="inline">Unnamed: 0</code> 到 <code class="inline">Unnamed: 11</code>。</li>
+      <li><strong>表头跨两行。</strong>一个写着 <code class="inline">FY2026</code> 的合并单元格坐在 <code class="inline">Q1 | Q2 | Q3 | Q4</code> 之上。真正的列名是这一对。天真地压平，你会得到四个叫 Q1 的列——而在一个有两个财年的工作簿里，是八个列、四个不同的名字。</li>
+      <li><strong>单位藏在表头里，或在一条批注里，或根本不存在。</strong><code class="inline">Revenue (€000s)</code> 这一列的数字比读者预期的小一千倍。清洗时把那个括号丢掉，你就把一个三个数量级的错误焊进了每一个答案里，而追踪里没有任何东西能抓住它。</li>
+      <li><strong>合计行长得和数据一样。</strong>一个 <code class="inline">Total</code> 行与其他每一行类型相同。把它纳入 <code class="inline">SUM</code>，你就重复计算了；结果是看似合理，而不是荒谬，所以它会一路发出去。</li>
+      <li><strong>你读到的值不是存储的值。</strong>一个显示 <code class="inline">48,210</code> 的单元格可能存的是公式，而它求值成什么，取决于工作簿别处的输入。读渲染值就是在读一份缓存。这个区分正是<a class="xref" href="/zh/playbooks/domain-playbooks/spreadsheet-and-workbook-agents">电子表格与工作簿智能体</a>的全部主题；它在这里之所以要紧，是因为一个过期的缓存值被检索出来时，和一个新鲜的一样干净。</li>
+    </ul>
+
+    <p>这些都不稀奇；每一份财务与运营工作簿都长这样。其含义是：<strong>表的摄入是一个解释步骤，需要每张表做一次人工审阅，而不是一个你拿去扫目录的解析器。</strong>好消息是它是「审一次」的：一张表的结构变化远少于它的内容，所以成本按表计，而且会被摊薄。请把结构性阅读当作<a class="xref" href="/zh/deep-dives/retrieval-and-rag/document-parsing-for-rag">面向 RAG 的文档解析</a>的一部分，而不是第二层在查询时能推断出来的东西。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>写一张表卡，并让它成为你索引的那个东西。</h3>
+
+    <p>让这两层都真正运作起来的那个产物，是每张表一份小文档——就叫它表卡吧。它既是第一层嵌入的东西，也是第二层在查询时被告知的东西，这意味着两层不会彼此漂移：</p>
+
+    <pre class="standalone"><span class="c-cm"># table card: one per table. the indexed document AND the schema.</span>
+
+table:        fy26_revenue_by_segment
+source:       finance/FY26 Plan v7.xlsx, sheet "Rev by Seg"
+header_rows:  6-7            <span class="c-cm"># merged FY above quarters</span>
+data_rows:    8-412
+excluded:     413            <span class="c-cm"># "Total" row — do not aggregate</span>
+grain:        one row per (region, segment)
+columns:
+  region      text           <span class="c-cm"># EMEA|APAC|AMER|LATAM</span>
+  segment     text           <span class="c-cm"># Enterprise|Mid-Market|SMB</span>
+  q1..q4      integer        <span class="c-cm"># EUR thousands, NOT units</span>
+  fx_rate     decimal        <span class="c-cm"># to USD, rate at period close</span>
+caveats:      Q4 is forecast, not actual, until 2027-01-15
+owner:        fp&a
+refreshed:    2026-11-03
+
+<span class="c-out"># layer 1 embeds this. layer 2 receives it verbatim as the schema.
+# the "excluded" and "caveats" lines are the two that prevent
+# confident wrong answers, and they are the two a parser cannot infer.</span></pre>
+
+    <p>有三个属性让这份功夫值得花。表卡是<strong>可审阅的</strong>——一位财务负责人读一眼就能发现 Q4 是预测值，而这是任何嵌入都永远不会告诉你的。它<strong>很小</strong>，所以一百张表就是一百份短文档，而不是一个语料库。而它携带着<strong>注意事项</strong>，那恰恰是让一个答案敢被拿去行动的内容，也恰恰是数据本身没有的内容。</p>
+
+    <p>两条运维上的提醒。<code class="inline">refreshed</code> 字段是一个检索信号，不是元数据：一个根据「三月最后刷新」的表作答的智能体应当把这一点说出来，而这就是<a class="xref" href="/zh/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">索引新鲜度与失效</a>在表格形态下的样子。另外，表卡继承它那张表的权限，所以如果不同用户能看到的行不同，过滤条件就属于第二层的查询之内——参见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/permission-aware-retrieval">权限感知检索</a>，它的论证在谓词变成一个 <code class="inline">WHERE</code> 子句时原封不动地成立。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>怎么评测它——以及为什么公开榜单替你定不了这件事。</h3>
+
+    <p>人会很想靠读 text-to-SQL 基准分数来挑方案。有两项发现应该让你停手。</p>
+
+    <p>第一，在真实数据上的绝对数字很低，而且已经低了一段时间。Spider 2.0 的发布论文报告，它测过的最佳智能体框架在完整的 agentic 基准上达到 <strong>21.3%</strong>，而在纯文本的 Spider 2.0-lite 设定下，最先进的解析器只处理了 <strong>5.7%</strong> 的问题。这些数字来自 2024 年，之后已有改善，但结果的形状才是耐久的那部分：带着真实列命名惯例的企业级模式，和干净的学术模式是不同的问题，而差距是巨大的，不是边际的。</p>
+
+    <p>第二，而且更尴尬的是，标注本身不可靠。2026 年 1 月，Jin、Choi、Zhu 与 Kang 的一项审计估计，BIRD Mini-Dev 的标注错误率为 <strong>52.8%</strong>，Spider 2.0-Snow 为 <strong>62.8%</strong>。当他们修正了 BIRD Dev 的一个子集并对榜单上 16 个开源智能体重新评分时，执行准确率变动幅度为 <strong>−4% 到 +19%</strong>，排名位次变动为 <strong>−9 到 +9</strong>。他们最锐利的那个观察才是要带走的：未修正子集上的排名与完整开发集高度相关，而与修正后的子集只有弱相关——也就是说，榜单忠实地复现自己，却很差地追踪正确性。</p>
+
+    <div class="callout">
+      <p>请把这个结果读成一句关于<em>你自己</em>评测集的话，而不只是关于他们的。如果专业标注者在一个已发表的基准里标错了一半的问题，那你们团队一下午写出来的题库并不会更好。请对一个样本做双标注、裁定分歧，并把分歧率当作你所报告的任何准确率数字的上限——这与<a class="xref" href="/zh/deep-dives/evaluating-agents/human-baselines-in-agent-evals">智能体评测中的人类基线</a>是同一套纪律。</p>
+    </div>
+
+    <p>那该量什么，按信息量排序。首先是<strong>选表准确率</strong>：第一层要么选对了表，要么没选对；它标注起来很便宜，而且它为其他一切设了上限。然后是在一个取自用户真实问过的问题所构成的题库上的<strong>执行匹配</strong>，评分方式是比较结果集而不是比较 SQL 字符串，因为存在许多种正确的查询。然后是<strong>对不可回答问题的拒答率</strong>——往题库里掺进一些任何已索引表都答不了的问题，量一量智能体多久会编一个数字出来而不是如实说明；这是那种让你损失信誉而非损失准确率的失败模式。更广的方法见<a class="xref" href="/zh/deep-dives/retrieval-and-rag/evaluating-rag">评测 RAG</a>。</p>
+
+    <div class="callout tip">
+      <p>请这样做：别再把电子表格的行放进你的向量索引。为每张表写一份表卡，和那个「对数字负责」的人一起过一遍，索引这些卡片，并把选中的表装进 DuckDB 或 SQLite 让智能体去查。把你的审阅预算花在解析器推断不出来的那两行上——哪些行是合计，以及单位是什么。把选表与答案正确性分开标注，因为出错时几乎总是第一层，而选错的表会产出一个看起来正确的答案。</p>
+    </div>
+  </div>
+</section>

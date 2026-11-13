@@ -1,0 +1,122 @@
+<section class="phase">
+  <div class="phase-num">R15</div>
+  <div class="week">Deep Dive · Retrieval &amp; RAG</div>
+  <h2>Retrieval over tables and spreadsheets.</h2>
+  <p class="goal">The moment you chunk a spreadsheet you have deleted the only property that made it answerable. A cell means "Q3 revenue, EMEA" because of where it sits; cut it into a 400-token window and it becomes the number 48,210 next to some words, and no reranker recovers the relation. Tabular data needs two retrieval layers instead of one — embeddings to find <em>which</em> table, a query engine to find <em>which</em> cell — and the expensive surprise is that the hard part is neither of those. It is that a spreadsheet has no schema until somebody decides where the header is, and every answer downstream inherits that decision.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What chunking destroys, stated precisely.</h3>
+
+    <p>Prose degrades gracefully when you cut it. A paragraph torn from a document is still a paragraph; it loses context but keeps its meaning. A table does not work that way, because the meaning of a cell is carried entirely by two coordinates that live somewhere else in the file — a column header possibly 300 rows above, and a row label in the leftmost column.</p>
+
+    <p>Serialise a sheet into chunks and here is the arithmetic of what survives. A 5,000-row financial model chunked at 50 rows per chunk gives you 100 chunks, exactly one of which contains the header row. The other 99 are matrices of bare numbers:</p>
+
+    <pre class="standalone"><span class="c-cm"># chunk 1 of 100 — the only one that knows what the columns are</span>
+Region,Segment,Q1_2026,Q2_2026,Q3_2026,FX_rate
+EMEA,Enterprise,41200,44800,48210,1.0850
+...
+
+<span class="c-cm"># chunk 47 of 100 — what retrieval actually hands the model</span>
+APAC,Mid-Market,18400,17950,19100,0.6720
+APAC,SMB,9100,8840,9330,0.6720
+...
+
+<span class="c-err"># ask "what was EMEA enterprise revenue in Q3?" and the embedding
+# for chunk 47 is a perfectly good match for the *words* in the
+# question. the number it contains is for a different region,
+# a different segment, and it is reported in a different currency.</span></pre>
+
+    <p>This is worse than a miss. A miss is recoverable — the model says it cannot find the figure. This failure returns a confident, well-formatted, wrong number, and the formatting is what makes it convincing. It is the exact pathology <a class="xref" href="/concepts/hallucination-and-grounding">grounding</a> is supposed to prevent, arriving through the grounding mechanism itself.</p>
+
+    <div class="callout warn">
+      <p>Repeating the header into every chunk is the standard first fix and it only moves the failure. You now have 100 chunks whose embeddings are near-identical, because they share the header text that dominates the vector and differ only in digits — which embeddings represent poorly. You have traded a wrong-answer problem for a retrieval problem in which every chunk looks equally relevant to every question.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Two layers: embed to find the table, query to find the cell.</h3>
+
+    <p>The architecture that works splits the job at the point where the data type changes. Semantic similarity is the right tool for a vague question against a corpus of candidate tables; it is the wrong tool for a precise lookup inside one. So use each where it is strong:</p>
+
+    <ul>
+      <li><strong>Layer one — table discovery, over descriptions, not data.</strong> Index one document per table: its title, its provenance, its column names with meanings and units, row counts, date coverage, and a handful of sample rows. Embed <em>that</em>. This document is small, semantically rich, and stable, which is everything the <a class="xref" href="/deep-dives/retrieval-and-rag/hybrid-search-and-reranking">hybrid search and reranking</a> stack is good at. "Which table has EMEA revenue by quarter?" is a question about descriptions.</li>
+      <li><strong>Layer two — cell lookup, by query.</strong> Load the chosen table into something that can be queried — SQLite, DuckDB, a dataframe — and have the agent emit SQL or dataframe code against a schema you hand it. "What was EMEA enterprise revenue in Q3?" is a <code class="inline">WHERE</code> clause, and a <code class="inline">WHERE</code> clause is either right or it errors. That binary property is the entire reason this layer is not an embedding problem.</li>
+    </ul>
+
+    <p>The division has a second payoff that is easy to miss: aggregation becomes possible. No amount of retrieval over chunks will correctly answer "what was total APAC revenue for the year", because the answer exists in no chunk — it has to be computed. Once layer two is a query engine, <code class="inline">SUM</code> is free, and the class of questions you can answer at all expands rather than just getting more accurate. This is the same move as <a class="xref" href="/deep-dives/tool-capability-design/code-as-action">code as action</a>, applied to the retrieval boundary.</p>
+
+    <p>Keep the layers honest about failure. Layer one should return its top candidate tables <em>with scores</em> and the agent should be able to say "none of these covers this question," which is a far better outcome than querying the wrong table successfully. This is the <a class="xref" href="/deep-dives/retrieval-and-rag/agentic-retrieval">agentic retrieval</a> loop with one extra rule: the agent may re-select the table, not just re-word the query.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The header is the schema, and in a real workbook nobody wrote it down.</h3>
+
+    <p>Layer two needs a schema. A database hands you one; a spreadsheet does not, and this is where most implementations quietly break. The gap between "a table" and "a CSV someone exported" is a pile of human conventions that carry meaning and have no machine representation:</p>
+
+    <ul>
+      <li><strong>The header is not row 1.</strong> Real sheets open with a title, a blank row, a "last updated" line, and a logo. The header is row 6, and a parser that assumes row 1 silently names your columns <code class="inline">Unnamed: 0</code> through <code class="inline">Unnamed: 11</code>.</li>
+      <li><strong>Headers span two rows.</strong> A merged cell reading <code class="inline">FY2026</code> sits above <code class="inline">Q1 | Q2 | Q3 | Q4</code>. The real column name is the pair. Flatten naively and you get four columns called Q1 — and in a workbook with two fiscal years, eight columns with four distinct names.</li>
+      <li><strong>Units live in the header, or in a note, or nowhere.</strong> <code class="inline">Revenue (€000s)</code> is a column whose numbers are a thousand times smaller than the reader expects. Drop the parenthetical during cleanup and you have built a three-orders-of-magnitude error into every answer, with nothing in the trace to catch it.</li>
+      <li><strong>Totals rows are data-shaped.</strong> A <code class="inline">Total</code> row has the same types as every other row. Include it in a <code class="inline">SUM</code> and you double-count; the result is plausible, not absurd, so it ships.</li>
+      <li><strong>The value you read is not the value stored.</strong> A cell displaying <code class="inline">48,210</code> may hold a formula, and what it evaluated to depends on inputs elsewhere in the workbook. Reading rendered values is reading a cache. That distinction is the whole subject of <a class="xref" href="/playbooks/domain-playbooks/spreadsheet-and-workbook-agents">spreadsheet and workbook agents</a>, and it matters here because a stale cached value retrieves just as cleanly as a fresh one.</li>
+    </ul>
+
+    <p>None of this is exotic; it is what every finance and operations workbook looks like. The implication is that <strong>table ingestion is an interpretation step that needs human review once per table, not a parser you run over a directory.</strong> The good news is that it is review-once: a table's structure changes far less often than its contents, so the cost is per-table and amortises. Treat the structural read as part of <a class="xref" href="/deep-dives/retrieval-and-rag/document-parsing-for-rag">document parsing for RAG</a> rather than as something layer two can infer at query time.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Write the table card, and make it the thing you index.</h3>
+
+    <p>The artefact that makes both layers work is one small document per table — call it a table card. It is what layer one embeds and what layer two is told at query time, which means the two layers cannot drift apart:</p>
+
+    <pre class="standalone"><span class="c-cm"># table card: one per table. the indexed document AND the schema.</span>
+
+table:        fy26_revenue_by_segment
+source:       finance/FY26 Plan v7.xlsx, sheet "Rev by Seg"
+header_rows:  6-7            <span class="c-cm"># merged FY above quarters</span>
+data_rows:    8-412
+excluded:     413            <span class="c-cm"># "Total" row — do not aggregate</span>
+grain:        one row per (region, segment)
+columns:
+  region      text           <span class="c-cm"># EMEA|APAC|AMER|LATAM</span>
+  segment     text           <span class="c-cm"># Enterprise|Mid-Market|SMB</span>
+  q1..q4      integer        <span class="c-cm"># EUR thousands, NOT units</span>
+  fx_rate     decimal        <span class="c-cm"># to USD, rate at period close</span>
+caveats:      Q4 is forecast, not actual, until 2027-01-15
+owner:        fp&a
+refreshed:    2026-11-03
+
+<span class="c-out"># layer 1 embeds this. layer 2 receives it verbatim as the schema.
+# the "excluded" and "caveats" lines are the two that prevent
+# confident wrong answers, and they are the two a parser cannot infer.</span></pre>
+
+    <p>Three properties make this worth the effort. The card is <strong>reviewable</strong> — a finance owner can read it and spot that Q4 is forecast, which no embedding will ever tell you. It is <strong>small</strong>, so a hundred tables is a hundred short documents rather than a corpus. And it carries the <strong>caveats</strong>, which are exactly the content that makes an answer safe to act on and that is absent from the data itself.</p>
+
+    <p>Two operational notes. The <code class="inline">refreshed</code> field is a retrieval signal, not metadata: an agent that answers from a table last refreshed in March should say so, and that is the tabular form of <a class="xref" href="/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">index freshness and invalidation</a>. And a table card inherits the permissions of its table, so if different users may see different rows, the filter belongs inside layer two's query — see <a class="xref" href="/deep-dives/retrieval-and-rag/permission-aware-retrieval">permission-aware retrieval</a>, whose argument applies unchanged when the predicate is a <code class="inline">WHERE</code> clause.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Evaluating it — and why the public leaderboards cannot settle it for you.</h3>
+
+    <p>The temptation is to pick an approach by reading text-to-SQL benchmark scores. Two findings should stop you.</p>
+
+    <p>First, the absolute numbers on realistic data are low and have been for a while. The Spider 2.0 launch paper reported that the best agent framework it tested reached <strong>21.3%</strong> on the full agentic benchmark, and that on the text-only Spider 2.0-lite setting the most advanced parser handled <strong>5.7%</strong> of questions. Those figures are from 2024 and have improved since, but the shape of the result is the durable part: enterprise-scale schemas with real column-naming conventions are a different problem from the clean academic ones, and the gap is large, not marginal.</p>
+
+    <p>Second, and more awkward, the labels themselves are unreliable. A January 2026 audit by Jin, Choi, Zhu and Kang estimated annotation error rates of <strong>52.8%</strong> on BIRD Mini-Dev and <strong>62.8%</strong> on Spider 2.0-Snow. When they corrected a subset of BIRD Dev and re-scored the 16 open-source agents on the leaderboard, execution accuracy moved by <strong>−4% to +19%</strong> and ranking positions by <strong>−9 to +9</strong>. Their sharpest observation is the one to carry away: rankings on the uncorrected subset correlated strongly with the full development set and only weakly with the corrected subset — that is, the leaderboard reproduces itself faithfully and tracks correctness poorly.</p>
+
+    <div class="callout">
+      <p>Read that result as a statement about your own evaluation set, not just theirs. If expert annotators mislabel half the questions in a published benchmark, the question bank your team wrote in an afternoon is not better. Double-label a sample, adjudicate the disagreements, and treat the disagreement rate as the ceiling on any accuracy number you report — the same discipline as <a class="xref" href="/deep-dives/evaluating-agents/human-baselines-in-agent-evals">human baselines in agent evals</a>.</p>
+    </div>
+
+    <p>What to measure instead, in order of how much it tells you. <strong>Table-selection accuracy</strong> first: layer one either picked the right table or it did not, it is cheap to label, and it upper-bounds everything else. Then <strong>execution match</strong> on a labelled question bank drawn from questions your users actually asked, scored by comparing result sets rather than SQL strings, since many correct queries exist. Then <strong>the refusal rate on unanswerable questions</strong> — salt the bank with questions no indexed table can answer and measure how often the agent invents a figure instead of saying so, which is the failure mode that costs you credibility rather than accuracy. Broader method in <a class="xref" href="/deep-dives/retrieval-and-rag/evaluating-rag">evaluating RAG</a>.</p>
+
+    <div class="callout tip">
+      <p>Do this: stop putting spreadsheet rows in your vector index. Write a table card per table, review it with whoever owns the numbers, index the cards, and load the selected table into DuckDB or SQLite for the agent to query. Spend your review budget on the two lines a parser cannot infer — which rows are totals, and what the units are. Label table selection separately from answer correctness, because when the thing is wrong it is almost always layer one, and a wrong table produces a right-looking answer.</p>
+    </div>
+  </div>
+</section>
