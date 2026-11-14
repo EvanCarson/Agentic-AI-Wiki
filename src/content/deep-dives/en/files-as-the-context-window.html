@@ -1,0 +1,116 @@
+<section class="phase">
+  <div class="phase-num">M15</div>
+  <div class="week">Deep Dive &middot; Memory &amp; Context Engineering</div>
+  <h2>Writing the observation to a file does not take it out of the loop. It only makes the re-read optional — and every token you save is saved in the slice, not in the file.</h2>
+  <p class="goal">The cheapest way to make an agent cost more is to offload a large tool result to disk and then let the agent read the whole file back on every turn: you now pay the same tokens you were paying inline, plus a round trip per turn, plus a worse cache hit rate. Offloading is not compression. It converts a mandatory carry into an optional read, and the entire saving lives in two numbers nobody instruments — how often the file is re-read, and how much of it is read each time. Get those right and a 48,000-token observation costs 12,000 tokens over a 20-step run instead of 816,000. Get them wrong and you have rebuilt the transcript with extra latency.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What a file actually buys you, stated precisely.</h3>
+
+    <p>The pattern is now standard practice. Manus's engineering write-up describes treating the file system as the agent's primary long-term context, on the grounds that files are effectively unbounded, persist across steps, and can be operated on directly; large observations go to disk and the context keeps the path. Claude Code reads project files on demand rather than pre-loading a repository. Agent Skills ship as directories the model opens when it needs them. The mechanism is the same in all three cases, and it buys exactly three things.</p>
+
+    <ul>
+      <li><strong>Reversibility.</strong> Truncating a 48,000-token tool result to its first 2,000 characters destroys information. Writing it to <code class="inline">./work/api-dump.json</code> and keeping the path does not — the agent can go back. This is the property that distinguishes offloading from the lossy techniques in <a class="xref" href="/deep-dives/memory-and-context/context-compaction">context compaction</a>, and it is the one that actually matters, because the thing you drop is reliably the thing you needed at step 14.</li>
+      <li><strong>Selectivity.</strong> Inline content is paid for on every subsequent turn whether or not it is used. A file is paid for only when read, and only for the bytes read. That is the whole economic argument, and it is conditional on the agent reading selectively — which is not automatic.</li>
+      <li><strong>Durability past the session.</strong> The transcript dies when the run ends; the directory does not. A file is the only one of the two that survives a compaction, a crash, a handoff to a sub-agent, or tomorrow.</li>
+    </ul>
+
+    <p>What it does <em>not</em> buy you is a smaller problem. The bytes still exist, the model still has to read them to use them, and reading them still fills the same context window described in <a class="xref" href="/deep-dives/memory-and-context/context-budgeting">context budgeting</a>. Nothing about writing data to disk makes a model better at attending to it — see <a class="xref" href="/deep-dives/memory-and-context/long-context-effective-vs-advertised">effective versus advertised context</a> for what happens when you put it all back.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The arithmetic, because the size of the effect is the argument.</h3>
+
+    <p>Take one concrete run. A tool returns a 48,000-token JSON payload at step 3 of a 20-step task. Models are stateless, so anything left in the transcript is re-sent on every following step — the quadratic effect described in <a class="xref" href="/concepts/agent-cost-control">agent cost control</a>. Four strategies, same payload, same task:</p>
+
+<pre class="standalone"><span class="c-cm"># 48,000-token observation at step 3 of a 20-step run.
+# "paid" = times those tokens enter a request's input.
+# assumes a read is evicted from the transcript after its turn.</span>
+
+<span class="c-cm">#  strategy                          reads   paid       input tokens</span>
+inline, left in the transcript        <span class="c-out">0      17x        816,000</span>
+offloaded, full re-read every turn    <span class="c-out">17     17x        816,510</span>  <span class="c-err"># + 17 round trips</span>
+offloaded, full re-read 4 times       <span class="c-out">4       4x        192,510</span>
+offloaded, grep then 2k slice, 6x     <span class="c-out">6     0.25x        12,510</span>
+
+<span class="c-cm"># pointer overhead: ~30 tokens x 17 turns = 510 tokens, all four rows.
+# the 98.5% saving is not from the file. it is from reading 2,000
+# tokens instead of 48,000 — the file only made that possible.</span></pre>
+
+    <p>Read the second row carefully, because it is the one teams ship by accident. An agent instructed to "check your notes before each step" and handed a <code class="inline">read_file</code> tool with no range argument will do exactly that: pay the full inline cost, add a tool call and its latency to every step, and — because the file now arrives fresh in a different position each turn — degrade cache behaviour as well. The offload was strictly negative. The only row that wins big is the fourth, and it wins because the agent had a way to read 4% of the file.</p>
+
+    <div class="callout">
+      <p>So the design question is not "should large results go to disk". It is "can the agent locate the part it needs without reading the whole thing". If the answer is no — an opaque blob, a minified payload, a 600-page PDF with no structure — offloading buys you reversibility and nothing else, and you should budget for it as if the content were still inline.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>A path is not a pointer. A pointer is what lets the model decide without reading.</h3>
+
+    <p>If the transcript says <code class="inline">wrote output to ./work/tmp7.json</code>, the model has no basis for deciding whether to read it, so it will either read it defensively every turn or forget it exists. Both are failures, and they are failures of the pointer, not of the agent. A usable pointer carries four things in under about fifty tokens: what the thing is, how big it is, what shape it has, and how to address a part of it.</p>
+
+<pre class="standalone"><span class="c-cm"># useless</span>
+<span class="c-out">wrote output to ./work/tmp7.json</span>
+
+<span class="c-cm"># usable: name, size, shape, and an addressing hint</span>
+<span class="c-out">./work/invoices-2026-q3.json — 48k tokens, 1,840 records,
+  keys: id, vendor, amount_cents, status, paid_at
+  addressable: jq '.records[] | select(.status=="open")'</span></pre>
+
+    <p>This is the design that Agent Skills formalise, and the published token budget is the useful part of the specification: Anthropic's own account puts a skill's frontmatter metadata at roughly 50 tokens, the body of its <code class="inline">SKILL.md</code> at roughly 500, and bundled reference files at 2,000 or more — with only the first tier present at all times and the deeper tiers loaded when the task actually matches. Third-party sources quote different per-skill metadata figures, so treat the exact number as approximate and the ratio as the point: roughly a hundredfold gap between knowing that something exists and reading it. That ratio is what you are engineering when you write the pointer. The same discipline applied to tool outputs rather than instructions is <a class="xref" href="/deep-dives/tool-capability-design/shaping-tool-results">shaping tool results</a>, and the question of which mechanism should carry which knowledge is <a class="xref" href="/deep-dives/tool-capability-design/skills-vs-subagents-vs-mcp-vs-hooks">skills vs subagents vs MCP vs hooks</a>.</p>
+
+    <p>The corollary is that the tool which writes the file should also provide the tool which slices it. Handing an agent <code class="inline">read_file(path)</code> and hoping it writes the right <code class="inline">grep</code> is how you get row two of the table above. Give it <code class="inline">read_file(path, offset, limit)</code>, a search primitive, and — best of all — the ability to run a query against the file in code rather than in tokens, which is the argument of <a class="xref" href="/deep-dives/tool-capability-design/code-as-action">code as action</a>: a <code class="inline">jq</code> filter that returns 40 records never puts the other 1,800 in the context window at all.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Where the file content lands in the prompt decides whether you saved anything.</h3>
+
+    <p>Offloading interacts with <a class="xref" href="/concepts/prompt-caching">prompt caching</a>, and the interaction is sharp enough to reverse the sign of the whole exercise. A cache hit requires an exact prefix match from the first token, and cached input is billed at a small fraction of base rate. So the position of your file content is a pricing decision:</p>
+
+    <ul>
+      <li><strong>Appended at the end of the message sequence</strong> — as a tool result, where tool results go. The system prompt, tool definitions and earlier turns are untouched, so the cached prefix still matches and you pay base rate only for the new bytes. This is the only shape that works.</li>
+      <li><strong>Re-injected near the top</strong> — the pattern where a <code class="inline">NOTES.md</code> or <code class="inline">state.json</code> is spliced into the system prompt and rewritten each turn. Every rewrite changes a token early in the prefix, which invalidates the cache from that point forward, which means you pay full rate for the <em>entire</em> stable preamble on every turn. On a 12,000-token preamble over 20 turns, that is 240,000 tokens moved from cached rate to base rate to save carrying a 400-token note.</li>
+    </ul>
+
+    <p>This is why Manus's description of rewriting a <code class="inline">todo.md</code> as the agent works is safe rather than reckless: the rewrite is appended at the end of the context, which both preserves the prefix and keeps the current goal in the most recently attended position. The cache mechanics underneath are <a class="xref" href="/deep-dives/memory-and-context/kv-cache-budgeting-for-agent-loops">KV-cache budgeting for agent loops</a>. The rule reduces to one sentence: files may be read into the tail of the context and must never be written into its head.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>A file is state outside the trace, and three things you relied on quietly stop being true.</h3>
+
+    <p>Once part of the agent's working memory lives on a disk, the transcript is no longer a complete record of the run. That has consequences beyond cost, and they are the ones that produce incidents rather than invoices.</p>
+
+    <ul>
+      <li><strong>Replay stops being replay.</strong> Re-running a recorded <a class="xref" href="/concepts/trajectories">trajectory</a> reproduces the model calls but not the directory they read from, so a run that passed in CI can fail in production for reasons no trace shows. If you offload, your recorded artefact has to include a snapshot or a content hash of every file read — otherwise <a class="xref" href="/operations/evaluation-and-observability/replay-testing-with-recorded-traces">replay testing with recorded traces</a> is testing a different program.</li>
+      <li><strong>Concurrency arrives without being invited.</strong> A shared scratch directory is a shared mutable store, so two sub-agents told to "record findings in <code class="inline">findings.md</code>" will overwrite each other with no error and no conflict marker. This is precisely the failure catalogued in <a class="xref" href="/deep-dives/multi-agent-systems/parallel-writes-and-silent-merges">parallel writes and silent merges</a>; the cheap fix is one file per writer plus a reducer, and the thing to decide deliberately is <a class="xref" href="/deep-dives/multi-agent-systems/what-a-subagent-inherits">what a subagent inherits</a>.</li>
+      <li><strong>The file is an injection surface, including from yourself.</strong> Content the agent wrote at step 4 is read back as ordinary context at step 14, with no marker saying it was never trusted. If step 4's content came from a web page or an email, the instruction embedded in it has now been laundered through your own filesystem and arrives looking like the agent's own notes. Keep provenance on the written record — see <a class="xref" href="/concepts/context-taint-tracking">context taint tracking</a> and <a class="xref" href="/deep-dives/memory-and-context/memory-poisoning-defenses">memory poisoning defenses</a>.</li>
+    </ul>
+
+    <div class="callout">
+      <p>The last one is the most commonly missed, because the file feels like infrastructure rather than input. It is input. A scratch directory an agent can write and later read is a persistence layer for prompt injection with a lifetime measured in sessions rather than turns, and the only general control is to label the origin of each written artefact and refuse to treat retrieved file content as instruction regardless of who wrote it.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Instrument the two ratios, and the rest of the decisions make themselves.</h3>
+
+    <p>Almost nobody logs the numbers that decide whether offloading worked, which is why most teams cannot tell you whether it did. Two counters are enough, and both are cheap:</p>
+
+    <ul>
+      <li><strong>Re-reads per file per run.</strong> A file read once is a correct offload. A file read on fourteen of twenty turns is a transcript with extra steps — either inline it, or summarise it into the pointer so the agent stops checking. The distribution is bimodal in practice, and the tail is where the money is.</li>
+      <li><strong>Bytes read ÷ bytes written.</strong> This is the selectivity ratio, and it is the single best predictor of whether the pattern is paying. Below about 0.1 you are getting the benefit. Approaching 1.0 you are paying inline cost plus round trips, and the fix is a better addressing primitive, not a bigger context window.</li>
+    </ul>
+
+    <p>Set a policy threshold rather than deciding per call site: anything over a few thousand tokens goes to a file by default, with a generated pointer; anything under stays inline, because the pointer plus the round trip costs more than the content. Then make the read path narrow — offset and limit, search, or a code query — and treat a full-file read as a signal worth alerting on, the way you would treat a <code class="inline">SELECT *</code> in a hot path.</p>
+
+    <div class="callout tip">
+      <p>Do these three in order. First, add the offset/limit and search arguments to your file-read tool before you offload anything, because without them offloading cannot pay. Second, generate pointers automatically at write time — name, token count, shape, one addressing example — rather than letting the model invent a description of a file it has not read. Third, log re-reads per file and the bytes-read-to-bytes-written ratio for one week and look at the p95; if the ratio is near 1, you have not moved the content out of the loop, you have only moved it out of view. And whatever you do, do not splice a mutable notes file into the system prompt — that single move can cost more in lost cache hits than the entire offload saves.</p>
+    </div>
+  </div>
+</section>
