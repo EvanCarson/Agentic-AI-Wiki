@@ -1,0 +1,116 @@
+<section class="phase">
+  <div class="phase-num">M15</div>
+  <div class="week">深入解析 &middot; 记忆与上下文工程</div>
+  <h2>把观测结果写进文件，并没有把它从循环里拿出去。它只是让"再读一遍"变成可选——而你省下的每一个令牌，都省在切片上，不是省在文件上。</h2>
+  <p class="goal">让一个智能体变得更贵，最省力的办法就是：把一大坨工具结果卸载到磁盘，然后让它每一步都把整个文件读回来——此时你付的令牌和内联时一样多，外加每一步一次往返，外加更差的缓存命中率。卸载不是压缩。它把"必须一直背着"换成"可以选择去读"，而全部的节省都住在两个没人埋点的数字里：这个文件被重读的频率，以及每次读多少。把这两个数弄对，一份 48,000 令牌的观测在 20 步的运行里只花 12,000 令牌，而不是 816,000。弄错了，你就是用更高的延迟重建了一遍对话记录。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>一个文件到底买到了什么，说准确些。</h3>
+
+    <p>这套做法现在已是标准实践。Manus 的工程文章描述了把文件系统当作智能体主要的长期上下文，理由是文件在体量上实际无界、能跨步骤留存、且可被直接操作；大块观测写到磁盘，上下文里只留路径。Claude Code 按需读取项目文件，而不是预先把整个仓库塞进去。Agent Skills 以目录形式发布，模型需要时才打开。三者的机制是同一个，而它恰好买到三样东西。</p>
+
+    <ul>
+      <li><strong>可逆性。</strong>把一份 48,000 令牌的工具结果截断到前 2,000 个字符，会毁掉信息。把它写进 <code class="inline">./work/api-dump.json</code> 并留住路径，则不会——智能体可以回头去拿。这个性质把卸载和<a class="xref" href="/zh/deep-dives/memory-and-context/context-compaction">上下文压缩</a>里那些有损技术区分开来，而它也是真正要紧的那个，因为你丢掉的那一块，十分可靠地正是你在第 14 步需要的那一块。</li>
+      <li><strong>选择性。</strong>内联的内容无论用不用，在之后每一步都要付费。文件只在被读时付费，而且只为读到的字节付费。这就是全部的经济学论证，而它的前提是智能体会有选择地读——这件事并不自动成立。</li>
+      <li><strong>越过会话的持久性。</strong>对话记录随运行结束而死，目录不会。两者之中，只有文件能活过一次压缩、一次崩溃、一次向子智能体的交接，或者活到明天。</li>
+    </ul>
+
+    <p>它<em>没有</em>买到的，是一个更小的问题。字节还在，模型要用就还得读，而读它仍然会填满<a class="xref" href="/zh/deep-dives/memory-and-context/context-budgeting">上下文预算</a>里讲的那同一个窗口。把数据写到磁盘这件事，丝毫不会让模型更善于注意它——想知道你把它们全放回去会发生什么，见<a class="xref" href="/zh/deep-dives/memory-and-context/long-context-effective-vs-advertised">有效上下文与标称上下文</a>。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>算一遍账，因为效应的量级就是论点本身。</h3>
+
+    <p>取一次具体的运行。在一个 20 步任务的第 3 步，某工具返回了一份 48,000 令牌的 JSON。模型是无状态的，所以留在对话记录里的东西，之后每一步都要重发一次——这就是<a class="xref" href="/zh/concepts/agent-cost-control">智能体成本控制</a>里讲的那个二次效应。四种策略，同一份载荷，同一个任务：</p>
+
+<pre class="standalone"><span class="c-cm"># 48,000-token observation at step 3 of a 20-step run.
+# "paid" = times those tokens enter a request's input.
+# assumes a read is evicted from the transcript after its turn.</span>
+
+<span class="c-cm">#  strategy                          reads   paid       input tokens</span>
+inline, left in the transcript        <span class="c-out">0      17x        816,000</span>
+offloaded, full re-read every turn    <span class="c-out">17     17x        816,510</span>  <span class="c-err"># + 17 round trips</span>
+offloaded, full re-read 4 times       <span class="c-out">4       4x        192,510</span>
+offloaded, grep then 2k slice, 6x     <span class="c-out">6     0.25x        12,510</span>
+
+<span class="c-cm"># pointer overhead: ~30 tokens x 17 turns = 510 tokens, all four rows.
+# the 98.5% saving is not from the file. it is from reading 2,000
+# tokens instead of 48,000 — the file only made that possible.</span></pre>
+
+    <p>请仔细读第二行，因为它正是团队们不知不觉就发布出去的那一行。一个被要求"每步之前先看看你的笔记"、手里又只有一个没有范围参数的 <code class="inline">read_file</code> 的智能体，会做的就是这件事：付足内联的成本，给每一步加上一次工具调用及其延迟，并且——因为文件现在每一轮都以不同位置新鲜抵达——还把缓存行为一起弄差。这次卸载是严格的负收益。唯一大赢的是第四行，而它赢，是因为智能体有办法只读这个文件的 4%。</p>
+
+    <div class="callout">
+      <p>所以设计问题不是"大结果该不该进磁盘"，而是"智能体能不能在不通读的情况下定位到它要的那一段"。如果答案是不能——一坨不透明的二进制、一份压缩过的载荷、一个毫无结构的 600 页 PDF——那么卸载只买到可逆性，别的什么都没有，你的预算就该按内容仍然内联来做。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>路径不是指针。指针是那个让模型不读就能决定的东西。</h3>
+
+    <p>如果对话记录里写的是 <code class="inline">wrote output to ./work/tmp7.json</code>，模型就没有任何依据去判断该不该读它，于是它要么每一轮防御性地读一遍，要么干脆忘了它存在。两者都是失败，而且是指针的失败，不是智能体的失败。一个可用的指针会在大约五十个令牌里带上四样东西：这是什么、有多大、什么形状、以及怎样寻址它的一部分。</p>
+
+<pre class="standalone"><span class="c-cm"># useless</span>
+<span class="c-out">wrote output to ./work/tmp7.json</span>
+
+<span class="c-cm"># usable: name, size, shape, and an addressing hint</span>
+<span class="c-out">./work/invoices-2026-q3.json — 48k tokens, 1,840 records,
+  keys: id, vendor, amount_cents, status, paid_at
+  addressable: jq '.records[] | select(.status=="open")'</span></pre>
+
+    <p>这正是 Agent Skills 所形式化的设计，而那份公开的令牌预算是这套规范里最有用的部分：按 Anthropic 自己的说法，一个 skill 的 frontmatter 元数据约 50 个令牌，其 <code class="inline">SKILL.md</code> 正文约 500 个，附带的参考文件 2,000 个以上——其中只有第一层始终在场，更深的层级要等任务真正匹配时才加载。第三方来源给出的每个 skill 的元数据数字并不一致，所以请把确切数值当作近似值，而把比例当作要点：从"知道有这么个东西"到"把它读进来"，差了大约一百倍。你在写指针时所工程化的，就是这个比例。把同样的纪律用在工具输出而非指令上，就是<a class="xref" href="/zh/deep-dives/tool-capability-design/shaping-tool-results">塑形工具结果</a>；而哪种机制该承载哪种知识，是<a class="xref" href="/zh/deep-dives/tool-capability-design/skills-vs-subagents-vs-mcp-vs-hooks">Skills、子智能体、MCP 与 Hooks 之辨</a>。</p>
+
+    <p>推论是：写出这个文件的那个工具，也应该提供切开它的那个工具。只给智能体一个 <code class="inline">read_file(path)</code>，然后指望它自己写对 <code class="inline">grep</code>，正是上面表格第二行的由来。给它 <code class="inline">read_file(path, offset, limit)</code>、一个搜索原语，以及最好的那一个——在代码里而不是在令牌里对文件发起查询，这正是<a class="xref" href="/zh/deep-dives/tool-capability-design/code-as-action">代码即动作</a>的论点：一个返回 40 条记录的 <code class="inline">jq</code> 过滤器，根本不会把另外 1,800 条放进上下文窗口。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>文件内容落在提示词的哪个位置，决定了你到底有没有省到钱。</h3>
+
+    <p>卸载会和<a class="xref" href="/zh/concepts/prompt-caching">提示词缓存</a>相互作用，而这个作用强到足以把整件事的符号翻转。缓存命中要求从第一个令牌起的前缀精确匹配，而命中的输入按基准价的一个很小的比例计费。于是你的文件内容放在哪里，是一个定价决策：</p>
+
+    <ul>
+      <li><strong>追加在消息序列的末尾</strong>——作为工具结果，放在工具结果该去的地方。系统提示词、工具定义和早先的轮次都没被碰过，于是被缓存的前缀依旧匹配，你只为新增的字节付基准价。这是唯一行得通的形状。</li>
+      <li><strong>重新注入到靠前的位置</strong>——也就是把一个 <code class="inline">NOTES.md</code> 或 <code class="inline">state.json</code> 拼进系统提示词、并每轮重写一次的那种做法。每一次重写都改动了前缀里一个很早的令牌，这会让缓存从该点起全部失效，也就意味着你每一轮都要为<em>整段</em>稳定前言付基准价。在一段 12,000 令牌的前言、20 轮的尺度上，这是把 240,000 个令牌从缓存价挪到基准价，只为了省下背着一条 400 令牌的笔记。</li>
+    </ul>
+
+    <p>这就是为什么 Manus 所描述的"边做边重写一个 <code class="inline">todo.md</code>"是安全的而非鲁莽的：那次重写被追加在上下文末尾，既保住了前缀，又把当前目标留在了最近被注意到的位置。底下的缓存机制是<a class="xref" href="/zh/deep-dives/memory-and-context/kv-cache-budgeting-for-agent-loops">智能体循环的 KV 缓存预算</a>。规则可以收成一句话：文件可以被读进上下文的尾部，绝不能被写进它的头部。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>文件是轨迹之外的状态，于是有三件你一直依赖的事悄悄不再成立。</h3>
+
+    <p>一旦智能体工作记忆的一部分住在磁盘上，对话记录就不再是这次运行的完整记录。它的后果超出成本之外，而那些才是会造出事故而不是造出账单的部分。</p>
+
+    <ul>
+      <li><strong>回放不再是回放。</strong>重跑一条记录下来的<a class="xref" href="/zh/concepts/trajectories">轨迹</a>，能复现模型调用，却复现不了它读的那个目录，于是一次在 CI 里通过的运行可能在生产里失败，而原因在任何轨迹里都看不到。如果你做卸载，你记录下来的那件产物就必须包含每个被读文件的快照或内容哈希——否则<a class="xref" href="/zh/operations/evaluation-and-observability/replay-testing-with-recorded-traces">用录制轨迹做回放测试</a>测的是另一个程序。</li>
+      <li><strong>并发会不请自来。</strong>一个共享的草稿目录就是一个共享可变存储，于是两个被告知"把发现记到 <code class="inline">findings.md</code>"的子智能体，会互相覆盖，没有报错，也没有冲突标记。这恰恰是<a class="xref" href="/zh/deep-dives/multi-agent-systems/parallel-writes-and-silent-merges">并行写入与静默合并</a>里编目的那种故障；便宜的修法是每个写者一个文件再加一个归并器，而需要刻意决定的那件事是<a class="xref" href="/zh/deep-dives/multi-agent-systems/what-a-subagent-inherits">子智能体继承了什么</a>。</li>
+      <li><strong>文件是一个注入面，包括来自你自己。</strong>智能体在第 4 步写下的内容，在第 14 步会作为普通上下文被读回来，而没有任何标记说它从未被信任过。如果第 4 步的内容来自一个网页或一封邮件，那么嵌在其中的指令现在已经通过你自己的文件系统洗过一遍，抵达时看起来就像智能体自己的笔记。请在写下的记录上保留来源——见<a class="xref" href="/zh/concepts/context-taint-tracking">上下文污染追踪</a>与<a class="xref" href="/zh/deep-dives/memory-and-context/memory-poisoning-defenses">记忆投毒防御</a>。</li>
+    </ul>
+
+    <div class="callout">
+      <p>最后这一条最常被漏掉，因为文件感觉上像基础设施，而不像输入。它是输入。一个智能体能写、之后又能读的草稿目录，是一个为提示词注入提供的持久层，其寿命以会话计而非以轮次计；而唯一的通用控制，是给每件写下的产物标注来源，并且不论是谁写的，都拒绝把读回来的文件内容当作指令。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>把那两个比率埋上点，剩下的决策就会自己做出来。</h3>
+
+    <p>几乎没人记录那两个决定"卸载有没有奏效"的数字，这就是为什么多数团队说不出它到底奏效没有。两个计数器就够了，而且都很便宜：</p>
+
+    <ul>
+      <li><strong>每次运行里每个文件的重读次数。</strong>读过一次的文件是一次正确的卸载。在二十轮里被读了十四轮的文件，是一份加了额外步骤的对话记录——要么把它内联回去，要么把它摘要进指针里，好让智能体不再去查。实践中这个分布是双峰的，而钱都在尾巴上。</li>
+      <li><strong>读出字节数 ÷ 写入字节数。</strong>这就是选择性比率，而它是"这套做法有没有在赚钱"的最佳单一预测指标。低于约 0.1，你拿到了好处。接近 1.0，你在付内联成本外加往返开销，而修法是更好的寻址原语，不是更大的上下文窗口。</li>
+    </ul>
+
+    <p>请定一条策略阈值，而不要在每个调用点上逐个决定：超过几千令牌的默认进文件，并附一个生成好的指针；低于阈值的留在内联，因为指针加一次往返比内容本身更贵。然后把读取路径做窄——offset 与 limit、搜索，或者一次代码查询——并把"整文件读取"当成一个值得告警的信号，就像你对待热路径里的 <code class="inline">SELECT *</code> 那样。</p>
+
+    <div class="callout tip">
+      <p>按顺序做这三件事。第一，在卸载任何东西之前，先给你的文件读取工具加上 offset/limit 与搜索参数，因为没有它们，卸载根本不可能赚钱。第二，在写入时自动生成指针——名字、令牌数、形状、一个寻址示例——而不是让模型去给一个它还没读过的文件编描述。第三，把"每个文件的重读次数"和"读出与写入字节比"记录一周，然后去看 p95；如果这个比值接近 1，那你并没有把内容移出循环，你只是把它移出了视野。还有，无论如何都不要把一个可变的笔记文件拼进系统提示词——仅这一招失掉的缓存命中，就可能比整次卸载省下的更多。</p>
+    </div>
+  </div>
+</section>
