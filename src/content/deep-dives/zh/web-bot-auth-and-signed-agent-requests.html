@@ -1,0 +1,92 @@
+<section class="phase">
+  <div class="phase-num">P15</div>
+  <div class="week">深入解析 · 协议与互操作</div>
+  <h2>一个 Web Bot Auth 签名证明的是「这个请求由哪家公司的软件发出」，而它只回答这一个问题。</h2>
+  <p class="goal">如果你的站点是靠读 <code class="inline">User-Agent</code> 字符串来决定一个 AI 智能体能做什么，那你是在用一个由客户端自己填写的字段做授权决定——而攻击者早就注意到了。Web Bot Auth 把那个字符串换成一个你能在毫秒级内验证的密码学签名，这彻底终结了冒名，却在你真正在意的那个问题上没把你往前推动一步：到底有没有一个真人要求做这件事。签名点出的是运营方。它点不出用户、点不出这趟差事，也点不出任何一项权限。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>到底发布了什么，以及其中哪一半是稳定的。</h3>
+
+    <p>Web Bot Auth 是一份 IETF 工作组互联网草案 <code class="inline">draft-ietf-webbotauth-httpsig-protocol</code>，于 2026 年 9 月初被采纳为 <code class="inline">webbotauth</code> 工作组的第一份工作组文档，作者来自 Cloudflare 与 Google。它不是 RFC。没有定下发布日期，而工作组早期的章程里程碑也已过期未达。谁要是叫你「照标准实现」，那他比文档本身超前了一两个修订版。</p>
+
+    <p>但这份草案只是一层薄薄的 profile，底下压着的东西已经定了好几年。签名机制就是 <a class="xref" href="https://www.rfc-editor.org/rfc/rfc9421.html">RFC 9421，HTTP Message Signatures</a>——自 2024 年 2 月起即为 Proposed Standard，在你可能用来提供服务的每一种语言里都有成熟的库。Web Bot Auth 在它之上加的东西很窄：一套关于「哪些组成部分进入签名基串」的约定，以及一条让验证方找到签名方公钥的路径。</p>
+
+    <p>这道划分就是全部的实现方案。把验证逻辑建在不会挪动的 RFC 9421 原语之上，再把草案特有的那些部分——组成部分清单、密钥发现这一步、头字段名——藏到一个你改得动的接口后面。跳过这一步的团队，会照着某个草案修订版写出验证器，然后发现自己硬编码进去的恰恰就是还在讨论中的那部分。<a class="xref" href="/zh/deep-dives/protocols-and-interop/capability-discovery">能力发现与协商</a>里那套特性探测的纪律在这里同样适用，理由和它适用于 Poppy 时一样：按对端呈现出来的东西分支，而不是按你编译进去的某个版本号。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>验证会把一次「查别人家基础设施」的动作塞进你的请求路径。</h3>
+
+    <p>机制上，一个会签名的智能体发出 RFC 9421 的那一对字段——<code class="inline">Signature-Input</code> 点明被覆盖的组成部分与所用密钥，<code class="inline">Signature</code> 携带签名字节——外加一个「是谁声称签了名」的指示。要校验它，你需要那个签名方的公钥，而密钥由运营方发布、也由运营方轮换。一份配套草案 <code class="inline">draft-meunier-webbotauth-registry</code> 定义了一个注册表与一张<em>签名代理卡片</em>，好让验证方有一个有文档可依的地方去查，而不是挨家厂商满世界翻找。</p>
+
+    <p>这意味着验证不是一个纯函数。它是一个纯函数，外加一次打到第三方的缓存未命中，而这一切就坐在你决定要设闸的每一个请求的热路径上。有三条后果会在生产里真咬人：</p>
+
+    <ul>
+      <li><strong>把密钥缓存得狠一点，并且与决定本身分开。</strong>密钥轮换的量级是天或周，不是秒。取密钥这件事，永远不该与一个你本来愿意照常服务的请求同步进行。</li>
+      <li><strong>故意选定「失败放行」还是「失败拦截」，并写下来。</strong>当密钥目录不可达时，一个无法验证的签名与一个伪造的签名无从分辨。失败拦截会把签名方的故障变成你的故障；失败放行会把它变成一个伪造行得通的时间窗。两种都站得住脚。不小心撞上一种则站不住。</li>
+      <li><strong>时钟偏移与重放是你自己的活儿。</strong>RFC 9421 给了你 <code class="inline">created</code> 与 <code class="inline">expires</code> 参数；它不替你决定容忍度。一个宽松的时间窗就是一个重放窗口。</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># the shape that survives a draft revision</span>
+<span class="c-kw">def</span> <span class="c-fn">classify</span>(request):
+    claim = discovery.<span class="c-fn">signer_claim</span>(request)        <span class="c-cm"># draft-specific: isolate it</span>
+    <span class="c-kw">if</span> claim <span class="c-kw">is</span> <span class="c-kw">None</span>:
+        <span class="c-kw">return</span> <span class="c-st">"unsigned"</span>                        <span class="c-cm"># still the common case</span>
+
+    key = keycache.<span class="c-fn">get</span>(claim.key_id)             <span class="c-cm"># never a blocking fetch</span>
+    <span class="c-kw">if</span> key <span class="c-kw">is</span> <span class="c-kw">None</span>:
+        <span class="c-kw">return</span> policy.unverifiable_signature     <span class="c-cm"># a decision, not an exception</span>
+
+    <span class="c-kw">if</span> <span class="c-kw">not</span> rfc9421.<span class="c-fn">verify</span>(request, key, max_age=<span class="c-st">300</span>):
+        <span class="c-kw">return</span> <span class="c-st">"forged"</span>                          <span class="c-cm"># the one clean verdict you get</span>
+
+    <span class="c-kw">return</span> <span class="c-fn">operator_policy</span>(claim.operator)      <span class="c-cm"># and now the hard part begins</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>签名回答的是「谁家的软件」，而人们总把它读成「谁的差事」。</h3>
+
+    <p>一个有效签名只确立一个事实：发送方持有某把私钥，而它的公钥那一半由某个运营方发布。翻译成你能照着做事的说法——<em>这个请求来自那家公司运行的软件</em>。</p>
+
+    <p>它不确立有人参与过。它不确立是<em>哪一个</em>人，而这正是最常被漏掉的一点：同一个运营方的智能体服务着上百万用户，用同一把密钥为他们每一个人的请求签名，而无论背后那个人是你的客户、一个陌生人，还是根本没有人，签名都长得一模一样。它不确立运营方在转发这条指令之前检查过任何东西，而且它不携带权限范围，所以它里面没有任何东西能区分「读这个商品页」和「改这个账户上的收货地址」。</p>
+
+    <p>这道缺口不是草案的疏漏；它是层与层之间的边界。把一个请求绑定到某个<em>用户</em>是委派问题，而委派协议是另一批、也更靠后的东西：常规情形用 OAuth 式的授权，第三方智能体以你客户身份登录用 <a class="xref" href="/zh/deep-dives/protocols-and-interop/poppy-personal-agent-protocol">Poppy</a>，把一份委托建模成可验证凭证用 <a class="xref" href="/zh/deep-dives/protocols-and-interop/ap2-and-agent-commerce">AP2</a>。Web Bot Auth 坐在它们全部的下面，与每一个都是互补关系。真正的失效模式是把它当替代品——把验证出来的运营方名字接进本该放用户身份的位置，那就是裹了一层密码学外衣的<a class="xref" href="/zh/concepts/principal-agent-problem">委托代理</a>混淆。</p>
+
+    <div class="callout"><p>给任何一条拟定规则的一句话检验：运营方自己的文档，能不能告诉你这一个具体请求是否得到了账户持有人的授权？如果不能，那签名也告诉不了你，而你正要写下的这条规则讲的是运营方的声誉，而不是这个请求。</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>签名方与验证方的采纳速度差得很远，所以「必须带签名」会把大多数智能体拒之门外。</h3>
+
+    <p>验证在基础设施这一侧来得很快。Cloudflare 把 HTTP Message Signatures 并入了它的 <a class="xref" href="https://blog.cloudflare.com/verified-bots-with-cryptography/">Verified Bots Program</a>，于是那些一行相关代码都没写过的站点也能用上签名校验；2026 年全年的报道还把 Akamai、置于 CloudFront 分发之前的 AWS WAF、HUMAN Security、Vercel 与 Stytch 列入了验证方。签名那一侧要薄得多：反复出现的名字是 Google 与 OpenAI，另有为在其上构建的智能体服务的 Amazon Bedrock AgentCore。</p>
+
+    <p>把这两份名单并在一起读，部署上的后果就无从回避了。能出示签名的智能体群体，远小于会打到你这里来的智能体群体，所以一条形如<em>要么签名、要么拦截</em>的规则，截至 2026 年末，就是一条把大多数正当自动化流量连同坏的一起拦掉的规则。你的策略有三个桶，不是两个：</p>
+
+    <ul>
+      <li><strong>已签名，且运营方可识别。</strong>唯一一类你对它知道些持久信息的流量。把你本来要凭信任发出去的优待给它：更高的速率上限、结构化的响应、一条有文档的路由。</li>
+      <li><strong>已签名，但运营方不可识别。</strong>密码学上是诚实的，而人还是个陌生人。值得作为单独一类记录下来，因为随着采纳扩散，正是这个桶会长大；而「对一个未知但可追责的运营方做一次第一方决定」，比瞎猜要好得多。</li>
+      <li><strong>未签名。</strong>其余的一切，而且仍是大多数。这个桶目前还不能默认拦截，这正是行为类信号依然承重、而非沦为遗产的原因。</li>
+    </ul>
+
+    <p>还有一处不对称，值得对智能体的建造者（而非站点运营方）点明：正因为验证已经铺开而签名还没有，「不签名」的代价已经在被收取了。一个未签名的智能体很少拿到一句干脆的拒绝——它拿到的是一道挑战、一个过期的缓存页面，或者一份被抹掉价格的文档，而这每一种都解析得通，并把答案接地在某个错误的东西上。这就是<a class="xref" href="/zh/concepts/bot-verification-and-agent-access">机器人验证与智能体访问</a>里的论点，也是为什么在智能体这一侧，签名首先是一个检索质量决定，其次才是一个合规决定。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>它终结冒名，对滥用却毫无作为，因为攻击者可以诚实地签名。</h3>
+
+    <p>Web Bot Auth 消灭的威胁既具体也真实：那种为了继承某个名字已获得的访问权、而冒用一个有信誉的智能体之名的流量。对付这个，它近乎彻底，因为那个声明不再是一个字符串，而变成了一份覆盖整个请求的签名。</p>
+
+    <p>它完全原封不动留下的，是一个可追责运营方的智能体能被怂恿去做的一切。一个被<a class="xref" href="/zh/concepts/prompt-injection-101">提示词注入</a>驱动的已签名智能体，是「签了名」与「在作恶」同时成立，而验证器返回的是有效。一个自己立起一家运营方、发布密钥、规规矩矩签名的攻击者，是一个密码学上可追责的攻击者——这比匿名的好，但签名校验挡不住他。而且由于签名标识的是运营方而非终端用户，运营方上百万用户中<em>某一个</em>的滥用，看起来与其他任何一个的正常使用一模一样。</p>
+
+    <p>所以行为层不会退场。抓住撞库的那个判别式根本不是身份，而是形状：只碰登录路由、而且每次都失败的流量就是滥用，不管它签的是什么名字——这正是<a class="xref" href="/zh/blogs/the-name-on-the-request-was-the-credential">《请求上那个名字就是凭证》</a>里的读法。把它留着，并把签名当作那个「终结了简单的谎」的东西，好让你的行为检测预算花在难的那些上。</p>
+
+    <p>另外还有一个尚在进行中的设计问题：这件事是否真需要身份。一份独立草案提出了匿名机器人认证——一个请求证明自己属于「信誉良好的机器人」这个集合，而不点明自己是其中哪一个。如果这个方向上真有东西落地，策略原语就不再是「你是谁」，而变成「有没有人为你作保」——对隐私严格更好，对眼下大多数站点正在搭的那种按运营方逐个列名的允许名单则严格更糟。</p>
+
+    <div class="callout tip"><p>按这个顺序推进。第一，把你现有的日志切成上面那三个桶，看看比例——大多数团队会发现，已签名那一份小到「必须带签名」这条规则从来就不在选项里。第二，在你的 CDN 已经提供的地方把验证打开，并且用它来<em>授予</em>而不是用来拒绝：速率上限优待与干净的结构化响应，归属的正是「已签名且可识别」这个桶，而把它们从 <code class="inline">User-Agent</code> 字符串上挪走不花你一分钱。第三，让每一项行为控制原地不动，并且永远不要让一个已验证的运营方名字抵达你代码里检查用户身份的那个位置——如果一个请求要对某个账户动手，就让它带上针对那个账户的授权，而那是任何签名里都没有的东西。<a class="xref" href="/zh/operations/safety-and-security/third-party-agents-logging-in-as-your-users">那些早已以你用户身份登录的第三方智能体</a>，会是替你查出有没有照做的那一方。</p></div>
+  </div>
+</section>
