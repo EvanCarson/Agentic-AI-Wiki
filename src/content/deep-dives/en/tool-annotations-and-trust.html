@@ -1,0 +1,92 @@
+<section class="phase">
+  <div class="phase-num">K15</div>
+  <div class="week">Deep Dive · Tool &amp; Capability Design</div>
+  <h2>The pessimistic defaults punish the honest server that stays quiet and reward the one that asserts, so an annotation can never be the gate.</h2>
+  <p class="goal">If your approval dialog skips confirmation when a tool declares <code class="inline">readOnlyHint: true</code>, you have handed the decision about what needs human review to the author of the tool being reviewed. MCP's four annotations are a risk vocabulary worth having, and the specification says plainly that they are untrusted input — which means the useful thing to build is a client-side classification the server cannot write to, with the annotations demoted to a default and a drift alarm.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Four hints, and the defaults are the part people never read.</h3>
+
+    <p>A tool in an MCP server may carry four boolean annotations. <code class="inline">readOnlyHint</code> says the tool does not modify its environment. <code class="inline">destructiveHint</code> says that if it does modify something, the change may be destructive rather than purely additive. <code class="inline">idempotentHint</code> says repeating the call with the same arguments has no additional effect. <code class="inline">openWorldHint</code> says the tool touches something outside a closed, local domain — the open web, a third-party API.</p>
+
+    <p>Two structural facts about that set matter more than the individual meanings. First, <code class="inline">destructiveHint</code> and <code class="inline">idempotentHint</code> are only meaningful when <code class="inline">readOnlyHint</code> is false; on a read-only tool they describe nothing. Second, and this is the one that changes behaviour in the field, the defaults when an annotation is absent are deliberately pessimistic:</p>
+
+    <ul>
+      <li><code class="inline">readOnlyHint</code> defaults to <strong>false</strong> — assume it writes.</li>
+      <li><code class="inline">destructiveHint</code> defaults to <strong>true</strong> — assume the write can destroy.</li>
+      <li><code class="inline">idempotentHint</code> defaults to <strong>false</strong> — assume a repeat does damage.</li>
+      <li><code class="inline">openWorldHint</code> defaults to <strong>true</strong> — assume it reaches the internet.</li>
+    </ul>
+
+    <p>As a safety default that is obviously the right direction: an unannotated tool is treated as the most dangerous thing it could be. The official MCP blog framed the set as a <em>risk vocabulary</em> in a March 2026 post, and as vocabulary it earns its place — before it existed, a client had no standard way to say "this one deletes things" at all. Everything difficult follows from one question the vocabulary cannot answer on its own: who is allowed to speak it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The specification already says the hints are untrusted, and that sentence is the whole design constraint.</h3>
+
+    <p>The protocol does not leave this to interpretation. Clients are told to treat annotations as untrusted unless they come from a server the client trusts, and not to let hints from an untrusted server drive tool-use decisions. The MCP blog's own example is a server that advertises itself as read-only and deletes files.</p>
+
+    <p>Notice what that rules out, because it is more than it first appears. It rules out the gate. If a hint cannot determine a tool-use decision, then "skip the confirmation when <code class="inline">readOnlyHint</code> is true" is not a permitted optimisation — it is the exact thing the sentence forbids, implemented as a convenience. The same goes for the quieter variants: excluding read-only tools from an audit log, omitting them from a rate budget, letting them run inside an auto-approved batch while writes are held for review.</p>
+
+    <p>And "unless the server is trusted" is doing less work than it looks like. Trust in an MCP server is not a property you can evaluate once and store, because the tool list is fetched at runtime and can change between sessions. A server you trusted last Tuesday is a server that can ship a new tool description tonight — which is the whole mechanism behind <a class="xref" href="/deep-dives/mcp/mcp-tool-poisoning">MCP tool poisoning</a>. The honest reading is that the trusted-server exemption covers first-party servers you build and deploy yourself, and almost nothing in a catalogue.</p>
+
+    <div class="callout warn"><p>If you can find the string <code class="inline">readOnlyHint</code> anywhere in your approval, logging, or retry logic as a condition rather than as a display value, you have a server-controlled switch on a client-side control. That is true even when every server in your deployment is currently honest.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The incentive runs backwards: silence is penalised, assertion is rewarded.</h3>
+
+    <p>Put the pessimistic defaults and the untrusted-input rule side by side and the result is a pricing error in the protocol's economics. Consider two servers offering the same <code class="inline">delete_record</code> capability.</p>
+
+    <p>Server A is scrupulous. Its author read the spec, decided they could not honestly characterise every code path, and shipped no annotations. Every call therefore inherits <code class="inline">readOnlyHint: false</code>, <code class="inline">destructiveHint: true</code>, <code class="inline">idempotentHint: false</code>, <code class="inline">openWorldHint: true</code>, and a client that keys its UX off annotations puts a confirmation dialog in front of every invocation.</p>
+
+    <p>Server B asserts <code class="inline">readOnlyHint: true</code>. It is either lying or wrong — it does not matter which, the wire format cannot tell them apart. A client that keys its UX off annotations runs it silently.</p>
+
+    <p>So the server that behaved well gets the friction, the server that made an unverifiable claim gets the quiet path, and the user experiences the difference as Server A being annoying. There is no mechanism anywhere in the protocol that resolves this, because resolving it would require verifying a claim about code you are not running. The conclusion is not that the defaults are wrong — they are right, and inverting them would be worse — but that <strong>an annotation-driven interface rewards assertion, so the interface has to stop being annotation-driven.</strong></p>
+
+    <p>This is the same shape as the problem in <a class="xref" href="/deep-dives/tool-capability-design/tool-schemas-and-contracts">tool schemas and contracts</a>, one layer up. A schema constrains the <em>arguments</em> the model may send, enforceable locally because you hold the validator. An annotation describes the <em>behaviour</em> of code on the other side of a boundary, and nothing local can check it. Treating the two as equally binding because they arrive in the same JSON object is the mistake.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Build the classification client-side, pin it at install, and use the hint to detect drift.</h3>
+
+    <p>The control you want is a risk class attached to the pair <em>(server identity, tool name)</em>, decided by you, stored on your side, and consulted instead of the annotation. It is less work than it sounds: a connected server exposes a handful of tools, the classification is a one-time review at install or approval time, and the review you are doing — reading the tool list and deciding what each one can do to you — is one you should be doing anyway before granting a server access to anything.</p>
+
+    <p>The annotations then do two jobs they are actually good at. They <strong>pre-fill</strong> that review, so a human is correcting a draft rather than starting from a blank form. And they become a <strong>drift signal</strong>: a tool whose annotations changed since you pinned them has had its description rewritten under you, which is worth an alarm whether the change was a rug-pull or a refactor.</p>
+
+<pre class="standalone"><span class="c-cm"># the hint pre-fills the review and watches for drift; it never decides</span>
+<span class="c-kw">def</span> <span class="c-fn">risk_class</span>(server_id, tool):
+    pinned = registry.<span class="c-fn">get</span>(server_id, tool.name)
+    <span class="c-kw">if</span> pinned <span class="c-kw">is</span> <span class="c-kw">None</span>:
+        <span class="c-kw">raise</span> <span class="c-err">UnreviewedTool</span>(server_id, tool.name)   <span class="c-cm"># fail closed, loudly</span>
+
+    <span class="c-kw">if</span> pinned.annotation_digest != <span class="c-fn">digest</span>(tool.annotations):
+        alarm.<span class="c-fn">raise_drift</span>(server_id, tool.name)        <span class="c-cm"># rewritten under you</span>
+
+    <span class="c-kw">return</span> pinned.risk_class                           <span class="c-cm"># yours, not the server's</span>
+
+<span class="c-cm"># WRONG, and it is the default shape of every quickstart:</span>
+<span class="c-cm">#   if tool.annotations.readOnlyHint: run_without_confirmation(tool)</span></pre>
+
+    <p>Two details decide whether this holds up. Key the registry on a <em>stable server identity</em> — an endpoint plus a pinned package digest, not a display name, since the display name is also server-controlled. And fail closed on an unreviewed tool rather than falling back to the defaults: falling back is how a newly appeared tool quietly acquires the pessimistic class, gets a confirmation dialog, gets approved by a user clicking through, and never gets reviewed. That path ends in the rubber-stamped approval that <a class="xref" href="/playbooks/agent-ux-and-human-interaction/approval-and-confirmation-ux">approval and confirmation UX</a> is about, and the gate exists to be read, not to be dismissed.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The retry layer is the second place a server-asserted hint becomes a decision, and nobody is watching it.</h3>
+
+    <p>Approval gates get the attention because they are visible. The quieter instance of the same bug lives in your retry policy, and it is arguably worse, because it fires without a human in the room.</p>
+
+    <p>A reasonable-looking optimisation: retry a timed-out tool call when <code class="inline">idempotentHint</code> is true, surface an error when it is false. The hint is server-asserted, so this is a configuration in which a remote party sets your retry behaviour. If the assertion is wrong, a non-idempotent write executes twice on a timeout — and a timeout is exactly the condition under which you cannot see whether the first attempt committed. Two charges, two tickets, two messages sent.</p>
+
+    <p>The correct source of a retry decision is the same place as the correct source of an approval decision: your own classification, plus a mechanism that makes the question moot. Send an idempotency key you generate and let the far side deduplicate on it — the discipline in <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a> — and you stop needing to believe anything about the tool's internals. A server that honours your key has demonstrated idempotency rather than claimed it. That is the general move available whenever a hint is load-bearing: replace a claim you cannot check with a protocol in which the claim does not matter.</p>
+
+    <p><code class="inline">openWorldHint</code> is the one annotation where acting on the hint is mostly harmless, because what it buys you is not safety. A tool that reaches a third party has latency you do not control and a failure mode you cannot fix, so the hint is useful for timeout budgets, for ordering a plan so the uncertain calls happen early, and for cost estimation. Being wrong about it costs you a bad estimate. Being wrong about <code class="inline">readOnlyHint</code> costs you a deleted record, and the two should not share a code path.</p>
+
+    <div class="callout tip"><p>Three changes, in order. First, grep your client for every use of an annotation and sort them into <em>display</em> and <em>decision</em>; everything in the decision pile is a bug, including the retry one. Second, add a registry keyed on (endpoint, package digest, tool name) holding a risk class you assigned, have the installer pre-fill it from the annotations, and fail closed on anything unreviewed. Third, hash the annotations at pin time and alarm on change — it is about ten lines, it is the only use of the hints that an adversarial server cannot turn to its advantage, and it catches the tool-description rewrite that nothing else in your stack is looking for. Then keep showing the hints in the UI, because <a class="xref" href="/deep-dives/tool-capability-design/tool-design-principles">a good tool description</a> is still the thing that makes the model call the right tool, and a risk vocabulary nobody displays helps nobody.</p></div>
+  </div>
+</section>

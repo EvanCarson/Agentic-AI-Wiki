@@ -1,54 +1,93 @@
 <section class="phase">
   <div class="phase-num">H4</div>
   <div class="week">Playbook · Agent UX &amp; Human Interaction</div>
-  <h2>The ability to stop and redirect a running agent is a feature, not an error path.</h2>
-  <p class="goal">Long-running agents will sometimes be on the wrong track, and the user will see it before the agent does. If the only controls are "wait for it to finish" and "kill it and lose everything," the user has no real authority — they have a kill switch and a hope. This essay treats interruption, mid-task steering, and clean human takeover/handback as primary interactions: how to stop work without destroying it, inject a correction without a full restart, and pass control across the human/agent boundary in both directions without losing state.</p>
+  <h2>An interrupt is a request and a resume is a re-execution, so the work is idempotency between the last durable write and the stop point — not the stop button.</h2>
+  <p class="goal">The stop button is the easy half, and shipping it is where most teams declare the feature done. Underneath it, the two protocols a 2026 agent most likely runs on both tell you plainly that cancellation may be ignored and that resuming re-runs code which already ran. That means a correctly built stop control can still send the same email twice, and the bug surfaces as a user who interrupted a visibly-wrong run and got charged for it anyway.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>Interruption must be promptly responsive and non-destructive.</h3>
-    <p>Two properties make a stop control real. <strong>Responsive</strong>: the agent must reach a safe stopping point quickly — not after the current 90-second tool call and the next three planned steps. <strong>Non-destructive</strong>: stopping must <em>preserve</em> work done so far, not discard it. An interrupt that throws away ten minutes of progress trains users never to interrupt, which means they let a visibly-wrong run continue — the exact behavior the control was meant to prevent.</p>
-    <ul>
-      <li>Checkpoint at step boundaries so a stop loses at most the current step.</li>
-      <li>Make in-flight side effects abortable or, where they cannot be, gate them (H2) so an interrupt never lands mid-irreversible-action.</li>
-      <li>Surface a state snapshot on stop — what's done, what's pending — so the user can decide steer / take over / abandon from facts, not a blank pause.</li>
-    </ul>
+    <h3>Cancellation is advisory, and the specification says so in as many words.</h3>
+
+    <p>MCP's cancellation utility is a notification — <code class="inline">notifications/cancelled</code> naming a request ID — and notifications are fire-and-forget. The specification is explicit that a receiver <em>may</em> ignore one: if the request ID is unknown, if processing already completed, or if the request simply cannot be cancelled. It also states the race directly: because of network latency a cancellation may arrive after processing has finished and potentially after a response has already been sent, and both parties are required to handle that gracefully.</p>
+
+    <p>So a stop request has three possible outcomes, and your interface is probably showing one. The work stops. The work finishes anyway and you discard a result that already had its effects. Or the work is at a point where stopping is not offered and the notification is dropped on the floor. The 2026-07-28 revision tightens the server's side of this further — a server may send <code class="inline">notifications/cancelled</code> to tear down a <code class="inline">subscriptions/listen</code> stream and must not send it for any other purpose — which is worth reading as a direction of travel: cancellation is being narrowed toward a transport signal, not broadened into a control channel.</p>
+
+    <p>The design instruction is to stop presenting cancellation as a verb that completes. A stop control should move the run into a <em>stopping</em> state that is visible and distinct from <em>stopped</em>, and the transition to <em>stopped</em> should be driven by the run confirming it, with a timeout that escalates rather than lies. A spinner that turns into a tick mark because the notification was sent is a user interface asserting something the protocol does not.</p>
+
+    <div class="callout warn"><p>There is a live correctness bug in this area worth knowing about if you run the Python SDK: issue #3807, open as of November 2026, reports that in-flight requests are keyed on a coerced request ID, so a cancellation naming request <code class="inline">7</code> can cancel a concurrent request <code class="inline">"7"</code>. The reporter's point is the general one — any matching rule looser than exact-ID equality can cancel the wrong work — and the TypeScript SDK, which keys on the typed ID, does not show it.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>Distinguish pause, steer, and abort — they are three different intents.</h3>
-    <p>Collapsing them into one "stop" button forces the user to over- or under-act. <strong>Pause</strong>: freeze, preserve everything, intent to resume unchanged. <strong>Steer</strong>: stop, accept a correction, resume with the new constraint and the prior progress intact. <strong>Abort</strong>: stop and discard, intent not to continue this attempt. Steering is the highest-value and most-often-missing one — the user usually does not want to kill the run, they want to nudge it.</p>
-<pre class="standalone"><span class="c-cm"># Steer = correction folded into preserved state, not a restart</span>
-ckpt = agent.checkpoint()
-<span class="c-kw">await</span> agent.interrupt(reason=<span class="c-st">"steer"</span>)
-ckpt.constraints.add(user_correction)
-<span class="c-kw">await</span> agent.resume(<span class="c-kw">from</span>=ckpt)   <span class="c-cm"># keep prior work; apply new constraint</span></pre>
-    <div class="callout tip"><p>Make steering reachable <em>without</em> stopping the world: an "also, do X / not Y" input the user can submit while the agent runs, applied at the next step boundary. Most corrections do not need a full halt.</p></div>
+    <h3>Resume restarts the step from the top, which is documented and still surprises everyone.</h3>
+
+    <p>LangGraph's human-in-the-loop primitive is <code class="inline">interrupt()</code>, resumed with <code class="inline">Command(resume=...)</code>, and its own documentation states the semantics clearly: on resume the runtime restarts the node from the beginning, not from the line where <code class="inline">interrupt()</code> was called. The docs' own advice follows from it — make anything before the interrupt idempotent, or move side effects after it, or put them in separate nodes.</p>
+
+    <p>Read that twice, because it inverts the mental model the word "resume" installs. The interrupt is not a yield that preserves a stack. It is a checkpoint-and-replay, and everything your node did before reaching the interrupt point is in the replayed region. A node that writes a record, calls an API and then asks for approval does the write and the API call again when the human approves.</p>
+
+    <p>This is not a theoretical reading of the docs. As of November 2026 the behaviour has a cluster of open issues around its edges: a side effect repeating after a resume from a tool error (#9185); resuming one of two parallel interrupts inside a subgraph re-running a sibling node that had already completed (#9106); a completed node inside a subgraph re-running on resume with its model call repeated (#9276); and under <code class="inline">durability="exit"</code>, a node that was still running when its sibling failed finishing its work but not having its writes saved, so the resume runs it again (#9397). A separate documentation issue (#7074) argues the docs oversell the other side too, since effects placed <em>after</em> the interrupt can also repeat if the node later fails and is retried.</p>
+
+    <p>The transferable lesson is framework-independent. Any durable-execution engine that implements pause by replaying from a checkpoint has this property, because that is what replay means — the discipline in <a class="xref" href="/operations/agentops/durable-state-and-resumability">durable state and resumability</a>. Interruption is not a UX feature you build on top of a loop. It is a constraint on how the loop's steps are allowed to be written.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>Handover and handback are symmetric — design both.</h3>
-    <p>Teams obsess over the agent handing a hard case to a human and forget the return trip. A clean <strong>handover</strong> transfers context so the human is not re-deriving what the agent already knew: the goal, the steps taken, the state, and crucially <em>why it stopped</em>. A clean <strong>handback</strong> is harder and more neglected: when the human is done, the agent must resume from the human's edited state — not from its own stale pre-handover memory. The classic bug is the agent overwriting the human's manual fix on resume because it never reconciled state.</p>
+    <h3>The unit of design is the span between the last durable write and the stop point.</h3>
+
+    <p>Put the two previous steps together and the thing you actually have to engineer becomes concrete. Work out, for each step your agent can be interrupted inside, which side effects sit between its last durable checkpoint and the point where a stop can land. Everything in that span runs twice.</p>
+
+    <p>A worked example. A six-step support agent: fetch the ticket, look up the account, draft a reply, post the reply, update the CRM field, close the ticket. The user hits stop while step 4 is in flight. If steps 1–3 checkpointed and step 4 is one node that posts the reply and then waits for approval, the replay re-posts the reply — the customer gets two messages, and the second one arrives after the human intervened to prevent exactly that. The fix is not a faster interrupt. It is that <code class="inline">post_reply</code> carries an idempotency key derived from the ticket and the draft digest, so the second execution is a no-op that returns the first result.</p>
+
+<pre class="standalone"><span class="c-cm"># the replayed region is the design surface</span>
+<span class="c-kw">def</span> <span class="c-fn">post_reply_node</span>(state):
+    <span class="c-cm"># everything above interrupt() runs again on resume</span>
+    key = <span class="c-fn">idem_key</span>(state.ticket_id, <span class="c-fn">digest</span>(state.draft))
+    sent = mail.<span class="c-fn">send</span>(state.draft, idempotency_key=key)   <span class="c-cm"># safe to repeat</span>
+
+    approval = <span class="c-fn">interrupt</span>({<span class="c-st">"sent"</span>: sent.id, <span class="c-st">"ask"</span>: <span class="c-st">"close ticket?"</span>})
+
+    <span class="c-cm"># and everything below can repeat too, if this node is retried</span>
+    <span class="c-kw">return</span> {<span class="c-st">"approved"</span>: approval}</pre>
+
+    <p>Three rules fall out, and they are cheaper than they look because they only apply to the spans you identified, not to the whole agent:</p>
+
+    <ul>
+      <li><strong>Give every external write an idempotency key you generate</strong>, derived from content rather than from a counter — <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a> covers the shapes. This is the single change that makes replay semantics safe.</li>
+      <li><strong>Put irreversible actions in their own step, alone.</strong> A step containing one unsafe call has a replayed region containing one unsafe call, and that is the smallest the problem gets.</li>
+      <li><strong>Gate the actions that cannot be made idempotent</strong> rather than trying to interrupt them — a refund, a physical dispatch, a message to a third party with no deduplication. The gate belongs before the call, which is <a class="xref" href="/playbooks/agent-ux-and-human-interaction/approval-and-confirmation-ux">approval and confirmation UX</a>, and the honest version of "interruptible" for these is that the window to stop them closes before the call, not during it.</li>
+    </ul>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>State is the substrate of every transfer — make it a shared, inspectable object.</h3>
-    <p>Interruption, steering, and handoff all reduce to the same primitive: a state object that survives a control change and can be read and edited by whoever holds control. If the agent's working state lives only inside an opaque context window, none of these interactions can be correct — the human cannot see what they are taking over, and the agent cannot see what the human changed. Externalize task state (goal, plan, progress, artifacts, open decisions) into a structure both parties read and write. <em>Who currently holds control</em> must be explicit and visible to both — ambiguous control is how two actors edit the same thing and lose a change.</p>
+    <h3>Pause, steer and abort are three intents, and only one of them is generically safe.</h3>
+
+    <p>Collapsing them into a single stop button forces the user to over- or under-act. <strong>Pause</strong> freezes and preserves, intending to resume unchanged. <strong>Steer</strong> stops, accepts a correction, and resumes with the new constraint and the prior progress intact. <strong>Abort</strong> stops and discards.</p>
+
+    <p>Abort is the one you can implement generically, because discarding state removes the reconciliation problem entirely — you only owe the user an accurate account of which side effects already landed. Pause is harder than it looks: a paused run holds leases, tokens and open transactions that expire on their own schedule, so a pause with no maximum duration becomes an abort at an unpredictable time. Set an explicit pause ceiling and tell the user what it is.</p>
+
+    <p>Steer is the highest-value and most-often-missing one, because the user usually does not want to kill the run — they want to nudge it. It is also the one that interacts worst with replay, since a correction changes the inputs to the replayed region: the draft the user edited is not the draft whose digest keyed the idempotent send. Decide deliberately whether a steer invalidates prior side effects or builds on them, and show the user which. The cheap version that avoids all of this: make steering reachable <em>without</em> stopping, as an "also do X / not Y" input applied at the next step boundary. Most corrections do not need a halt, and a correction that never triggered a replay cannot duplicate anything.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>Reconcile on resume; never blindly continue.</h3>
-    <p>After any human intervention, the agent's first action on resume must be to re-read shared state and detect what changed, not to continue from its pre-interrupt plan. The world may have moved: the human edited an artifact, the earlier goal is now partly satisfied, an assumption is now false. Treat resume as "re-orient against current state, then act" — the same conservative-restart discipline a careful human uses when picking up an interrupted task.</p>
-    <div class="callout warn"><p>An agent that resumes from its own memory instead of reconciled shared state will silently revert the human's intervention. This is the single most trust-destroying handoff bug — the user fixed it, watched the agent undo the fix, and will never hand back again.</p></div>
+    <h3>Handback is where the agent reverts the human's fix, and state is the only cure.</h3>
+
+    <p>Teams design the agent handing a hard case to a human and forget the return trip. A clean <strong>handover</strong> transfers the goal, the steps taken, the current state and — crucially — <em>why it stopped</em>, so the human is not re-deriving what the agent already knew. A clean <strong>handback</strong> is harder: the agent must resume from the human's edited state, not from its own pre-handover memory.</p>
+
+    <p>That bug has a specific shape and it is the most trust-destroying one in this whole area. The human fixes the record by hand; the agent resumes from a checkpoint taken before the fix; its plan still contains the write that produced the wrong value; it executes that write; the fix is gone. The user watched the system undo their correction and will never hand back again.</p>
+
+    <p>All three interactions — interrupt, steer, handoff — reduce to the same primitive: a task state object that survives a change of control and can be read and edited by whoever holds it. If the agent's working state lives only inside an opaque context window, none of them can be correct, because the human cannot see what they are taking over and the agent cannot see what the human changed. Externalise goal, plan, progress, artefacts and open decisions into a structure both parties read and write, make <em>who currently holds control</em> explicit and visible to both, and have the agent's first action on every resume be to re-read that state and diff it against its plan rather than to continue. Where a human edit and a replayed write genuinely collide, the human edit wins and the step is re-planned — and if your side effects already landed in the world rather than in your own store, you are in <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a>, which is a much worse place to be than a merge conflict.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>When NOT to allow free-form mid-task steering.</h3>
-    <p><strong>If a step is mid-way through an irreversible side effect, the right control is "finish or roll back this step cleanly," not "accept an arbitrary correction now" — steering into an uncommitted external action corrupts state worse than no interruption at all.</strong></p>
+    <h3>When not to offer free-form mid-task steering.</h3>
+
+    <p>If a step is part-way through an irreversible external action, the right control is "finish or roll back this step cleanly", not "accept an arbitrary correction now". Steering into an uncommitted external action corrupts state worse than no interruption would have. The same applies to a step whose replayed region contains a write you could not make idempotent: offering a stop there is offering a duplicate.</p>
+
+    <p>And one honest limit on the whole feature. A responsive interrupt requires the agent to reach a safe stopping point quickly, which means short steps — but short steps mean more checkpoints, more replay boundaries and more round trips. Interruptibility is bought with latency and tokens, so buy it where the user can actually see a run going wrong: long, visible, multi-step work. For a four-second call, the honest control is <a class="xref" href="/playbooks/agent-ux-and-human-interaction/undo-and-reversibility">undo</a>, not interruption.</p>
+
+    <div class="callout tip"><p>Do this before you touch the UI. List every step your agent can be interrupted inside; for each, list the external writes between its last durable checkpoint and the earliest point a stop can land; then put an idempotency key on every one of those writes and move the ones you cannot key into their own gated step. That list is the actual specification of your stop button, and it is also a test you can write: resume a run twice from the same checkpoint and assert the external side effects happened once. Then make the UI tell the truth — <em>stopping</em> is a state, <em>stopped</em> is a confirmation, and the state snapshot on stop should say what already landed so the user chooses steer, take over or abandon from facts rather than from a blank pause.</p></div>
   </div>
 </section>

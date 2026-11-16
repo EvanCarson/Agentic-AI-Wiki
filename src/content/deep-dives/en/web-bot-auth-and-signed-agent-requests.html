@@ -1,0 +1,92 @@
+<section class="phase">
+  <div class="phase-num">P15</div>
+  <div class="week">Deep Dive · Protocols &amp; Interop</div>
+  <h2>A Web Bot Auth signature proves which company's software sent the request, and that is the only question it answers.</h2>
+  <p class="goal">If your site decides what an AI agent may do by reading the <code class="inline">User-Agent</code> string, you are making an authorization decision on a field the client picked for itself — and attackers have noticed. Web Bot Auth replaces that string with a cryptographic signature you can verify in milliseconds, which retires impersonation completely and moves you no closer at all on the question you actually care about: whether a real person asked for this. The signature names an operator. It does not name a user, an errand, or a permission.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What shipped, and which half of it is stable.</h3>
+
+    <p>Web Bot Auth is an IETF working-group Internet-Draft, <code class="inline">draft-ietf-webbotauth-httpsig-protocol</code>, adopted as the <code class="inline">webbotauth</code> working group's first document in early September 2026 and co-authored out of Cloudflare and Google. It is not an RFC. No publication date is set, and the group's early charter milestones passed without one. Anyone telling you to "implement the standard" is a revision or two ahead of the documents.</p>
+
+    <p>But the draft is a thin profile over something that has been settled for years. The signing machinery is <a class="xref" href="https://www.rfc-editor.org/rfc/rfc9421.html">RFC 9421, HTTP Message Signatures</a> — a Proposed Standard since February 2024, with mature libraries in every language you are likely to be serving from. What Web Bot Auth adds on top is narrow: a convention for which components go into the signature base, and a way for a verifier to find the signer's public key.</p>
+
+    <p>That split is the whole implementation plan. Build verification against RFC 9421 primitives, which will not move, and put the draft-specific parts — the component list, the key-discovery step, the header names — behind one interface you can revise. Teams that skip this write a verifier against a draft revision and then discover that the part they hard-coded is precisely the part still under discussion. The same feature-test discipline from <a class="xref" href="/deep-dives/protocols-and-interop/capability-discovery">capability discovery and negotiation</a> applies, for the same reason it applied to Poppy: branch on what the peer presents, not on a version number you compiled in.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Verification puts a lookup against someone else's infrastructure in your request path.</h3>
+
+    <p>Mechanically, a signing agent sends the RFC 9421 pair — <code class="inline">Signature-Input</code> naming the covered components and the key, <code class="inline">Signature</code> carrying the bytes — plus an indication of who is claiming to have signed. To check it you need that signer's public key, and keys are published by the operator and rotated by the operator. A companion draft, <code class="inline">draft-meunier-webbotauth-registry</code>, defines a registry and a <em>signature agent card</em> so a verifier has a documented place to look rather than a per-vendor scavenger hunt.</p>
+
+    <p>Which means verification is not a pure function. It is a pure function plus a cache miss against a third party, sitting inside the hot path of every request you decided to gate. Three consequences that bite in production:</p>
+
+    <ul>
+      <li><strong>Cache keys aggressively, and separately from the decision.</strong> Keys rotate on the order of days or weeks, not seconds. A key fetch should never be synchronous with a request you are willing to serve.</li>
+      <li><strong>Choose fail-open or fail-closed on purpose, and write it down.</strong> When the key directory is unreachable, an unverifiable signature is indistinguishable from a forged one. Failing closed turns the signer's outage into your outage; failing open turns it into a window where the forgery works. Both are defensible. Picking by accident is not.</li>
+      <li><strong>Clock skew and replay are yours to handle.</strong> RFC 9421 gives you <code class="inline">created</code> and <code class="inline">expires</code> parameters; it does not decide your tolerance. A generous window is a replay window.</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># the shape that survives a draft revision</span>
+<span class="c-kw">def</span> <span class="c-fn">classify</span>(request):
+    claim = discovery.<span class="c-fn">signer_claim</span>(request)        <span class="c-cm"># draft-specific: isolate it</span>
+    <span class="c-kw">if</span> claim <span class="c-kw">is</span> <span class="c-kw">None</span>:
+        <span class="c-kw">return</span> <span class="c-st">"unsigned"</span>                        <span class="c-cm"># still the common case</span>
+
+    key = keycache.<span class="c-fn">get</span>(claim.key_id)             <span class="c-cm"># never a blocking fetch</span>
+    <span class="c-kw">if</span> key <span class="c-kw">is</span> <span class="c-kw">None</span>:
+        <span class="c-kw">return</span> policy.unverifiable_signature     <span class="c-cm"># a decision, not an exception</span>
+
+    <span class="c-kw">if</span> <span class="c-kw">not</span> rfc9421.<span class="c-fn">verify</span>(request, key, max_age=<span class="c-st">300</span>):
+        <span class="c-kw">return</span> <span class="c-st">"forged"</span>                          <span class="c-cm"># the one clean verdict you get</span>
+
+    <span class="c-kw">return</span> <span class="c-fn">operator_policy</span>(claim.operator)      <span class="c-cm"># and now the hard part begins</span></pre>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The signature answers "whose software", and people keep reading it as "whose errand".</h3>
+
+    <p>A valid signature establishes exactly one fact: the sender holds a private key whose public half is published by some operator. Translated into something you can act on — <em>this request came from software run by that company</em>.</p>
+
+    <p>It does not establish that a human was involved. It does not establish <em>which</em> human, which is the point most often missed: the same operator's agent serves millions of users, signs every one of their requests with the same key, and the signature is identical whether the person behind it is a customer of yours, a stranger, or nobody at all. It does not establish that the operator checked anything before relaying the instruction, and it does not carry a scope, so there is nothing in it that distinguishes "read this product page" from "change the delivery address on this account".</p>
+
+    <p>That gap is not an oversight in the draft; it is the layer boundary. Binding a request to a <em>user</em> is a delegation problem, and delegation protocols are separate and later: OAuth-style grants for the conventional case, <a class="xref" href="/deep-dives/protocols-and-interop/poppy-personal-agent-protocol">Poppy</a> for a third party's agent signing in as your customer, <a class="xref" href="/deep-dives/protocols-and-interop/ap2-and-agent-commerce">AP2</a> for modelling a mandate as a verifiable credential. Web Bot Auth sits underneath all of them and is complementary to each. The failure mode is treating it as a substitute — wiring the verified operator name into the place where a user identity belongs, which is the <a class="xref" href="/concepts/principal-agent-problem">principal-agent</a> confusion with a cryptographic veneer on it.</p>
+
+    <div class="callout"><p>A one-line test for any proposed rule: could the operator's own documentation tell you whether this specific request was authorised by the account holder? If not, the signature cannot tell you either, and the rule you are about to write is about the operator's reputation rather than about this request.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Signers and verifiers adopted at very different rates, so "require a signature" denies most agents.</h3>
+
+    <p>Verification arrived fast on the infrastructure side. Cloudflare folded HTTP Message Signatures into its <a class="xref" href="https://blog.cloudflare.com/verified-bots-with-cryptography/">Verified Bots Program</a>, so signature checking is available to sites that never wrote a line of it; reporting through 2026 also lists Akamai, AWS WAF in front of CloudFront distributions, HUMAN Security, Vercel and Stytch among verifiers. Signing is thinner: Google and OpenAI are the names that recur, along with Amazon Bedrock AgentCore for agents built on it.</p>
+
+    <p>Read those two lists together and the deployment consequence is unavoidable. The population of agents that can present a signature is much smaller than the population of agents that will reach you, so a rule of the form <em>signed or blocked</em> is, as of late 2026, a rule that blocks most legitimate automated traffic along with the bad. Your policy has three buckets, not two:</p>
+
+    <ul>
+      <li><strong>Signed, operator recognised.</strong> The only traffic about which you know something durable. Give it the carve-outs you would otherwise hand out on trust: higher rate limits, structured responses, a documented route.</li>
+      <li><strong>Signed, operator unrecognised.</strong> Cryptographically honest and still a stranger. Worth logging as a distinct class, because this is the bucket that grows as adoption spreads, and a first-party decision about an unknown-but-accountable operator is a much better problem to have than guessing.</li>
+      <li><strong>Unsigned.</strong> Everything else, still the majority. This bucket cannot default to deny yet, which is why behavioural signals remain load-bearing rather than legacy.</li>
+    </ul>
+
+    <p>One asymmetry worth naming for agent builders rather than site operators: because verification is widespread and signing is not, the cost of being unsigned is already being charged. An unsigned agent rarely gets a clean refusal — it gets a challenge, a stale cached page, or a version of the document with the prices stripped out, each of which parses fine and grounds the answer in something wrong. That is the argument in <a class="xref" href="/concepts/bot-verification-and-agent-access">bot verification and agent access</a>, and it is why signing is a retrieval-quality decision on the agent side before it is a compliance one.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>It ends impersonation and does nothing about abuse, because an attacker can sign honestly.</h3>
+
+    <p>The threat Web Bot Auth retires is specific and real: traffic that claims a reputable agent's name in order to inherit the access that name has been granted. Against that it is close to total, because the claim stops being a string and becomes a signature over the request.</p>
+
+    <p>What it leaves entirely in place is everything an accountable operator's agent can be talked into doing. A signed agent driven by a <a class="xref" href="/concepts/prompt-injection-101">prompt injection</a> is signed and malicious at the same time, with a verifier that returns valid. An attacker who stands up an operator, publishes a key and signs properly is a cryptographically accountable attacker, which is better than an anonymous one but is not blocked by signature checking. And because a signature identifies the operator rather than the end user, abuse by <em>one</em> of an operator's millions of users looks exactly like use by any other.</p>
+
+    <p>So the behavioural layer does not retire. The discriminator that catches credential testing is not identity at all but shape: traffic that only ever touches the sign-in route and fails every attempt is abuse whatever name it signs with — the reading argued in <a class="xref" href="/blogs/the-name-on-the-request-was-the-credential">the name on the request was the credential</a>. Keep that, and treat the signature as the thing that stops the easy lie so your behavioural budget is spent on the hard ones.</p>
+
+    <p>There is also a live design question about whether identity is required for this to work. A separate draft proposes anonymous bot authentication, where a request proves membership in a set of bots in good standing without naming which one. If something in that direction lands, the policy primitive stops being "who are you" and becomes "are you vouched for" — strictly better for privacy, and strictly worse for the per-operator allowlists most sites are building right now.</p>
+
+    <div class="callout tip"><p>Sequence it like this. First, split your existing logs into the three buckets above and look at the proportions — most teams discover the signed share is small enough that a signature-required rule was never on the table. Second, turn on verification where your CDN already offers it, and use it to <em>grant</em> rather than to deny: the signed-and-recognised bucket is where rate-limit carve-outs and clean structured responses belong, and moving them off the <code class="inline">User-Agent</code> string costs you nothing. Third, leave every behavioural control exactly where it is, and never let a verified operator name reach the place in your code where a user identity is checked — if a request is going to act on an account, make it carry a grant for that account, which no signature contains. The <a class="xref" href="/operations/safety-and-security/third-party-agents-logging-in-as-your-users">third-party agents already logging in as your users</a> are the ones that will find out whether you did.</p></div>
+  </div>
+</section>
