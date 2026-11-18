@@ -1,0 +1,106 @@
+<section class="phase">
+  <div class="phase-num">U33</div>
+  <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
+  <h2>Data-pipeline agents: the test suite is not the oracle, the output diff is.</h2>
+  <p class="goal">A pipeline change that compiles, passes every test and still silently drops 4% of yesterday's rows is the normal failure here, and no test you wrote was looking for it — because a transformation's correctness lives in the rows it produced, not in the code that produced them. Build this agent around a row-level diff of the changed model against production state, gate the merge on an explained delta, and accept the autonomy ceiling the benchmarks give you: on the only repository-level dbt benchmark published, the best frontier model on a reference harness solves about a third of the tasks.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Start from the measured ceiling, not from the demo.</h3>
+
+    <p>Text-to-SQL looks close to solved and repository-level pipeline work is not. On BIRD, a single-query benchmark, the top published test-set execution accuracy was <code class="inline">83.40%</code> as of an October 2026 submission, against a stated human baseline of <code class="inline">92.96%</code>. Then look at Spider 2.0-DBT, which the authors describe as "a comprehensive code generation agent task that includes 68 examples" requiring models to "understand project code, navigating complex SQL environments and handling long contexts". On the leaderboard as published and retrieved on 18 November 2026, purpose-built commercial agents reach <code class="inline">65.6</code>, the strongest frontier models on the project's own reference harness land between <code class="inline">35.29</code> and <code class="inline">39.71</code>, and the plain reference agent with slightly older models scores from <code class="inline">2.94</code> to <code class="inline">14.70</code>.</p>
+
+    <p>Read those two rows together and the design follows. Roughly one in three repository-level dbt tasks completes end-to-end with a general model, so the agent is a draughtsman and your gate is the product. That is the same posture as <a class="xref" href="/playbooks/coding-and-computer-use-agents/patch-generation-and-tests">patch generation and test-driven loops</a>, with one difference that changes everything: a code agent can run the tests and know whether it succeeded. A pipeline agent cannot, because the thing that would tell it is a table it is not allowed to build.</p>
+
+    <div class="callout"><p>Leaderboard caution: the entries above 90% on Spider 2.0's other settings are vendor-submitted bespoke systems, not a frontier model run out of the box, and the project warns that scores "may change slightly over time" as it re-checks its evaluation metrics. Use the reference-harness rows for "what a general model does for me".</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Give the agent a deferred build, or it cannot run anything at all.</h3>
+
+    <p>The first practical problem is that a dbt model is meaningless without its upstreams, and the agent cannot rebuild a 2,000-model warehouse to test one edit. Deferral is the mechanism that fixes this, and it is the single most important flag to put in the agent's harness. The dbt docs describe it as making it possible "to run a subset of models, tests, or functions in a sandbox environment without having to first build their upstream parents", and the resolution rule is worth quoting exactly, because it is what makes the behaviour predictable:</p>
+
+<pre class="standalone"><span class="c-cm"># When --defer is enabled, dbt resolves ref() using the state</span>
+<span class="c-cm"># manifest instead, but ONLY if:</span>
+<span class="c-cm">#   1. the node isn't among the selected nodes, AND</span>
+<span class="c-cm">#   2. it doesn't exist in the database (or --favor-state is used)</span>
+
+dbt build <span class="c-kw">--select</span> state:modified+ \
+          <span class="c-kw">--defer</span> <span class="c-kw">--state</span> ./prod-artifacts</pre>
+
+    <p>Three things are doing work in that command. <code class="inline">dbt build</code> rather than <code class="inline">dbt run</code>, because build "will: run models, test tests, snapshot snapshots, seed seeds, build user-defined functions" in DAG order — one gate instead of four. <code class="inline">state:modified+</code>, where the trailing <code class="inline">+</code> "includes the resource itself and all its descendants", so the agent is forced to build everything downstream of its own edit rather than only the file it touched. And <code class="inline">--state</code> pointing at a manifest from a previous production invocation, because deferral "requires both <code>--defer</code> and <code>--state</code> to be set".</p>
+
+    <p>Two failure modes to pre-empt in the harness rather than in review. First, the docs' own caution: with deferral "you may be selecting from production datasets, development datasets, or a mix of both", and if you "apply environment-specific limits in development but not in production, you may select more data than expected" — so a dev-sampled environment plus a deferred parent is a comparison across two populations. Second, never point <code class="inline">--state</code> at <code class="inline">target/</code>: dbt overwrites <code class="inline">target/manifest.json</code> during parsing, so the previous state is erased before change detection reads it, and the agent gets a confident "no models modified". Where <code class="inline">dbt clone</code> is available it is the alternative — it creates real objects, zero-copy on Snowflake, Databricks and BigQuery, which lets you test downstream consumers outside dbt — at the cost of compute the deferral path does not spend.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>State comparison is incomplete, and dbt says so in writing.</h3>
+
+    <p>An agent that trusts <code class="inline">state:modified</code> to enumerate the blast radius of its own change will miss cases, and the vendor documents which ones. This matters more for an agent than for a person, because a human reviewer notices that the CI run built two models when they expected nine; an agent reads "2 of 2 OK" as success.</p>
+
+    <ul>
+      <li><strong>The sub-selectors tell you what the full check covers:</strong> <code class="inline">state:modified.body</code>, <code class="inline">.configs</code>, <code class="inline">.relation</code>, <code class="inline">.persisted_descriptions</code>, <code class="inline">.macros</code> and <code class="inline">.contract</code>. Useful as documentation of the surface; <code class="inline">state:modified</code> includes all of them plus resource-specific criteria.</li>
+      <li><strong>Variables break lineage.</strong> Quoting the caveats page: "If a model uses a <code>var</code> or <code>env_var</code> in its definition, dbt is unable to identify that lineage in such a way that it can include the model in <code>state:modified</code>". An agent that changes a variable's value has changed behaviour that change detection cannot see.</li>
+      <li><strong>Metadata is deliberately excluded.</strong> <code class="inline">tags</code> and <code class="inline">meta</code> changes do not trigger <code class="inline">state:modified</code>, "because these fields don't affect how dbt materializes the resource". Correct, and a surprise if your orchestration keys on tags.</li>
+      <li><strong>False positives have a named flag.</strong> Set <code class="inline">state_modified_compare_more_unrendered_values</code> to <code class="inline">true</code> "to reduce false positives during <code>state:modified</code> selection due to env-aware logic" — and rebuild the state directory with dbt 1.9 or higher afterwards, or comparison keeps producing them.</li>
+      <li><strong>Macro edits are wide.</strong> "dbt will mark modified any resource that depends on a changed macro, or on a macro that depends on a changed macro." An agent refactoring a shared macro has selected most of the project, which is correct and also a runaway build if you did not cap it.</li>
+    </ul>
+
+    <p>The page ends with an admission worth putting in front of anyone who wants an unattended pipeline agent: "State comparison is complex. We hope to reach eventual consistency between all configuration options". Treat selection as a best-effort hint about <a class="xref" href="/concepts/blast-radius">blast radius</a>, not a proof of it.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>The gate is a row-level diff, and the open-source tool most people reach for is archived.</h3>
+
+    <p>Here is the whole argument in one sentence: the agent's diff is a code diff, your gate has to be an output diff. Two models can differ by one <code class="inline">LEFT JOIN</code> and produce identical row counts with 3% of values changed, or identical values with 8% of rows dropped, and only a comparison of the built relations distinguishes those.</p>
+
+    <p>Check the tooling before you design around it. <code class="inline">data-diff</code>, the tool most search results still point at, was archived on <strong>17 May 2024</strong>; its README's first line reads "As of May 17, 2024, Datafold is no longer actively supporting or developing open source data-diff", and its last PyPI release went out the same day. What is current, as of November 2026:</p>
+
+    <ul>
+      <li><strong><code class="inline">dbt-audit-helper</code> (package <code class="inline">audit_helper</code>, 0.4.0)</strong> — in-warehouse macros, no extra service. <code class="inline">compare_and_classify_query_results</code> generates "a row-by-row comparison of two queries, as well as summary stats of added, removed, identical and modified records", returning a <code class="inline">dbt_audit_row_status</code> of <code class="inline">identical</code>, <code class="inline">modified</code> or <code class="inline">added</code> with counts. It requires <code class="inline">primary_key_columns</code>, which is the real precondition: a model with no reliable key cannot be diffed at the row level by anything, and that is a modelling bug the agent should be made to fix first. <code class="inline">quick_are_queries_identical</code> is the cheap pre-check — "calculated relatively quickly compared to other macros in this package" — and <code class="inline">compare_which_query_columns_differ</code> localises the damage to a column. Note <code class="inline">compare_queries</code> and <code class="inline">compare_relations</code> are now marked legacy in favour of the classify macros.</li>
+      <li><strong>Recce (1.72.0, 11 November 2026, Apache-2.0)</strong> — "Environment diff tool for dbt", built for PR review, with Profile, Value, Top-K and Histogram diffs plus a side-by-side query diff and column-level lineage. It needs two prepared environments to compare, which is the same precondition as deferral. Its hosted tier can block PR merging until checks are approved, which is the gate shape you want.</li>
+    </ul>
+
+<pre class="standalone"><span class="c-cm"># the merge gate, in the order it should run</span>
+<span class="c-fn">quick_are_queries_identical</span>()      <span class="c-cm"># cheap: identical? merge.</span>
+<span class="c-fn">compare_row_counts</span>()               <span class="c-cm"># rows moved? by how many?</span>
+<span class="c-fn">compare_which_query_columns_differ</span>()  <span class="c-cm"># which column changed?</span>
+<span class="c-fn">compare_and_classify_query_results</span>()  <span class="c-cm"># added/removed/modified, by key</span>
+
+<span class="c-cm"># the agent must PREDICT this delta in the PR description.</span>
+<span class="c-cm"># An unpredicted non-zero delta is the review. Not the diff.</span></pre>
+
+    <p>That last line is the operational trick worth stealing from <a class="xref" href="/playbooks/coding-and-computer-use-agents/notebook-and-data-science-agents">notebook and data-science agents</a>: make the agent state, before the diff runs, how many rows it expects to move and why. A correct prediction is strong evidence it understood its own change. An unpredicted delta of any size is the thing a human should look at, and it is a far better review queue than the code.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Two gates fire before the warehouse is touched — use both.</h3>
+
+    <p>Diffing is expensive and runs late. Two dbt features fail an agent's change earlier and cheaper, and they catch different classes of error.</p>
+
+    <p><strong>Model contracts</strong> turn the output shape into a declared interface. With <code class="inline">contract: enforced: true</code>, dbt does two things differently: it runs "a 'preflight' check to ensure that the model's query will return a set of columns with names and data types matching the ones you have defined", and it includes those names, types and constraints in the DDL it submits. The consequence that matters for an agent: removing a column or changing an existing column's type "is considered a breaking change, and will raise an error" — so the most common destructive refactor an agent attempts cannot reach the warehouse at all. Two limits to know. Contracts apply to <em>all</em> columns, so enforcing one means declaring every column, and "most platforms only enforce <code>not_null</code>" among the constraints. They are also unsupported on Python models, materialized views, ephemeral models, sources, seeds and snapshots.</p>
+
+    <p><strong>Unit tests</strong> (dbt 1.8 and later) are the gate for logic. The docs draw the line precisely: data tests "could only be executed <em>after</em> building a model", while unit tests "allow you to validate your SQL modeling logic on a small set of static inputs <em>before</em> you materialize your full model in production". That is exactly the loop an agent needs — an oracle it can run itself, in seconds, with no warehouse. dbt's own guidance on when they pay off reads like a list of what agents get wrong: regex, date maths, window functions, <code class="inline">case when</code> with many branches, truncation, and "prior to refactoring the transformation logic". Note dbt Labs recommends running unit tests only in development and CI, since static inputs make production runs pointless compute.</p>
+
+    <div class="callout tip"><p>Require the agent to write the unit test first, with the fixture rows spelled out, and to show it failing against the old model before the change. A unit test authored after the fact against the new logic asserts that the code does what the code does. One authored before it is the only artefact in this pipeline that encodes intent.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Airflow isolates the orchestrator, never the side effects.</h3>
+
+    <p>Once the transformation is right, the agent still has to change the thing that schedules it, and here the sandbox people assume exists does not. Airflow 3.4.0 ships no <code class="inline">--dry-run</code> on any <code class="inline">tasks</code> subcommand. What <code class="inline">airflow tasks test</code> actually promises is narrow, and the CLI's own help text is the clearest statement of it: "Test a task instance. This will run a task without checking for dependencies or recording its state in the database." Dependencies and metadata-DB state are what it skips. The operator's code runs for real, against whatever connections the environment holds — so an agent "testing" a task that writes to a bucket or calls an API has written to the bucket and called the API.</p>
+
+    <p><code class="inline">dag.test()</code> is the same trade at DAG scope. The docs say it "executes a real Dag run", needs an initialised metadata database and a DAG that Airflow can serialise, and the best-practices page is blunt that "that is an integration test… not a substitute for the unit tests". Its one isolation knob is <code class="inline">mark_success_pattern</code>, which auto-passes tasks matching a <code class="inline">task_id</code> pattern — the practical use being to skip sensors and cleanup steps. Which means the real isolation has to come from the environment, not the command: give the agent credentials that can only reach a scratch dataset, and treat every task invocation as a write. This is the <a class="xref" href="/concepts/dry-run-and-preview">dry run and preview</a> problem with the preview missing, and it is why <a class="xref" href="/operations/agentops/staging-environments-for-agents">staging environments for agents</a> is a prerequisite rather than a nicety.</p>
+
+    <p>Two Airflow 3 changes alter what an agent can safely touch. <strong>Assets</strong> replaced datasets and asset-driven scheduling is now first-class: a task marks an asset updated via <code class="inline">outlets</code>, but "Airflow marks an asset as updated only if the task completes successfully", and a consumer DAG runs only after <em>all</em> the assets it lists have been updated at least once. An agent that adds an asset to a <code class="inline">schedule</code> list has added an AND condition, and a DAG that now never fires is the result. Note also that 3.4.0 changed the default: single-asset schedules and asset-OR expressions "now create one Dag run per event instead of consuming all queued events in one run", restorable with <code class="inline">batch_asset_events=True</code> — a behaviour change that silently multiplies run counts, and therefore cost.</p>
+
+    <p><strong>DAG bundles and versioning</strong> decide whether a mid-run edit is safe. Bundles let "a task using a specific version of the Dag bundle" run "the same code for the whole run, even if the Dag is updated mid-way through the run" — but only some bundles version. The Git bundle "does support versioning"; the local, S3, GCS and Azure Blob bundles explicitly "do not support versioning of the bundle, meaning tasks always run using the latest code". So on a local or object-storage bundle, an agent merging a change while a run is in flight has changed that run's code underneath it. If an agent is allowed to merge DAG changes unattended, the bundle must be the Git one.</p>
+
+    <div class="callout warn"><p>Everything above assumes the pipeline's writes are repeatable. They usually are not: a partially completed run has already loaded rows, and re-running it loads them again. Settle idempotency before autonomy — <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a> for the construction, <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing what the agent already did</a> for the day you need it, and <a class="xref" href="/operations/agentops/bulk-and-backfill-runs">bulk and backfill runs</a> for the backfill the fix will require. Related reading: <a class="xref" href="/playbooks/coding-and-computer-use-agents/database-migration-agents">database migration agents</a> for the schema side, <a class="xref" href="/playbooks/coding-and-computer-use-agents/ci-repair-agents">CI repair agents</a> for the loop shape, and <a class="xref" href="/playbooks/domain-playbooks/data-analysis-agents">data-analysis agents</a> for the consumer downstream of all of this.</p></div>
+  </div>
+</section>

@@ -1,0 +1,101 @@
+<section class="phase">
+  <div class="phase-num">O37</div>
+  <div class="week">运营 · AgentOps：部署与运维</div>
+  <h2>伺服大量微调适配器：权重变便宜了，治理没有。</h2>
+  <p class="goal">适配器伺服让四十个客户专属模型占用的 GPU 内存与一个差不多，这正是团队伸手去拿它的原因——然后他们发现，自己是在用「一个部署份量」的评测、回滚与事故工具，运营着四十个模型。伺服上的那笔便宜是真的，而账单是搬了家、不是消失了：它落在保障这一侧，并且随适配器数量而放大。请在伺服第二个适配器之前，就决定好你将如何评测与吊销第四十个。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>它真正买到的是：一个引擎、多个适配器，由 model 字段来选。</h3>
+
+    <p>这套机制值得说准确，因为误导人的恰恰是它的人体工程学。在 vLLM 里，你用基础模型启动服务，并按名字注册适配器：</p>
+
+<pre class="standalone"><span class="c-cm"># one engine, two tenants' adapters, one GPU</span>
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  <span class="c-kw">--enable-lora</span> \
+  <span class="c-kw">--lora-modules</span> acme=/adapters/acme hooli=/adapters/hooli \
+  <span class="c-kw">--max-loras</span> 8 <span class="c-kw">--max-lora-rank</span> 16
+
+<span class="c-cm"># the client selects a tenant by naming it as the MODEL</span>
+<span class="c-out">{"model": "acme", "messages": [...]}</span></pre>
+
+    <p>从这个形状掉出三个后果。适配器会与基础模型一并出现在 <code class="inline">/v1/models</code> 里，各自带一个指向基础模型的 <code class="inline">parent</code> 字段和一个指向适配器所在位置的 <code class="inline">root</code>——于是发现是免费的，而你的清册就是一次 API 调用。客户端「by passing its name as the <code class="inline">model</code> parameter」来选适配器，而适配器请求与基础模型请求是在同一批次里<em>并肩</em>跑的，效率就是从这儿来的。而基础权重只加载一次：一个低秩适配器比基础模型小大约两个数量级，不过确切体积取决于你训练时用的秩，以及你针对了哪些模块。</p>
+
+    <p>在硬件这一层，这确实是笔好买卖，也正是对<a class="xref" href="/zh/operations/agentops/self-hosted-inference-for-agents">面向智能体的自托管推理</a>所提出的「按租户做专精」那个问题的正确答案。问题在于把上面三条里的最后一条反过来读：把一个租户的模型与另一个租户的模型区分开来的那个东西，是<em>请求体里的一个字符串</em>。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>适配器名字是一条没人在执行的授权边界。</h3>
+
+    <p>把两条事实并排摆着。适配器在 <code class="inline">model</code> 字段里按名字寻址，而任何点名了某个已注册适配器的请求都会被伺服。伺服层里并不存在「哪个调用方有权用哪个适配器」这个概念——也本不该有，因为那是应用层的事。但这意味着失效模式是具体而安静的：一个路由 bug 把租户 A 的请求带着 <code class="inline">"model": "hooli"</code> 发了出去，它不会报错。它返回 <code class="inline">200</code>，附上一段由别人的微调模型、在别人的数据上训练出来的、流畅而看似合理的补全。</p>
+
+    <p>这件事在一个方面比跨租户数据泄露更糟，在另一个方面更好。更好，因为一个适配器的权重不等于它的训练语料，用错适配器并不会把行交出去。更糟，因为响应里没有任何东西标记它——没有报错、没有延迟异常、token 数也没变。输出形状正确而来源错误，而这恰恰是<a class="xref" href="/zh/operations/economics-roi/economics-failure-modes">静默失败那一税</a>所讲的那一类失效，并且它将由客户、而不是由监控发现。</p>
+
+    <div class="callout warn">
+      <p>三道控制，推理服务一道都不提供。在服务端由已认证的主体推导出适配器名字、绝不从客户端接收；把解析出的适配器名字作为一等字段记进每一次请求的日志，这样事后一次错路由是 grep 得出来的；并且写一条测试，断言一个被限定到租户 A 的令牌，无法从租户 B 的适配器那里引出一段补全。<a class="xref" href="/zh/operations/agentops/multi-tenancy-for-agents">面向智能体的多租户</a>编目了其余那些以这种方式泄漏的存储，而<a class="xref" href="/zh/concepts/agent-identity-and-permissions">智能体身份与权限</a>正是这里需要的那道绑定。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>那些服务级旋钮是一道共享天花板，于是一个适配器向全体租户收税。</h3>
+
+    <p>vLLM 的 LoRA 参数——<code class="inline">max_loras</code>、<code class="inline">max_lora_rank</code>、<code class="inline">max_cpu_loras</code>——被记载为对所有请求生效，而这一句话里就装着容量规划的大部分后果。它们是部署的属性、不是某个适配器的属性，这意味着整个机群是按它最苛刻的那个租户来定容的。</p>
+
+    <p><code class="inline">--max-lora-rank</code> 是那道锋利的边。文档建议把它设为你那批适配器里最高的那个秩，并避免设得大得多，「since they waste memory」——于是一个在秩 64 上训练、而其他所有人都在秩 8 上训练的客户，把整台服务每次请求的工作集都抬了上去。由此掉出的运营规则一点也不花哨，而且值得写成政策：<strong>秩是一个平台参数，不是一项按客户来的选择。</strong>把支持的秩公布出来、在接入时拒掉高于它的适配器，并把例外做成一次刻意的第二部署，而不是对共享那台的一次无声征税。</p>
+
+    <p><code class="inline">--max-loras</code> 给「同时驻留多少个适配器」设上限，而 <code class="inline">--max-cpu-loras</code> 是溢出层。超出那个上限之后，适配器会换入换出，而换入换出的代价会以尾延迟的形式、落在当时倒霉的那个租户身上。四十个适配器配八个槽位，你的 p99 属于那些当下没人在用的适配器——这是一种与<a class="xref" href="/zh/operations/agentops/sandbox-pools-and-cold-starts">沙箱池与冷启动</a>同形状的冷启动模式，而它会奖励「把同一适配器的请求路由到同一副本」这种做法。<code class="inline">--lora-target-modules</code> 是另一个值得知道的杠杆：留空时 LoRA 会作用于所有受支持的模块，而把它限制到指定的后缀名，就是你用一点质量换一个更小工作集的方式。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>动态加载是你想要的那个功能，也是文档叫你不要跑的那个。</h3>
+
+    <p>运营四十个适配器，显而易见的做法是按需加载，而 vLLM 恰好支持：<code class="inline">POST /v1/load_lora_adapter</code> 带上 <code class="inline">lora_name</code> 与 <code class="inline">lora_path</code>，<code class="inline">POST /v1/unload_lora_adapter</code> 卸掉一个，以及 <code class="inline">load_inplace: true</code> 在保留名字的前提下替换某个已有适配器的权重。还有解析器插件——<code class="inline">lora_filesystem_resolver</code> 从本地缓存目录读，而 <code class="inline">lora_hf_hub_resolver</code> 从一份配置好的 Hugging Face 仓库清单里拉。</p>
+
+    <p>这一切都被一个环境变量 <code class="inline">VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> 闸着，而文档对它的立场毫不含糊：它警告存在安全风险，并说除非环境是隔离且完全可信的，否则不应在生产中使用。那个远程解析器还自带一条警告：远程下载不安全、也不是为生产准备的。读一遍这套机制，就会明白那条警告显然是对的——一个未经认证、会把任意路径下的任意权重加载进你伺服进程的端点，是一条披着模型外衣的远程代码路径；而 <code class="inline">load_inplace</code> 意味着攻击者连一个新名字都不需要被路由到。</p>
+
+    <p>所以生产形态不是「把开关打开、前面摆个代理」。而是把适配器注册当作一次<strong>部署</strong>：适配器是带摘要的产物，已注册适配器的集合在部署配置里声明，而新增一个就滚动一遍机群。这更慢，而它与<a class="xref" href="/zh/operations/agentops/rollout-and-versioning">滚动发布与版本化</a>在别处所做的是同一笔交易。如果你确实需要运行时加载——而一个每小时接入一个客户的平台确实需要——那就把这个开关打开在一个专用、网络隔离的部署上，它唯一的客户端是你自己的控制面；适配器路径绝不从用户输入推导；并且在加载之前把产物的摘要钉死并校验，而不是去信任那个路径。</p>
+
+    <div class="callout">
+      <p>同一页里还有一处边界，给任何要伺服多模态适配器的人：默认的多模态 LoRA 每个提示只允许一个 LoRA，而如果一个提示里出现了多个已注册的模态，那就<em>一个都不</em>应用。这不报错——它会静默回落到基础模型，看起来像一次没有原因的质量回退。另外，开了 <code class="inline">--enable-mixed-moe-lora-format</code> 之后，vLLM 会信任调用方给出的 <code class="inline">is_3d_lora_weight</code> 声明，而一个错的取值可能导致加载失败或输出错误。这两件都该进测试套件，而不是进事故复盘。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>四十个适配器就是四十个模型，而保障账单正是它落下来的地方。</h3>
+
+    <p>这一步决定了这套架构当初是不是个好主意。在 GPU 上，四十个适配器是一个部署。在其他每一层，它都是四十个模型——而那套算术并不客气：</p>
+
+<pre class="standalone"><span class="c-cm"># what one release costs, per layer</span>
+eval_suite_tasks   = 300
+adapters           = 40
+
+base_model_only    = 300          <span class="c-cm"># one run</span>
+per_adapter        = 300 * 40     <span class="c-cm"># = 12,000 task runs</span>
+
+<span class="c-cm"># and the base-model upgrade does not amortise:</span>
+<span class="c-cm"># every adapter was trained against the OLD base weights,</span>
+<span class="c-cm"># so a base bump is 40 retrainings + 40 re-evaluations,</span>
+<span class="c-cm"># not one migration.</span></pre>
+
+    <p>每一行都是一项真实的义务，而不是一份完美主义的劝告。某一个适配器上的质量回退在聚合指标里是看不见的，所以<a class="xref" href="/zh/operations/evaluation-and-observability/quality-regression-detection">回退检测</a>必须是按适配器来的，否则它不叫检测。回滚是按适配器来的，这意味着你需要把每一个适配器的上一版摘要保留并可取回，而不只是保留服务的上一个发布版。而基础模型升级才是让人意外的那一个：一个适配器是针对特定基础权重训练出来的，于是<a class="xref" href="/zh/operations/agentops/model-deprecation-and-migration">模型退役与迁移</a>不再是一次迁移，而成了四十次重训练配四十次评测运行——也就是<a class="xref" href="/zh/operations/economics-roi/cost-of-evaluation">评测的成本</a>所描述的那套成本结构，再乘上你的客户数。</p>
+
+    <p>这给出一条带数字的规划规则。把你每次发布的评测预算，除以你打算伺服的适配器数量；如果按适配器摊下来的那一份养不起一套有意义的套件，那你并不是在运营四十个模型，你是在运营一个模型、并对其余三十九个抱有希望。这件事的诚实版本有两个：把套件削成「每适配器一小套冒烟测试 + 基础模型上的一整套」，或者少伺服一些适配器。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>什么时候「一客户一适配器」压根就是错的形状。</h3>
+
+    <p>反对按租户配适配器的最强理由是：人们拿去微调的那些东西，大多并不需要权重。如果适配器编码的是客户的术语、文档集或行文风格，那是检索与提示词的事，而它只要一个部署份量的评测、而不是四十份。请把适配器留给提示词真正到不了的地方：一种基础模型守不稳的输出格式、一个 token 分布离预训练配比很远的领域，或者一套从客户自己的轨迹里学来的工具使用策略——那正是<a class="xref" href="/zh/deep-dives/training-agentic-models/training-on-your-own-traces">在自己的轨迹上训练</a>所论证的情形。</p>
+
+    <p>有两种适配器数量能跑得不错，而让团队受伤的是中间那一档。按<em>任务</em>分的少数几个适配器——抽取、分类、智能体的规划回路——是一个小而稳定的集合，你评测得过来，而且它与<a class="xref" href="/zh/concepts/model-routing">模型路由</a>组合得上。按<em>租户</em>分的数百个适配器，是一门平台生意，配着平台的保障预算，刻意建起来。而四十个——靠着一个一个地对客户说「好」攒出来的那四十个——正是那种「背着平台的义务、却只有单个服务的工具」的形状。</p>
+
+    <div class="callout tip">
+      <p>在第二个适配器之前：在服务端由已认证的主体解析出适配器名字，并把它记进每一次请求的日志；公布一个受支持的 <code class="inline">max_lora_rank</code> 并在接入时强制执行；通过部署配置、以钉死的摘要来注册适配器，而不是用那个运行时加载端点——除非那个端点坐在一个只有你控制面能触达的隔离部署里；为回滚保留每一个适配器的上一版摘要；并把「在你这个适配器数量下，一次基础模型升级要花多少钱」写下来——因为决定这套架构能不能活过第二年的，是那个数字，不是省下来的 GPU。相关：适配器是什么见<a class="xref" href="/zh/concepts/parameter-efficient-fine-tuning">参数高效微调</a>，路由那一层见<a class="xref" href="/zh/operations/agentops/serving-agent-traffic">伺服智能体流量</a>，而一个共享引擎为何会把某个租户的适配器变成所有人的问题，见<a class="xref" href="/zh/concepts/blast-radius">影响半径</a>。</p>
+    </div>
+  </div>
+</section>
