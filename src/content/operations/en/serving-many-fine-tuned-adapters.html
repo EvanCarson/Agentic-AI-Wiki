@@ -1,0 +1,101 @@
+<section class="phase">
+  <div class="phase-num">O37</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Serving many fine-tuned adapters: the weights got cheap, the governance did not.</h2>
+  <p class="goal">Adapter serving makes forty customer-specific models cost about as much GPU memory as one, which is why teams reach for it — and then discover that they are operating forty models with one deployment's worth of evaluation, rollback and incident tooling. The serving win is real and the bill moves rather than disappears: it lands on the assurance side, where it scales with the number of adapters. Decide how you will evaluate and revoke adapter number forty before you serve adapter number two.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>What it actually buys: one engine, many adapters, selected by the model field.</h3>
+
+    <p>The mechanism is worth stating precisely, because the ergonomics are what mislead people. In vLLM you start the server with the base model and register adapters by name:</p>
+
+<pre class="standalone"><span class="c-cm"># one engine, two tenants' adapters, one GPU</span>
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  <span class="c-kw">--enable-lora</span> \
+  <span class="c-kw">--lora-modules</span> acme=/adapters/acme hooli=/adapters/hooli \
+  <span class="c-kw">--max-loras</span> 8 <span class="c-kw">--max-lora-rank</span> 16
+
+<span class="c-cm"># the client selects a tenant by naming it as the MODEL</span>
+<span class="c-out">{"model": "acme", "messages": [...]}</span></pre>
+
+    <p>Three consequences follow from that shape. The adapters appear in <code class="inline">/v1/models</code> alongside the base model, each carrying a <code class="inline">parent</code> field pointing at the base and a <code class="inline">root</code> pointing at the adapter's location — so discovery is free and your inventory is one API call. Clients select an adapter "by passing its name as the <code class="inline">model</code> parameter", and adapter requests run <em>alongside</em> base-model requests in the same batch, which is where the efficiency comes from. And the base weights are loaded once: a low-rank adapter is smaller than the base model by roughly two orders of magnitude, though the exact size depends on the rank you trained at and which modules you targeted.</p>
+
+    <p>That is a genuinely good deal at the hardware layer, and it is the right answer to the question <a class="xref" href="/operations/agentops/self-hosted-inference-for-agents">self-hosted inference for agents</a> raises about per-tenant specialisation. The problem is the last of those three consequences read from the other direction: the thing that distinguishes one tenant's model from another's is a <em>string in a request body</em>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>The adapter name is an authorization boundary that nothing is enforcing.</h3>
+
+    <p>Put the two facts next to each other. Adapters are addressed by name in the <code class="inline">model</code> field, and a request naming any registered adapter is served. There is no notion in the serving layer of which caller is entitled to which adapter — nor should there be, since that is an application concern. But it means the failure mode is specific and quiet: a routing bug that sends tenant A's request with <code class="inline">"model": "hooli"</code> does not error. It returns <code class="inline">200</code> with a fluent, plausible completion produced by someone else's fine-tune, trained on someone else's data.</p>
+
+    <p>That is worse than a cross-tenant data leak in one respect and better in another. Better, because an adapter's weights are not its training corpus and a wrong adapter does not hand over rows. Worse, because nothing in the response marks it — no error, no latency anomaly, no change in token counts. The output is correct-shaped and wrong-sourced, which is precisely the class of failure that <a class="xref" href="/operations/economics-roi/economics-failure-modes">the silent-failure tax</a> is about, and it will be discovered by a customer rather than by a monitor.</p>
+
+    <div class="callout warn">
+      <p>Three controls, none of which the inference server provides. Derive the adapter name server-side from the authenticated principal and never accept it from the client; log the resolved adapter name on every request as a first-class field so a mis-route is greppable after the fact; and assert in a test that a token scoped to tenant A cannot elicit a completion from tenant B's adapter. <a class="xref" href="/operations/agentops/multi-tenancy-for-agents">Multi-tenancy for agents</a> catalogues the other stores that leak this way, and <a class="xref" href="/concepts/agent-identity-and-permissions">agent identity and permissions</a> is the binding this needs.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The server-wide knobs are a shared ceiling, so one adapter taxes every tenant.</h3>
+
+    <p>vLLM's LoRA parameters — <code class="inline">max_loras</code>, <code class="inline">max_lora_rank</code>, <code class="inline">max_cpu_loras</code> — are documented as applying to all requests, and that single sentence has most of the capacity-planning consequences in it. They are properties of the deployment, not of an adapter, which means the fleet is sized by its most demanding tenant.</p>
+
+    <p><code class="inline">--max-lora-rank</code> is the sharp edge. The docs advise setting it to the highest rank among your adapters and avoiding much larger values "since they waste memory" — so one customer who trained at rank 64 while everyone else trained at rank 8 raises the per-request working set for the whole server. The operational rule that falls out is unglamorous and worth writing down as policy: <strong>rank is a platform parameter, not a per-customer choice.</strong> Publish the supported rank, reject adapters above it at intake, and make the exception a deliberate second deployment rather than a silent tax on the shared one.</p>
+
+    <p><code class="inline">--max-loras</code> caps how many adapters can be resident concurrently, with <code class="inline">--max-cpu-loras</code> as the overflow tier. Beyond that cap, adapters swap, and swapping has a cost that shows up as tail latency on whichever tenant was unlucky. With forty adapters and eight slots, your p99 belongs to the adapters nobody is currently using — a cold-start pattern with the same shape as <a class="xref" href="/operations/agentops/sandbox-pools-and-cold-starts">sandbox pools and cold starts</a>, and one that rewards routing requests for the same adapter to the same replica. <code class="inline">--lora-target-modules</code> is the other lever worth knowing: left unset, LoRA applies to all supported modules, and restricting it to named suffixes is how you trade a little quality for a smaller working set.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Dynamic loading is the feature you want and the one the docs tell you not to run.</h3>
+
+    <p>The obvious way to operate forty adapters is to load them on demand, and vLLM supports exactly that: <code class="inline">POST /v1/load_lora_adapter</code> with a <code class="inline">lora_name</code> and <code class="inline">lora_path</code>, <code class="inline">POST /v1/unload_lora_adapter</code> to remove one, and <code class="inline">load_inplace: true</code> to replace an existing adapter's weights while keeping its name. There are resolver plugins too — <code class="inline">lora_filesystem_resolver</code> reading from a local cache directory, and <code class="inline">lora_hf_hub_resolver</code> pulling from a configured list of Hugging Face repositories.</p>
+
+    <p>All of it is gated behind an environment variable, <code class="inline">VLLM_ALLOW_RUNTIME_LORA_UPDATING</code>, and the documentation's position on it is unambiguous: it warns of security risks and says this should not be used in production unless the environment is isolated and fully trusted. The remote resolver carries its own warning that remote downloads are insecure and not intended for production. Read the mechanism and the warning is obviously right — an unauthenticated endpoint that loads arbitrary weights from an arbitrary path into your serving process is a remote code path wearing a model's clothes, and <code class="inline">load_inplace</code> means an attacker does not even need a new name to be routed to.</p>
+
+    <p>So the production shape is not "turn the flag on and put a proxy in front of it". It is to treat adapter registration as a <strong>deploy</strong>: adapters are artefacts with digests, the set of registered adapters is declared in the deployment config, and adding one rolls the fleet. That is slower and it is the same trade <a class="xref" href="/operations/agentops/rollout-and-versioning">rollout and versioning</a> makes everywhere else. If you do need runtime loading — and a platform onboarding a customer an hour genuinely does — then the flag goes on in a dedicated, network-isolated deployment whose only client is your own control plane, the adapter path is never derived from user input, and you pin and verify the artefact's digest before it is loaded rather than trusting the path.</p>
+
+    <div class="callout">
+      <p>One more edge from the same page, for anyone serving multimodal adapters: default multimodal LoRAs allow only one LoRA per prompt, and if several registered modalities appear in one prompt, <em>none</em> is applied. Not an error — a silent fall-back to the base model, which looks like a quality regression with no cause. And with <code class="inline">--enable-mixed-moe-lora-format</code>, vLLM trusts the caller's <code class="inline">is_3d_lora_weight</code> declaration, where a wrong value can cause load failures or incorrect outputs. Both belong in the test suite rather than in the incident review.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Forty adapters is forty models, and the assurance bill is where that lands.</h3>
+
+    <p>This is the step that decides whether the architecture was a good idea. At the GPU, forty adapters is one deployment. At every other layer, it is forty models — and the arithmetic is unkind:</p>
+
+<pre class="standalone"><span class="c-cm"># what one release costs, per layer</span>
+eval_suite_tasks   = 300
+adapters           = 40
+
+base_model_only    = 300          <span class="c-cm"># one run</span>
+per_adapter        = 300 * 40     <span class="c-cm"># = 12,000 task runs</span>
+
+<span class="c-cm"># and the base-model upgrade does not amortise:</span>
+<span class="c-cm"># every adapter was trained against the OLD base weights,</span>
+<span class="c-cm"># so a base bump is 40 retrainings + 40 re-evaluations,</span>
+<span class="c-cm"># not one migration.</span></pre>
+
+    <p>Each line is a real obligation rather than a counsel of perfection. A quality regression in one adapter is invisible in aggregate metrics, so <a class="xref" href="/operations/evaluation-and-observability/quality-regression-detection">regression detection</a> has to be per-adapter or it is not detection. A rollback is per-adapter, which means you need the previous digest of each one retained and reachable, not just the previous release of the service. And the base-model upgrade is the one that surprises people: an adapter is trained against specific base weights, so <a class="xref" href="/operations/agentops/model-deprecation-and-migration">model deprecation and migration</a> stops being a migration and becomes forty retrainings with forty eval runs — the cost structure described in <a class="xref" href="/operations/economics-roi/cost-of-evaluation">the cost of evaluation</a>, multiplied by your customer count.</p>
+
+    <p>Which gives a planning rule with a number in it. Divide your eval budget per release by the number of adapters you intend to serve; if the per-adapter share will not fund a meaningful suite, you are not operating forty models, you are operating one model and hoping about thirty-nine. The honest versions of that are to cut the suite to a small per-adapter smoke set plus a full suite on the base, or to serve fewer adapters.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When one adapter per customer is the wrong shape entirely.</h3>
+
+    <p>The strongest case against per-tenant adapters is that most of what people fine-tune for does not need weights. If the adapter encodes the customer's terminology, document set or house style, that is retrieval and prompting, and it costs one deployment to evaluate rather than forty. Reserve adapters for what prompting genuinely cannot reach: an output format the base model will not hold reliably, a domain whose token distribution is far from the pretraining mix, or a tool-use policy learned from the customer's own trajectories, which is the case <a class="xref" href="/deep-dives/training-agentic-models/training-on-your-own-traces">training on your own traces</a> makes.</p>
+
+    <p>Two adapter counts work well and the middle is where teams get hurt. A handful of adapters by <em>task</em> — extraction, classification, the agent's planning loop — is a small, stable set you can evaluate properly, and it composes with <a class="xref" href="/concepts/model-routing">model routing</a>. Hundreds of adapters by <em>tenant</em> is a platform business with a platform's assurance budget, built deliberately. Forty, arrived at by saying yes to customers one at a time, is the shape that has a platform's obligations and a single service's tooling.</p>
+
+    <div class="callout tip">
+      <p>Before adapter number two: resolve the adapter name server-side from the authenticated principal and log it on every request; publish one supported <code class="inline">max_lora_rank</code> and enforce it at intake; register adapters through the deployment config with pinned digests rather than the runtime-loading endpoint, unless that endpoint sits in an isolated deployment your control plane alone can reach; keep the previous digest of every adapter retained for rollback; and write down what a base-model upgrade costs at your adapter count — because that number, not the GPU saving, is what decides whether this architecture survives its second year. Related: <a class="xref" href="/concepts/parameter-efficient-fine-tuning">parameter-efficient fine-tuning</a> for what an adapter is, <a class="xref" href="/operations/agentops/serving-agent-traffic">serving agent traffic</a> for the routing layer, and <a class="xref" href="/concepts/blast-radius">blast radius</a> for why a shared engine makes one tenant's adapter everyone's problem.</p>
+    </div>
+  </div>
+</section>

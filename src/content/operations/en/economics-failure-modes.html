@@ -1,21 +1,36 @@
 <section class="phase">
   <div class="phase-num">B6</div>
   <div class="week">Operation · Economics &amp; ROI</div>
-  <h2>Agent unit economics do not erode gradually — they invert, suddenly, at the places everyone stopped looking.</h2>
-  <p class="goal">A profitable agent and a money-losing agent are frequently the same agent on different inputs. The economics rarely degrade on a smooth slope; they flip at specific structural points — retry storms, the long tail, escalation, the eval bill, and the silent-failure tax — where cost per win crosses revenue per win and stays there. This essay catalogs where the inversion happens, so the watch is on the failure surface and not on the comfortable average.</p>
+  <h2>Agent economics invert in the denominator, and the largest multiplier is a default nobody chose.</h2>
+  <p class="goal">A profitable agent and a money-losing agent are usually the same agent on different inputs, and the flip is invisible on the token meter, because every inversion here moves the denominator rather than the price. Retries, the p99 tail and escalation each multiply spend per finished piece of work while cost per token holds perfectly flat — and the retry multiplier in particular is assembled from library defaults you inherited rather than picked. The only number that shows the inversion is cost per <em>accepted</em> outcome, watched at the p99.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>Retries are a multiplier, and a multiplier on a flaky tool is unbounded.</h3>
+    <h3>Count your retry multiplier before you argue about model prices.</h3>
 
-    <p>Retry logic that looks prudent in isolation composes catastrophically. A 3× retry on a step inside a 5-deep agent tree where each level also retries is not 3×; it is 3⁵ in the worst case, and the worst case is correlated — when a dependency degrades, <em>every</em> task retries at once. The economics invert not at the average retry rate but in the correlated burst, where a tool blip turns a profitable hour into the month's largest cost line. <strong>Retry policy is a unit-economics decision disguised as a reliability detail.</strong></p>
+    <p>Nearly every agent stack retries in at least two layers, and in most of them neither layer was configured. Both of the vendor SDKs that agents are actually built on ship a non-zero retry default: <code class="inline">openai-python</code> and <code class="inline">anthropic-sdk-python</code> each define <code class="inline">DEFAULT_MAX_RETRIES = 2</code>, so a single call you believe you made once is up to <strong>three</strong> billed attempts before your own code sees an error. Anthropic's client retries on connection errors, <code class="inline">408</code>, <code class="inline">409</code>, <code class="inline">429</code> and any status at or above <code class="inline">500</code>, and will also obey a non-standard <code class="inline">x-should-retry</code> response header when the server sets one. LangChain's <code class="inline">ChatOpenAI</code> leaves <code class="inline">max_retries</code> unset by default and passes through, so it inherits the SDK's two rather than adding its own — one of the few defaults in this stack that composes politely.</p>
+
+    <p>The durable-execution layer is where it stops composing politely. Temporal retries Activities automatically, and its default Retry Policy starts at a 1-second interval with a 2.0 backoff coefficient, caps the interval at 100× the initial one, and sets <strong>Maximum Attempts to unlimited</strong> — the field defaults to zero, which is evaluated as unlimited. Workflow Executions, by contrast, are not retried by default. So the ordinary shape of a production agent — a Temporal Activity wrapping one model call — is three HTTP attempts inside an unbounded number of Activity attempts, and the only thing standing between that and a runaway is the schedule-to-close timeout, which is not set for you either.</p>
+
+<pre class="standalone"><span class="c-cm"># what the defaults actually compose to, per logical call</span>
+sdk_attempts      = 3        <span class="c-cm"># DEFAULT_MAX_RETRIES = 2, plus the original</span>
+activity_attempts = "unlimited"   <span class="c-cm"># Temporal maximumAttempts = 0</span>
+framework_retry   = 1        <span class="c-cm"># langchain-openai passes through: no extra layer</span>
+
+<span class="c-cm"># and in a nested agent, the multiplier is per level</span>
+depth = 5
+<span class="c-fn">worst_case</span>(3 ** depth)     <span class="c-cm"># 243 billed calls for one logical step</span></pre>
+
+    <div class="callout warn">
+      <p>Read your own numbers off the config rather than off this page — these are the shipped defaults as of November 2026, and vendors move them. The point is the arithmetic: a retry policy is a unit-economics decision wearing a reliability costume, and the worst case is <em>correlated</em>. When a provider degrades, every task in the fleet retries in the same minute, so the multiplier does not arrive spread thinly across a quarter. It arrives as one afternoon that becomes the month's largest cost line. See <a class="xref" href="/concepts/retry-amplification">retry amplification</a> for the failure shape and <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency and retries</a> for the construction that makes retrying safe at all.</p>
+    </div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
     <h3>The long tail eats the margin the median earned.</h3>
 
-    <p>Task cost is power-law distributed: the median task is cheap and the p99 task is 50–100× it, burning loops and fan-out on the inputs the agent handles worst. Because the tail is a small fraction of volume, it is invisible on the mean dashboard while it consumes the majority of total spend.</p>
+    <p>Task cost is power-law distributed. The median task is cheap; the p99 task is routinely 50–100× it, burning loops, fan-out and re-read context on the inputs the agent handles worst. Because the tail is a small fraction of volume, it is invisible on a mean-cost dashboard the whole time it is consuming most of the spend.</p>
 
 <pre class="standalone"><span class="c-cm"># the mean is healthy; the tail already ate the profit</span>
 median_cost = 0.18
@@ -25,40 +40,64 @@ tail_share  = 0.02          <span class="c-cm"># 2% of tasks ...</span>
 tail_spend_fraction = (0.02 * 14.0) / (0.98 * 0.18 + 0.02 * 14.0)
 <span class="c-cm"># ≈ 0.61  — 2% of tasks are 61% of total cost</span></pre>
 
-    <div class="callout warn"><p>Optimizing the median is optimizing the 39% of spend that was never the problem. The margin lives or dies on the p99 — cap, route, or refuse the tail explicitly, because it will not show up in any average you are watching until the invoice does.</p></div>
+    <p>The tail is not a separate population of unlucky tasks. It is where everything else on this page lands: the unbounded retry, the tool result nobody truncated, the run that crossed a <a class="xref" href="/operations/economics-roi/long-context-price-tiers">long-context price tier</a> and doubled the rate on its entire request. That is why capping beats optimising here. A per-task ceiling on steps and tokens, enforced by the harness rather than requested in the prompt, converts an unbounded tail into a bounded one — and a bounded tail can be priced.</p>
+
+    <div class="callout warn"><p>Optimising the median optimises the 39% of spend that was never the problem. Cap, route or explicitly refuse the tail, because it will not appear in any average you are watching until the invoice does. <a class="xref" href="/operations/economics-roi/cost-attribution">Cost attribution</a> is the prerequisite: you cannot find a p99 you cannot join to a run.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>Escalation inverts the economics it was supposed to protect.</h3>
+    <h3>Your break-even escalation rate does not contain the token bill.</h3>
 
-    <p>Human escalation is the safety valve that also quietly destroys the unit economics. Each escalated task pays the full agent cost <em>and then</em> a human's loaded cost, so an escalation rate creeping from 5% to 20% does not add 15% to cost — it can double cost per successful task, because escalations cluster on the expensive hard cases. An agent that hits its ROI target only by escalating the hard work has not automated the workflow; it has added an AI surcharge on top of the human one.</p>
+    <p>Human escalation is the safety valve that quietly destroys the unit economics, and the reason is selection: escalations do not sample the workload, they cluster on the hard cases that were always the slow ones. Work a population rather than an average. Say 80% of tasks take a person 10 minutes and 20% take 40 minutes, so the all-human average is 16 minutes. The agent clears the easy ones and escalates the hard ones — but an escalated task is not a 40-minute task, because the human now has to read the agent's partial work and decide whether to trust it before starting. Call that 25% overhead: 50 minutes.</p>
+
+<pre class="standalone"><span class="c-cm"># minutes of human time per task</span>
+all_human      = 0.80 * 10 + 0.20 * 40      <span class="c-cm"># = 16.0</span>
+escalated_task = 40 * 1.25                  <span class="c-cm"># = 50.0 (read the agent's work first)</span>
+
+<span class="c-cm"># with the agent, human time = escalation_rate * escalated_task</span>
+at_20_percent  = 0.20 * 50                  <span class="c-cm"># = 10.0  -> 37% saved, not 80%</span>
+at_35_percent  = 0.35 * 50                  <span class="c-cm"># = 17.5  -> worse than no agent</span>
+
+break_even     = 16.0 / 50.0                <span class="c-cm"># = 0.32</span></pre>
+
+    <p>Two things fall out of that arithmetic, and both are counter-intuitive. First, the break-even escalation rate is just the all-human average task time divided by the escalated task time — <strong>the agent's token bill does not appear in it at all</strong>. At these numbers the deployment inverts somewhere around a 32% escalation rate no matter what you pay per million tokens, which is why "switch to the cheap model" is not a response to this failure mode. Second, because escalation selects the tail, the escalated task time is always above the all-human average, so the break-even rate is always below 50% — often far below. An agent whose escalation rate drifts from 20% to 35% has not got 15% worse. It has crossed from saving a third of the work to costing more than doing nothing.</p>
+
+    <p>So publish the break-even rate as a number next to the escalation rate itself, and alert on the ratio rather than the level. The two inputs are measurable: time the escalated tasks, and time a sample of the same work done without the agent. If you have never measured the second one, you do not know which side of the line you are on — see <a class="xref" href="/operations/economics-roi/cost-of-human-review">the cost of human review</a> and <a class="xref" href="/operations/economics-roi/fractional-time-savings">fractional time savings</a>, where the minutes-saved claim gets taken apart properly.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>The eval bill scales with autonomy, not with revenue.</h3>
+    <h3>The assurance bill scales with autonomy, not with revenue.</h3>
 
-    <p>Making an autonomous agent trustworthy costs money that the pilot did not: LLM-as-judge calls on every output, regression suites on every model upgrade, trace storage, and human review of the eval itself. This cost grows with the agent's autonomy and risk surface, not with the revenue it earns — so the safer and more autonomous you make it, the more the eval line crowds the margin. It is real cost of goods, and a model that books it as one-time R&amp;D is hiding the inversion, not avoiding it.</p>
+    <p>Making an autonomous agent trustworthy costs money the pilot never paid: judge calls on sampled or every output, a regression suite re-run on every model and prompt change, trace storage with a retention clock, and human review of the eval set itself because an unmaintained eval silently stops measuring. That cost tracks the agent's autonomy and blast radius, not the revenue it earns — so the safer and more autonomous you make it, the more the assurance line crowds the margin, and it crowds it hardest precisely where the agent is allowed to act without a human in front of it.</p>
+
+    <p>Two accounting errors make this invert without warning. Booking it as one-time R&amp;D hides a recurring cost of goods: every model deprecation forces a re-run, and <a class="xref" href="/operations/agentops/model-deprecation-and-migration">model deprecation</a> is not an event you schedule. And costing review in money while rationing it in people ignores the real constraint — review capacity is a headcount ceiling, not a budget line, so the agent's throughput is capped by the reviewers long before it is capped by spend. That ceiling is the subject of <a class="xref" href="/concepts/oversight-capacity">oversight capacity</a>; the spend side is <a class="xref" href="/operations/economics-roi/cost-of-evaluation">the cost of evaluation</a>.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>The silent-failure tax is the cost you only pay downstream.</h3>
+    <h3>The silent-failure tax is the only line that never reaches a meter.</h3>
 
-    <p>The most expensive failure is the one that costs nothing on the dashboard: a confident, wrong answer that passes the agent's own checks, ships, and detonates downstream — a wrong refund, a bad merge, a misfiled record. Its cost is not in the model bill; it is the cleanup, the trust damage, and the human re-verification of everything the agent now touches.</p>
+    <p>The most expensive failure costs nothing on any dashboard you own: a confident, wrong answer that passes the agent's own checks, ships, and detonates downstream as a wrong refund, a bad merge, a misfiled record. Its cost is not in the model bill. It is the cleanup, the trust damage, and the human re-verification of everything the agent has touched since.</p>
 
     <ul>
-      <li><strong>It is unmetered.</strong> No token counter sees it; it surfaces as a support cost, a chargeback, or churn weeks later.</li>
-      <li><strong>It taxes the wins too.</strong> One silent failure forces re-checking of the correct outputs, erasing the labor savings that justified the agent.</li>
-      <li><strong>It compounds the ROI lie.</strong> ROI counted the output as a success; the real ledger pays for it twice.</li>
+      <li><strong>It is unmetered.</strong> No token counter sees it. It surfaces weeks later as a support cost, a chargeback, or churn, by which time it has no attributable run.</li>
+      <li><strong>It taxes the wins too.</strong> One silent failure forces re-checking of the correct outputs as well, which erases the labour saving that justified the agent — and that re-check is the escalation arithmetic in STEP 3 applied retroactively to work you had already booked as done.</li>
+      <li><strong>It compounds the ROI claim.</strong> Your ROI counted the output as a success. The real ledger pays for it twice, and <a class="xref" href="/operations/economics-roi/cost-of-agent-errors">the cost of agent errors</a> is where that second payment gets priced.</li>
     </ul>
+
+    <p>The operational consequence is that this failure mode is bounded by detection latency, not by error rate. An agent with a 2% silent-error rate and same-day detection is a manageable product; the same agent with a three-week detection lag is a repair project, because by then the wrong actions are a backlog of judgements rather than a set of rows you can roll back. That asymmetry is the whole argument of <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing what the agent already did</a>, and it is why <a class="xref" href="/concepts/failure-concealment">failure concealment</a> is an economics problem and not only a safety one.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
     <h3>When the honest move is to narrow scope or not ship.</h3>
 
-    <p>When the tail cannot be bounded, escalation cannot be contained, or the silent-failure tax exceeds the labor saved, the economics do not improve with scale — they invert harder, because every failure mode here is amplified by volume. The fix is rarely a cheaper model; it is a narrower scope where the agent is actually reliable, or a decision not to ship this workflow. <strong>An agent that is only profitable on its easy inputs is not a product with a tuning problem — it is a smaller product pretending to be a bigger one.</strong></p>
+    <p>When the tail cannot be bounded, the escalation rate will not stay under its break-even, or the silent-failure tax exceeds the labour saved, the economics do not improve with scale — they invert harder, because every failure mode here is amplified by volume rather than diluted by it. The fix is rarely a cheaper model. It is a narrower scope on which the agent is actually reliable, or a decision not to ship this workflow at all. <strong>An agent that is only profitable on its easy inputs is not a product with a tuning problem; it is a smaller product pretending to be a bigger one</strong> — and shipping the smaller one deliberately is a better outcome than discovering it from an invoice. <a class="xref" href="/operations/economics-roi/scaling-back-an-agent-deployment">Scaling back a deployment</a> is the version of this decision taken late.</p>
+
+    <div class="callout tip">
+      <p>Four changes, in order, none of which requires an architecture change. <strong>One:</strong> set <code class="inline">max_retries=0</code> on the vendor client and own retry in exactly one layer, with <code class="inline">maximumAttempts</code> and a schedule-to-close timeout set explicitly rather than inherited. <strong>Two:</strong> put cost per accepted outcome on the dashboard at p50 <em>and</em> p99, where accepted means it passed your evaluation and not that it returned. <strong>Three:</strong> compute the break-even escalation rate from measured minutes and alert when the live rate crosses a fixed fraction of it. <strong>Four:</strong> move eval and review spend out of R&amp;D and into cost of goods, so the margin you report is the margin you have. Related: <a class="xref" href="/operations/economics-roi/unit-economics">unit economics</a> for the base model, and <a class="xref" href="/operations/economics-roi/price-deflation-and-cost-per-task">price deflation and cost per task</a> for why falling token prices do not rescue any of the five.</p>
+    </div>
   </div>
 </section>

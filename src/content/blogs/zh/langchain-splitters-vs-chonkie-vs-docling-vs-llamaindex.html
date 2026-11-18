@@ -1,0 +1,187 @@
+<p class="lede">生态里用得最广的那个切分器，至今默认切 4,000 个<em>字符</em>，由 Python 的 <code>len()</code> 来数——而从来没有哪个嵌入模型有过「字符上限」。这处错位就是本文的全部主题：请选那个「以你的嵌入模型分词器为单位」的库，然后把它钉死，因为分块边界是一份模式，一旦改动，你已经存下的每一个向量、每一处引用偏移、每一个评测数字都会随之作废。</p>
+
+<section>
+  <h2>一览</h2>
+  <p>四个库，按 2026 年 11 月 18 日 PyPI 上的版本阅读。它们并不是同一个想法的四种实现；它们对「一个分块该用什么来度量」存在分歧，而这恰恰是唯一会改变你检索数字的那条轴。</p>
+
+  <table>
+    <thead>
+      <tr><th>库</th><th>版本（2026-11-18）</th><th>分块单位</th><th>许可证</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>langchain-text-splitters</code></td><td>1.1.3（2026-10-02）</td><td>字符，经 <code>len()</code></td><td>MIT</td></tr>
+      <tr><td><code>chonkie</code></td><td>1.7.0（2026-07-07）</td><td>token，或原始字节</td><td>MIT</td></tr>
+      <tr><td><code>docling-core</code>（HybridChunker）</td><td>2.107.1（2026-11-16）</td><td>token，用你的分词器</td><td>MIT</td></tr>
+      <tr><td><code>llama-index-core</code></td><td>0.14.26（2026-11-13）</td><td>句子，由嵌入打分</td><td>MIT</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/langchain-splitters-vs-chonkie-vs-docling-vs-llamaindex/data-feature-matrix.svg" alt="四个库在分块单位、文档结构感知与边界可复现性三条轴上的对照矩阵" width="900" height="400" loading="lazy" />
+    <figcaption>四者都是 MIT 许可、都在持续发版。它们的分歧在单位，以及你能否复现出去年那套边界。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>默认值本身就是结论</h2>
+  <p>在那个确切的发布标签上读 <code>langchain_text_splitters</code>，基类是这么写的：</p>
+
+  <pre><code>class TextSplitter(BaseDocumentTransformer, ABC):
+    def __init__(
+        self,
+        chunk_size: int = 4000,
+        chunk_overlap: int = 200,
+        length_function: Callable[[str], int] = len,
+        ...
+    ) -&gt; None:
+        """
+            chunk_size: Maximum size of chunks to return
+            chunk_overlap: Overlap in characters between chunks
+        """</code></pre>
+
+  <p><code>RecursiveCharacterTextSplitter</code>——每篇教程都伸手去拿的那一个——自己并不声明任何尺寸。它继承上面这些，所以开箱状态下它按 4,000 个字符切、重叠 200 个字符，而那行文档字符串把「characters」写得明明白白。</p>
+
+  <p>这为什么要紧，是算术问题，不是口味问题。英文散文大约四个字符一个 token，所以 4,000 个字符落在 1,000 token 附近，塞进任何现代嵌入模型的窗口都很宽裕。而压缩过的 JSON、源代码，以及中文或日文文本，并不是四个字符一个 token；它们更接近一个字符一个 token。同一个默认值，给博客文章切出舒舒服服的 1,000 token 分块，给中日文语料切出的分块却是模型上限的好几倍，于是嵌入调用默默截断——这意味着那个分块的尾部以文本形式躺在你的索引里，却缺席于那个负责把它检索出来的向量。</p>
+
+  <p>这个库默认用字符并没有错；在不知道你用哪个分词器的前提下，<code>len()</code> 是唯一可用的长度函数。错在下游：把默认值当成了推荐值。改成按 token 计数只差一个参数——<code>TokenTextSplitter</code>，或者 <code>.from_tiktoken_encoder()</code>、<code>.from_huggingface_tokenizer()</code>——而值得这么做的理由是：你检索器的单位和你切分器的单位，应该是同一个单位。</p>
+</section>
+
+<section>
+  <h2>langchain-text-splitters——菜单最宽，默认最弱</h2>
+  <p>它的长处是覆盖面。这个包导出了 20 多个切分器，包括 <code>MarkdownHeaderTextSplitter</code>、三个 HTML 切分器、<code>RecursiveJsonSplitter</code>、按语言划分的代码切分器，以及若干由分词器支撑的变体。面对一份异质语料、需要按文件类型换策略、又不想引四个依赖，它依然是务实的答案。</p>
+
+  <h3>那些结构感知的切分器真正帮得上忙的地方</h3>
+  <p>标题切分器是被低估的那部分。<code>MarkdownHeaderTextSplitter</code> 按标题层级切，并把标题路径挂成元数据，这几乎把人们追着语义切分去要的那份收益给了你，而且一分钱成本都不用付——一个知道自己来自<em>定价 → 企业版</em>的分块，是重排器用得上的分块。注意它与 <code>HTMLHeaderTextSplitter</code> 都不继承 <code>TextSplitter</code>，因此它们压根不接受 <code>chunk_size</code>；它们是第一道工序，之后你再把结果喂给一个有尺寸上限的切分器。</p>
+
+  <h3>SemanticChunker 并不在这个包里</h3>
+  <p>值得直说，因为它会动你的依赖图：LangChain 的 <code>SemanticChunker</code> 住在 <code>langchain-experimental</code>（0.4.2，2026-05-22 发布）里，而不是 <code>langchain-text-splitters</code>。它自己的模块文档字符串称其为「Experimental text splitter based on semantic similarity」，并把 Greg Kamradt 的 notebook 列为该方法的来源。它的默认值是 <code>buffer_size=1</code> 与第 95 百分位的断点阈值。</p>
+</section>
+
+<section>
+  <h2>Chonkie——原生按 token，也是唯一留了字节级后门的那个</h2>
+  <p>Chonkie 1.7.0 带了十二个切分器，而且与 LangChain 不同，它的默认单位就是 token。该版本的清单是 <code>TokenChunker</code>、<code>FastChunker</code>、<code>SentenceChunker</code>、<code>RecursiveChunker</code>、<code>SemanticChunker</code>、<code>LateChunker</code>、<code>CodeChunker</code>、<code>NeuralChunker</code>、<code>SlumberChunker</code>、<code>TableChunker</code> 与 <code>TeraflopAIChunker</code>。其中两个的意味超出名字本身：<code>LateChunker</code> 实现了下文那种「先嵌入、后切分」的次序，而 <code>SlumberChunker</code>——README 也把它叫作「AgenticChunker」——把一个 LLM 放进了切分回路里。</p>
+
+  <h3>把那些性能宣称当作厂商数字来读</h3>
+  <p>README 打头的是 token 切分「33x faster than the slowest alternative」，以及一个 505 KB 的 wheel 对比「1-12MB for alternatives」。而仓库自己的 <code>BENCHMARKS.md</code> 更有用、也更不齐整：在 100,000 篇维基百科文章上，它报告 Chonkie 的 token 切分为 58 秒、LangChain 为 1 分 10 秒——差距是 1.21 倍，不是 33 倍——而 LlamaIndex 是 50 分钟，那个大倍数就是从这儿来的。安装体积的数字在两份文件之间也互相矛盾（README 说 49 MB，<code>BENCHMARKS.md</code> 说默认 15 MiB）。这些是厂商自测自报的营销数字；真正可以据以规划的是对 LangChain 的那 1.21 倍，而对多数语料来说，切分本来就不是瓶颈。</p>
+
+  <h3>FastChunker 才是真正新鲜的那一项</h3>
+  <p>一个用 SIMD 加速、基于字节的切分器、还包含在默认安装里，这件事听起来没什么用——直到你要重切一份大到让分词器开销占主导的语料。它适合做一次批量的首轮切分，而不适合任何你打算直接拿去嵌入的东西，因为字节离你检索器的单位比字符还要远。</p>
+</section>
+
+<section>
+  <h2>Docling HybridChunker——唯一围着你的分词器来设计的那个</h2>
+  <p>Docling 把设计反了过来。它的 <code>HierarchicalChunker</code> 依据解析出的版面，为每一个被识别出的文档元素产出一个分块；随后 <code>HybridChunker</code> 按文档的原话施加「tokenization-aware refinements on top of document-based hierarchical chunking」——一轮只在必要时切分（即「oversized w.r.t. tokens」），另一轮把「undersized successive chunks with same headings &amp; captions」合并，由 <code>merge_peers</code>（默认 <code>True</code>）控制。当一张表跨越多个分块时，它还会通过 <code>repeat_table_header</code>（默认 <code>True</code>）把表头重复进每一块。</p>
+
+  <h3>默认分词器就是那个坑</h3>
+  <p>Docling 的示例 notebook 把规则写明了：「In a RAG / retrieval context, it is important to make sure that the chunker and embedding model are using the same tokenizer.」但分词器这个参数是可选的，而默认值是 <code>sentence-transformers/all-MiniLM-L6-v2</code>：</p>
+
+  <pre><code>class HybridChunker(BaseChunker):
+    tokenizer: BaseTokenizer = Field(default_factory=_get_default_tokenizer)
+    repeat_table_header: bool = True
+    merge_peers: bool = True</code></pre>
+
+  <p>于是，一条用 Voyage、Cohere 或 OpenAI 模型做嵌入、却没设分词器的流水线，是在拿一个 384 维 MiniLM 的分词器与 256 token 的序列长度去给分块编预算。什么错都不会报。你得到的是一批尺寸不适配那个即将嵌入它们的模型的分块——而这恰恰发生在那个为把这件事做对而生的库里。</p>
+
+  <h3>你会看到的那条警告是误报</h3>
+  <p>Docling 的 FAQ 提前打了招呼：HybridChunker 会触发<em>「Token indices sequence length is longer than the specified maximum sequence length for this model」</em>，而 FAQ 称之为「a known &amp; anticipated 'false alarm'」——切分器之所以在一段长序列上调用分词器，正是为了数它有多长，所以 <code>transformers</code> 在切分发生之前就先警告了。该查的数字是 FAQ 让你打印的那个：实际产出的最长分块，对比模型的最大长度。把这项检查放进 CI，那条警告就不再要紧了。</p>
+</section>
+
+<section>
+  <h2>LlamaIndex 的 node parser——句子，加一个你必须调的阈值</h2>
+  <p><code>SemanticSplitterNodeParser</code> 把句子分组，并在嵌入的不相似度越过某个百分位时下刀：<code>buffer_size=1</code>、<code>breakpoint_percentile_threshold=95</code>。文档字符串把这个旋钮的方向说得很清楚——「the smaller this number is, the more nodes will be generated」——而文档列的是两条注意事项、而非称其为实验性：「The regex primarily works for English sentences」以及「You may have to tune the breakpoint percentile threshold.」</p>
+
+  <p>那个安静的后果，正是属于本文论点的那一条：一个语义切分器的边界，是某个嵌入模型的函数。换掉嵌入模型，你改变的就不只是向量，而是分块边界本身——于是本应是「把同一批分块重新嵌入」的迁移，变成了「重新切分并重新嵌入」，而你针对旧节点存下的每一处引用偏移都错了。</p>
+
+  <h3>SentenceWindowNodeParser 是那位规矩得多的表亲</h3>
+  <p>它把文本切成单句，并把周围的窗口存进元数据（默认 <code>window_size=3</code>，即每侧三句），对嵌入模型与 LLM 都不可见，直到 <code>MetadataReplacementNodePostProcessor</code> 在生成前把那一句替换为它的上下文。这是一条确定性的边界外加一份上下文载荷——在精神上离「晚期切分」比离「语义切分」更近，而且复现起来容易得多。</p>
+</section>
+
+<section>
+  <h2>把你切掉的上下文买回来</h2>
+  <figure>
+    <img src="/blogs/langchain-splitters-vs-chonkie-vs-docling-vs-llamaindex/arch-chunk-first-vs-late.svg" alt="两条流水线：先切分再嵌入，对比先嵌入整段文本再按分块池化" width="900" height="320" loading="lazy" />
+    <figcaption>晚期切分不动边界，只改变每个分块的向量被允许看到什么。</figcaption>
+  </figure>
+
+  <p>上面每一个切分器都有同一个结构性毛病：一个分块的向量从未见过文档的其余部分，所以一个主语出现在三段之前的句子，是在没有那个主语的情况下被嵌入的。有两种已发表的技术从相反的两头来对付它，而且都不要求你去挪动边界。</p>
+
+  <h3>晚期切分改的是次序</h3>
+  <p>Günther、Mohr、Williams、Wang 与 Xiao 的《Late Chunking: Contextual Chunk Embeddings Using Long-Context Embedding Models》（arXiv 2409.04701，2024）先让 transformer 跑过整段文本，再把 token 向量按每个分块的跨度做均值池化，而不是把每个分块单独嵌入。作者自己仓库里的增益是真实的，但幅度不大且不均匀：在 BeIR 上、256 token 的分块、用 <code>jina-embeddings-v2-small-en</code>，SciFact 的 nDCG@10 从 64.20% 动到 66.10%，NFCorpus 从 23.46% 动到 29.98%；但 Quora 上两者完全相同（都是 87.19%），而在 NFCorpus 与 TRECCOVID 上，压根不切分反而比两者都好。仓库自己那句观察才是有用的：增益与文档平均长度相关。短文档本来就没有什么远处的上下文可丢。</p>
+
+  <h3>上下文化检索改的是文本</h3>
+  <p>Anthropic 在 2024 年 9 月的方法，是在嵌入每个分块之前，给它前置一句由模型生成、知晓整篇文档的句子。公布出来的那道阶梯是这个领域里最值得引用的一组数字，而且四行用的是同一套分块边界：</p>
+
+  <figure>
+    <img src="/blogs/langchain-splitters-vs-chonkie-vs-docling-vs-llamaindex/data-retrieval-failure-ladder.svg" alt="前 20 个分块的检索失败率柱状图：5.7%、3.7%、2.9%、1.9%" width="900" height="400" loading="lazy" />
+    <figcaption>Anthropic，2024 年 9 月：失败率下降 67%，而文档被切在哪里一点没动。</figcaption>
+  </figure>
+
+  <p>仅上下文化嵌入就把前 20 分块的检索失败率降低了 35%（5.7% → 3.7%）；再加上下文化 BM25 达到 49%（5.7% → 2.9%）；再加重排达到 67%（5.7% → 1.9%）。一次性的生成成本被写作「$1.02 per million document tokens」。把它对着晚期切分那张表读，这个对比对「挑切分器」这件事相当不客气：挪动边界买到的是个位数的 nDCG 分，而在同一套边界上加上下文与一个<a href="/zh/concepts/rerankers">重排器</a>，砍掉了三分之二的失败。</p>
+</section>
+
+<section>
+  <h2>为什么边界是一份模式</h2>
+  <p>下面这个论点，那四个库的文档都不会替你讲。分块边界不是一项预处理选择，它是一个键。有三件产物是以它为基准定义的，而当它挪动时，这三件都会无声地坏掉：</p>
+
+  <ul>
+    <li><strong>每一个已存向量。</strong>你索引里的那个嵌入，是某一段具体跨度的嵌入。重新切分之后，那些向量描述的是已不再以那种形状存在的文本，于是索引以一种任何新鲜度检查都发现不了的方式过期了——参见<a href="/zh/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">索引新鲜度与失效</a>。</li>
+    <li><strong>每一处引用偏移。</strong>如果你给用户显示「第 4 页，第 1,200–2,000 个字符」，这些数字是相对于某套边界方案的。一次改动了分隔符列表的库升级，会改变下刀的位置，而你的引用现在指偏了一整段。</li>
+    <li><strong>每一个评测数字。</strong>一个检索分数，是（切分器、嵌入器、检索器）这个三元组的分数。跨着一次切分器版本升级，把这个月的召回率和上个月的相比，比的其实什么都不是——这正是<a href="/zh/deep-dives/retrieval-and-rag/evaluating-rag">评测 RAG</a> 的主题。</li>
+  </ul>
+
+  <p>于是运营上的规则很短。把切分库钉到确切版本、按名字钉死分词器，并把两者都记进索引元数据、放在嵌入模型旁边——然后把这三者中任何一者的改动，当作一次带回填的索引迁移来对待，而不是当作一次依赖升级。这与<a href="/zh/operations/agentops/reindexing-and-embedding-migrations">重建索引与嵌入迁移</a>是同一套纪律，而切分器属于它的管辖范围之内。</p>
+
+  <p>这也是为什么这方面的评测工具存在、而且值得知道：Smith 与 Troynikov 的《Evaluating Chunking Strategies for Retrieval》（Chroma，2024 年 7 月）附带一个配套包，用 token 级的交并比（IoU）与召回率，针对一份生成出来的数据集给切分器打分，并在定长 token 与递归两条基线之外实现了 <code>ClusterSemanticChunker</code> 与 <code>LLMSemanticChunker</code>。对「这一刀有没有落在答案所在之处」这个问题，IoU 才是对的指标，单看召回率不是——一个切分器完全可以靠返回大块、让答案连同其他一切一起被包含进来，从而在召回率上拿到好分数。</p>
+</section>
+
+<section>
+  <h2>什么情况选哪个</h2>
+  <table>
+    <thead>
+      <tr><th>情形</th><th>选</th><th>理由</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>PDF、DOCX、表格，以及任何带版面的东西</td><td>Docling HybridChunker</td><td>唯一既读解析出的结构、又按你分词器的 token 编预算的——但请显式设定分词器。</td></tr>
+      <tr><td>混合语料、文件类型多、只想引一个依赖</td><td><code>langchain-text-splitters</code></td><td>菜单最宽，含标题与代码切分器。第一天就把那个字符默认值覆盖掉。</td></tr>
+      <tr><td>大语料、经常重切，或者想在库内就用上晚期切分</td><td>Chonkie</td><td>默认原生按 token、带 <code>LateChunker</code>，还有一条字节级快路用于批量处理。</td></tr>
+      <tr><td>已经在用 LlamaIndex，想要上下文但不动边界</td><td><code>SentenceWindowNodeParser</code></td><td>确定性的句子边界，外加一个元数据上下文窗口；在可复现性上是语义切分做不到的。</td></tr>
+      <tr><td>真正的问题是检索质量</td><td>以上都先别选</td><td>给你现有的边界加上生成的上下文与一个重排器。已公布的增益远大于任何边界改动。</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>我该用多大的分块？</h3>
+  <p>用 token 来问，不要用字符，并且对着你嵌入模型的序列长度与你重排器的预算来回答。Anthropic 自己那份 RAG 入门把分块描述为「usually no more than a few hundred tokens」，而他们公布的结果用的是 800 token 的分块；具体数字远不如「你是用检索器的那个单位量出来的」这件事要紧。</p>
+  <h3>语义切分比定长切分更好吗？</h3>
+  <p>还不到可以拿它当头牌的程度。那些挪动边界的技术，已发表的证据显示的是个位数的改进，而且随语料而变——晚期切分在 SciFact 与 NFCorpus 上有帮助、在 Quora 上打平、在两个数据集上输给了压根不切分。LangChain 与 LlamaIndex 都在自家文档里给语义切分器留了余地，一个标为「实验性」，另一个附上了「正则主要适用于英文句子」与「阈值需要调」这两条注意事项。</p>
+  <h3>晚期切分和上下文化检索是一回事吗？</h3>
+  <p>不是。晚期切分改的是操作次序——先嵌入整段文本、再按分块池化——而且不增加任何 token。上下文化检索改的是文本：在嵌入之前给每个分块前置一句生成的定位句，一次性成本被写作每百万文档 token 1.02 美元。两者可以兼容，而且都把边界留在原处。</p>
+  <h3>Docling 的 HybridChunker 需要我传分词器参数吗？</h3>
+  <p>尽管它是可选的，你也应该传。默认值是 <code>sentence-transformers/all-MiniLM-L6-v2</code>，所以在用另一个模型做嵌入时把它留空，就是在拿错误的分词器默默给分块定尺寸——而这恰恰是这个切分器被设计出来要防的那种失败。</p>
+  <h3>Chonkie 真的比 LangChain 快 33 倍吗？</h3>
+  <p>不。README 那个数字是跟这一组里最慢的那个比，而那是 LlamaIndex。Chonkie 自己的基准文件给出的是：在 100,000 篇维基百科文章上，token 切分 58 秒对 LangChain 的 1 分 10 秒——约 1.2 倍。这些全都是厂商自测的。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站：</h3>
+  <ul>
+    <li><a href="/zh/concepts/chunking-and-vector-search">分块与向量检索</a>——这个概念，从头讲起。</li>
+    <li><a href="/zh/deep-dives/retrieval-and-rag/contextual-retrieval">上下文化检索</a>——那道失败率阶梯背后的技术，深入版。</li>
+    <li><a href="/zh/deep-dives/retrieval-and-rag/document-parsing-for-rag">面向 RAG 的文档解析</a>——切分器之前发生了什么，以及 Docling 那道版面解析为何存在。</li>
+    <li><a href="/zh/deep-dives/retrieval-and-rag/index-freshness-and-invalidation">索引新鲜度与失效</a>——一次边界改动制造出的过期索引问题。</li>
+    <li><a href="/zh/deep-dives/retrieval-and-rag/retrieval-over-tables-and-spreadsheets">对表格与电子表格的检索</a>——为什么把电子表格切成分块，会删掉让它可被回答的那个东西。</li>
+    <li><a href="/zh/operations/agentops/reindexing-and-embedding-migrations">重建索引与嵌入迁移</a>——怎么跑一次重切所要求的回填。</li>
+  </ul>
+  <h3>项目来源：</h3>
+  <ul>
+    <li><a href="https://github.com/langchain-ai/langchain/tree/master/libs/text-splitters">langchain-text-splitters</a></li>
+    <li><a href="https://github.com/chonkie-inc/chonkie">Chonkie</a></li>
+    <li><a href="https://github.com/docling-project/docling">Docling</a></li>
+    <li><a href="https://github.com/run-llama/llama_index">LlamaIndex</a></li>
+    <li><a href="https://github.com/jina-ai/late-chunking">晚期切分（Jina AI）</a></li>
+    <li><a href="https://github.com/brandonstarxel/chunking_evaluation">Chroma 的切分评测包</a></li>
+  </ul>
+</section>
