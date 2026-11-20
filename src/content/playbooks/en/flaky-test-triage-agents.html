@@ -1,0 +1,86 @@
+<section class="phase">
+  <div class="phase-num">U34</div>
+  <div class="week">Playbook · Coding &amp; Computer-Use Agents</div>
+  <h2>Proving a test is flaky is cheap; proving one is fixed is not. Build the agent around that asymmetry or it will quietly delete your suite.</h2>
+  <p class="goal">A flaky-test agent that can quarantine but never has to justify a release will shrink your suite to the tests that always pass, and every build will be green on the way down. The asymmetry is the whole design: one rerun that passes on an unchanged commit proves flakiness outright, while proving a test is <em>no longer</em> flaky takes 59 clean reruns at a 5% flake rate — so quarantine entry can be automatic and quarantine exit can only ever be a deadline with a name on it.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>Do the arithmetic before you design the loop, because it decides which questions the agent may ask.</h3>
+    <p>A test that fails independently 5% of the time passes a single rerun 95% of the time. Rerun it <code class="inline">n</code> times and see nothing, and the chance you would have seen nothing anyway is <code class="inline">0.95^n</code>. To push that under 5% — the weakest confidence anyone would accept — takes 59 consecutive passes. At a 1% flake rate it takes 299. Those numbers are the reason "just rerun it until we know" is not an available strategy: the agent would spend more compute confirming one test's health than running the entire suite.</p>
+    <p>Now run it the other way. A test that <em>failed</em> and then <em>passed</em> on the identical commit, with no code change between the two runs, is flaky by definition — the suite has just contradicted itself, and one observation settles it. Flakiness is cheaply provable and health is not, and every routing decision in the agent follows from that:</p>
+    <ul>
+      <li><strong>"Is this failure a flake?"</strong> — answerable, cheaply, from one rerun plus history. Let the agent decide this and act on it.</li>
+      <li><strong>"Is this test healthy again?"</strong> — not answerable at any price you will pay. Never let the agent decide this. Exit from quarantine is a date and an owner, not an evidence threshold.</li>
+      <li><strong>"Is this a real regression?"</strong> — answerable only in the negative. The agent can show a failure is a flake; it cannot show a failure is not, so the default on an unresolved failure must stay "blocks".</li>
+    </ul>
+    <div class="callout warn"><p>The common build inverts this. Teams give the agent a confidence score and a threshold, and the threshold silently answers the unanswerable question — "80% confident it is flaky" becomes a de-quarantine, and the 20% is a regression now shipping on a green board. See <a href="/deep-dives/evaluating-agents/eval-variance-and-statistical-power" class="xref">eval variance and statistical power</a> for the same error in eval harnesses.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Feed it history keyed to test identity, not to the test's name.</h3>
+    <p>The agent's entire diagnostic power is in the record of previous runs, which means the record has to survive the things that happen to tests. A rename, a move between files, or a parameterised case whose id contains a timestamp all break name-keyed history, and the agent then sees a brand-new test with a single failure and no basis for any judgement at all. Key on something stable — a hash of the test's fully qualified path plus its parameter set, carried in the report — and store, per run: the commit, the outcome, the duration, the worker or shard, and the failure's first stack frame.</p>
+<pre class="standalone"><span class="c-cm"># The four queries that do all the work. Everything else is decoration.</span>
+same_commit_disagreement  <span class="c-cm"># failed and passed at the same SHA -> flake, proven</span>
+first_seen_failing_sha    <span class="c-cm"># bisect target if it has never passed since</span>
+shard_skew                <span class="c-cm"># fails only on worker 3 -> shared port/fixture, not the test</span>
+duration_p99_vs_timeout   <span class="c-cm"># 'flake' that is a timeout you set 200ms above p99</span>
+</pre>
+    <p>That last query catches the single most misclassified family in practice. A test whose p99 duration sits just under its timeout is not flaky, it is correctly reporting that the thing it calls got slower, and an agent that quarantines it has suppressed a performance regression. Make the agent check the duration distribution before it is allowed to use the word flake at all — see <a href="/playbooks/coding-and-computer-use-agents/performance-optimization-agents" class="xref">performance optimization agents</a> for where that signal should have gone instead.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Make quarantine a governed action with an expiry, not a label.</h3>
+    <p>Quarantine is the agent's only real power and it is a write to your risk posture, so it gets the treatment any other privileged action gets: a record, a named owner, a blast radius and a deadline that fires whether or not anyone did the work. The expiry is the load-bearing field. Without it the population only grows, because nothing in the system has an interest in taking a test back out.</p>
+<pre class="standalone"><span class="c-cm"># quarantine/checkout_total_rounding.yml — written by the agent, owned by a human</span>
+test: tests/billing/test_checkout.py::test_total_rounding[eu]
+identity: 9f2c4b           <span class="c-cm"># stable hash, survives renames</span>
+proven_by: same-commit-disagreement at 4e81aa0
+first_seen: 2026-11-14
+owner: billing-platform    <span class="c-cm"># a team that can be paged, never 'unassigned'</span>
+expires: 2026-11-28        <span class="c-cm"># 14 days. On expiry the test un-quarantines and blocks.</span>
+scope: pr-gate             <span class="c-cm"># pr-gate | nightly | never-release-gate</span>
+still_runs: true           <span class="c-cm"># reported, just not blocking. NEVER skip the test.</span>
+suspected: shared-fixture  <span class="c-cm"># agent's hypothesis, not a verdict</span>
+</pre>
+    <p>Two fields deserve argument. <code class="inline">still_runs: true</code> is non-negotiable: a quarantined test must keep executing and keep reporting, or you have lost the only data that could ever retire the quarantine, and you have converted a known-unreliable signal into no signal. And <code class="inline">scope</code> exists because the release gate is a different question from the pull-request gate — an agent may reasonably stop a flake from blocking one developer's merge and must never be the thing that decides a release ships. Wire the gate itself as described in <a href="/playbooks/coding-and-computer-use-agents/merge-queues-for-agent-changes" class="xref">merge queues for agent changes</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Give it the four repairs that are real, and forbid the one that works.</h3>
+    <p>Most flakiness has a small number of mechanical causes, and an agent with repository context is genuinely good at them because each leaves a recognisable signature in the diff or the failure. Scope the agent to these and require a reproduction before and after:</p>
+    <ul>
+      <li><strong>Order dependence</strong> — passes alone, fails after a sibling. Signature: state left in a module-level or class-level fixture. The repair is isolation, and it is verifiable by running the pair in both orders.</li>
+      <li><strong>Shared resource collision</strong> — fails only under parallelism or only on one shard. Signature: a hard-coded port, path, table name or temp directory. The repair is to derive it from the worker id.</li>
+      <li><strong>Clock and timezone</strong> — fails at midnight, on the 1st, or in one CI region. Signature: a real <code class="inline">now()</code> in the assertion path. The repair is to inject the clock.</li>
+      <li><strong>Unconditional waits</strong> — a <code class="inline">sleep</code> standing in for a condition. Signature: a timing-shaped failure under load. The repair is to poll the condition with a timeout, which is a different thing from sleeping longer.</li>
+    </ul>
+    <p>Then the prohibition. The agent must never add a retry wrapper, lengthen a sleep, loosen an assertion, or mark a test skipped — and the reason is not purity, it is that retry-on-failure is the most effective of all these repairs and the arithmetic is what makes it a trap. At a 5% flake rate, retrying a failure up to three times drops the reported failure rate from 1 in 20 to roughly 1 in 8,000, and costs about 5% more runtime, because the extra runs only happen on the 5% that failed. It is cheap, it works, and it is indistinguishable at the dashboard from having fixed the test. It also hides a genuine 5%-of-the-time regression just as completely. A repair the agent is allowed to make must change the test's behaviour, not its reporting.</p>
+    <div class="callout warn"><p>If your CI already retries failures globally, the agent has no signal to work from — <code class="inline">same_commit_disagreement</code> is being consumed and discarded inside the runner before anything records it. Turn the retry into a <em>recorded</em> rerun that reports both outcomes before you build any of this. That one change is often worth more than the agent.</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>Measure the population, not the agent's close rate.</h3>
+    <p>A close rate rewards exactly the behaviour you are trying to prevent, because quarantining is a close. Four numbers tell you whether the thing is reducing risk or laundering it, and all four are properties of the suite rather than of the agent:</p>
+    <ul>
+      <li><strong>Quarantine population over time</strong> — must be flat or falling. Rising monotonically means the expiry is not firing or is being renewed by default, which is the same failure.</li>
+      <li><strong>Median quarantine age</strong> — the honest measure of whether anyone is doing the repairs. If it exceeds your expiry window, your expiries are being rubber-stamped.</li>
+      <li><strong>Escape rate</strong> — defects that reached the default branch through a test that was quarantined at the time. This is the number the agent exists to keep at zero, and the only one that can justify shutting it off.</li>
+      <li><strong>Reruns per proven flake</strong> — your actual compute bill for the diagnosis. If it drifts above a handful, the agent is rerunning instead of reading history, and STEP 1's arithmetic is about to arrive as an invoice.</li>
+    </ul>
+    <p>Report all four on the same surface as the suite's pass rate, because the pass rate alone will improve under every one of the failure modes above. <a href="/operations/evaluation-and-observability/quality-regression-detection" class="xref">Quality regression detection</a> covers the general shape of this trap.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>Three cases where the agent is the wrong instrument.</h3>
+    <p><strong>Your flakiness is concentrated.</strong> If twenty tests account for most of the noise, a week of one engineer's time removes the problem permanently and an agent institutionalises it. Count first: a Pareto check costs an afternoon and frequently cancels the project.</p>
+    <p><strong>The flakiness is in the environment, not the tests.</strong> A shared staging database, a rate-limited third-party sandbox, or a CI runner that oversubscribes CPU produces flakiness that is uniform across unrelated tests. The agent will quarantine dozens of innocent tests and never touch the cause. The <code class="inline">shard_skew</code> and cross-test correlation checks exist to detect precisely this and hand it to infrastructure instead — see <a href="/playbooks/coding-and-computer-use-agents/ci-repair-agents" class="xref">CI repair agents</a>.</p>
+    <p><strong>You cannot un-quarantine.</strong> If no team owns the suite, nothing will ever come back out, and the expiry will be renewed forever by whoever is on call. An agent that can only add to a list is a suite-deletion machine with a 14-day delay.</p>
+    <div class="callout tip"><p>Do this today, before writing any agent: make your CI record both outcomes of every rerun against the same commit, and emit a stable test identity in the report. Then run one query — <code class="inline">same_commit_disagreement</code> over the last 30 days — and look at the distribution. You will learn whether you have a flakiness problem or twenty bad tests, and you will have built the only dataset the agent would have needed. Related: <a href="/playbooks/coding-and-computer-use-agents/patch-generation-and-tests" class="xref">patch generation and tests</a>, <a href="/concepts/reproducibility-and-determinism" class="xref">reproducibility and determinism</a>, and <a href="/concepts/retry-amplification" class="xref">retry amplification</a>.</p></div>
+  </div>
+</section>

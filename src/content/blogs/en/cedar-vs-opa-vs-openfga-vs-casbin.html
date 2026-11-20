@@ -1,0 +1,110 @@
+<p class="lede">Every comparison of these four argues about policy languages, and for agents the language is the part that barely matters. An agent request is never "user U may do A" — it is "agent G, acting for U, under a grant issued at some earlier moment, may do A" — and the only question that separates these engines is whether they can read that grant without the agent handing it to them. Three of the four, by default, cannot.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>All four are production-grade and actively released as of November 2026. They are not four answers to one question; they are four different places to keep the facts a decision rests on.</p>
+  <table>
+    <thead>
+      <tr><th>Engine</th><th>Latest release</th><th>Shape</th><th>Authorization model it is native to</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Cedar</td><td>4.15.0 — 16 Nov 2026</td><td>Library + language, stateless by design</td><td>Attribute-based, with schema validation and symbolic analysis</td></tr>
+      <tr><td>OPA</td><td>1.22.4 — 12 Nov 2026</td><td>Service or sidecar, Rego</td><td>General-purpose policy, one engine across infra and app</td></tr>
+      <tr><td>OpenFGA</td><td>1.22.1 — 28 Oct 2026</td><td>Server with its own database</td><td>Relationship-based, Zanzibar lineage</td></tr>
+      <tr><td>Casbin</td><td>3.11.0 — 20 Aug 2026</td><td>In-process library, many languages</td><td>Model file plus policy rows; RBAC/ABAC by configuration</td></tr>
+    </tbody>
+  </table>
+  <p>Casbin's release carries a detail worth noting before you build on it: it is titled <em>Apache Casbin (Incubating)</em>. The project entered the Apache Incubator on 7 February 2026, and 3.11.0 on 20 August 2026 was its first release under the foundation. Incubating is a governance status, not a quality judgement, but it does mean the repository scope and IP coverage across Casbin's many sub-projects were still being worked through during the year you would be adopting it.</p>
+  <figure>
+    <img src="/blogs/cedar-vs-opa-vs-openfga-vs-casbin/data-grant-source-matrix.svg" alt="Matrix of Cedar, OPA, OpenFGA and Casbin against policy artefact, grant data location, and whether the caller can forge the facts" width="900" height="400" loading="lazy" />
+    <figcaption>The third column is the one that decides an agent deployment, and it is not a feature any of them advertises.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Why "who supplies the grant" is the axis</h2>
+  <figure>
+    <img src="/blogs/cedar-vs-opa-vs-openfga-vs-casbin/arch-grant-paths.svg" alt="Two paths by which a grant reaches a policy engine: context on the request, which the agent fills in, or a stored grant written earlier by the platform" width="900" height="500" loading="lazy" />
+    <figcaption>Fresh and forgeable, or trustworthy and stale. No engine gives you both; they differ in which one is the default.</figcaption>
+  </figure>
+  <p>Classical authorization has a comfortable property: the subject is authenticated by the layer above, and the attributes the decision needs — this user's role, this document's owner — are facts about your own system that the request cannot change. Agents break it in a specific way. The request now carries a second principal and a delegation between them, and the delegation is the thing that varies per request: scope, expiry, which user approved it, whether approval was for this action or a class of actions.</p>
+  <p>So the grant has to come from somewhere, and there are exactly two somewheres. It travels on the request, where it is current but asserted by the component you are trying to constrain — a <a href="/concepts/confused-deputy">confused deputy</a> that can describe its own authority is not constrained at all. Or it is stored ahead of time by you, where it cannot be forged but can be out of date by however long your propagation path is. Every engine below makes one of those the easy path, and that choice, not the syntax, is what you are adopting.</p>
+  <p>The corollary is uncomfortable and worth stating plainly: <strong>no engine here solves the agent problem, because the problem is upstream of all of them.</strong> What solves it is making grant issuance a separate, audited write with an expiry — <a href="/operations/governance-compliance/delegated-access-and-consent-records">delegated access and consent records</a> — after which the engine's only job is to read it. The engine choice is then narrow and answerable: can it read that record without the caller passing it, and what is the lag before a revocation bites?</p>
+</section>
+
+<section>
+  <h2>Where each engine puts the grant</h2>
+  <h3>Cedar — stateless on purpose, which puts the facts in the caller's hands</h3>
+  <p>Cedar evaluates a request against a policy set and a set of entities, and it does not store the entities. They are supplied at evaluation time, either by your application or by an entity store you wire up (AWS Verified Permissions is the managed version of exactly that). For a service authorizing its own users this is clean and fast. For an agent it means the default integration hands the agent's own request path the job of describing the delegation, which is the one thing it must not describe.</p>
+  <p>What Cedar gives you in exchange is the strongest analysis story of the four. It has a schema, so a policy referring to an attribute that does not exist fails validation rather than quietly evaluating to false, and the 16 November 2026 release shipped alongside <code>cedar-policy-symcc</code> 0.9.0, the symbolic compiler for reasoning about policies formally — asking whether one policy set is strictly more permissive than another, rather than testing examples. If your agent permissions are going to be reviewed by someone who needs to prove a property about them rather than sample them, that capability has no equivalent in the other three.</p>
+  <h3>OPA — the data is yours, and its freshness is a number you set</h3>
+  <p>OPA evaluates Rego against data it holds, and the data arrives either in bundles it fetches on an interval you configure or by calling out mid-evaluation. That first mode is the useful one here: a grant written to your consent store, published into a bundle, and polled by every OPA instance is a fact the agent cannot touch. The cost is explicit and, unusually, honest — your revocation lag is your polling interval, and you chose it.</p>
+  <p>Rego is the standard complaint and it is a real one: it is a language your team learns rather than reads. The compensating argument is scope. If you already run OPA for Kubernetes admission or Terraform policy, putting agent authorization in the same engine means one place where "what is allowed" is written, which is worth more than elegance. If you do not, adopting Rego for this alone is the hardest sell of the four.</p>
+  <h3>OpenFGA — the only one where the grant is a stored object by default</h3>
+  <p>OpenFGA keeps an authorization model plus relationship tuples in its own database, and a check is a graph query over them. A delegation is simply a tuple — <em>agent:g is actor_for user:u on account:123</em> — written by whatever issued the grant and readable by nothing else. That is the shape the agent case wants, and it is the default rather than something you build.</p>
+  <p>Two caveats stop this from being a straight recommendation. First, contextual tuples exist, and they are caller-supplied: reach for them to express "and the grant has not expired" and you have reopened the hole you chose OpenFGA to close. Second, the consistency story needs reading before you deploy. Caching is disabled by default, and with it off every check reads the database and is strongly consistent; enable it and the default consistency mode serves from cache where it can, with <code>HIGHER_CONSISTENCY</code> available per-request to bypass it. That default is the right way round — you trade away correctness deliberately, per call — but it means a revocation-sensitive check must be written to ask for the stronger mode rather than inheriting it.</p>
+  <h3>Casbin — in-process, which makes the lag invisible rather than absent</h3>
+  <p>Casbin is a library, not a service: a model file, policy rows loaded through an adapter from your own database, and a check that is a function call with no network hop. For a single application that wants authorization in-process and nothing to operate, it is the lowest-friction option here and available in more languages than the other three combined.</p>
+  <p>The agent-specific risk is that the staleness moves somewhere you are less likely to measure. Each process holds its own copy of the policy, refreshed on whatever reload you configured, so a revoked grant is live in every replica that has not reloaded — and because there is no service, there is no central place where that lag is a metric someone owns. Being library-only also means the policy lifecycle, the control plane and the audit trail are yours to build, which is precisely the work the agent case needs most.</p>
+</section>
+
+<section>
+  <h2>Revocation lag is the number you are actually choosing</h2>
+  <p>Line the four up on the question "how long after I revoke a grant can an agent still use it?" and the comparison stops being about expressiveness. Cedar's answer is whatever your entity store's freshness is, and the engine is not involved — it evaluates what it is given, so the lag is entirely a property of code you wrote. OPA's answer is your bundle polling interval, visible in configuration and identical across instances. OpenFGA's answer is zero with caching off, and your cache TTL with it on, per request. Casbin's answer is your reload interval, multiplied by the number of processes, and nobody is watching it.</p>
+  <p>That ordering is roughly the inverse of the ordering you get from a feature comparison, which is the point. The engine with the most elegant language has the weakest default story for the agent case; the one whose model looks narrowest has the strongest. And all four are strictly better than the arrangement they usually replace, which is a scope string inside a token the agent itself presents — see <a href="/operations/safety-and-security/scoped-credentials-for-agents">scoped credentials for agents</a> for why a self-describing credential is a grant you cannot revoke at all.</p>
+  <p>One more axis worth naming because it is easy to discover late: none of these four publishes a latency or throughput guarantee, and the performance claims circulating in vendor comparisons mostly trace back to a single paper. Benchmark the check on your own data shape — particularly OpenFGA's graph queries at your tuple count — before the number matters.</p>
+</section>
+
+<section>
+  <h2>When to pick which</h2>
+  <table>
+    <thead>
+      <tr><th>Situation</th><th>Pick</th><th>Because</th><th>Watch out for</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Agents acting for users across shared resources</td><td>OpenFGA</td><td>The delegation is a stored tuple the agent cannot assert</td><td>Contextual tuples quietly hand the grant back to the caller</td></tr>
+      <tr><td>Permissions a reviewer must prove properties about</td><td>Cedar</td><td>Schema validation plus symbolic analysis via SymCC</td><td>You must build the entity store; statelessness is yours to fix</td></tr>
+      <tr><td>You already run policy-as-code elsewhere</td><td>OPA</td><td>One engine and one review path across infra and agents</td><td>Rego; and your revocation lag is the polling interval</td></tr>
+      <tr><td>One app, no service to operate, many languages</td><td>Casbin</td><td>In-process checks, lowest operational cost</td><td>Per-replica staleness with no central metric; Incubating status</td></tr>
+      <tr><td>Attribute logic over relationship logic</td><td>Cedar or OPA</td><td>Both express attributes natively</td><td>Relationship checks at depth get expensive without a tuple store</td></tr>
+    </tbody>
+  </table>
+  <p>The combination that keeps appearing in practice is OpenFGA answering "is this agent acting for this user on this resource?" and Cedar or OPA answering "and is this specific action permitted right now?" That is two systems and two review paths, and it is worth it only when the relationship graph is genuinely deep. Below that, one engine plus a properly audited grant-issuance write beats two engines plus a forgeable context object.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Which of these is best for AI agent authorization?</h3>
+  <p>OpenFGA has the best default, because a delegation is a stored tuple rather than something the caller asserts. But the engine is not the deciding factor — grant issuance being a separate, audited, expiring write is. With that in place any of the four works; without it, none of them does.</p>
+  <h3>Can I just put the agent's permissions in its token?</h3>
+  <p>Only if you never need to revoke them before expiry. A scope string in a token the agent presents is a grant the agent carries and you cannot withdraw, which is the arrangement all four of these engines exist to replace.</p>
+  <h3>Is Rego worth learning for this?</h3>
+  <p>If OPA is already running in your estate, yes — the win is one policy engine and one review path, not the language. If it is not, Cedar's schema and validation give you more safety for less learning curve on an app-authorization problem.</p>
+  <h3>What does Casbin being "Incubating" mean for production use?</h3>
+  <p>It is a governance status at the Apache Software Foundation, not a stability warning. The practical implication is that repository scope and IP coverage across Casbin's sub-projects were still being resolved through 2026, so pin versions and check the licence position of any adapter you pull in.</p>
+  <h3>Does OpenFGA return stale decisions?</h3>
+  <p>Not by default — caching is off, and with it off every check reads the database. If you enable caching, the default consistency mode will serve from cache; pass the higher-consistency option on checks where a fresh revocation must be respected.</p>
+  <h3>Do I need a policy engine at all for a single-tenant internal agent?</h3>
+  <p>Often not. If the agent acts only as itself against resources it wholly owns, a scoped credential and an egress allowlist cover it. The engines earn their keep the moment the agent acts <em>for</em> someone, because that is when the grant becomes a per-request variable.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/deep-dives/agent-security/policy-as-code-for-agents">Policy as code for agents</a> — how the decision point fits an agent loop.</li>
+    <li><a href="/operations/governance-compliance/delegated-access-and-consent-records">Delegated access and consent records</a> — the grant-issuance write these engines read.</li>
+    <li><a href="/operations/safety-and-security/scoped-credentials-for-agents">Scoped credentials for agents</a> — why a self-describing token is not a grant.</li>
+    <li><a href="/concepts/confused-deputy">Confused deputy</a> — the failure the forgeable path produces.</li>
+    <li><a href="/concepts/reference-monitor">Reference monitor</a> — what a decision point has to be to be worth having.</li>
+    <li><a href="/deep-dives/agent-security/separation-of-duties-for-agents">Separation of duties for agents</a> — keeping issuance and use apart.</li>
+  </ul>
+  <h3>Project sources:</h3>
+  <ul>
+    <li><a href="https://github.com/cedar-policy/cedar/releases">Cedar releases</a> — 4.15.0 and cedar-policy-symcc 0.9.0, 16 November 2026</li>
+    <li><a href="https://github.com/open-policy-agent/opa/releases">OPA releases</a> — 1.22.4, 12 November 2026</li>
+    <li><a href="https://github.com/openfga/openfga/releases">OpenFGA releases</a> — 1.22.1, 28 October 2026</li>
+    <li><a href="https://github.com/casbin/casbin/releases">Casbin releases</a> — Apache Casbin (Incubating) 3.11.0, 20 August 2026</li>
+    <li><a href="https://incubator.apache.org/clutch/casbin.html">Apache Incubator — Casbin status</a></li>
+  </ul>
+</section>
