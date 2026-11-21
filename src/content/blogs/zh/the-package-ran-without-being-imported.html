@@ -1,0 +1,146 @@
+<p class="lede">微软 <code>agent-framework</code> 里的那个凭据窃取器，并没有等着被 import。它是以一个 <code>.pth</code> 文件的形式到来的，而 CPython 的 <code>site</code> 模块会在每一次解释器启动时执行这类文件——所以在 2026 年 11 月 17 日装过 1.26.1 或 1.26.2 的任何机器上，只要<em>任何东西</em>下一次启动了 Python，采集器就跑了，包括那个与它毫不相干的测试步骤、部署脚本、pre-commit 钩子。「我们装了，但那个任务从不 import <code>agent_framework</code>」并不构成辩解。这个故事有用的那一半，是什么确实挡住了它：一份带哈希的锁文件把这次完全拦下了，因为 1.26.1 从来不在任何人的哈希清单里。</p>
+
+<section>
+  <h2>概览</h2>
+  <p>这次事件的佐证异常充分——Aikido、Chainguard、Elastic、Endor Labs、Orca、Socket 与 StepSecurity 都在约 48 小时内发了分析，而它们在下面这些事实上是一致的。每一行都点出了报告方，因为这些细节来自厂商的遥测，而不是微软自己的安全公告。</p>
+
+  <table>
+    <thead>
+      <tr><th>发生了什么</th><th>细节</th><th>报告方</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>两个恶意发行版</td>
+        <td><code>1.26.1</code> 与 <code>1.26.2</code>，2026 年 11 月 17 日发布、相隔约 33 分钟；大约 20:35 至 21:20 UTC 之间的安装都在影响范围内</td>
+        <td>Aikido</td>
+      </tr>
+      <tr>
+        <td>合法发布者</td>
+        <td>不是仿冒名、也不是近似名——这些发行版来自真正与微软关联的 PyPI 发布者，而且 1.26.2 是在 1.26.1 已被隔离之后才上传的</td>
+        <td>Orca、Chainguard</td>
+      </tr>
+      <tr>
+        <td>启动时执行，而非 import 时</td>
+        <td>1.26.1 经由 <code>agent_framework_meta.pth</code> 走通；1.26.2 用 <code>af_runtime_diag.pth</code> 去运行 <code>af_runtime_diag.py</code></td>
+        <td>Socket、Orca</td>
+      </tr>
+      <tr>
+        <td>它拿走了什么</td>
+        <td>环境变量、本地配置文件，以及其他正在运行的进程；被点名的目标包括 Azure、AWS、GitHub、Docker、Hugging Face 与 OpenAI 的凭据</td>
+        <td>Endor Labs、Wiz</td>
+      </tr>
+      <tr>
+        <td>命名空间的影响半径</td>
+        <td><code>agent-framework-core</code> 及另外 22 个同族包未受影响；11 月 12 日的 <code>1.26.0</code> 仍是最新的干净版本</td>
+        <td>Orca、Endor Labs</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/the-package-ran-without-being-imported/arch-two-paths-to-execution.svg" alt="一次安装往 site-packages 里写进了两样东西：agent-framework 包本身，以及一个 .pth 文件。上面那条通往执行的路径需要显式 import agent_framework，而它很少被走到。下面那条根本不需要 import：每一次 Python 进程启动，site 模块都会读取每一个 .pth 文件并执行其中的 import 行，从而触达该环境里的密钥。" width="900" height="500" loading="lazy" />
+    <figcaption>上面那条是审查者脑子里想的路径。下面那条才是真正跑了的。</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2><code>.pth</code> 为何就是这个故事的全部</h2>
+  <p><code>site-packages</code> 里的一个 <code>.pth</code> 文件通常很乏味：一串要加进 <code>sys.path</code> 的目录。让它成为投递手段的那个特性，是一项比今天在用的每一个包管理器都更古老、且有文档记载的 CPython 行为——<code>.pth</code> 文件里以 <code>import</code> 开头的那一行，会被 <code>site</code> 模块在解释器启动期间<em>执行</em>。</p>
+
+  <pre class="standalone"><span class="c-cm"># what a dull .pth file contains</span>
+../src
+
+<span class="c-cm"># what a weaponised one contains — site.py runs this line at every start</span>
+import af_runtime_diag</pre>
+
+  <p>把这个顺序对照一下团队面对一个被攻陷的依赖时实际的推理方式。第一个小时里问出来的是「我们用它吗？」「我们在哪里 import 它？」「它在生产环境里、还是只在那个原型里？」这三个问题都问错了。对的那个是「有没有任何主机上的任何环境装过它」，因为触发器不是你的代码——是 <code>python</code> 自己，而且它在你的第一行代码之前就开火了。</p>
+
+  <p>这也是人们顺手去抓的那些缓解措施为何全都不适用的原因。延迟 import 没用；那次 import 根本没发生。把这个框架从某个服务的依赖清单里删掉也没用，只要还有一位开发者的笔记本虚拟环境里留着它。容器不可变性也没用，只要那个镜像层是在窗口期内构建的。而由于采集器还读了其他正在运行的进程，一个恰好有部署正在进行的构建机，泄露的东西比它自己的环境还多。</p>
+</section>
+
+<section>
+  <h2>三十三分钟，以及比撤回活得更久的那份缓存</h2>
+  <p>时间线是这次事件里最令人安心、也最具误导性的部分。Elastic 称它在发布后约六分钟就标记出了这次上传。两个版本都在 PyPI 上被隔离。整个暴露窗口是 UTC 时区一个周二傍晚的大约 45 分钟。于是人们很容易得出结论：几乎没人中招。</p>
+
+  <p>那个结论把「发布窗口」和「安装窗口」弄混了，而两者并不是同一件事。隔离是把一个发行版从索引里移除；它伸不进那个制品已经走到过的那些地方：</p>
+  <ul>
+    <li><strong>你自己的缓存。</strong><code>~/.cache/pip</code>、<code>~/.cache/uv</code> 以及 CI 的 wheel 缓存会保留下载下来的制品，而一次缓存命中根本不会去查索引。一条曾拉取过 1.26.1 的流水线，只要缓存键还活着，就能一直继续安装它。</li>
+    <li><strong>穿透式镜像。</strong>Artifactory、Nexus 以及各类代理注册表会在首次请求时抓取、然后一直提供自己那份副本。上游撤回不会把下游那份清掉。</li>
+    <li><strong>已构建的镜像。</strong>任何在窗口期内构建的 Docker 层，现在都是一份持久副本，并且会把那个 <code>.pth</code> 文件带给它启动的每一个容器。</li>
+    <li><strong>锁文件哈希。</strong>如果有人在窗口期内解析并提交了一份锁文件，那个坏制品如今就是被钉住的、可复现的、「正确的」那一个——而你的工具链会竭力把它恢复回来。</li>
+  </ul>
+
+  <p>所以补救问题是全资产范围的，而且关乎存储、不关乎流量：<em>我们控制下的任何缓存、镜像、容器镜像或锁文件，是否持有 <code>agent-framework</code> 1.26.1 或 1.26.2？</em>如果你有一份清册，这个查询几分钟就能答完；如果没有，它基本答不出来——这才是这类事件要花好几天而不是几小时的真正原因。</p>
+
+  <div class="callout warn">
+    <p>按暴露轮换，而不是按确认轮换。采集器读了环境变量以及主机上其他进程的内存；没有任何日志能让你查出「某个特定令牌没被拿走」。Elastic 给的那条建议就是正确的默认值——如果这两个版本之一碰过某台构建机或某台笔记本，就把那台主机上的每一个密钥都当成已经没了。</p>
+  </div>
+</section>
+
+<section>
+  <h2>干净的同族包是运气，不是隔离</h2>
+  <p>多数分析文章顺带提到的那个细节值得更多重量：<code>agent-framework-core</code> 以及另外 22 个 <code>agent-framework-*</code> 包都没被动，仍停在 11 月 12 日的发行版上。这读起来像是「被控住了」。其实不是——它是这次攻击的形状，而不是你防御体系的某项属性。</p>
+
+  <p>一个能推送 <code>agent-framework</code> 的发布者账号，一般也能推送它的同族包，而掌握它的那一方把它握得够久，足以在第一个版本被隔离之后再发一个。这个命名空间是 23 个各自独立版本化的包，你的锁文件把它们各自独立地钉住，而一个审 diff 的人会把它们读成一个依赖。钉住那个伞形包并不等于钉住这个命名空间；一次改挑两个同族包的攻陷，会在你的锁文件里产生完全一样的 diff，并吸引到完全一样多的注意力。</p>
+
+  <p>对智能体技术栈而言，更一般的教训是：一个智能体框架底下的依赖图异常地宽、也异常地有特权。它正是你有意交出云凭据、模型 API key、GitHub 令牌、而且往往还有一个 shell 的那个组件。不存在任何一种配置能让它成为低信任依赖——这就是为什么下面那些控制手段在这里值得它们的代价，即便你在别处会跳过它们。与之相邻的另一种失败——一个压根不在锁文件里的包——见我们早前那篇<a href="/zh/blogs/the-server-was-archived-the-install-still-worked">智能体替你加上的依赖</a>。</p>
+</section>
+
+<section>
+  <h2>真正守住的是什么，按它买到多少排序</h2>
+  <figure>
+    <img src="/blogs/the-package-ran-without-being-imported/data-which-control-stopped-it.svg" alt="六种依赖实践，按它们是否拦住安装、以及是否事后告知你来评分。开放版本范围与升级式安装两者都做不到。不带哈希的精确钉版能挡住这次，但什么也不上报。带哈希的锁文件直接拦住，并抛出一个解析错误。带发布延迟的私有镜像既拦住、也记录下这次尝试。装后完整性扫描什么也拦不住，但可能上报。" width="900" height="400" loading="lazy" />
+    <figcaption>只有两行能拦住安装。其中一行是多数团队已经有、却没有强制执行的那个文件。</figcaption>
+  </figure>
+
+  <p>比较这些行比逐行读更有启发。守住的那两行是出于同一个原因守住的——制品必须匹配某个事先决定好的东西——而失手的那两行也是出于同一个原因失手的，那就是它们在安装时去问索引「可接受的最新版本是哪个」。</p>
+
+  <ul>
+    <li><strong>带哈希的锁文件，并且强制执行。</strong>这是 11 月 17 日真正起作用的那项控制，也是多数团队以为自己有、而其实没有的那一项。一份 <code>poetry.lock</code>、<code>uv.lock</code>，或带 <code>--require-hashes</code> 的 <code>requirements.txt</code>，会让 1.26.1 无法被解析：它是一个没人记录过哈希的版本。「强制执行」这个词很要紧——Dockerfile、tox 环境或某位开发者的 setup 脚本里任何一处未钉版的 <code>pip install</code>，都会绕过你赖以为生的那份锁文件。</li>
+    <li><strong>私有镜像上的发布延迟。</strong>隔离在大约 45 分钟内发生。一个拒绝提供发布不足 24 或 48 小时的发行版的镜像，会把这一类事件中的几乎每一次都变成非事件，而且还顺便给了你一份「谁请求过什么」的记录。这是平台团队手上杠杆最高的一项改动，也是最常被当作「摩擦」而否掉的一项。</li>
+    <li><strong>执行安装的那个环境里不放凭据。</strong>这个窃取器很擅长它的活儿；修法不是去跑得比它快，而是让它运行的那一步变得乏味。在一个没有云凭据的作业里解析与构建，然后在一个不做安装的作业里带着凭据运行。这同时也消掉了「其他正在运行的进程」这条路径，因为那里没有值得读的进程。</li>
+    <li><strong>一份能回答存储问题的清册。</strong>不是依赖扫描器——那些上报的是被声明过的依赖——而是列出哪些主机、镜像与缓存持有某个指定制品版本的能力。这次事件的持续时长，几乎完全是这件事要花你多久的函数。</li>
+    <li><strong>不带哈希的精确钉版。</strong>值得作为诚实的中间档提一句：<code>==1.26.0</code> 本来能挡住这次具体的攻击，因为攻击者发的是新版本、而不是重发一个已存在的版本。它挡不住以同一版本号重发的制品，而那正是哈希要解决的事。</li>
+  </ul>
+
+  <p>这些没有一条是智能体专属的，而这恰恰是值得带走的要点。那个智能体框架被攻陷，不是因为它是个智能体框架；是因为它是个流行的 Python 包。真正智能体专属的是赔付额。一个藏在 Web 框架里的窃取器拿到一个数据库密码。一个藏在「你交出了云角色、模型 key 与仓库令牌」的那个东西里的窃取器，拿到的是这整个循环的钥匙。</p>
+</section>
+
+<section class="faq">
+  <h2>常见问题</h2>
+  <h3>微软的包是真的被攻陷了，还是这只是个仿冒包？</h3>
+  <p>是真包。研究人员是在真正与微软关联的 PyPI 发布者下面发现这些恶意发行版的，不是仿冒名——Orca 报告该发布者账号随后已被加固。这正是它与持续存在的那一类名称混淆攻击的区别所在。</p>
+  <h3>如果我的代码从不 import <code>agent_framework</code>，我受影响吗？</h3>
+  <p>只要安装发生过，就受影响。载荷是经由一个 <code>.pth</code> 文件投递的，而 <code>site</code> 模块会在解释器启动时执行它，与你 import 了什么无关。相关的问题是：1.26.1 或 1.26.2 是否曾被装进这台主机上的任何一个环境。</p>
+  <h3>哪些版本是安全的？</h3>
+  <p>2026 年 11 月 12 日发布的 1.26.0 是最后一个干净版本，而且在事件发生时仍是当前版本。在微软确认之前，请把日期为 2026 年 11 月 17 日或 18 日的任何 <code>agent-framework</code> 发行版都视为可疑——这是 Chainguard 的建议，也是保守的读法。</p>
+  <h3>我需要轮换密钥，还是可以先查日志？</h3>
+  <p>轮换。采集器读了主机上的环境变量、配置文件以及其他进程的内存，而这些读取都不留下你能审计的痕迹。如果这两个版本之一被装到过某台构建机或笔记本，就假定那台主机能拿到的每一个密钥都已泄露。</p>
+  <h3>同族包也需要钉版吗？</h3>
+  <p>它们没受影响，但它们共用同一个发布者。如果你依赖 <code>agent-framework-core</code> 或任何其他 <code>agent-framework-*</code> 包，请逐个钉版并加哈希——你的锁文件本来就把它们当作 23 个独立依赖，你的评审也该如此。</p>
+  <h3>用容器能保护我吗？</h3>
+  <p>只有在镜像不是窗口期内构建的、并且容器里没有值得拿的凭据时才行。不可变性不等于隔离：一个在 11 月 17 日约 20:35 至 21:20 UTC 之间构建的层，会把那个 <code>.pth</code> 文件无限期地带进从它启动的每一个容器。</p>
+</section>
+
+<section>
+  <h2>延伸阅读</h2>
+  <h3>本站相关：</h3>
+  <ul>
+    <li><a href="/zh/deep-dives/agent-security/agent-supply-chain-security">智能体供应链安全</a>——这次事件只是其中一例的那整套威胁模型。</li>
+    <li><a href="/zh/concepts/pinning-and-verification">钉版与验证</a>——一次钉版承诺了什么、又没承诺什么。</li>
+    <li><a href="/zh/operations/safety-and-security/secrets-management-for-agents">面向智能体的密钥管理</a>——安装那一步为何不该持有凭据。</li>
+    <li><a href="/zh/operations/safety-and-security/agent-artifacts-on-the-endpoint">终端上的智能体产物</a>——开发者笔记本，最难盘清的那个面。</li>
+    <li><a href="/zh/operations/safety-and-security/detecting-agent-compromise">检测智能体被攻陷</a>——一个被盗凭据在下游长什么样。</li>
+    <li><a href="/zh/deep-dives/agent-security/vetting-a-third-party-skill">审查一个第三方技能</a>——上一层的同一个评审难题。</li>
+  </ul>
+  <h3>来源：</h3>
+  <ul>
+    <li><a href="https://www.aikido.dev/blog/two-malicious-agent-framework-releases-hit-pypi-in-33-minutes">Aikido——33 分钟内的两个恶意发行版</a>（时间线与安装窗口）</li>
+    <li><a href="https://socket.dev/blog/agent-framework-pypi-package-compromised-with-credential-stealer">Socket——两个版本里的 <code>.pth</code> 走法</a></li>
+    <li><a href="https://orca.security/resources/research/microsoft-agent-framework-pypi-supply-chain-attack-versions-1-26-1-and-1-26-2-steal-cloud-credentials/">Orca Security——发布者、同族包与凭据目标</a></li>
+    <li><a href="https://www.chainguard.dev/unchained/microsoft-agent-framework-compromised-on-pypi-november-2026">Chainguard——对后续发行版的处置建议</a></li>
+    <li><a href="https://www.elastic.co/security-labs/threat-command/we-caught-the-agent-framework-pypi-compromise-six-minutes-after-it-published">Elastic Security Labs——检测时效与轮换建议</a></li>
+    <li><a href="https://www.endorlabs.com/learn/agent-framework-compromised-software-supply-chain-attack">Endor Labs——启动钩子与同族包核查</a></li>
+    <li><a href="https://pypi.org/project/agent-framework/">PyPI——<code>agent-framework</code> 发行历史</a></li>
+  </ul>
+</section>

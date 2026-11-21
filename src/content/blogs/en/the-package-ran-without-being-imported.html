@@ -1,0 +1,146 @@
+<p class="lede">The credential stealer in Microsoft's <code>agent-framework</code> did not wait to be imported. It arrived as a <code>.pth</code> file, and CPython's <code>site</code> module executes those at every interpreter start — so on any machine that installed version 1.26.1 or 1.26.2 on 17 November 2026, the collector ran the next time <em>anything</em> started Python, including the unrelated test step, the deploy script, the pre-commit hook. "We installed it but that job never imports <code>agent_framework</code>" is not a defence. The useful half of the story is what did hold: a hash-pinned lockfile stopped this outright, because 1.26.1 was never in anybody's hashes.</p>
+
+<section>
+  <h2>At a glance</h2>
+  <p>The incident is unusually well-attested — Aikido, Chainguard, Elastic, Endor Labs, Orca, Socket and StepSecurity all published analyses within about 48 hours, and they agree on the facts below. Each row names who reported it, because the details are vendor telemetry rather than a vendor advisory from Microsoft.</p>
+
+  <table>
+    <thead>
+      <tr><th>What happened</th><th>Detail</th><th>Reported by</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Two malicious releases</td>
+        <td><code>1.26.1</code> and <code>1.26.2</code>, published 17 November 2026 roughly 33 minutes apart; installs between about 20:35 and 21:20 UTC are in scope</td>
+        <td>Aikido</td>
+      </tr>
+      <tr>
+        <td>Legitimate publisher</td>
+        <td>Not a typosquat or a lookalike name — the releases came from the real Microsoft-associated PyPI publisher, and 1.26.2 went up after 1.26.1 had already been quarantined</td>
+        <td>Orca, Chainguard</td>
+      </tr>
+      <tr>
+        <td>Startup execution, not import</td>
+        <td>1.26.1 routed through <code>agent_framework_meta.pth</code>; 1.26.2 used <code>af_runtime_diag.pth</code> to run <code>af_runtime_diag.py</code></td>
+        <td>Socket, Orca</td>
+      </tr>
+      <tr>
+        <td>What it took</td>
+        <td>Environment variables, local config files and other running processes; targets named include Azure, AWS, GitHub, Docker, Hugging Face and OpenAI credentials</td>
+        <td>Endor Labs, Wiz</td>
+      </tr>
+      <tr>
+        <td>Blast radius of the namespace</td>
+        <td><code>agent-framework-core</code> and 22 other sibling packages were not affected; <code>1.26.0</code> from 12 November remains the latest clean release</td>
+        <td>Orca, Endor Labs</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="/blogs/the-package-ran-without-being-imported/arch-two-paths-to-execution.svg" alt="One install step writes two things into site-packages: the agent-framework package and a .pth file. The upper path to execution requires an explicit import of agent_framework and is rarely taken. The lower path requires no import: every Python process start makes the site module read every .pth file and execute its import line, which reaches the environment's secrets." width="900" height="500" loading="lazy" />
+    <figcaption>The upper path is the one a reviewer imagines. The lower one is the one that ran.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Why <code>.pth</code> is the whole story</h2>
+  <p>A <code>.pth</code> file in <code>site-packages</code> is normally dull: a list of directories to add to <code>sys.path</code>. The feature that makes it a delivery mechanism is a documented CPython behaviour that predates every package manager in use today — a line in a <code>.pth</code> file that begins with <code>import</code> is <em>executed</em> by the <code>site</code> module during interpreter startup.</p>
+
+  <pre class="standalone"><span class="c-cm"># what a dull .pth file contains</span>
+../src
+
+<span class="c-cm"># what a weaponised one contains — site.py runs this line at every start</span>
+import af_runtime_diag</pre>
+
+  <p>Read that sequence against how a team actually reasons about a compromised dependency. The questions asked in the first hour are "do we use it?", "where do we import it?", "is it in production or only in that one prototype?" All three are the wrong question. The right one is "did any environment on any host install it", because the trigger is not your code — it is <code>python</code> itself, and it fires before your first line runs.</p>
+
+  <p>This is also why the usual mitigations people reach for do not apply. Lazy imports do not help; the import never happens. Removing the framework from a service's dependency list does not help if a developer's laptop venv still has it. Container immutability does not help if the image layer was built during the window. And because the collector also read other running processes, a build agent that happened to have a deploy in flight leaked more than its own environment.</p>
+</section>
+
+<section>
+  <h2>Thirty-three minutes, and the cache that outlives a yank</h2>
+  <p>The timeline is the most reassuring and the most misleading part of the incident. Elastic says it flagged the publication roughly six minutes after it went up. Both versions were quarantined on PyPI. The entire exposure window is about 45 minutes on a Tuesday evening in UTC. It is tempting to conclude that almost nobody was hit.</p>
+
+  <p>That conclusion confuses the publication window with the installation window, and they are not the same thing. Quarantine removes a release from the index; it does not reach into the places an artefact has already travelled:</p>
+  <ul>
+    <li><strong>Your own caches.</strong> <code>~/.cache/pip</code>, <code>~/.cache/uv</code> and CI wheel caches keep the downloaded artefact, and a cache hit does not consult the index. A pipeline that pulled 1.26.1 once can keep installing it for as long as the cache key survives.</li>
+    <li><strong>Pull-through mirrors.</strong> Artifactory, Nexus and the various proxy registries fetch on first request and then serve their copy. A yank upstream does not evict it downstream.</li>
+    <li><strong>Built images.</strong> Any Docker layer built in the window is now a durable copy, and it will keep shipping the <code>.pth</code> file to every container it starts.</li>
+    <li><strong>Lockfile hashes.</strong> If someone resolved and committed a lockfile during the window, the bad artefact is now the pinned, reproducible, "correct" one — and your tooling will fight to restore it.</li>
+  </ul>
+
+  <p>So the remediation question is estate-wide and it is about storage, not about traffic: <em>does any cache, mirror, image or lockfile under our control hold <code>agent-framework</code> 1.26.1 or 1.26.2?</em> That query is answerable in minutes if you have an inventory and effectively unanswerable if you do not, which is the real reason this class of incident takes days rather than hours.</p>
+
+  <div class="callout warn">
+    <p>Rotate on exposure, not on confirmation. The collector read environment variables and the memory of other processes on the host; there is no log you can inspect that proves a specific token was not taken. Elastic's guidance is the right default — if either version touched a build agent or a laptop, treat every secret on that host as gone.</p>
+  </div>
+</section>
+
+<section>
+  <h2>The clean siblings were luck, not isolation</h2>
+  <p>The detail most of the write-ups note in passing deserves more weight: <code>agent-framework-core</code> and 22 other <code>agent-framework-*</code> packages were untouched, still sitting at their 12 November releases. That reads like containment. It is not — it is the shape of the attack rather than a property of your defences.</p>
+
+  <p>A publisher account that can push <code>agent-framework</code> can generally push its siblings too, and whoever had it kept it long enough to publish a second release after the first was quarantined. The namespace is 23 independently-versioned packages that your lockfile pins independently and that a human reviewing a diff reads as one dependency. Pinning the umbrella package is not pinning the namespace; a compromise that had chosen two siblings instead would have produced exactly the same diff in your lockfile and attracted exactly the same amount of attention.</p>
+
+  <p>The general lesson for agent stacks specifically is that the dependency graph under an agent framework is unusually wide and unusually privileged. It is the component you deliberately give cloud credentials, a model API key, a GitHub token and often a shell. There is no configuration in which this is a low-trust dependency, which is why the controls below are worth their cost here even if you skip them elsewhere. See our earlier piece on <a href="/blogs/the-server-was-archived-the-install-still-worked">dependencies the agent adds for you</a> for the adjacent failure: a package that was never in the lockfile at all.</p>
+</section>
+
+<section>
+  <h2>What actually held, in order of how much it buys</h2>
+  <figure>
+    <img src="/blogs/the-package-ran-without-being-imported/data-which-control-stopped-it.svg" alt="Six dependency practices scored on whether they block the install and whether they report it afterwards. An open version range and an upgrade install do neither. An exact pin without hashes blocks this particular case but reports nothing. A hash-pinned lockfile blocks it and surfaces a resolver error. A private mirror with a publish delay blocks it and records the attempt. A post-install integrity scan blocks nothing but may report." width="900" height="400" loading="lazy" />
+    <figcaption>Only two rows stop the install. One of them is a file most teams already have and do not enforce.</figcaption>
+  </figure>
+
+  <p>Comparing the rows is more instructive than reading them. The two that hold do so for the same reason — the artefact has to match something decided in advance — while the two that fail do so for the same reason, which is that they ask the index what the newest acceptable version is at install time.</p>
+
+  <ul>
+    <li><strong>Hash-pinned lockfiles, enforced.</strong> This is the control that actually worked on 17 November, and it is also the one most teams believe they have and do not. A <code>poetry.lock</code>, <code>uv.lock</code> or <code>requirements.txt</code> with <code>--require-hashes</code> makes 1.26.1 unresolvable: it is a version nobody recorded a hash for. The enforcement word matters — an unpinned <code>pip install</code> anywhere in a Dockerfile, a tox environment or a developer's setup script routes around the lockfile you are relying on.</li>
+    <li><strong>A publish delay on a private mirror.</strong> Quarantine happened in roughly 45 minutes. A mirror that refuses to serve a release less than 24 or 48 hours old converts almost every incident of this class into a non-event, and it also gives you the record of what was requested. This is the highest-leverage change available to a platform team and the one most often rejected as friction.</li>
+    <li><strong>No credentials in the environment that performs installs.</strong> The stealer was good at its job; the fix is not to out-run it but to make the step it runs in boring. Resolve and build in a job with no cloud credentials, then run with credentials in a job that does not install. This also removes the "other running processes" vector, because there are none worth reading.</li>
+    <li><strong>An inventory that answers the storage question.</strong> Not a dependency scanner — those report declared dependencies — but the ability to list which hosts, images and caches hold a given artefact version. The incident's duration is almost entirely a function of how long this takes you.</li>
+    <li><strong>Exact pins without hashes.</strong> Worth noting as the honest middle: <code>==1.26.0</code> would have stopped this specific attack, because the attacker published new versions rather than republishing an existing one. It would not stop a republished artefact under the same version, which is what hashes are for.</li>
+  </ul>
+
+  <p>None of this is agent-specific, and that is the point worth taking away. The agent framework was not compromised because it is an agent framework; it was compromised because it is a popular Python package. What is agent-specific is the payout. A stealer inside a web framework gets a database password. A stealer inside the thing you handed a cloud role, a model key and a repository token gets the keys to the loop.</p>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Was Microsoft's package actually compromised, or was this a lookalike?</h3>
+  <p>The real package. Researchers found the malicious releases under the legitimate Microsoft-associated PyPI publisher, not a typosquat — Orca reports the publisher account was subsequently secured. That is what distinguishes this from the steady background rate of name-confusion attacks.</p>
+  <h3>Am I affected if my code never imports <code>agent_framework</code>?</h3>
+  <p>Yes, if the install happened. The payload was delivered through a <code>.pth</code> file, which the <code>site</code> module executes at interpreter startup regardless of what you import. The relevant question is whether 1.26.1 or 1.26.2 was ever installed into any environment on the host.</p>
+  <h3>Which versions are safe?</h3>
+  <p>1.26.0, published 12 November 2026, is the last clean release and was still current at the time of the incident. Treat any <code>agent-framework</code> release dated 17 or 18 November 2026 as suspect until Microsoft confirms it, which is Chainguard's guidance and the conservative reading.</p>
+  <h3>Do I need to rotate secrets, or can I check the logs first?</h3>
+  <p>Rotate. The collector read environment variables, config files and other processes' memory on the host, and none of those reads leave a trace you can audit. If either version was installed on a build agent or a laptop, assume every secret available to that host is compromised.</p>
+  <h3>Did the sibling packages need pinning too?</h3>
+  <p>They were not affected, but they share the publisher. If you depend on <code>agent-framework-core</code> or any other <code>agent-framework-*</code> package, pin and hash them individually — your lockfile already treats them as 23 separate dependencies, and so should your review.</p>
+  <h3>Would a container have protected me?</h3>
+  <p>Only if the image was not built during the window and the container holds no credentials worth taking. Immutability is not isolation: a layer built between roughly 20:35 and 21:20 UTC on 17 November carries the <code>.pth</code> file into every container started from it, indefinitely.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki:</h3>
+  <ul>
+    <li><a href="/deep-dives/agent-security/agent-supply-chain-security">Agent supply-chain security</a> — the full threat model this incident is one instance of.</li>
+    <li><a href="/concepts/pinning-and-verification">Pinning &amp; verification</a> — what a pin does and does not promise.</li>
+    <li><a href="/operations/safety-and-security/secrets-management-for-agents">Secrets management for agents</a> — why the install step should not hold credentials.</li>
+    <li><a href="/operations/safety-and-security/agent-artifacts-on-the-endpoint">Agent artifacts on the endpoint</a> — the developer laptop as the hardest surface to inventory.</li>
+    <li><a href="/operations/safety-and-security/detecting-agent-compromise">Detecting agent compromise</a> — what a stolen credential looks like downstream.</li>
+    <li><a href="/deep-dives/agent-security/vetting-a-third-party-skill">Vetting a third-party skill</a> — the same review problem one layer up.</li>
+  </ul>
+  <h3>Sources:</h3>
+  <ul>
+    <li><a href="https://www.aikido.dev/blog/two-malicious-agent-framework-releases-hit-pypi-in-33-minutes">Aikido — two malicious releases in 33 minutes</a> (timeline and install window)</li>
+    <li><a href="https://socket.dev/blog/agent-framework-pypi-package-compromised-with-credential-stealer">Socket — the <code>.pth</code> routing in both versions</a></li>
+    <li><a href="https://orca.security/resources/research/microsoft-agent-framework-pypi-supply-chain-attack-versions-1-26-1-and-1-26-2-steal-cloud-credentials/">Orca Security — publisher, siblings and credential targets</a></li>
+    <li><a href="https://www.chainguard.dev/unchained/microsoft-agent-framework-compromised-on-pypi-november-2026">Chainguard — guidance on later releases</a></li>
+    <li><a href="https://www.elastic.co/security-labs/threat-command/we-caught-the-agent-framework-pypi-compromise-six-minutes-after-it-published">Elastic Security Labs — detection timing and rotation advice</a></li>
+    <li><a href="https://www.endorlabs.com/learn/agent-framework-compromised-software-supply-chain-attack">Endor Labs — startup hooks and sibling-package check</a></li>
+    <li><a href="https://pypi.org/project/agent-framework/">PyPI — <code>agent-framework</code> release history</a></li>
+  </ul>
+</section>
