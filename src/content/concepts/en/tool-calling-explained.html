@@ -1,14 +1,14 @@
 <section class="phase">
   <div class="phase-num">B5</div>
-  <div class="week">Concepts · Core Building Blocks</div>
+  <div class="week">Concepts &middot; Core Building Blocks</div>
   <h2>Tool / function calling explained.</h2>
-  <p class="goal">A <a class="xref" href="/concepts/what-is-an-llm">language model</a> can only emit text. Tool calling (a.k.a. function calling) is the protocol that turns "emit text" into "do things in the world": the model requests a function, your code runs it, and the result goes back into context. This entry explains the exact request/response shape, the loop it implies, why the model never executes anything itself, and the design rules that keep tool-using agents safe.</p>
+  <p class="goal">"Tool calling" named one mechanism in 2024 and names at least four in late 2026 — a plain JSON request, a schema-constrained one, a search over tool definitions, and code the model writes to call your tools inside a sandbox — and the vendors document that these are mutually exclusive. So the first decision in a tool-using system is not which tools to expose. It is which calling mechanism, because that choice fixes your schema guarantee, your round-trip count and your token bill before you write a single tool.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
     <h3>The model proposes; your code disposes.</h3>
 
-    <p>The single most important fact: <strong>the model does not call your function. It outputs a structured request asking you to call it.</strong> There is no code execution inside the model. Tool calling is a disciplined text protocol with three steps:</p>
+    <p>The fact that survives every change of mechanism: <strong>the model does not call your function. It outputs a structured request asking you to call it.</strong> There is no code execution inside the model. Even the newest code-generating variants only move <em>where</em> the loop runs — into a sandbox you operate — not who executes the real work.</p>
 
     <ul>
       <li>You describe the available tools (name, purpose, parameter schema) in the request; <a class="xref" href="/concepts/what-is-mcp">MCP</a> is the open standard that lets any model reach any tool this way.</li>
@@ -16,7 +16,7 @@
       <li>Your application executes the real function, then sends the result back as a <em>tool-result</em> message. The model continues, now able to use that result.</li>
     </ul>
 
-    <p>Everything the model does is still next-token prediction. It was post-trained to emit a specific JSON-shaped structure when a tool would help; the "calling" is your code reacting to that structure.</p>
+    <p>Everything the model does is still next-token prediction. It was post-trained to emit a specific JSON-shaped structure when a tool would help; the "calling" is your code reacting to that structure. This is why the tool <em>description</em> is prompt engineering rather than boilerplate — the model's choice of whether and how to call a tool rests almost entirely on that text. A vague description ("does stuff with users") produces unreliable calling; a precise one ("Fetch a user by ID. Use only when you have a numeric user_id; do not guess IDs") produces reliable calling. <a class="xref" href="/concepts/tool-design-for-agents">Tool design for agents</a> is the whole subject.</p>
   </div>
 
   <div class="step">
@@ -45,53 +45,65 @@ tools = [{
 # 4. Model now answers in prose, grounded in the result
 "It's 12C with light rain in Paris right now."</span></pre>
 
-    <p>The tool <em>description</em> and parameter schema are prompt engineering, not boilerplate. The model decides whether and how to call a tool based almost entirely on that text. A vague description ("does stuff with users") produces unreliable calling; a precise one ("Fetch a user by ID. Use only when you have a numeric user_id; do not guess IDs") produces reliable calling.</p>
+    <p>One call is rarely the end. The result may prompt another, until the model has enough to answer. That cycle — model &rarr; tool request &rarr; execute &rarr; result &rarr; model — is the <a class="xref" href="/concepts/the-agent-loop">agent loop</a>. Two consequences follow that no mechanism removes. <strong>You own the loop:</strong> the API does not auto-execute; you write the code that detects a tool-use message, runs the function, appends the result and calls the model again. And <strong>you need a stop condition:</strong> a tool that always errors can make the model retry until your budget is gone, so cap iterations (<a class="xref" href="/concepts/planning-and-termination">planning and termination</a>).</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>The loop this implies.</h3>
+    <h3>Four mechanisms, and the exclusivity nobody reads.</h3>
 
-    <p>One tool call is rarely the end. The result may prompt another call, then another, until the model has enough to answer. That cycle — model → tool request → execute → result → model — repeated until the model emits a final answer instead of a tool request, is the <strong>agent loop</strong> (covered in the Agentic AI section). Tool calling is the primitive; the loop is the pattern built on it. Two consequences for beginners:</p>
+    <p>As of November 2026 the major APIs offer these as separate, documented features, and the constraints between them are stated plainly in the docs rather than discovered in production — if you read that far.</p>
+
     <ul>
-      <li><strong>You own the loop.</strong> The API does not auto-execute. You write the code that detects a tool-use message, runs the function, appends the result, and calls the model again.</li>
-      <li><strong>You need a stop condition.</strong> A buggy tool that always errors can make the model retry forever. Always cap iterations.</li>
+      <li><strong>Plain JSON tool use.</strong> The default. The model emits a tool-use block; nothing guarantees the arguments match your schema, so you validate. Several calls can arrive in one response (<a class="xref" href="/concepts/parallel-tool-calls">parallel tool calls</a>) — on Anthropic's API you must return every result in a single following message, one <code class="inline">tool_result</code> block per call, or the request errors.</li>
+      <li><strong>Strict / schema-constrained tool use.</strong> Setting <code class="inline">strict: true</code> on a tool definition switches the sampler to grammar-constrained decoding, so the arguments are schema-valid by construction. OpenAI exposes the same flag per function tool. It is a real guarantee, and it costs you flexibility: Anthropic requires <code class="inline">additionalProperties: false</code> and a complete <code class="inline">required</code> list, and only a subset of JSON Schema survives per vendor (<a class="xref" href="/deep-dives/tool-capability-design/json-schema-subsets-per-vendor">JSON Schema subsets per vendor</a>).</li>
+      <li><strong>Tool search.</strong> Instead of putting every definition in the prompt, the model searches a catalogue and gets back references that expand into full definitions on demand. This exists because a large catalogue is a token problem before it is a selection problem — see <a class="xref" href="/deep-dives/tool-capability-design/tool-discovery-and-docs">tool docs and discoverability</a> and <a class="xref" href="/operations/agentops/mcp-context-overload">MCP context overload</a>.</li>
+      <li><strong>Programmatic tool calling.</strong> The model writes code that invokes your tools inside an execution container, so a five-step chain costs one model turn instead of five. Anthropic's docs are explicit that <code class="inline">strict: true</code> is <em>not supported</em> with programmatic calling, and neither is <code class="inline">disable_parallel_tool_use: true</code>. See <a class="xref" href="/deep-dives/tool-capability-design/code-as-action">code as action</a>.</li>
     </ul>
+
+    <div class="callout warn">
+      <p>The pattern across vendors is the same and it is the thing to remember: <strong>you can have a schema guarantee or you can have the mechanisms that reduce round trips, not both.</strong> OpenAI's Structured Outputs announcement states that structured outputs are not compatible with parallel function calls, and recommends setting <code class="inline">parallel_tool_calls: false</code> to get the guarantee — note that this flag defaults to <code class="inline">true</code>, and setting it false means exactly zero or one tool call per turn. Anthropic's exclusion list for programmatic calling is the same trade in a different place. Decide which guarantee you are buying, then write tools that assume it.</p>
+    </div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>Why this primitive is powerful.</h3>
+    <h3>What the measurements say, and what they do not.</h3>
 
-    <p>Tool calling removes three structural weaknesses of a bare LLM:</p>
+    <p>The temptation is to read "fewer round trips" as "worse accuracy, cheaper bill". An August 2026 arXiv study (<em>The Bitter Lesson of Tool Calling</em>, arXiv:2608.06370) measured a 309-entry subset of BFCL v4 across 14 models with typed Python stubs as the tool interface, and found programmatic calling matched or beat native JSON calling in <strong>11 of 14 models</strong>, with the GPT-5.6 family 10.6% above the JSON baseline, and 13 of 14 under parallel fan-out.</p>
+
+    <p>Read the caveats, because they are the useful part. The authors note that BFCL v4's echo-return stubs mean the benchmark measures <em>argument serialisation</em> rather than end-to-end tool-use correctness; programmatic calling used 1.5&times; the input tokens of JSON in the chaining ablation; and the ablation samples were 31–52 entries each, so only the cross-model pattern is reliable. So: code mode is not a free win on either axis, and a benchmark score here is not a claim about your tools.</p>
+
+    <p>What you can take from it is the shape of the decision. Round trips dominate latency and transcript growth; the transcript is re-sent every step, so a chain collapsed into one turn is a <a class="xref" href="/concepts/agent-cost-control">quadratic cost</a> saving on the steps it removes and an input-token premium on the turn it keeps. Three rules of thumb:</p>
     <ul>
-      <li><strong>Stale knowledge → live data.</strong> The model's training has a cutoff. A <code class="inline">search</code> or <code class="inline">get_account</code> tool gives it current facts instead of memorized guesses.</li>
-      <li><strong>Bad at exact computation → real computation.</strong> Models are unreliable at arithmetic and precise logic. A <code class="inline">calculator</code> or <code class="inline">run_sql</code> tool offloads exactness to code that is actually exact.</li>
-      <li><strong>Can't act → can act.</strong> <code class="inline">send_email</code>, <code class="inline">create_ticket</code>, <code class="inline">deploy</code> — tools are how an LLM affects the world rather than only describing it.</li>
+      <li><strong>Few tools, high stakes, strict schema.</strong> A payments or database tool where a malformed argument is an incident: take the grammar guarantee and the extra round trips.</li>
+      <li><strong>Long deterministic chains, bulk data.</strong> Fetch-filter-aggregate over hundreds of records: programmatic calling, because the intermediate results never need to enter the transcript at all.</li>
+      <li><strong>Large catalogue, sparse use.</strong> Fifty tools of which any run touches three: tool search, and measure the prompt before and after rather than assuming.</li>
     </ul>
-    <p>This is also the through-line of this section: RAG is essentially a retrieval tool wired into context; structured output is the same JSON-shaping machinery pointed at the final answer instead of a function call.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>The safety rules that are not optional.</h3>
+    <h3>The safety rules are mechanism-independent — and one of them gets harder.</h3>
 
     <div class="callout danger">
-      <p>A tool argument produced by the model is untrusted input. The model can be wrong, or steered by prompt injection in retrieved/tool content. Treat every tool call as if a stranger on the internet sent that request to your function.</p>
+      <p>A tool argument produced by the model is untrusted input. The model can be wrong, or steered by <a class="xref" href="/concepts/prompt-injection-101">prompt injection</a> in retrieved or tool-returned content. Treat every tool call as if a stranger on the internet sent that request to your function — because via injected content, one effectively did.</p>
     </div>
 
     <ul>
-      <li><strong>Validate before executing.</strong> Re-check the arguments against the schema and your own business rules in code. Never pass model output straight into a shell, SQL string, or filesystem path.</li>
-      <li><strong>Least privilege.</strong> Expose the narrowest tool that does the job. <code class="inline">refund_order(order_id, amount)</code> with server-side limits, not <code class="inline">run_arbitrary_sql</code>.</li>
-      <li><strong>Gate irreversible actions.</strong> Deletes, payments, sends — require explicit confirmation or human approval. Capability limits hold even when the prompt is subverted; a sentence telling the model "be careful" does not.</li>
-      <li><strong>Return errors as data.</strong> When a tool fails, send a structured error back as the tool result so the model can react ("that user does not exist") rather than crashing the loop.</li>
-      <li><strong>Make tools idempotent where possible.</strong> The loop may retry; a retried <code class="inline">charge_card</code> must not double-charge.</li>
+      <li><strong>Validate before executing.</strong> Re-check arguments against the schema <em>and</em> your business rules in code. Never pass model output straight into a shell, SQL string or filesystem path. Note that <code class="inline">strict: true</code> narrows this job without removing it: a schema-valid <code class="inline">order_id</code> can still belong to another tenant.</li>
+      <li><strong>Least privilege.</strong> Expose the narrowest tool that does the job: <code class="inline">refund_order(order_id, amount)</code> with server-side limits, not <code class="inline">run_arbitrary_sql</code>.</li>
+      <li><strong>Gate irreversible actions.</strong> Deletes, payments, sends — require explicit confirmation. Capability limits hold when the prompt is subverted; a sentence telling the model "be careful" does not (<a class="xref" href="/concepts/blast-radius">blast radius</a>).</li>
+      <li><strong>Return errors as data.</strong> Send a structured error back as the tool result so the model can react ("that user does not exist") rather than crashing the loop.</li>
+      <li><strong>Make tools idempotent.</strong> The loop may retry; a retried <code class="inline">charge_card</code> must not double-charge.</li>
     </ul>
-  </div>
 
-  <div class="deliverable">
-    <div class="tag">Takeaway</div>
-    <h3>Deliverable</h3>
-    <p>You understand tool calling as a text protocol: you declare tools with precise descriptions and schemas, the model emits a structured tool-use request, your code executes the real function and returns a tool-result, and the model continues grounded in it. You own the surrounding loop and its stop condition. You know it exists to fix stale knowledge, weak computation, and inability to act. And you treat every model-produced argument as untrusted: validate it, scope tools to least privilege, gate irreversible actions with capability limits rather than instructions, and make execution idempotent.</p>
+    <p>The rule that gets harder is review. With plain JSON calls your approval gate sees a tool name and its arguments — a reviewable artefact. With programmatic calling it sees a program, and "approve this code" is a strictly weaker control than "approve this payment of $4,000", because the interesting behaviour is a branch three lines down. If you adopt code mode on a surface with human approval, keep the gate on the <em>effects</em> inside the container rather than on the generated source.</p>
+
+    <div class="callout tip">
+      <p>Start with plain JSON tool use and a validation layer; it is the only mechanism every model supports and the only one whose failures you can read. Then make exactly one change based on a measurement you took: add <code class="inline">strict: true</code> to the tools where a malformed argument is an incident, turn on tool search when tool definitions are over roughly a tenth of your prompt, and reach for programmatic calling only when a single chain is costing you five round trips. Changing the mechanism changes your guarantees — so change one at a time, and keep the eval that told you to.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/structured-outputs">structured outputs</a> for the same JSON-shaping machinery pointed at the final answer, <a class="xref" href="/deep-dives/tool-capability-design/tool-calling-vendor-matrix-2026">the tool-calling vendor matrix</a> for feature-by-feature differences, <a class="xref" href="/deep-dives/tool-capability-design/shaping-tool-results">shaping tool results</a> for what to return, and <a class="xref" href="/concepts/what-is-mcp">MCP</a> for making the whole thing portable.</p>
   </div>
 </section>
