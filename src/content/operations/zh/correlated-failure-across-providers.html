@@ -1,0 +1,118 @@
+<section class="phase">
+  <div class="phase-num">O38</div>
+  <div class="week">运维 · 智能体运维：部署与运营</div>
+  <h2>相关性故障：与主路径共享依赖的备选，根本不是备选。</h2>
+  <p class="goal">2026 年 11 月 21 日，对一套 Postgres 服务的维护同时搞掉了 OpenAI 的两个只读副本，而那两个副本在平台范围的请求路径上是承重的，于是在 211 分钟里，API 与 ChatGPT 的失败率峰值都达到 75%——所有把韧性方案写成「切到同一家厂商的更便宜模型」的团队，这时才发现自己什么也没买到。备选只在针对某个被点名的故障时才算备选，而真正会发生的故障住在共享基础设施里，换模型绕不过去。先把主路径与备路径之间的共同点列清楚，再故意把它弄坏——因为独立性是一项测量结果，永远不是一张架构图。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>模型层面的备选扛不住的那次故障。</h3>
+
+    <p>请把 OpenAI 自己对 2026 年 11 月 21 日的说明当作一份工程文档来读，而不是当新闻读，因为其中每一句都否掉了一种不同的韧性设计。对 Primary API 服务所用的一套 PostgresDB 服务做的计划内维护，导致<em>两个</em>只读副本同时失效。那两个副本是承重的，于是依赖它们的请求路径全线失败。在太平洋时间 1:48 到 5:21 之间，这家公司商用与消费产品的大多数请求都返回了错误，峰值达到 75%。</p>
+
+    <p>现在把团队通常为韧性所做的三件事，逐一对照这段描述检查一遍。</p>
+
+    <ul>
+      <li><strong>切到同一家厂商的另一个模型。</strong>什么也买不到。失效的组件坐在这家厂商所提供的每一个模型的前面；你请求里的那个模型标识符，根本到不了坏掉的那一段。这是最常被部署的智能体备选方案，而它防的是最不常发生的那类故障。</li>
+      <li><strong>切换到另一个区域。</strong>在这里也什么都买不到，而事后说明把这一点说得很明白：试图<em>在其他区域</em>拉起替代副本并未成功，事件最终是靠在<em>同一区域</em>投入两个新副本来缓解的。当受限的资源就在某一个区域里，「多开区域」不是一根可用的杠杆。</li>
+      <li><strong>重试。</strong>在 75% 的错误率下是主动有害的，因为一支正在重试的机群就是一个负载倍增器，而它到场的时刻恰好是依赖最脆弱的时刻——算式见<a class="xref" href="/zh/concepts/retry-amplification">重试放大</a>。</li>
+    </ul>
+
+    <p>真正能帮上忙的，是一条通往另一家公司的路径。这就是全部的发现，而它之所以不受欢迎，是因为第二家厂商是最贵、也最烦人的那种冗余。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>「我们有备选吗？」这个问题本身没有答案。</h3>
+
+    <p>只有给它附上一个具体故障，它才变得可回答，因为智能体面对的四类故障要由四种不同的机制来化解，而团队往往只拥有其中一种，却相信自己拥有全部四种。</p>
+
+<pre class="standalone"><span class="c-cm"># "Fallback" resolves differently per failure class</span>
+model is degraded / deprecated   -&gt; another model, same vendor      <span class="c-out">OK</span>
+vendor capacity, 429 / 529       -&gt; another model, same vendor      <span class="c-out">sometimes</span>
+vendor control plane is down     -&gt; another model, same vendor      <span class="c-err">USELESS</span>
+                                 -&gt; another vendor                  <span class="c-out">OK</span>
+your own dependency is down      -&gt; neither                         <span class="c-err">USELESS</span>
+<span class="c-cm">#  (gateway, queue, trace store, vector DB, secret broker)</span>
+</pre>
+
+    <p>四行里有两行，几乎所有人都在用的那个控制手段根本覆盖不到。第三行正是产生 11 月 21 日那次中断的那一行，也是厂商事故里数量第二多的一类：不是 GPU，不是权重，而是认证、计量、限流状态、请求准入——控制平面；它天生就是共享的，因为正是共享它，厂商才能在一把 API key 背后提供十二个模型。</p>
+
+    <p>第四行则是团队完全忘记的那一行。如果你的智能体离了你自己的网关、你自己的队列或你自己的密钥代理就跑不起来，那你的可用性就是这些东西的乘积，再多的厂商多样性也动不了它。把你自己的组件和厂商的放进同一张表，算出来通常会显示：你自己才是最大的那个风险源——这其实是好消息，因为它在你手里。</p>
+
+    <div class="callout warn">
+      <p>把故障类别写进配置里，而不是只写进运行手册。一个用同一条规则对 <code class="inline">429</code> 和 <code class="inline">5xx</code> 都做切换的路由器，是在用一条策略做两个不同的决定——而 <code class="inline">5xx</code> 这一支，恰恰是需要离开这家厂商的那一支。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>共享依赖清单，它比你的厂商清单长。</h3>
+
+    <p>独立性不是「两个名字不一样」这个属性。它是「两条路径没有共同组件」这个属性，而这些共同组件大多从 API 表面看不见。每个智能体做一遍这份清单，用 trace 而不是架构图来做，并把它和你的 SLO 放在同一个文件里。</p>
+
+    <ul>
+      <li><strong>认证与 key 校验。</strong>每家厂商一套服务，坐在每一个模型的前面。11 月 21 日的故障就落在这里。你按请求配置的任何东西都绕不过它。</li>
+      <li><strong>计量、配额与限流状态。</strong>通常是单一存储，通常比推理本身有更强的一致性要求——这使它最有可能成为那个「没法靠复制挪开」的组件。</li>
+      <li><strong>区域，以及区域的控制平面。</strong>这是两件不同的事。一个全局作用域的控制平面会全局失效，无论你的负载跨了多少个区域；而恢复路径还经常需要那个正好挂掉的控制平面——这正是云厂商一贯建议「预先置备容量、把控制平面调用从恢复路径里拿掉」的原因。</li>
+      <li><strong>路由器背后的那个服务端点。</strong>如果是路由器在替你选端点，那你配置里的两个模型名可能解析到同一个下游提供方，于是你的「两家厂商」其实是一家。这里也是数据留存属性与你的假设发生分叉的地方——见<a class="xref" href="/zh/blogs/the-canary-came-back-two-days-later">两天之后，那只金丝雀回来了</a>。</li>
+      <li><strong>你的网关。</strong>你为了韧性而加的那个东西，坐在通往每一家厂商的每一个请求的路径上。单一网关背后的备选，继承网关的可用性作为天花板；这项取舍的一般形态见<a class="xref" href="/zh/concepts/ai-gateways">AI 网关</a>。</li>
+      <li><strong>DNS、TLS 与状态页。</strong>这不是玩笑。一次证书或解析故障表现出来就像厂商中断，而它的修复发生在你们双方都不掌控的地方；至于你打算去读的那个状态页，往往托管在正出事的那一方手里。</li>
+      <li><strong>两家厂商底下的一切。</strong>跑在同一家超大规模云、同一个区域里的两家独立模型厂商，其实是一个可用区披着两张发票。请追问各自跑在哪里，因为他们不会主动说。</li>
+    </ul>
+
+    <p>你想要的产出，是每一类故障对应的一个数字：它会打掉你几条路径。如果「厂商控制平面」那一行的答案是「全部」，那你拥有的就是一个配置更繁琐的单厂商系统。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>按计划把独立性打坏，以此证明它。</h3>
+
+    <p>一份依赖清单是一个假设。唯一能把它变成知识的，是拿掉一个组件然后看会发生什么；而对智能体来说，这必须在整个任务的层面上做，而不是在单个请求的层面上，因为有意思的故障都在「恢复」那一部分里。</p>
+
+<pre class="standalone"><span class="c-cm"># One drill per failure class, quarterly, in staging then in prod at 1%</span>
+<span class="c-kw">def</span> <span class="c-fn">drill</span>(fault):
+    <span class="c-cm"># 1. inject at the layer, not at the call site</span>
+    proxy.<span class="c-fn">block</span>(fault.host)              <span class="c-cm"># not: mock the SDK</span>
+
+    <span class="c-cm"># 2. assert on task outcomes, not on request counts</span>
+    <span class="c-kw">assert</span> tasks.<span class="c-fn">completed_or_parked</span>() == tasks.<span class="c-fn">admitted</span>()
+    <span class="c-kw">assert</span> effects.<span class="c-fn">duplicates</span>() == <span class="c-st">0</span>        <span class="c-cm"># the real failover bug</span>
+
+    <span class="c-cm"># 3. assert the things nobody checks</span>
+    <span class="c-kw">assert</span> router.<span class="c-fn">routes_used</span>() &lt;= allowlist
+    <span class="c-kw">assert</span> guardrails.<span class="c-fn">active_on</span>(fallback_path)
+    <span class="c-kw">assert</span> cost.<span class="c-fn">per_task</span>(fallback_path) &lt; budget * <span class="c-st">3</span>
+
+<span class="c-fn">drill</span>(<span class="c-fn">BlockHost</span>(<span class="c-st">"api.primary-vendor.example"</span>))   <span class="c-cm"># control plane gone</span>
+<span class="c-fn">drill</span>(<span class="c-fn">Return429</span>(rate=<span class="c-st">1.0</span>))                      <span class="c-cm"># capacity gone</span>
+<span class="c-fn">drill</span>(<span class="c-fn">BlockHost</span>(<span class="c-st">"gateway.internal"</span>))            <span class="c-cm"># your own ceiling</span>
+<span class="c-fn">drill</span>(<span class="c-fn">SlowBy</span>(seconds=<span class="c-st">90</span>))                       <span class="c-cm"># worse than down</span>
+</pre>
+
+    <p>有三个细节决定这场演练值不值得做。要在网络层注入，因为 mock 掉 SDK 只是在测你的 mock；故障必须经过那一天真正会生效的同一套超时、连接池与重试策略。断言要放在任务完成度和重复副作用上，而不是错误率上，因为真正花钱的那种失败，是那个恢复后把邮件发了两遍的任务——<a class="xref" href="/zh/operations/agentops/idempotency-and-retries">幂等、重试与副作用安全</a>是那个控制手段，<a class="xref" href="/zh/operations/agentops/durable-state-and-resumability">持久状态与可恢复性</a>是它的底座。还要把「变慢」这一种包括进来，因为一个延迟 90 秒的依赖比一个直接挂掉的更难对付：它吃掉 worker、塞满队列，并且能骗过那些只检查「能不能连通」的健康检查。通用机械部分在<a class="xref" href="/zh/operations/agentops/fault-injection-for-agents">智能体的故障注入</a>；本页要回答的是「注入什么」这个具体问题。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>第二家厂商是另一个产品，而切换的代价会迟一步到来。</h3>
+
+    <p>真正的独立性意味着第二家公司，而第二家公司不是即插即用。在切换发生的那一刻，有四件事会变，而其中没有一件会出现在延迟面板上。</p>
+
+    <ul>
+      <li><strong>智能体的行为变了。</strong>工具调用方言、并行调用行为、拒答画像、有效上下文、结构化输出支持。备选是一个<em>不同的</em>智能体，而不是一个更慢的；完整论证见<a class="xref" href="/zh/operations/agentops/graceful-degradation-and-fallback">优雅降级与备选</a>。如果那套降级配置从没跑过你的评测集，你就没有备选。</li>
+      <li><strong>数据边界变了。</strong>你的留存安排、你的数据处理协议、你的驻留承诺，都是按厂商、而且常常是按端点来定的。一次把受监管流量静默路由到一家你根本没有协议的厂商的切换，会把一次可用性事故变成一次合规事故——机制见<a class="xref" href="/zh/operations/governance-compliance/zero-data-retention-and-abuse-monitoring">零数据留存与滥用监控</a>。最廉价的强制手段是一份白名单：遇到未批准的路由就拒绝请求，而不是靠一份「假定没人加过」的策略文档。</li>
+      <li><strong>成本变了，通常是上涨，而且不是线性的。</strong>一个更弱的备选要用更多轮次才能完成同一个任务，而每一轮都要重发一份越来越长的会话记录。请按「每任务成本」给备选做预算，而不是按它自己的「每 token 单价」。</li>
+      <li><strong>承诺额变了。</strong>预置吞吐、承诺消费折扣与预留容量都是按厂商算的，所以那个有韧性的配置，恰恰是不去用你已经预付掉的那份东西——见<a class="xref" href="/zh/operations/economics-roi/provisioned-throughput-and-commitments">预置吞吐与消费承诺</a>。把一条常温的第二路径当作保险来定价，而不是当作浪费；并且按「绝不能丢的那部分流量」来给它定容，而不是按全部流量。</li>
+    </ul>
+
+    <p>另外要注意，有用的备选往往根本不是另一个模型。把任务挂起——持久状态、一个明确的「已暂停，将自动恢复」状态、以及一次「重放而非重新推导」的恢复——比第二家厂商便宜，而且对任何「截止期比一次典型中断更长」的负载都是正确做法。大多数批量与后台智能体工作都属于这一类，而要判断你的哪些工作属于它，去<a class="xref" href="/zh/operations/agentops/timeouts-and-deadline-budgets">超时与截止期预算</a>。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>什么时候不要加备选。</h3>
+
+    <p><strong>如果你不会去评测第二条路径、不会去演练它，也说不清它和第一条共享了什么，那就不要上线——一个未经演练的备选，会把一次干净、可读的中断，变成一条未经测试的代码路径承载你的峰值流量，而它头上的护栏是按另一个模型校准的、它走的路由没人批准过。一个挂起的任务加一张诚实的状态页，胜过一个你从没跑过的备选。</strong></p>
+  </div>
+</section>

@@ -1,0 +1,118 @@
+<section class="phase">
+  <div class="phase-num">O38</div>
+  <div class="week">Operation · AgentOps: Deploy &amp; Operate</div>
+  <h2>Correlated failure: a fallback that shares a dependency is not a fallback.</h2>
+  <p class="goal">On 21 November 2026 maintenance on one Postgres service took out both of OpenAI's read replicas at the same time, those replicas were load-bearing for request paths across the platform, and for 211 minutes the failure rate peaked at 75% on the API and ChatGPT alike — so every team whose resilience plan was "fall back to a cheaper model at the same vendor" discovered that it had bought nothing. A fallback is only a fallback with respect to a named failure, and the failures that actually happen live in shared infrastructure that no model choice routes around. Enumerate what your primary and secondary paths have in common, then break it on purpose, because independence is a measurement and never a diagram.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The incident that model-level fallback cannot survive.</h3>
+
+    <p>Read OpenAI's own account of 21 November 2026 as an engineering document rather than as news, because every sentence in it invalidates a different resilience design. Scheduled maintenance on a PostgresDB service used by the Primary API service caused <em>both</em> read replicas to fail simultaneously. The replicas were load-bearing, so the request paths that depended on them failed. Between 1:48 and 5:21 PT the majority of requests to the company's commercial and consumer products returned errors, peaking at 75%.</p>
+
+    <p>Now take the three things a team typically does to be resilient and check each against that description.</p>
+
+    <ul>
+      <li><strong>Fall back to another model at the same provider.</strong> Buys nothing. The failing component sits in front of every model the vendor serves; the model identifier in your request never reaches the part that is broken. This is the most commonly deployed agent fallback and it defends against the least common failure.</li>
+      <li><strong>Fail over to another region.</strong> Buys nothing here, and the postmortem says so explicitly: attempts to bring up replacement replicas <em>in other regions</em> did not work, and the incident was mitigated by bringing two new replicas into service in the <em>same</em> region. When the constrained resource is in one region, more regions is not a lever.</li>
+      <li><strong>Retry.</strong> Actively harmful at 75% error rates, because a retrying fleet is a load multiplier arriving exactly when the dependency is weakest — the arithmetic is in <a class="xref" href="/concepts/retry-amplification">retry amplification</a>.</li>
+    </ul>
+
+    <p>What would have helped is a path to a different company. That is the whole finding, and it is unwelcome because a second vendor is the most expensive and most annoying form of redundancy to own.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>"Do we have a fallback?" is not a question with an answer.</h3>
+
+    <p>The question only becomes answerable once you attach a failure to it, because the four failure classes an agent faces are defeated by four different mechanisms and teams routinely own one and believe they own all four.</p>
+
+<pre class="standalone"><span class="c-cm"># "Fallback" resolves differently per failure class</span>
+model is degraded / deprecated   -&gt; another model, same vendor      <span class="c-out">OK</span>
+vendor capacity, 429 / 529       -&gt; another model, same vendor      <span class="c-out">sometimes</span>
+vendor control plane is down     -&gt; another model, same vendor      <span class="c-err">USELESS</span>
+                                 -&gt; another vendor                  <span class="c-out">OK</span>
+your own dependency is down      -&gt; neither                         <span class="c-err">USELESS</span>
+<span class="c-cm">#  (gateway, queue, trace store, vector DB, secret broker)</span>
+</pre>
+
+    <p>Two of the four rows are not addressed by the control almost everyone ships. The third row is the one that produced the 21 November outage and the second-largest category of provider incidents generally: not the GPUs, not the weights, but authentication, metering, rate-limit state, request admission — the control plane, which is shared by construction because sharing it is why a provider can offer twelve models behind one API key.</p>
+
+    <p>The fourth row is the one teams forget entirely. If your agent cannot run without your own gateway, your own queue or your own secret broker, then your availability is the product of every one of those, and no amount of vendor diversity moves it. Put your own components in the same table as the vendor's and the arithmetic usually reveals that you are your own largest risk, which is good news: you control it.</p>
+
+    <div class="callout warn">
+      <p>Write the failure class into the configuration, not just into the runbook. A router that fails over on <code class="inline">429</code> and on <code class="inline">5xx</code> with the same rule is making two different decisions with one policy — and the <code class="inline">5xx</code> branch is the one that needs to leave the vendor.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>The shared-dependency list, which is longer than your vendor list.</h3>
+
+    <p>Independence is not a property of two names being different. It is a property of two paths having no common component, and the common components are mostly invisible from the API surface. Build this list once per agent, from traces rather than from an architecture diagram, and keep it in the same file as your SLOs.</p>
+
+    <ul>
+      <li><strong>Authentication and key validation.</strong> One service per vendor, in front of every model. The 21 November failure landed here. Nothing you configure per request routes around it.</li>
+      <li><strong>Metering, quota and rate-limit state.</strong> Usually a single store, usually with a stronger consistency requirement than inference itself, which makes it the component most likely to be the one that cannot be replicated away.</li>
+      <li><strong>The region, and the region's control plane.</strong> Distinct things. A globally scoped control plane fails globally no matter how many regions your workload spans, and the recovery path frequently needs the control plane that is down — which is why the standing cloud guidance is to pre-provision capacity and keep control-plane calls out of the recovery path.</li>
+      <li><strong>The serving endpoint behind a router.</strong> If a router selects your endpoint, two model names in your config may resolve to one sub-provider, and your "two providers" are one. This is also where retention properties diverge from your assumptions — see <a class="xref" href="/blogs/the-canary-came-back-two-days-later">the canary came back two days later</a>.</li>
+      <li><strong>Your gateway.</strong> The thing you added for resilience is in the path of every request to every vendor. A fallback behind a single gateway inherits the gateway's availability as a ceiling; <a class="xref" href="/concepts/ai-gateways">AI gateways</a> is the trade in general.</li>
+      <li><strong>DNS, TLS and the status page.</strong> Not jokes. A certificate or resolver failure presents as a vendor outage and is fixed somewhere neither of you controls, and the status page you plan to read is frequently hosted by the party having the incident.</li>
+      <li><strong>Everything underneath both vendors.</strong> Two independent model vendors on the same hyperscaler, in the same region, are one availability zone wearing two invoices. Ask where each one runs, because they will not volunteer it.</li>
+    </ul>
+
+    <p>The output you want is a single number per failure class: how many of your paths it takes out. If the answer for "vendor control plane" is "all of them", you have a single-vendor system with extra configuration.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Prove independence by breaking it, on a schedule.</h3>
+
+    <p>A dependency list is a hypothesis. The only thing that converts it into knowledge is removing a component and watching what happens, which for an agent has to be done at the level of a whole task rather than a single request, because the interesting failures are in the parts that resume.</p>
+
+<pre class="standalone"><span class="c-cm"># One drill per failure class, quarterly, in staging then in prod at 1%</span>
+<span class="c-kw">def</span> <span class="c-fn">drill</span>(fault):
+    <span class="c-cm"># 1. inject at the layer, not at the call site</span>
+    proxy.<span class="c-fn">block</span>(fault.host)              <span class="c-cm"># not: mock the SDK</span>
+
+    <span class="c-cm"># 2. assert on task outcomes, not on request counts</span>
+    <span class="c-kw">assert</span> tasks.<span class="c-fn">completed_or_parked</span>() == tasks.<span class="c-fn">admitted</span>()
+    <span class="c-kw">assert</span> effects.<span class="c-fn">duplicates</span>() == <span class="c-st">0</span>        <span class="c-cm"># the real failover bug</span>
+
+    <span class="c-cm"># 3. assert the things nobody checks</span>
+    <span class="c-kw">assert</span> router.<span class="c-fn">routes_used</span>() &lt;= allowlist
+    <span class="c-kw">assert</span> guardrails.<span class="c-fn">active_on</span>(fallback_path)
+    <span class="c-kw">assert</span> cost.<span class="c-fn">per_task</span>(fallback_path) &lt; budget * <span class="c-st">3</span>
+
+<span class="c-fn">drill</span>(<span class="c-fn">BlockHost</span>(<span class="c-st">"api.primary-vendor.example"</span>))   <span class="c-cm"># control plane gone</span>
+<span class="c-fn">drill</span>(<span class="c-fn">Return429</span>(rate=<span class="c-st">1.0</span>))                      <span class="c-cm"># capacity gone</span>
+<span class="c-fn">drill</span>(<span class="c-fn">BlockHost</span>(<span class="c-st">"gateway.internal"</span>))            <span class="c-cm"># your own ceiling</span>
+<span class="c-fn">drill</span>(<span class="c-fn">SlowBy</span>(seconds=<span class="c-st">90</span>))                       <span class="c-cm"># worse than down</span>
+</pre>
+
+    <p>Three details decide whether the drill is worth running. Inject at the network layer, because mocking the SDK tests your mock; the fault has to pass through the same timeouts, connection pools and retry policies that will be in play on the day. Assert on task completion and on duplicate side effects rather than on error rates, since the failure that costs money is the resumed task that sends the email twice — <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency, retries and side-effect safety</a> is the control and <a class="xref" href="/operations/agentops/durable-state-and-resumability">durable state and resumability</a> is the substrate. And include the slow case, because a dependency at 90 seconds is harder than one at zero: it consumes workers, fills queues and defeats health checks that only test for reachability. The general machinery is <a class="xref" href="/operations/agentops/fault-injection-for-agents">fault injection for agents</a>; this page is the specific question of what to inject.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The second vendor is a different product, and the switch has costs that arrive later.</h3>
+
+    <p>Genuine independence means a second company, and a second company is not a drop-in. Four things change at the moment of failover, and none of them is visible in a latency dashboard.</p>
+
+    <ul>
+      <li><strong>The agent's behaviour changes.</strong> Tool-calling dialect, parallel-call behaviour, refusal profile, effective context, structured-output support. The fallback is a different agent, not a slower one, and the argument in full is <a class="xref" href="/operations/agentops/graceful-degradation-and-fallback">graceful degradation and fallback</a>. If the degraded configuration has never passed your eval suite, you do not have a fallback.</li>
+      <li><strong>The data boundary changes.</strong> Your retention arrangement, your data-processing agreement and your residency commitment are per vendor and often per endpoint. A failover that silently routes regulated traffic to a vendor you have no agreement with converts an availability incident into a compliance one — the mechanics are in <a class="xref" href="/operations/governance-compliance/zero-data-retention-and-abuse-monitoring">zero data retention and abuse monitoring</a>. The cheap enforcement is an allowlist that refuses an unapproved route rather than a policy that assumes nobody added one.</li>
+      <li><strong>The cost changes, usually upward and non-linearly.</strong> A weaker fallback takes more turns to finish the same task, and each turn re-sends a growing transcript. Budget the fallback at its own per-task cost, not at its own per-token price.</li>
+      <li><strong>The commitment changes.</strong> Provisioned capacity, committed-spend discounts and reserved throughput are per vendor, so the resilient configuration is the one that fails to use what you pre-paid for — see <a class="xref" href="/operations/economics-roi/provisioned-throughput-and-commitments">provisioned throughput and commitments</a>. Price a warm second path as insurance rather than as waste, and size it to the traffic you must not drop rather than to all of it.</li>
+    </ul>
+
+    <p>Note also that the useful fallback is often not another model at all. Parking the task — durable state, a clear "paused, resuming automatically" status, and a resume that replays rather than re-derives — is cheaper than a second vendor and correct for any workload whose deadline is longer than a typical outage. Most batch and background agent work is in that category, and <a class="xref" href="/operations/agentops/timeouts-and-deadline-budgets">timeouts and deadline budgets</a> is where you decide which of your work is.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>When NOT to add a fallback.</h3>
+
+    <p><strong>If you will not evaluate the second path, will not drill it, and cannot enumerate what it shares with the first, do not ship it — an unexercised fallback converts a clean, legible outage into an untested code path carrying your peak traffic, under guardrails calibrated for a different model and routes nobody approved. A parked task and an honest status page beat a fallback you have never run.</strong></p>
+  </div>
+</section>
