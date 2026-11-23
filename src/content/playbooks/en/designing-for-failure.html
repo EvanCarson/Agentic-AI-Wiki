@@ -2,53 +2,73 @@
   <div class="phase-num">H6</div>
   <div class="week">Playbook · Agent UX &amp; Human Interaction</div>
   <h2>The quality of an agent product is decided by what happens after it is wrong.</h2>
-  <p class="goal">Every agent will fail visibly in front of a user. The differentiator is not failure rate alone — it is whether failure is graceful, recoverable, and trust-repairing rather than catastrophic, opaque, and trust-destroying. This essay covers failing safely, undo and rollback as the primary safety net, error messages a user can actually act on, and the specific work of rebuilding calibrated trust after a mistake the user watched happen.</p>
+  <p class="goal">The failure screen you are able to show is already determined by a decision you made in the write path, hours earlier, because "the invoice was not sent" and "undo" are claims about state that only exist if something recorded them before the effect landed. Teams try to fix failure UX by rewriting copy, and copy is the one part that cannot be fixed, since an error message can only report what the system knows. Decide at each write which of three tiers the effect is on — cancellable, compensable, or merely disclosable — store the handle that tier needs, and your failure screens write themselves; skip it and no amount of careful wording saves you from "something went wrong".</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>Design the failure path with the same care as the success path.</h3>
-    <p>Most agent UX effort goes into the happy path; the failure path is whatever the exception handler happens to do. That ratio is backwards — users form their durable judgment of an agent during failures, not successes. A graceful failure has three properties: it stops <em>before</em> compounding (one bad step, not ten built on it), it leaves the system in a known state (not half-applied), and it tells the user precisely where things stand. Failing loudly and early beats failing silently and late every time.</p>
-    <div class="callout warn"><p>The dangerous failure is not the visible crash — it is the agent that quietly produces a plausible-but-wrong result and continues. Bias detection toward surfacing uncertainty and stopping, not toward pushing through.</p></div>
+    <h3>You cannot author a failure message retroactively.</h3>
+    <p>Most agent UX effort goes into the happy path, and the failure path gets whatever the exception handler happened to do. The usual diagnosis of that is a priorities problem, which makes it sound fixable later. It is not. Users form their durable judgment of an agent during failures, and by the time a failure is being rendered the useful information either exists or does not.</p>
+    <p>Work backwards from the three sentences a user actually needs — <em>what state am I in</em>, <em>what can I do about it</em>, <em>what should I not assume</em> — and each one resolves to a record somebody had to write earlier. "Nothing was applied" requires that effects were ordered and journaled, not fired concurrently. "The email was not sent, but the ticket was created" requires per-effect outcomes, not a single try/except around a five-step plan. "Undo" requires a stored inverse. A handler that holds only an exception object can tell the user that it is sorry, which is the one thing nobody needs.</p>
+    <div class="callout warn"><p>The dangerous failure is not the visible crash — it is the agent that quietly produces a plausible-but-wrong result and continues. Bias detection toward surfacing uncertainty and stopping rather than pushing through, and treat a half-applied plan as a failure even when every individual call returned 200.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>Undo is the safety net that makes everything else affordable.</h3>
-    <p>If actions can be cleanly undone, the entire cost of being wrong drops by an order of magnitude — and so can the friction everywhere else (this is the reversibility lever from H2, viewed from the failure side). Invest in undo before investing in better confirmations: a strong undo lets you safely lower approval friction, which reduces fatigue, which improves the oversight that catches the failures undo then cleans up.</p>
-<pre class="standalone"><span class="c-cm"># Make the action reversible; record how to reverse it</span>
-op = effect.apply(action)
-journal.record(op.inverse)          <span class="c-cm"># compensating action, kept ready</span>
-<span class="c-kw">if</span> user.undo(op) <span class="c-kw">or</span> monitor.detected_regression(op):
-    <span class="c-kw">await</span> journal.compensate(op)     <span class="c-cm"># roll back to known-good state</span></pre>
+    <h3>Three tiers of reversal, and the handle each one demands.</h3>
+    <p>"Can we undo it?" is not one question. Real systems answer it in three distinct ways, each requiring a different thing to have been stored, and the tier is a property of the <em>effect</em> rather than of your product's ambition.</p>
+    <p><strong>Cancellable</strong> — the effect has not landed yet, and withdrawing the authorisation leaves no trace. Stripe is the cleanest illustration: a payment that has been authorised but not captured cannot be refunded at all, it must be <em>cancelled</em>, which releases the hold without creating a Refund object and costs nothing. Gmail's Undo Send is the same shape in consumer clothing — a send-cancellation period of 5, 10, 20 or 30 seconds, chosen in web settings and defaulting to 5, during which the message has not actually gone anywhere. The handle this tier needs is the pending operation's id plus the deadline.</p>
+    <p><strong>Compensable</strong> — the effect landed and an inverse exists, but running it is a second visible event. The same Stripe payment, once captured, must be refunded through the refunds API; you may refund partially and more than once, up to the original amount. The money comes back and the statement line does not disappear. The handle is the stored inverse operation, with the identifiers it needs, written down before the forward action ran.</p>
+    <p><strong>Disclosable only</strong> — no inverse exists at any price. Mail accepted by a receiving server has no protocol-level recall; a notified counterparty cannot be un-notified; a consumed quota is gone. The handle here is the full description of what happened, because disclosure is the entire remedy.</p>
+<pre class="standalone"><span class="c-cm"># Classify at the write, not at the error. Three fields, forever.</span>
+effect = plan.<span class="c-fn">next</span>()
+journal.<span class="c-fn">record</span>(
+    tier   = effect.tier,            <span class="c-cm"># cancel | compensate | disclose</span>
+    handle = effect.<span class="c-fn">reversal_handle</span>(),  <span class="c-cm"># op id, or the inverse call</span>
+    until  = effect.cancel_deadline, <span class="c-cm"># None for the other two tiers</span>
+)
+op = effect.<span class="c-fn">apply</span>()                   <span class="c-cm"># journal BEFORE, always</span>
+
+<span class="c-kw">if</span> user.<span class="c-fn">undo</span>(op) <span class="c-kw">or</span> monitor.<span class="c-fn">regressed</span>(op):
+    journal.<span class="c-fn">reverse</span>(op)              <span class="c-cm"># picks cancel or compensate by tier</span>
+<span class="c-cm"># and if the tier is 'disclose', the UI says so instead of offering a button</span>
+</pre>
     <ul>
-      <li>Prefer real reversibility (compensating actions) over a confirmation that merely <em>warns</em>.</li>
-      <li>Where true rollback is impossible, insert a delay window with cancel before the effect lands.</li>
-      <li>Make undo discoverable at the moment of regret, not buried in a menu.</li>
+      <li>Where true reversal is impossible, buy yourself a cancellable window: a short delay before the effect lands converts tier three into tier one for the price of some latency, which is what Gmail's five seconds are for.</li>
+      <li>Never show an Undo control for a disclosable effect. A button that does not work is worse than an explanation, and users generalise from one lying affordance to all of them.</li>
+      <li>Invest in reversibility before investing in better confirmations. Strong undo lets you safely lower approval friction, which reduces fatigue, which improves the oversight that catches the failures undo then cleans up — the lever in full is <a class="xref" href="/playbooks/agent-ux-and-human-interaction/undo-and-reversibility">undo and reversibility</a>, and the server-side machinery is <a class="xref" href="/operations/agentops/repairing-agent-side-effects">repairing agent side effects</a>.</li>
     </ul>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
     <h3>An error message is a UI for the user's next action.</h3>
-    <p>"Something went wrong" tells the user nothing they can use. An actionable failure message answers three questions: <em>what state am I in now</em> (was anything applied? is it consistent?), <em>what can I do</em> (retry / undo / take over / escalate), and <em>what should I not assume</em> (e.g., "the email was NOT sent"). Surface the durable facts — what completed, what was rolled back, what is pending — and put the recovery action the user most likely wants as the primary control, right there, not three screens away.</p>
+    <p>"Something went wrong" tells the user nothing they can use, and the fix is not better prose — it is reporting the applied/not-applied boundary. A failure in a five-step plan has at least four distinct meanings: nothing ran; some steps ran and were reversed; some steps ran and could not be reversed; everything ran but the result is wrong. Those four have four different recovery actions, and a UI that renders them identically has thrown away the only information the user needed.</p>
+    <p>So the shape of a good failure screen is a short ledger, not a sentence. Name each effect, its outcome, and whether it is reversible; put the single most likely recovery action as the primary control next to it; and state the negative facts explicitly, because a user cannot infer "the email was not sent" from the absence of a line. Then give the run's identifier — the failure the user reports and the trace you investigate have to be joinable, and retrofitting that join is far harder than emitting it now.</p>
+    <div class="callout tip"><p>Write the ledger for the worst case first: the agent died mid-plan, with two effects applied and one unknown. If your data model cannot render that screen, the gap is in the write path and no copy edit will reach it. <a class="xref" href="/operations/agentops/durable-state-and-resumability">Durable state and resumability</a> is the substrate; <a class="xref" href="/concepts/dry-run-and-preview">dry run and preview</a> is how you let the user see the plan before any of it is a question.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>Fail closed on consequences, fail open on capability.</h3>
-    <p>The direction of failure is a deliberate choice. On the <em>consequence</em> axis — money, data, external communication — fail closed: when uncertain or erroring, do less, not more; an action not taken is recoverable, an erroneous irreversible action often is not. On the <em>capability</em> axis — a tool is down, a source is unreachable — fail open toward honest degradation: return partial results clearly labeled, or hand back to the human with state intact, rather than fabricating to appear functional. The worst failure mode combines them: a confident, complete-looking, wrong, irreversible result.</p>
+    <h3>Fail closed on consequence, fail open on capability.</h3>
+    <p>The direction of failure is a deliberate choice, and the two axes pull opposite ways. On the <em>consequence</em> axis — money, data, external communication — fail closed: when uncertain or erroring, do less rather than more, because an action not taken is recoverable and an erroneous irreversible one frequently is not. On the <em>capability</em> axis — a tool is down, a source is unreachable — fail open toward honest degradation: return partial results clearly labelled, or hand back to the human with state intact, rather than fabricating to appear functional.</p>
+    <p>The worst failure mode combines them: a confident, complete-looking, wrong, irreversible result. That is the one that destroys trust in capabilities which never failed, and the structural defence is to keep the irreversible step behind a check that is code rather than a model — the argument is in <a class="xref" href="/concepts/fail-closed-and-fail-open">fail closed and fail open</a>, and the worked version for money is <a class="xref" href="/deep-dives/architectures-and-patterns/deterministic-boundary-for-finance-agents">the deterministic boundary for finance agents</a>.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>Trust repair after a visible mistake is explicit work, not time.</h3>
-    <p>A visible error does not just cost that task; it resets the user's calibration (H1) for the whole agent, often globally even though the failure was scoped. Trust does not recover by waiting — it recovers through deliberate repair: acknowledge the specific error plainly (no minimizing, no anthropomorphic apology theater), state the concrete change that makes a recurrence less likely, and — most powerfully — propose a temporarily lowered autonomy rung (H5) in exactly the scope that failed. A demotion the agent proposes itself reads as accountability and rebuilds calibrated trust faster than any worded apology.</p>
-    <div class="callout tip"><p>After a visible failure, scope the trust impact for the user explicitly: "this affected refund handling; ticket labeling is unchanged." Unscoped failures silently poison trust in capabilities that never failed.</p></div>
+    <h3>Trust repair is scoped, explicit work — not the passage of time.</h3>
+    <p>A visible error does not just cost that task; it resets the user's calibration for the whole agent, usually globally even though the failure was narrow. Trust does not recover by waiting. It recovers through three deliberate moves, in this order.</p>
+    <ul>
+      <li><strong>Acknowledge the specific error plainly.</strong> No minimising, no anthropomorphic apology theatre. "The refund was calculated against the wrong invoice" lands; "I apologise for any inconvenience" does not, and over-apologising reads as a system that expects to be wrong again.</li>
+      <li><strong>Scope the damage out loud.</strong> "This affected refund handling; ticket labelling is unchanged." Unscoped failures silently poison trust in capabilities that never failed, and the user has no way to draw the boundary themselves — which is the calibration argument in <a class="xref" href="/playbooks/agent-ux-and-human-interaction/designing-for-trust">designing for trust</a>.</li>
+      <li><strong>Propose a demotion the agent asks for itself.</strong> Offer a temporarily lower autonomy rung in exactly the scope that failed — approval required on refunds, nothing else changed — and let the user accept or decline. A self-proposed demotion reads as accountability and rebuilds calibrated trust faster than any wording, and it gives you a measurable ladder back up: <a class="xref" href="/playbooks/agent-ux-and-human-interaction/progressive-autonomy">progressive autonomy</a>.</li>
+    </ul>
+    <p>Two failure modes of repair itself are worth naming. Repairing silently — shipping the fix with no message — leaves the user's calibration where the failure left it, so the engineering cost buys no trust. And repairing too broadly, by dropping the whole agent to manual approval, teaches the user that one mistake costs them the product; the demotion has to be as narrow as the failure.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
     <h3>When NOT to auto-retry.</h3>
-    <p><strong>If the failure may have partially applied a non-idempotent effect, do not auto-retry — silently retrying over uncertain state turns one recoverable failure into a duplicated, irreversible one.</strong></p>
+    <p><strong>If the failure may have partially applied a non-idempotent effect, do not auto-retry — silently retrying over uncertain state turns one recoverable failure into a duplicated, irreversible one, and the user now has two of something with no record of which attempt created which. Park the task, show the ledger, and make the human choose; the keys that would have made the retry safe are in <a class="xref" href="/operations/agentops/idempotency-and-retries">idempotency, retries and side-effect safety</a>.</strong></p>
   </div>
 </section>
