@@ -1,54 +1,110 @@
 <section class="phase">
   <div class="phase-num">H6</div>
   <div class="week">Playbook · Agent UX &amp; Human Interaction</div>
-  <h2>The quality of an agent product is decided by what happens after it is wrong.</h2>
-  <p class="goal">Every agent will fail visibly in front of a user. The differentiator is not failure rate alone — it is whether failure is graceful, recoverable, and trust-repairing rather than catastrophic, opaque, and trust-destroying. This essay covers failing safely, undo and rollback as the primary safety net, error messages a user can actually act on, and the specific work of rebuilding calibrated trust after a mistake the user watched happen.</p>
+  <h2>Your failure path needs three terminal states, and the one everybody omits is "unknown".</h2>
+  <p class="goal">Every recovery primitive shipping in November 2026 — checkpoints, rewind, retries, approval gates — is scoped to things it can snapshot or re-run, and not one of them claims to reverse a network call. So the honest outcome of a crash mid-write is not success and not failure but <em>I do not know whether that happened</em>, and a product with only two terminal states will silently pick one. It picks failure, which triggers a retry, which is how one recoverable incident becomes two irreversible ones.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
-    <h3>Design the failure path with the same care as the success path.</h3>
-    <p>Most agent UX effort goes into the happy path; the failure path is whatever the exception handler happens to do. That ratio is backwards — users form their durable judgment of an agent during failures, not successes. A graceful failure has three properties: it stops <em>before</em> compounding (one bad step, not ten built on it), it leaves the system in a known state (not half-applied), and it tells the user precisely where things stand. Failing loudly and early beats failing silently and late every time.</p>
-    <div class="callout warn"><p>The dangerous failure is not the visible crash — it is the agent that quietly produces a plausible-but-wrong result and continues. Bias detection toward surfacing uncertainty and stopping, not toward pushing through.</p></div>
+    <h3>The reversibility boundary is a property of your tool surface, not of your promise.</h3>
+
+    <p>"We have undo" is never the claim a harness actually makes. Read the documentation and the claim is always narrower and more specific, and the four shipping answers differ enough that you cannot reason about them interchangeably.</p>
+
+    <ul>
+      <li><strong>Claude Code's <code class="inline">/rewind</code></strong> tracks changes made by its own file-editing tools. Every prompt that starts a turn creates a checkpoint; it keeps snapshots for the <strong>100 most recent checkpoints</strong> in a session and deletes them in a retention sweep roughly <strong>30 days</strong> after the session last saved one. A shell command's writes are restorable only in files its tools had already touched. Subagent edits are usually not captured. Directories created, moved or deleted are not undone. Remote and network files are not tracked. Symlinked and hard-linked paths are skipped, with a warning naming how many.</li>
+      <li><strong>GitHub Copilot CLI's <code class="inline">/undo</code></strong> is the opposite boundary on all three axes: file changes are tracked per turn across editing tools, shell commands <em>and</em> sub-agents, with no Git required. It pays for that with hard numeric limits — files over <strong>10 MB</strong> are not captured, a single turn that changes more than <strong>500 files</strong> is not captured at all, and a file whose contents no longer match what Copilot last wrote is left untouched. The rewind itself cannot be undone.</li>
+      <li><strong>Codex CLI</strong> ships no undo, rewind, checkpoint or revert command. Git is the whole answer.</li>
+      <li><strong>Copilot's cloud coding agent</strong> has no rewind either, and replaces it with architecture — see STEP 5.</li>
+    </ul>
+
+    <p>Two things generalise. First, every one of them names version control as the remedy for whatever it does not cover, which is a vendor telling you the boundary is narrower than your users will assume. Second, no harness anywhere claims to reverse an outbound effect. Undo is a filesystem feature wearing a product word.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
-    <h3>Undo is the safety net that makes everything else affordable.</h3>
-    <p>If actions can be cleanly undone, the entire cost of being wrong drops by an order of magnitude — and so can the friction everywhere else (this is the reversibility lever from H2, viewed from the failure side). Invest in undo before investing in better confirmations: a strong undo lets you safely lower approval friction, which reduces fatigue, which improves the oversight that catches the failures undo then cleans up.</p>
-<pre class="standalone"><span class="c-cm"># Make the action reversible; record how to reverse it</span>
-op = effect.apply(action)
-journal.record(op.inverse)          <span class="c-cm"># compensating action, kept ready</span>
-<span class="c-kw">if</span> user.undo(op) <span class="c-kw">or</span> monitor.detected_regression(op):
-    <span class="c-kw">await</span> journal.compensate(op)     <span class="c-cm"># roll back to known-good state</span></pre>
-    <ul>
-      <li>Prefer real reversibility (compensating actions) over a confirmation that merely <em>warns</em>.</li>
-      <li>Where true rollback is impossible, insert a delay window with cancel before the effect lands.</li>
-      <li>Make undo discoverable at the moment of regret, not buried in a menu.</li>
-    </ul>
+    <h3>Compute undo coverage per run, not per tool.</h3>
+
+    <p>The number teams quote is the share of their tools that are reversible. The number that predicts incidents is the share of <em>runs</em> in which every effect was reversible, and the two are far apart because the irreversible tools are the useful ones.</p>
+
+<pre class="standalone"><span class="c-cm"># a support agent's tool surface, and what undo really covers</span>
+tools_total          = 14
+file_edits           =  9      <span class="c-cm"># reversible by checkpoint</span>
+shell_commands       =  3      <span class="c-cm"># reversible only where a file tool touched it first</span>
+outbound             =  2      <span class="c-cm"># send_email, issue_refund</span>
+tool_coverage        = 9 / 14  <span class="c-cm"># = 64% — the number that gets quoted</span>
+
+<span class="c-cm"># now sample 200 real runs and ask what each one touched</span>
+runs                        = 200
+runs_only_reversible_tools  =  56   <span class="c-cm"># = 28% — the number that matters</span>
+runs_touching_outbound      =  31   <span class="c-cm"># = 16% where "undo" is a word, not a feature</span></pre>
+
+    <p>Sixty-four per cent of the tools, twenty-eight per cent of the runs. Do this calculation before you promise a user anything, and do it again whenever a tool is added: one new outbound tool on a common path can halve per-run coverage without changing the quoted figure at all.</p>
+
+    <p>Then sort the remaining work by cost of reversal rather than by how frightening an action sounds, which is the lever <a class="xref" href="/playbooks/agent-ux-and-human-interaction/undo-and-reversibility">undo and reversibility</a> is built on. Real reversibility beats a confirmation that merely warns, because confirmation asks a person to predict a bad outcome while undo only asks them to recognise one. Where true rollback is impossible, a hold window with cancel buys you the same thing more cheaply than a dialog does.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
-    <h3>An error message is a UI for the user's next action.</h3>
-    <p>"Something went wrong" tells the user nothing they can use. An actionable failure message answers three questions: <em>what state am I in now</em> (was anything applied? is it consistent?), <em>what can I do</em> (retry / undo / take over / escalate), and <em>what should I not assume</em> (e.g., "the email was NOT sent"). Surface the durable facts — what completed, what was rolled back, what is pending — and put the recovery action the user most likely wants as the primary control, right there, not three screens away.</p>
+    <h3>Add the third terminal state, because four vendors now tell you to.</h3>
+
+    <p>This is the part the original version of this page, and most shipping products, got wrong. The documentation has converged, independently, on the same admission:</p>
+
+    <ul>
+      <li><strong>LangGraph:</strong> a retry re-runs the node from the start, giving at-least-once semantics for node execution — and it explicitly does not make external side effects happen exactly once. Checkpoints are written at super-step boundaries, not mid-function, so payments and emails inside a node fall outside the boundary.</li>
+      <li><strong>Temporal:</strong> Temporal does not make side effects run once. Its own worked example is a worker that completes an activity successfully and crashes just before notifying the service, so the event history has no record, the activity is retried, and a payment processor sees a duplicate charge.</li>
+      <li><strong>OpenAI's Agents SDK</strong> states it most plainly: approval permits a tool call to execute, it does not guarantee exactly-once execution — a payment can complete even though the saved snapshot holds no record of the result. And the instruction that follows is the one to build: a missing result in an ordinary lookup is not proof that retrying is safe, because reads lag and an earlier request can still land, so <strong>if the outcome remains uncertain, record it as unknown and avoid automatic replay</strong>.</li>
+      <li><strong>Claude Code</strong> shipped the user interface for it. Release 2.1.326 fixed <code class="inline">/rewind</code> reporting "No code changes" when a shell command had changed files it could not restore; a turn whose changes were not tracked now reads <strong>"Code changes unknown"</strong>.</li>
+    </ul>
+
+    <p>That last one is the pattern worth stealing wholesale. The bug was not that the harness failed to restore the files — it could not, by design. The bug was that it rendered "I cannot know" as "nothing happened", which is the most expensive sentence a recovery UI can print. Make <code class="inline">unknown</code> a value your state machine can hold, your API can return and your interface can draw, and make it visually distinct from both success and failure. A user who is told "the refund may or may not have been issued — check before retrying" can act correctly; a user told "the refund failed" will press the button again.</p>
+
+    <div class="callout warn">
+      <p>The dangerous failure was never the visible crash. It is the agent that quietly produces a plausible-but-wrong result and continues, and its close relative — the recovery surface that reports a clean failure it has no evidence for. Bias your detection toward surfacing uncertainty and stopping. See <a class="xref" href="/concepts/failure-concealment">failure concealment</a> for how this looks from the model's side.</p>
+    </div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>Fail closed on consequences, fail open on capability.</h3>
-    <p>The direction of failure is a deliberate choice. On the <em>consequence</em> axis — money, data, external communication — fail closed: when uncertain or erroring, do less, not more; an action not taken is recoverable, an erroneous irreversible action often is not. On the <em>capability</em> axis — a tool is down, a source is unreachable — fail open toward honest degradation: return partial results clearly labeled, or hand back to the human with state intact, rather than fabricating to appear functional. The worst failure mode combines them: a confident, complete-looking, wrong, irreversible result.</p>
+    <h3>A resume is a re-execution, so the idempotency key must be durable before the effect.</h3>
+
+    <p>LangGraph's documentation is blunt about the mechanism: when execution resumes after an interrupt, the runtime restarts the entire node from the beginning rather than from the line where <code class="inline">interrupt</code> was called, so any code that ran before it executes again. Subgraphs replay the same way. <a class="xref" href="/playbooks/agent-ux-and-human-interaction/interruption-and-handoff">Interruption, steering and handoff</a> works through what that costs a user mid-run; what matters for the failure path is the specific trap it sets.</p>
+
+    <p>Generating the idempotency key inside the step it protects does not work, and the failure is silent:</p>
+
+<pre class="standalone"><span class="c-cm"># the key must already be durable BEFORE the side effect runs</span>
+attempt 1:  node starts -&gt; generate key K1 -&gt; charge succeeds -&gt; process dies
+attempt 2:  node starts -&gt; state has no key -&gt; generate key K2 -&gt; charge AGAIN
+
+<span class="c-cm"># K1 was never checkpointed, because the node never returned.</span>
+<span class="c-cm"># Fix: derive the key from state that is already durable, or persist</span>
+<span class="c-cm"># it in a step that completes before the effect.</span></pre>
+
+    <p>Three corollaries, all from vendor documentation. Put side effects <em>after</em> the pause, or in a step of their own, so the replay window contains nothing that charges anyone. Re-read external state — price, inventory, policy — after a long pause, because the pre-pause world has expired. And remember that idempotency is enforced by the service you are calling, not by your activity: your key is a request, and the destination's retention period decides how long it is honoured. Make the unit of work the recovery boundary, since that is the only lever that stops completed work repeating. <a class="xref" href="/operations/agentops/idempotency-and-retries">Idempotency and retries</a> has the implementation.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>Trust repair after a visible mistake is explicit work, not time.</h3>
-    <p>A visible error does not just cost that task; it resets the user's calibration (H1) for the whole agent, often globally even though the failure was scoped. Trust does not recover by waiting — it recovers through deliberate repair: acknowledge the specific error plainly (no minimizing, no anthropomorphic apology theater), state the concrete change that makes a recurrence less likely, and — most powerfully — propose a temporarily lowered autonomy rung (H5) in exactly the scope that failed. A demotion the agent proposes itself reads as accountability and rebuilds calibrated trust faster than any worded apology.</p>
-    <div class="callout tip"><p>After a visible failure, scope the trust impact for the user explicitly: "this affected refund handling; ticket labeling is unchanged." Unscoped failures silently poison trust in capabilities that never failed.</p></div>
+    <h3>Where you cannot reverse, bound — and choose the direction of failure.</h3>
+
+    <p>The strongest answer to "what if the agent does something bad" is sometimes not undo at all. GitHub's cloud coding agent ships no rewind and instead makes the blast radius small enough that ordinary Git is sufficient: it can push to a single branch and no other, its credentials permit only simple push operations so it <strong>cannot directly run <code class="inline">git push</code></strong> or other Git commands, its draft pull requests must be reviewed and merged by a human — it cannot mark them ready for review, approve or merge — and by default workflows do not run until someone with write access approves them. Nothing is reversible because nothing landed. That is a better guarantee than a rollback, and it is available to any agent whose output can be staged.</p>
+
+    <p>Where effects must land, the direction of failure is a deliberate choice and it differs by axis. On the <em>consequence</em> axis — money, data, external communication — fail closed: when uncertain, do less, because an action not taken is recoverable and an erroneous irreversible action often is not. On the <em>capability</em> axis — a tool is down, a source unreachable — fail open toward honest degradation: return partial results clearly labelled, or hand back to the human with state intact, rather than fabricating to look functional. The worst outcome combines them: a confident, complete-looking, wrong, irreversible result. <a class="xref" href="/concepts/fail-closed-and-fail-open">Fail closed and fail open</a> is the general treatment; <a class="xref" href="/concepts/blast-radius">blast radius</a> is what you are actually sizing.</p>
+
+    <p>One detail worth copying because it is so often got wrong: cancellation is not rollback. Copilot CLI documents that a file write already in progress will complete, so files are not left corrupted mid-write, but remaining planned changes are abandoned. That is the right behaviour and it means a cancelled run ends in a <em>partially applied</em> state — which is exactly STEP 3's third terminal state, and which your stop button should say out loud.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>When NOT to auto-retry.</h3>
-    <p><strong>If the failure may have partially applied a non-idempotent effect, do not auto-retry — silently retrying over uncertain state turns one recoverable failure into a duplicated, irreversible one.</strong></p>
+    <h3>Write the message, then repair the trust — and do not auto-retry over uncertainty.</h3>
+
+    <p>An error message is a UI for the user's next action, and it answers three questions: <em>what state am I in now</em> (what was applied, what was rolled back, what is unknown), <em>what can I do</em> (retry, undo, take over, escalate), and <em>what should I not assume</em> — "the email was NOT sent", or, more honestly in many cases, "we cannot confirm whether the email was sent". Put the recovery action the user most likely wants as the primary control, right there, and surface the durable facts rather than a stack trace. "Something went wrong" is not a sentence; it is an abdication.</p>
+
+    <p><strong>Never auto-retry a failure that may have partially applied a non-idempotent effect.</strong> This is the single rule on this page that turns one recoverable incident into a duplicated, irreversible one, and the Agents SDK's guidance is the test to apply: retry only after authoritative reconciliation establishes that no earlier attempt performed the action and none can still perform it. Absence of a record is not reconciliation. Where reconciliation is unavailable, the run ends in <code class="inline">unknown</code> and a human decides. <a class="xref" href="/concepts/retry-amplification">Retry amplification</a> is what happens when a fleet of agents makes this mistake simultaneously.</p>
+
+    <p>Then do the trust work, because a visible error does not just cost that task — it resets the user's <a class="xref" href="/playbooks/agent-ux-and-human-interaction/designing-for-trust">calibration</a> for the whole agent, usually globally even though the failure was scoped. Trust does not recover by waiting. It recovers through specific repair: acknowledge the exact error plainly, with no minimising and no apology theatre; state the concrete change that makes recurrence less likely; and scope the damage explicitly — "this affected refund handling; ticket labelling is unchanged" — because unscoped failures poison trust in capabilities that never failed. The strongest move available is for the agent to propose a temporarily lowered autonomy rung in precisely the scope that failed, which reads as accountability rather than as a worded apology (<a class="xref" href="/playbooks/agent-ux-and-human-interaction/progressive-autonomy">progressive autonomy</a>).</p>
+
+    <div class="callout tip">
+      <p>In order: read your harness's documentation and write down the actual reversibility boundary, then compute undo coverage per run rather than per tool. Add <code class="inline">unknown</code> as a first-class terminal state in your state machine, your API and your UI, and never render it as failure. Derive every idempotency key from already-durable state, and put side effects after the pause. For anything you cannot reverse, stage it behind a gate instead — a branch and a review beat a rollback. Fail closed on consequence, open on capability. And if you keep one sentence: an agent that says "I do not know whether that happened" is working correctly, and a retry button next to that message is a bug.</p>
+    </div>
   </div>
 </section>
