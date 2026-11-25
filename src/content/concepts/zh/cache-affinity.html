@@ -1,0 +1,79 @@
+<section class="phase">
+  <div class="phase-num">B31</div>
+  <div class="week">概念 · 核心构件</div>
+  <h2>缓存亲和性。</h2>
+  <p class="goal">前缀缓存住在某一个副本上，于是决定提示词缓存到底值不值的那个组件是你的负载均衡器，而不是你的缓存：把每一步按轮询分发到八个副本上，稳态命中率就会趋向八分之一，也就等于把你已经花钱建起来的那份折扣扔掉了八分之七。缓存亲和性，就是"把请求送到已经持有它前缀的那台机器上"这个性质；而在自建栈上，它是杠杆最大、却没人去检查的那一个设置。</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>命中率是路由的属性，不是缓存的属性。</h3>
+
+    <p>一个<a class="xref" href="/zh/concepts/the-agent-loop">智能体循环</a>几乎是前缀缓存的理想负载。每一步都会重发系统提示词、工具定义以及到目前为止的整段对话，而新内容——下一个工具结果——是追加在<em>末尾</em>的。于是共享前缀单调增长、从不失效，这恰恰就是<a class="xref" href="/zh/concepts/prompt-caching">提示词缓存</a>当初被设计来利用的形状。</p>
+
+    <p>然后请求离开了你的进程。那段前缀的 KV 块，驻留在上一步服务它的那个副本的 GPU 显存里；另一个副本从来没见过这些 token，只能从头重算。所以第 <em>n</em> 步命中热缓存的概率，就是你的路由器把它送到与第 <em>n−1</em> 步同一个地方的概率：</p>
+
+<pre class="standalone"><span class="c-cm"># steady-state prefix-cache hit rate, by routing policy</span>
+replicas          = 8
+round_robin       = 1 / replicas        <span class="c-cm"># = 0.125</span>
+least_connections = ~1 / replicas       <span class="c-cm"># uncorrelated with cache content</span>
+sticky_by_session = ~1.0                <span class="c-cm"># minus restarts and evictions</span>
+prefix_aware      = ~1.0                <span class="c-cm"># minus load-driven overrides</span></pre>
+
+    <p>从第一行到最后一行，缓存本身什么都没变。引擎一样、哈希函数一样、前缀一样。唯一挪动的是请求落到了哪台机器上——而它把折扣挪动了八倍。</p>
+
+    <div class="callout">
+      <p>这就是为什么"我们打开了前缀缓存，几乎看不出效果"是一句如此常见的汇报。基准测试是对着一个副本跑的，那里亲和性是免费的、命中率近乎完美。而生产跑在一支负载均衡器后面的机队上，那台均衡器被配置成追求利用率均摊——那恰恰是一条明确设计来<em>打断</em>亲和性所依赖的那种相关性的策略。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>一次未命中到底多贵，取决于下面还有没有一层。</h3>
+
+    <p>未命中并不总意味着重算。服务栈越来越多地保留第二层缓存——主机内存、本地 NVMe，或者一个共享的分布式存储——于是落错副本的请求可以把这些块取过来，而不必重新生成。这把一笔预填充成本换成了一笔传输成本，而两者在你的互联带宽与序列长度下，可以在两个方向上差出几个数量级。</p>
+
+    <ul>
+      <li><strong>没有下层。</strong>一次未命中的代价是把共享前缀整段预填充一遍：你已经付过一次的算力，再付一次，而且就在用户下一步的关键路径上。</li>
+      <li><strong>主机或磁盘层。</strong>一次未命中的代价是一次向 GPU 显存的拷贝。对长前缀比预填充便宜，而盈亏平衡点随前缀长度移动——短前缀重算比取回更快。</li>
+      <li><strong>共享分布式层。</strong>一次未命中的代价是一次网络传输，这也是为什么这些项目公布的是互联带宽数字而不是 token 数字。比如 Mooncake 的 Transfer Engine 报出在 4×200 Gbps RoCE 上最高 87 GB/s、在 8×400 Gbps 上 190 GB/s，测量的是一次 40 GB 的搬运——大致相当于一个 70B 模型 128k token 的 KV 缓存。</li>
+    </ul>
+
+    <p>这个次序对该怎么花钱很重要。缓存分层让未命中更便宜；亲和性让未命中更稀少。如果你没有亲和性，买一层就是在用硬件价格治症状；而如果你有亲和性，那一层主要是在重启、再平衡与<a class="xref" href="/zh/deep-dives/memory-and-context/kv-cache-budgeting-for-agent-loops">驱逐</a>上挣回本钱，而不是在日常的每一步上。</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>亲和性是一个设置，而它有一条被写进文档的、悄悄失效的路。</h3>
+
+    <p>自建栈上有三套机制在起作用，而它们是三个分开的决定。</p>
+
+    <ul>
+      <li><strong>什么会被缓存。</strong>vLLM 对每一个<em>完整</em> KV 块做哈希，输入是父块的哈希，加上该块的 token，再加上一些附加项——LoRA ID、多模态输入哈希，以及一个按请求携带的 <code class="inline">cache_salt</code>。不完整的块不会被缓存，驱逐是在一条空闲队列上做 LRU。哈希算法可用 <code class="inline">--prefix-caching-hash-algo</code> 选择，默认 <code class="inline">sha256</code>；文档建议在需要哈希跨 Python 与 vLLM 版本可复现时用 <code class="inline">sha256_cbor</code>，并警告更快的 <code class="inline">xxhash</code> 变体不是密码学安全的，在多租户场景下碰撞可能泄露私密信息。</li>
+      <li><strong>什么绝不能共享。</strong><code class="inline">cache_salt</code> 是刻意打断亲和性：只有携带同一个 salt 的请求之间才能共享块。对<a class="xref" href="/zh/deep-dives/memory-and-context/memory-scopes-and-tenancy">租户隔离</a>来说这是正确的原语——一个纯以 token 内容为键的缓存就是一条跨租户通道，而按租户加盐，付出的只是你本来就不想要的那部分复用。</li>
+      <li><strong>请求会去哪里。</strong>一个前缀感知的路由器会给每个 worker 打分：它已经持有请求前缀的多少，减去它身上已经排着的活；所以当活跃负载让总的预估成本更高时，一个缓存很足的 worker 仍然会输给一个更冷的。NVIDIA Dynamo 的 KV 感知路由器正是这么工作的，并且带着那条真正要紧的告示：如果 KV 事件不可用、而 <code class="inline">--no-router-kv-events</code> 又没有设置，<code class="inline">kv</code> 模式会退回到只看负载的打分。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>把最后那半句当作它本来的样子来读——一种失效模式。一套部署可以被配置成缓存感知路由、不报任何错误，而实际上在做多绕了几步的轮询，因为路由器用来打分的那个信号从来就没被发布出来。唯一能知道的办法是按副本测命中率，而不是去读配置。如果你的仪表盘上只有一个聚合的缓存命中数字，它分辨不出这两个世界。</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>在托管 API 上你不做路由——但亲和性仍然归你。</h3>
+
+    <p>调用厂商的端点把机队藏了起来，于是人很容易得出结论：亲和性是他们的问题。并不是，因为缓存以你的前缀为键、按你的账户划定作用域、还带着一个生命周期，这就把决定命中率的那两个变量留在了你手上。</p>
+
+    <ul>
+      <li><strong>前缀的逐字节稳定。</strong>前缀匹配是字面意义上的匹配。混进一个时间戳、重排一次工具定义、让某个 JSON 键以不同顺序输出，每一步就都是一次冷写入。任何会变的东西，都该放在上下文末尾、在可缓存的那一段之后。</li>
+      <li><strong>在 TTL 之内到达。</strong>Anthropic 的缓存默认生命周期是五分钟，另有一小时的选项，计价为写入 1.25 倍基础输入价（一小时档为 2 倍）、读取 0.1 倍。一个在窗口内返回的智能体步骤能以 90% 的折扣读取；超出窗口的那一步要再付一次写入倍数。所以一次夹在循环中间的人工审批，不只是一个<a class="xref" href="/zh/operations/economics-roi/the-cost-of-an-idle-agent">空闲成本问题</a>——它还是一个缓存过期问题，而<a class="xref" href="/zh/deep-dives/architectures-and-patterns/context-caching-economics">上下文缓存经济学</a>里的算术会告诉你该买哪一档生命周期。</li>
+      <li><strong>看并发，不是看总量。</strong>因为缓存条目是按前缀来的，十个共享同一段系统提示词的并发运行共享一段缓存，而十个各带用户专属开场白的运行则有十段。把所有共享的东西提到所有个人化的东西之上，是唯一能可靠提高托管命中率的重构。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>按这个顺序做。先给<em>每个副本</em>的缓存命中率上仪表（在托管 API 上则是每次运行），在动任何东西之前就上——一个聚合数字会把整个问题藏起来。接着让路由对"标识这段对话的那个键"保持粘性，在多数机队上这是一行改动，也是可拿到的最大一笔单项收益。只有做完这些，再去争论要不要第二层缓存，因为分层让你的未命中更便宜，而亲和性让它们更稀少；在任何前缀长度上，稀少都胜过便宜。</p>
+    </div>
+
+    <p>相关：<a class="xref" href="/zh/concepts/prefill-and-decode">预填充、解码与 KV 缓存</a>讲清到底存了什么，<a class="xref" href="/zh/concepts/semantic-caching">语义缓存</a>是另一个、也更冒险的主意——复用<em>答案</em>，<a class="xref" href="/zh/concepts/agent-cost-control">智能体成本控制</a>说明这件事在其他杠杆之中的位置。</p>
+  </div>
+</section>
