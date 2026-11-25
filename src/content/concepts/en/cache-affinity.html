@@ -1,0 +1,79 @@
+<section class="phase">
+  <div class="phase-num">B31</div>
+  <div class="week">Concepts · Core Building Blocks</div>
+  <h2>Cache affinity.</h2>
+  <p class="goal">A prefix cache lives on one replica, so the component that decides whether prompt caching pays for itself is your load balancer, not your cache: route each step round-robin across eight replicas and the steady-state hit rate tends toward one in eight, which deletes seven-eighths of a discount you have already paid to build. Cache affinity is the property of sending a request to the machine that already holds its prefix, and on a self-hosted stack it is the single highest-leverage setting nobody checks.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The hit rate is a routing property, not a cache property.</h3>
+
+    <p>An <a class="xref" href="/concepts/the-agent-loop">agent loop</a> is close to the ideal workload for a prefix cache. Every step re-sends the system prompt, the tool definitions and the whole transcript so far, and new content — the next tool result — is appended at the <em>end</em>. The shared prefix therefore grows monotonically and is never invalidated, which is exactly the shape <a class="xref" href="/concepts/prompt-caching">prompt caching</a> was designed to exploit.</p>
+
+    <p>Then the request leaves your process. The KV blocks for that prefix are resident in the GPU memory of whichever replica served the previous step; a different replica has never seen those tokens and must recompute them from scratch. So the probability that step <em>n</em> hits warm cache is the probability that your router sent it to the same place as step <em>n−1</em>:</p>
+
+<pre class="standalone"><span class="c-cm"># steady-state prefix-cache hit rate, by routing policy</span>
+replicas          = 8
+round_robin       = 1 / replicas        <span class="c-cm"># = 0.125</span>
+least_connections = ~1 / replicas       <span class="c-cm"># uncorrelated with cache content</span>
+sticky_by_session = ~1.0                <span class="c-cm"># minus restarts and evictions</span>
+prefix_aware      = ~1.0                <span class="c-cm"># minus load-driven overrides</span></pre>
+
+    <p>Nothing about the cache changed between the first and the last line. The engine is identical, the hash function is identical, the prefix is identical. The only thing that moved is which machine the request arrived at — and it moved the discount by a factor of eight.</p>
+
+    <div class="callout">
+      <p>This is why "we enabled prefix caching and saw almost nothing" is such a common report. Benchmarks are run against one replica, where affinity is free and the hit rate is near-perfect. Production runs against a fleet behind a load balancer configured for even utilisation, which is a policy explicitly designed to <em>break</em> the correlation affinity depends on.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>What a miss actually costs depends on whether there is a tier below.</h3>
+
+    <p>A miss is not always a recompute. Serving stacks increasingly keep a second cache tier — host memory, local NVMe, or a shared distributed store — so a request that lands on the wrong replica can fetch the blocks instead of regenerating them. That converts a prefill cost into a transfer cost, and the two differ by orders of magnitude in both directions depending on your interconnect and your sequence length.</p>
+
+    <ul>
+      <li><strong>No lower tier.</strong> A miss costs a full prefill of the shared prefix: compute you already paid for once, paid again, on the critical path of the user's next step.</li>
+      <li><strong>Host or disk tier.</strong> A miss costs a copy into GPU memory. Cheaper than prefill for long prefixes, and the break-even moves with prefix length — short prefixes are faster to recompute than to fetch.</li>
+      <li><strong>Shared distributed tier.</strong> A miss costs a network transfer, which is why these projects publish interconnect numbers rather than token numbers. Mooncake's Transfer Engine, for example, reports up to 87 GB/s on 4×200 Gbps RoCE and 190 GB/s on 8×400 Gbps, measured on a 40 GB move — roughly the KV cache for 128k tokens of a 70B model.</li>
+    </ul>
+
+    <p>The ordering matters for how you spend. A cache tier makes misses cheaper; affinity makes misses rarer. If you have no affinity, buying a tier is treating the symptom at hardware prices — and if you have affinity, the tier mostly earns its keep on restarts, rebalances and <a class="xref" href="/deep-dives/memory-and-context/kv-cache-budgeting-for-agent-loops">evictions</a> rather than on routine steps.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Affinity is a setting, and it has a documented way of silently turning off.</h3>
+
+    <p>Three mechanisms are in play on a self-hosted stack, and they are separate decisions.</p>
+
+    <ul>
+      <li><strong>What gets cached.</strong> vLLM hashes each <em>full</em> KV block from its parent block's hash plus the block's tokens plus extras — LoRA IDs, multimodal input hashes, and a per-request <code class="inline">cache_salt</code>. Partial blocks are not cached, and eviction is LRU over a free queue. The hash algorithm is selectable with <code class="inline">--prefix-caching-hash-algo</code>, default <code class="inline">sha256</code>; the docs recommend <code class="inline">sha256_cbor</code> when you need hashes to be reproducible across Python and vLLM versions, and warn that the faster <code class="inline">xxhash</code> variants are non-cryptographic, with collisions able to leak private information in multi-tenant setups.</li>
+      <li><strong>What must not be shared.</strong> <code class="inline">cache_salt</code> is deliberate affinity-breaking: only requests carrying the same salt can share blocks. That is the correct primitive for <a class="xref" href="/deep-dives/memory-and-context/memory-scopes-and-tenancy">tenancy</a> — a cache keyed purely on token content is a cross-tenant channel, and salting per tenant costs you reuse you never wanted.</li>
+      <li><strong>Where the request goes.</strong> A prefix-aware router scores each worker by how much of the request's prefix it already holds, minus the work already queued on it, so a cache-rich worker can still lose to a colder one when its active load makes the total projected cost higher. NVIDIA Dynamo's KV-aware router works exactly this way, and carries the caveat that matters: if KV events are not available and <code class="inline">--no-router-kv-events</code> is not set, <code class="inline">kv</code> mode falls back to load-only scoring.</li>
+    </ul>
+
+    <div class="callout warn">
+      <p>Read that last clause as the failure mode it is. A deployment can be configured for cache-aware routing, report no error, and be doing round-robin with extra steps — because the signal the router scores on was never published. The only way to know is to measure hit rate per replica, not to read the config. If your dashboard has one aggregate cache-hit number, it cannot tell these two worlds apart.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>On a hosted API you do not route — but you still own affinity.</h3>
+
+    <p>Calling a provider's endpoint hides the fleet, and the temptation is to conclude that affinity is their problem. It is not, because the cache is keyed on your prefix and scoped to your account with a lifetime, which leaves you holding the two variables that decide the hit rate.</p>
+
+    <ul>
+      <li><strong>Byte-stability of the prefix.</strong> A prefix match is literal. One injected timestamp, one re-ordered tool definition, one JSON key emitted in a different order, and every step is a cold write. Anything that varies belongs at the end of the context, after the cacheable span.</li>
+      <li><strong>Arrival inside the TTL.</strong> Anthropic's cache carries a five-minute default lifetime with a one-hour option, priced as a write at 1.25× base input (2× for the hour) and a read at 0.1×. An agent step that returns within the window reads at a 90% discount; one that returns after it pays the write multiplier again. So a human approval in the middle of a loop is not only an <a class="xref" href="/operations/economics-roi/the-cost-of-an-idle-agent">idle-cost problem</a> — it is a cache-expiry problem, and the arithmetic in <a class="xref" href="/deep-dives/architectures-and-patterns/context-caching-economics">context caching economics</a> tells you which lifetime to buy.</li>
+      <li><strong>Concurrency, not volume.</strong> Because the entry is per prefix, ten concurrent runs sharing one system prompt share one cached span, while ten runs with per-user preambles have ten. Hoisting everything shared above everything personal is the one restructuring that reliably raises a hosted hit rate.</li>
+    </ul>
+
+    <div class="callout tip">
+      <p>Do this in order. Instrument cache-hit rate <em>per replica</em> (or per run, on a hosted API) before you touch anything — one aggregate number hides the whole problem. Then make routing sticky on whatever key identifies the conversation, which on most fleets is a one-line change and the largest single win available. Only then argue about a second cache tier, because a tier makes your misses cheaper while affinity makes them rare, and rare beats cheap at every prefix length.</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/concepts/prefill-and-decode">prefill, decode &amp; the KV cache</a> for what is actually being stored, <a class="xref" href="/concepts/semantic-caching">semantic caching</a> for the different and riskier idea of reusing an <em>answer</em>, and <a class="xref" href="/concepts/agent-cost-control">agent cost control</a> for where this sits among the other levers.</p>
+  </div>
+</section>

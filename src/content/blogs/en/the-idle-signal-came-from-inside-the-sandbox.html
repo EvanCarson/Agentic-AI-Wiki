@@ -1,0 +1,90 @@
+<p class="lede">For thirty years a platform decided your workload was idle by watching it from outside — CPU below a threshold, no requests for N seconds, a scheduler's timeout. Google's Agent Compute Engine, announced on 22 October 2026, inverts that: "when an agent finishes executing a tool call and enters the 'thinking' phase of the agentic loop, the microVM signals that it's idle, and the host moves it from an active to an idle state." That is the correct design, and it quietly makes your idle bill a property of your agent's code — which means the suspend boundary is now something you have to choose, evaluate and defend, not something the platform gets right on your behalf.</p>
+
+<section>
+  <h2>What was actually announced</h2>
+  <p>Agent Compute Engine is described as "a purpose-built compute service that already powers Gemini as an agent for work tasks," giving "every Gemini agent its own high-performance, secure computer to act upon." It is not generally available: "it will be available in preview in the coming months," and "you will soon be able to use this service to power your own custom agents." So the thing to read it as is a published design from a platform already running it at scale internally, not a product you can buy this quarter.</p>
+  <p>Three mechanisms carry the whole post. Isolation is "a hardware-isolated Cloud Hypervisor boundary with its own guest kernel and root access," run on Titanium, Google's offload IPU, for what the post calls "silicon-rooted defense-in-depth built for untrusted AI agents." Density comes from "copy-on-write memory sharing to run multiple agents on a single operating system template." And the lifecycle is "pausing idle microVMs via fast checkpoint and restore," which the post says can also "pause a running microVM while an agent waits on a human or an external system, and quickly resume it from snapshots."</p>
+  <figure>
+    <img src="/blogs/the-idle-signal-came-from-inside-the-sandbox/arch-who-decides-idle.svg" alt="A loop: model thinks, tool call runs, guest signals idle, host checkpoints the microVM, next step resumes from the snapshot." width="900" height="320" loading="lazy" />
+    <figcaption>The signal that starts the checkpoint originates inside the sandbox.</figcaption>
+  </figure>
+  <h3>The numbers belong to the sibling, not to this</h3>
+  <p>Agent Compute Engine's own section carries no performance figures — microVMs "boot rapidly" and that is all. The quantities in the announcement attach to Agent Substrate, the open-source GKE runtime launched alongside it: "as much as 10x higher compute density compared to traditional compute," and "in benchmark validation running 200,000 agents, Agent Substrate sustained 500 activations per second at less than 500 ms suspend and resume latency," with a Filestore integration quoted at "sub-second resume latency."</p>
+  <p>Those are the numbers worth planning against, and they are vendor benchmark numbers for a different product in the same family, so treat them as an order of magnitude rather than an SLO. The order of magnitude is the point: suspend and resume is a sub-second operation, not a free one.</p>
+</section>
+
+<section>
+  <h2>Why moving the decision inside the box is right</h2>
+  <p>An agent is the worst possible workload for utilisation-based idle detection. A long-horizon run alternates between bursts of real work — a tool call compiling something, a browser rendering a page — and stretches where the sandbox holds a checked-out repository, a warm interpreter and an open session while literally nothing executes, because the model is generating tokens somewhere else entirely. From outside, those stretches look exactly like a process that might resume at any millisecond, which is why the safe scheduler choice has always been to keep it warm. That is how a sandbox ends up billing <a href="/operations/economics-roi/the-cost-of-an-idle-agent">about 66 cents of pure nothing</a> through a four-hour approval wait.</p>
+  <p>Software inside the box knows the answer exactly. The harness just posted a tool result and is waiting for the next model response; there is nothing to schedule and nothing to lose. No amount of outside-in heuristics recovers that fact, and no timeout tuned to be safe can be aggressive. Giving the guest a way to say so is the first real improvement to this problem, and the design to copy whether or not you ever touch Google Cloud: the runtime that knows the loop's phase is the only thing that can declare the phase.</p>
+  <h3>What you have just taken on</h3>
+  <p>The flip side is that an idle signal is code, and code is a thing that can be absent, wrong, or late. Three consequences follow, and none of them is on the announcement.</p>
+  <ul>
+    <li><strong>An agent that never signals is billed as active forever.</strong> Your most expensive run becomes the one whose harness crashed in an unusual place, or whose custom tool wrapper swallowed the post-call hook. That failure is silent in every dashboard you own, because the sandbox looks healthy — it is healthy, it is just awake.</li>
+    <li><strong>An agent that signals at the wrong boundary pays a resume on every step.</strong> Suspend at the end of each tool call and a twenty-step task eats twenty suspend-and-resume cycles. At the Agent Substrate order of magnitude that is a few seconds of added wall clock on a task where the thinking phases might have totalled less than that.</li>
+    <li><strong>The signal is now part of your evaluation surface.</strong> "Did the run emit an idle signal at each quiescent point?" is a trajectory property, measurable the same way you measure whether a run called the right tool — and if you do not measure it, the regression that stops emitting it shows up first as a cloud invoice.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>The suspend boundary is a latency decision wearing a cost costume</h2>
+  <p>Work the arithmetic rather than the architecture. Suspending between steps saves you the held-resource cost of the thinking phase and charges you a suspend plus a resume. Whether that trade is positive is decided entirely by how long your thinking phase is, which is a property of your model and your effort budget, not of the platform.</p>
+  <figure>
+    <img src="/blogs/the-idle-signal-came-from-inside-the-sandbox/data-when-suspending-pays.svg" alt="Three kinds of agent wait — between tool calls, on a human, on an external job — against wait length, whether suspending pays, and what you risk." width="900" height="300" loading="lazy" />
+    <figcaption>One of these three is the case the whole mechanism was built for.</figcaption>
+  </figure>
+  <p>A fast tool-calling loop with a small thinking budget sits in the top row: the wait is short, the saving is a fraction of a vCPU-second, and the cost is user-visible latency added to every single step. A <a href="/concepts/reasoning-models">reasoning model</a> with a large effort budget can sit in the middle: tens of seconds of thinking is long enough that a sub-second resume disappears into it. And the bottom row — waiting on a human, waiting on a batch job, waiting on a webhook that may not arrive for hours — is the case where this is not an optimisation but a different cost structure, and it is the one the announcement names explicitly.</p>
+  <p>So the rule that falls out is narrower than "suspend when idle": <strong>suspend on the waits you can name, not on the gaps you can detect.</strong> A wait on a human or an external system is a semantic event your harness already knows about and can safely declare. The inter-step gap is a mechanical one, and tying a checkpoint to it converts a cost win into a latency tax that your p95 will find before your finance team does.</p>
+</section>
+
+<section>
+  <h2>Two design details worth stealing immediately</h2>
+  <h3>The credential never enters the box</h3>
+  <p>"Each microVM runs its agent's own identity, using short-lived credentials. Every microVM also gets its own cryptographically verified ID, and service credentials are injected in egress outside the microVM." Read that last clause slowly, because it is the strongest sentence in the post. The usual question about a sandbox is whether code can get out; the question that actually sets your blast radius is <a href="/deep-dives/agent-security/credential-delivery-to-the-sandbox">what the platform put inside before the agent started</a>, and the answer here is: nothing worth stealing. Egress goes through Agent Gateway, the post's "air traffic controller for client-to-agent and agents-to-anywhere traffic," and the gateway attaches the credential.</p>
+  <p>Be precise about what that buys. A prompt-injected agent inside the box still gets to make requests, and the gateway will still attach the credential to them — this is <a href="/concepts/confused-deputy">confused deputy</a>, unchanged. What it removes is exfiltration of the secret itself: the token cannot be read, logged, copied into a file or carried into the next session, because it was never resident. That is a genuine reduction in the worst case and it is independent of the hypervisor, which is why it is worth implementing on any sandbox you run.</p>
+  <h3>The snapshot is state with no retention policy</h3>
+  <p>Fast checkpoint and restore means guest memory is now a durable artifact, and guest memory mid-task is the agent's working set: the tool results it just read, the document it just fetched, the customer record it was reasoning over. Transcripts have <a href="/operations/governance-compliance/retention-and-legal-hold">retention rules</a> and <a href="/operations/evaluation-and-observability/pii-redaction-in-agent-traces">redaction pipelines</a> because somebody classified them as conversation data. Snapshots get lifecycle rules written by infrastructure teams who classified them as machine images.</p>
+  <p>The credential design above partly saves you here — a snapshot that never contained a token is a much less interesting object — but it does not save you from the content. If your answer to "where is this user's data" has to be complete, add "and in any checkpoint of the sandbox that was processing it" to the list, before someone else does. This is the same obligation that <a href="/operations/agentops/durable-state-and-resumability">durable state</a> created for every other resumable system, arriving in a form that does not look like a database.</p>
+</section>
+
+<section>
+  <h2>What to do about it this quarter</h2>
+  <p>Agent Compute Engine is in preview "in the coming months," so nothing here is a migration plan. It is a specification of a design that two Google runtimes now implement, and most of it is portable to whatever you are running today.</p>
+  <ul>
+    <li><strong>Find your longest wait and instrument it.</strong> Not average sandbox lifetime — the specific named waits: human approval, external job, scheduled retry. Multiply held-resource cost by that duration by run volume. If the number is small, none of this matters to you yet.</li>
+    <li><strong>Make the harness declare quiescence explicitly.</strong> Even without checkpointing, an explicit "this run is parked on X" event is what lets you release a sandbox, drop a pool slot, or <a href="/operations/agentops/sandbox-pools-and-cold-starts">hand the warm sandbox to someone else</a>. The signal is useful before the suspend mechanism exists.</li>
+    <li><strong>Do not checkpoint between steps because a vendor can.</strong> Measure your thinking-phase distribution first. If the median gap is shorter than a resume, per-step suspension is a latency regression you will ship as a cost optimisation.</li>
+    <li><strong>Move credentials out of the sandbox regardless.</strong> This one needs no new platform: a proxy that attaches the token on egress is an afternoon's work and it changes what a compromise is worth.</li>
+    <li><strong>Classify your snapshots as content.</strong> Whoever owns transcript retention should own checkpoint retention, and should know they own it.</li>
+  </ul>
+</section>
+
+<section class="faq">
+  <h2>FAQ</h2>
+  <h3>Can I use Agent Compute Engine today?</h3>
+  <p>No. The announcement of 22 October 2026 says it already powers Gemini as an agent for work tasks and that it "will be available in preview in the coming months," with support for custom agents coming after that. Treat it as a published design rather than an available product.</p>
+  <h3>How fast is suspend and resume?</h3>
+  <p>Google published no figures for Agent Compute Engine itself. The numbers in the same announcement belong to Agent Substrate, its open-source GKE sibling: 500 activations per second at under 500 ms suspend and resume latency in a 200,000-agent benchmark, and sub-second resume via Filestore. Those are vendor benchmarks for a different runtime, so plan to the order of magnitude, not the digit.</p>
+  <h3>Does checkpointing a microVM between tool calls save money?</h3>
+  <p>Only when the gap it covers is long. The saving is held-resource cost for the duration of the thinking phase; the charge is one suspend plus one resume, on the critical path. For a fast tool-calling loop the gap is often shorter than the resume, which makes per-step suspension a latency cost dressed as a cost saving. For a wait on a human or an external job it is clearly positive.</p>
+  <h3>If credentials are injected at egress, is prompt injection solved?</h3>
+  <p>No. An injected agent can still make requests, and the gateway still attaches the credential to those requests — the deputy is still confused. What the design removes is theft of the secret itself, because it was never inside the sandbox to read.</p>
+  <h3>What does an idle signal mean for my evals?</h3>
+  <p>It becomes a trajectory property. Whether a run emitted an idle signal at each quiescent point is measurable in a trace the same way tool choice is, and it is worth asserting, because a regression that stops emitting it does not fail any test — it raises an invoice.</p>
+</section>
+
+<section>
+  <h2>Further reading</h2>
+  <h3>On this wiki</h3>
+  <ul>
+    <li><a href="/operations/economics-roi/the-cost-of-an-idle-agent">The cost of an idle agent</a> — the bill this mechanism exists to cut.</li>
+    <li><a href="/operations/agentops/sandbox-pools-and-cold-starts">Sandbox pools &amp; cold starts</a> — why snapshot restore is both the fast path and a hazard.</li>
+    <li><a href="/deep-dives/agent-security/credential-delivery-to-the-sandbox">Credential delivery to the sandbox</a> — isolation and authority are different properties.</li>
+    <li><a href="/operations/safety-and-security/egress-control-for-agents">Egress control for agents</a> — where the gateway's half of this design lives.</li>
+    <li><a href="/operations/agentops/durable-state-and-resumability">Durable state &amp; resumability</a> — the resume problem in its general form.</li>
+  </ul>
+  <h3>Primary source</h3>
+  <ul>
+    <li><a href="https://cloud.google.com/blog/topics/ai-infrastructure/introducing-agent-compute-engine-and-expanded-agent-governance/">Introducing Agent Compute Engine and expanded agent governance</a> — Google Cloud, 22 October 2026</li>
+  </ul>
+</section>
