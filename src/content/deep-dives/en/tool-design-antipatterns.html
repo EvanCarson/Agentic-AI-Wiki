@@ -1,14 +1,14 @@
 <section class="phase">
   <div class="phase-num">K6</div>
   <div class="week">Deep Dive · Tool &amp; Capability Design</div>
-  <h2>Most failing agents are not failing on the model — they are failing on four recurring tool-design anti-patterns.</h2>
-  <p class="goal">The first five essays argued for principles; this one is the field guide to their violations. Each anti-pattern below is something you can spot in an existing tool definition in under a minute, each has a characteristic failure signature in the trace, and each has a mechanical fix. If an agent is mysteriously unreliable and the prompt looks fine, the tools are the first place to look — and these four are what you will usually find.</p>
+  <h2>An anti-pattern is defined against a calling convention, and the convention moved.</h2>
+  <p class="goal">The four classic tool-design defects are still real and still cost you traces, but they are now the cheap half of the audit — each is a one-minute read of a schema with a mechanical fix. The expensive half is the one nobody wrote down in 2024: the catalog itself. Anthropic's own engineering post reports internal tool definitions consuming <strong>134K tokens</strong> before optimisation, against roughly 500 for an on-demand search tool. Audit the four, then audit the shape of the list.</p>
 
   <div class="step">
     <div class="step-num">STEP 1</div>
     <h3>The kitchen-sink tool: one call with a mode flag that is really five tools.</h3>
 
-    <p>The signature: a single tool with an <code class="inline">action</code> or <code class="inline">operation</code> argument and a schema where most fields are conditionally relevant — half apply only when <code class="inline">action="create"</code>, half only when <code class="inline">action="delete"</code>. The model must first pick the tool, then pick the mode, then figure out which fields this mode needs, and it gets the mode wrong or fills the wrong field set. The fix is K2's split: one tool per action, each with a tight schema. The trace tell is the same tool called with internally contradictory arguments.</p>
+    <p>The signature: a single tool with an <code class="inline">action</code> or <code class="inline">operation</code> argument and a schema where most fields are conditionally relevant — half apply only when <code class="inline">action="create"</code>, half only when <code class="inline">action="delete"</code>. The model must first pick the tool, then pick the mode, then work out which fields this mode needs, and it gets the mode wrong or fills the wrong field set. The fix is <a class="xref" href="/deep-dives/tool-capability-design/tool-granularity/">K2's split</a>: one tool per action, each with a tight schema. The trace tell is the same tool called with internally contradictory arguments.</p>
 
 <pre class="standalone"><span class="c-cm"># Anti-pattern: kitchen-sink, conditional fields</span>
 <span class="c-fn">manage_user</span>(action: <span class="c-st">str</span>, id=<span class="c-st">None</span>, name=<span class="c-st">None</span>,
@@ -16,45 +16,78 @@
 
 <span class="c-cm"># Fix: one tool per action, each schema tight</span>
 <span class="c-fn">create_user</span>(name, email, role)
-<span class="c-fn">delete_user</span>(id, hard=<span class="c-st">False</span>)</pre>
+<span class="c-fn">delete_user</span>(id, hard=<span class="c-st">False</span>)
+</pre>
+
+    <p>Note what the fix costs, because it is the hinge for <strong>STEP 5</strong>: splitting one kitchen-sink tool into five tight ones makes each call more reliable and makes the catalog five entries longer. That is the right trade at five tools and a questionable one at five hundred, which is exactly why the two halves of this audit have to be run together rather than in sequence.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 2</div>
     <h3>Stringly-typed arguments: a free string where a structure belonged.</h3>
 
-    <p>The signature: a parameter typed <code class="inline">string</code> that actually expects a date, an enum value, a JSON blob, or a query DSL the model has to construct from nothing. Free strings are where the model puts plausible garbage — <code class="inline">"next Tuesday"</code> into a field that wanted <code class="inline">2026-05-26</code>, <code class="inline">"high priority"</code> into a field that wanted <code class="inline">P1</code>. The fix is K3: replace the string with an <code class="inline">enum</code>, a typed field with a format, or a structured object so the bad value cannot be expressed.</p>
+    <p>The signature: a parameter typed <code class="inline">string</code> that actually expects a date, an enum value, a JSON blob, or a query DSL the model has to construct from nothing. Free strings are where the model puts plausible garbage — "next Tuesday" into a field that wanted <code class="inline">2026-11-26</code>, "high priority" into a field that wanted <code class="inline">P1</code>. The fix is <a class="xref" href="/deep-dives/tool-capability-design/tool-schemas-and-contracts/">K3</a>: replace the string with an enum, a typed field with a <code class="inline">format</code>, or a structured object, so the bad value cannot be expressed.</p>
 
-    <div class="callout tip"><p>Grep your tool definitions for parameters typed plain <code class="inline">string</code> with no enum, format, or pattern. Each one is a place the model is currently free to hallucinate; most of them wanted a constrained type and nobody tightened it.</p></div>
+    <p>Grep your tool definitions for parameters typed plain <code class="inline">string</code> with no <code class="inline">enum</code>, <code class="inline">format</code>, or <code class="inline">pattern</code>. Each one is a place the model is currently free to hallucinate; most of them wanted a constrained type and nobody tightened it.</p>
+
+    <p>One 2026 caveat on the fix: the constraint only binds if the provider actually enforces the keyword you used. JSON Schema support is a per-vendor subset, not a standard — if your <code class="inline">pattern</code> is silently dropped on the way in, you have a document, not a contract. Check your own provider's <a class="xref" href="/deep-dives/tool-capability-design/json-schema-subsets-per-vendor/">accepted subset</a> before you count the field as fixed, and keep server-side validation regardless, because a schema the model obeys 97% of the time still fails 3% of the time.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 3</div>
     <h3>Silent failure: the tool returns success when nothing happened.</h3>
 
-    <p>The signature: a tool that catches its own exceptions and returns an empty list, a default object, or a bare <code class="inline">200</code> instead of an error. This is the most dangerous anti-pattern because it produces no local symptom — the agent proceeds confidently on a false premise and the failure surfaces many steps later as behavior no trace can localize to a cause. The fix is K4: fail loudly, report partial success as partial, never let "nothing happened" look like "it worked." A tool that cannot fail visibly cannot be debugged.</p>
+    <p>The signature: a tool that catches its own exceptions and returns an empty list, a default object, or a bare 200 instead of an error. This is the most dangerous anti-pattern because it produces no local symptom — the agent proceeds confidently on a false premise, and the failure surfaces many steps later as behaviour no trace can localise to a cause. The fix is <a class="xref" href="/deep-dives/tool-capability-design/tool-error-messages/">K4</a>: fail loudly, report partial success as partial, never let "nothing happened" look like "it worked."</p>
 
-    <div class="callout warn"><p>"Return empty on error so the agent doesn't crash" is the single most expensive convenience in agent engineering. The agent doesn't crash — it confidently does the wrong thing for ten more steps, and the postmortem cannot find where it went wrong because the tool erased the evidence.</p></div>
+    <p>"Return empty on error so the agent doesn't crash" is the single most expensive convenience in agent engineering. The agent does not crash — it confidently does the wrong thing for ten more steps, and the postmortem cannot find where it went wrong because the tool erased the evidence.</p>
+
+    <p>The worked cost, on a fleet running 10,000 tool calls a day with a 2% underlying error rate: 200 failures. Returned as errors, the agent retries or escalates and the damage is bounded by the retry policy. Swallowed, those 200 become 200 runs that each continue for an average of, say, six more steps on a false premise — 1,200 steps of work that is wrong and <em>looks fine</em>, and a triage queue in which the originating call is invisible by construction. The anti-pattern does not raise your error rate; it deletes your ability to measure it, which is worse, because the number on the dashboard improves.</p>
+
+    <div class="callout warn"><p>A tool that cannot fail visibly cannot be debugged. If a reviewer cannot tell from the tool's return value whether the world changed, the return value is not an observation — it is a guess the agent will treat as fact.</p></div>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 4</div>
-    <h3>The leaky abstraction: the tool exposes its implementation, not its job.</h3>
+    <h3>The leaky abstraction, and why these four rarely travel alone.</h3>
 
-    <p>The signature: a tool whose arguments or outputs are shaped by the backend, not the task — pagination cursors the model has to thread, internal status codes, raw join keys, a <code class="inline">db_query</code> that makes the model author SQL. The model is forced to reason about your storage layer instead of the user's goal, and it reasons about it badly. The fix is K1: design the tool around the task and hide the machinery; if the model is constructing your internal query language, the abstraction has leaked and the tool is doing the wrong job.</p>
+    <p>The signature: a tool whose arguments or outputs are shaped by the backend, not the task — pagination cursors the model has to thread, internal status codes, raw join keys, a <code class="inline">db_query</code> that makes the model author SQL. The model is forced to reason about your storage layer instead of the user's goal, and it reasons about it badly. The fix is <a class="xref" href="/deep-dives/tool-capability-design/tool-design-principles/">K1</a>: design the tool around the task and hide the machinery.</p>
+
+    <p>Then audit for the other three, because a kitchen-sink tool is usually also stringly-typed (the <code class="inline">action</code> argument) and often leaky (it mirrors a CRUD endpoint), and it tends to fail silently because broad tools have broad, vague error handling. Fixing the granularity frequently dissolves the typing and abstraction problems at the same time, because a task-shaped tool has nowhere to leak and nothing to mode-switch on. That correlation is the practical reason to start the audit at granularity rather than at schemas.</p>
+
+    <p>There is one leak worth re-examining in 2026, though, and it is the pagination cursor. Threading a cursor through a model's context was always ugly; it is now also the wrong layer, because a tool whose results run to thousands of rows should be handing the model a <a class="xref" href="/deep-dives/mcp/mcp-large-results-and-pagination/">reference it can operate on</a> rather than a page it has to reassemble turn by turn. The anti-pattern has not changed. The available fix has.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 5</div>
-    <h3>The meta-tell: these rarely travel alone.</h3>
+    <h3>The fifth anti-pattern, and the one that now dominates: shipping the catalog up front.</h3>
 
-    <p>A kitchen-sink tool is usually also stringly-typed (the <code class="inline">action</code> arg) and often a leaky abstraction (it mirrors a CRUD endpoint), and it tends to fail silently because broad tools have broad, vague error handling. When you find one, audit the same tool for the other three — fixing the granularity (K2) frequently dissolves the typing and abstraction problems at the same time, because a task-shaped tool has nowhere to leak and nothing to mode-switch on.</p>
+    <p>Every definition in your tool list is paid for on every turn, before the model does any work, whether or not the task could possibly use it. Anthropic's engineering write-up on advanced tool use puts a number on its own internal case: tool definitions consumed <strong>134K tokens</strong> before optimisation, against <strong>roughly 500 tokens</strong> for loading only a search tool and discovering the rest on demand. That is the whole anti-pattern in two figures. It is not a hypothetical about very large deployments; it is the default state of any agent wired to a handful of MCP servers, because each server contributes its entire surface whether you wanted it or not.</p>
+
+    <p>The signature is easy to spot and nobody looks for it: count the tokens your tool definitions occupy, then divide by the tokens a typical task actually needs. If the ratio is worse than about 1:10 you are not running an agent with tools, you are running a catalog with an agent attached. Two other tells travel with it — the model picking a plausible neighbour of the right tool, and accuracy that improves when you delete tools rather than when you improve them.</p>
+
+    <p>The fixes are all forms of not showing the model the list:</p>
+
+    <ul>
+      <li><strong>Search instead of enumerate.</strong> Load one discovery tool and fetch definitions on demand. This is the 134K-to-500 move, and it is the cheapest of the three because it is a configuration change rather than a redesign.</li>
+      <li><strong>Scope the catalog to the task.</strong> If the run is "triage this ticket", the deploy tools do not need to exist for the duration. Per-task scoping also happens to be the <a class="xref" href="/deep-dives/agent-security/visual-prompt-injection">security control</a> you wanted anyway, which is rare enough to be worth noticing.</li>
+      <li><strong>Let the model write code against the tools</strong> rather than calling them one at a time — see <strong>STEP 6</strong>, because this one changes the first four anti-patterns too.</li>
+    </ul>
+
+    <p>And resist the fix that looks cheapest: deleting tools until the model copes. That trades capability for selection accuracy, which is a real trade but a bad default, because it is irreversible in the only direction that matters — the tool you removed is the one next quarter's task needed.</p>
   </div>
 
   <div class="step">
     <div class="step-num">STEP 6</div>
-    <h3>When an "anti-pattern" is the pragmatic call.</h3>
+    <h3>Check each anti-pattern against the convention you are actually using — and measure the fix on your own traces.</h3>
 
-    <p>These are defaults to violate consciously, not laws. A throwaway internal tool used once by a fixed harness can be stringly-typed and leaky and it does not matter. A genuinely general escape hatch — a sandboxed <code class="inline">run_code</code> — is a deliberate, contained leaky abstraction whose power is the point. <strong>The anti-pattern is shipping these by accident on a model-facing, freely-chosen, side-effecting tool — not choosing one knowingly, scoped, with the failure mode understood.</strong></p>
+    <p>The four signatures in <strong>STEP 1</strong>–<strong>STEP 4</strong> all assume one convention: the model emits a JSON object naming one tool, per turn, chosen from a flat list. That assumption is no longer safe. "The Bitter Lesson of Tool Calling" (arXiv 2608.06370) evaluated 14 models on a 309-entry subset of BFCL v4 and reports that programmatic tool calling — the model writing code that invokes your tools — matches or exceeds native JSON tool calling in <strong>11 of the 14</strong>, with the GPT-5.6 family gaining 10.6% over the JSON baseline.</p>
+
+    <p>Re-read the four under that convention and two of them change weight. Pagination cursors and internal join keys are far less leaky to code than to prose, because code can loop and filter; a kitchen-sink tool with a mode flag, on the other hand, is <em>worse</em>, because the model now has to get the mode right without the per-call schema pressure a direct tool call applies. The lesson is not "programmatic calling fixes tool design". It is that an anti-pattern is a claim about how a specific reader will misread a specific interface, so changing the reader re-ranks the list. Decide which of your tools is direct-called and which is code-called, then audit each group against its own convention.</p>
+
+    <p>Last, be careful how you prove the fix landed. A validity audit of tool-calling evaluation (arXiv 2607.02577) had experts review 496 tasks drawn from BFCL v4, τ²-Bench, LiveMCPBench and MCP-Atlas and found 92 evaluator–human disagreements — an <strong>18.5% misalignment rate</strong>. Nearly one task in five is scored in a way a human expert would dispute, and BFCL v3 and v4 are not cross-comparable suites either. So a leaderboard delta is not evidence that your schema change worked. Your own <a class="xref" href="/operations/evaluation-and-observability/replay-testing-with-recorded-traces/">recorded traces</a>, replayed before and after, are — and the failure signatures named above are what you are counting.</p>
+
+    <p>None of this makes the four laws. A throwaway internal tool used once by a fixed harness can be stringly-typed and leaky and it does not matter. A genuinely general escape hatch — a sandboxed <code class="inline">run_code</code> — is a deliberate, contained leaky abstraction whose power is the point. The anti-pattern is shipping these by accident on a model-facing, freely chosen, side-effecting tool.</p>
+
+    <div class="callout tip"><p>Run the audit in this order, because it is cheapest-first and each step shrinks the next: (1) count the tokens your tool definitions occupy and compare against a typical task's working set — if the ratio is worse than 1:10, fix the catalog before touching a single schema; (2) grep for plain <code class="inline">string</code> parameters with no <code class="inline">enum</code>, <code class="inline">format</code> or <code class="inline">pattern</code>; (3) grep your tool implementations for <code class="inline">except</code> blocks that return a success-shaped value; (4) list every tool with an <code class="inline">action</code>-style mode flag. Then verify on replayed traces, not on a benchmark.</p></div>
   </div>
 </section>
