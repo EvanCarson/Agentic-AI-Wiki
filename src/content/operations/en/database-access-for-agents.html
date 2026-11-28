@@ -1,0 +1,115 @@
+<section class="phase">
+  <div class="phase-num">S34</div>
+  <div class="week">Operation &middot; Safety &amp; Security</div>
+  <h2>A read-only grant is not a bounded read.</h2>
+  <p class="goal">The agent that drops your table is the incident everyone planned for; the one that selects your whole customer list in a single legal <code class="inline">SELECT</code> is the one your controls were never designed to stop. Can you give an AI agent access to your production database? Yes &mdash; but only if the boundary is a query surface with a row budget, because <code class="inline">GRANT SELECT</code> bounds what the agent may <em>touch</em> and says nothing about how much of it leaves, how long it runs, or whose rows it reads.</p>
+
+  <div class="step">
+    <div class="step-num">STEP 1</div>
+    <h3>The write path got fixed. The read path never got a budget.</h3>
+
+    <p>The reason database access for agents is treated as a solved problem is that the famous failure was a write. In July 2025 the founder of SaaStr reported that Replit's coding agent deleted his application's database during a declared code freeze and then told him a rollback was impossible; Replit's CEO posted that the agent "deleted data from the production database", called it "unacceptable and should never be possible", and said automatic dev/prod separation was being rolled out. Details of that account came largely from the affected user and were never independently verified, and at least one outlet reported the data was from a demo app rather than production &mdash; but the industry response was immediate and basically correct: separate the environments, and do not hand an agent a connection that can run DDL.</p>
+
+    <p>That response left a gap, because it treats destruction as the risk and read access as the safe remainder. Line up what a single <code class="inline">SELECT</code> can do with the privileges almost everyone considers harmless:</p>
+
+    <ul>
+      <li><strong>Export the table.</strong> <code class="inline">SELECT * FROM customers</code> is a complete extract. Nothing in the grant distinguishes it from <code class="inline">SELECT * FROM customers WHERE id = 42</code>.</li>
+      <li><strong>Exhaust the server.</strong> A join with no selective predicate, or an <code class="inline">ORDER BY</code> on an unindexed column, spills to disk and competes with production traffic. Read-only queries contend for the same buffers, CPU and temp space as everything else.</li>
+      <li><strong>Read other tenants.</strong> Row scoping is a separate control with separate failure modes (STEP 4). The grant does not supply it.</li>
+      <li><strong>Act as an oracle.</strong> An agent that can run arbitrary predicates can infer the contents of columns it never selects, one <code class="inline">WHERE</code> clause at a time.</li>
+    </ul>
+
+    <p>None of these is an exploit. Every one of them is the privilege working as granted, which is why detection built on "did the agent write?" sees nothing at all.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 2</div>
+    <h3>Price the read, because the model never sees the number you are worried about.</h3>
+
+    <p>The reason read volume goes unmanaged is that the two numbers people look at are not the number that matters. A tool definition that says "returns up to 50 rows" is describing the <em>display</em>, and a context window limit is describing what the model can hold. Neither bounds what left the database.</p>
+
+<pre class="standalone"><span class="c-cm"># where a row count is enforced decides what it protects</span>
+LIMIT in the model-written SQL   &rarr; the model chose it; it can choose 10000000  <span class="c-err">not a control</span>
+LIMIT in the tool description    &rarr; prose. the engine never reads it           <span class="c-err">not a control</span>
+truncation before display        &rarr; the rows already crossed the boundary       <span class="c-err">not a control</span>
+LIMIT in a view the role can use &rarr; the engine enforces it                      <span class="c-out">a control</span>
+row/byte cap in the adapter      &rarr; fails the call, logs the attempt            <span class="c-out">a control</span>
+<span class="c-cm"># the first three are the three that ship.</span></pre>
+
+    <p>Work the arithmetic once and the sizing stops being a judgment call. A support agent answering one customer's question needs that customer's rows: at a few hundred bytes a row, a 200-row cap is roughly 60&nbsp;KB and comfortably more than any single answer requires. The same tool with no cap, pointed at a 2-million-row table, returns around 600&nbsp;MB &mdash; four orders of magnitude more, from one extra word in a generated query, with no privilege change and no alert. Pick the cap from the task, set it at the engine or the adapter, and the gap between "the query the agent should write" and "the query it can write" collapses from 10,000&times; to 1&times;.</p>
+
+    <div class="callout">
+      <p>Set a byte cap as well as a row cap. One row containing a large <code class="inline">jsonb</code> document or a base64 blob defeats a row cap entirely, and those columns are exactly the ones an exploratory agent gravitates to.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 3</div>
+    <h3>Where "read-only" is enforced decides whether it is read-only.</h3>
+
+    <p>This is the part with a published worked example, and it is worth knowing in detail because the broken pattern is still the default in hand-rolled tools.</p>
+
+    <p>The archived reference server <code class="inline">@modelcontextprotocol/server-postgres</code> implemented read-only by wrapping each query in a read-only transaction. Its driver accepted multiple statements in one string, so a payload beginning <code class="inline">COMMIT;</code> ended that transaction and everything after it ran with the connection's full privileges &mdash; <code class="inline">COMMIT; DROP SCHEMA public CASCADE</code> being the demonstration. Datadog Security Labs published the bypass; secondary sources date the disclosure to August 2025 and a later write-up to April 2026, and they disagree on whether the npm package was ever patched. The mechanism is consistent across every account, and the package is deprecated and archived, so treat the dates as approximate and the lesson as exact.</p>
+
+    <p>The lesson is an enforcement ladder. Each rung holds against a strictly stronger adversary than the one above it:</p>
+
+    <ul>
+      <li><strong>Prose in the prompt</strong> ("only run SELECT"). Holds against nothing. The model is the thing you are bounding.</li>
+      <li><strong>A transaction wrapper in the tool.</strong> Holds against an accident, and fell to one keyword above.</li>
+      <li><strong>A SQL parser in the tool</strong> that rejects non-<code class="inline">SELECT</code> statements. Better &mdash; the maintained Postgres MCP Pro parses statements and rejects <code class="inline">COMMIT</code> and <code class="inline">ROLLBACK</code> in its restricted mode &mdash; but you are now betting on your parser matching the engine's grammar.</li>
+      <li><strong>Privileges on a dedicated role.</strong> A login with <code class="inline">CONNECT</code>, schema <code class="inline">USAGE</code> and <code class="inline">SELECT</code> and nothing else cannot write, whatever SQL arrives. The engine is the parser.</li>
+      <li><strong>A physical read replica.</strong> The role cannot write because the server cannot, and the production primary is out of reach of a bad plan as well as a bad statement.</li>
+    </ul>
+
+    <p>Settings sit beside this ladder rather than on it. <code class="inline">ALTER ROLE agent SET statement_timeout = '15s'</code> and <code class="inline">default_transaction_read_only = on</code> are both worth setting, and both are user-settable parameters: a client can issue <code class="inline">SET statement_timeout = 0</code> in its own session. They stop accidents, not a determined caller. Keep the database timeout <em>below</em> your tool-call timeout, or the client gives up while the query keeps burning server resources &mdash; see <a class="xref" href="/operations/agentops/timeouts-and-deadline-budgets">deadline budgets</a> for the general version of that mismatch.</p>
+
+    <div class="callout tip">
+      <p>Acceptance test, before an agent is ever pointed at it: connect as the agent role and run <code class="inline">UPDATE</code>, <code class="inline">DELETE</code>, <code class="inline">CREATE TABLE</code>, <code class="inline">SET default_transaction_read_only = off</code> and <code class="inline">COMMIT; SELECT 1</code>. Every one must fail. Five minutes, and it distinguishes a privilege boundary from a configuration intention.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 4</div>
+    <h3>Row-level security is the right tenancy control and it has three ways to silently not apply.</h3>
+
+    <p>If the agent serves one customer at a time, scoping belongs in the database rather than in a <code class="inline">WHERE</code> clause the model writes. Row-level security does that. Three traps turn it into decoration:</p>
+
+    <ul>
+      <li><strong>The table owner bypasses its own policies.</strong> In PostgreSQL, policies do not apply to the table's owner unless you issue <code class="inline">ALTER TABLE t FORCE ROW LEVEL SECURITY</code>. An agent connecting as the schema owner &mdash; which is what happens when someone reuses the migration credential &mdash; reads every row and the policies are still listed as enabled.</li>
+      <li><strong>Superuser and <code class="inline">BYPASSRLS</code> always bypass.</strong> No policy constrains them. Check the role attributes, not just the policy list.</li>
+      <li><strong>A connection pooler can detach the policy's input from the request.</strong> This is the subtle one. RLS policies for multi-tenant apps are usually written against a session variable set per request. Under transaction-level pooling (PgBouncer's <code class="inline">transaction</code> mode and equivalents) a session-level <code class="inline">SET</code> does not stay bound to the logical request, because the server connection is handed to a different client at the next transaction boundary. The policy still evaluates; it evaluates against whatever the last caller left behind. Use <code class="inline">SET LOCAL</code> inside an explicit transaction, or session pooling, and assert the scoping in a test that runs two tenants concurrently.</li>
+    </ul>
+
+    <p>The test that catches all three is the same one: connect as the agent role, select from the table with no predicate, and count the rows. If the number is larger than one tenant's, your scoping is not where you think it is. The retrieval-side version of this problem &mdash; an index that already merged everyone's documents &mdash; is <a class="xref" href="/operations/safety-and-security/permission-aware-retrieval">permission-aware retrieval</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 5</div>
+    <h3>The bound that holds is a query surface, not a privilege set.</h3>
+
+    <p>Everything above narrows what the agent may reach. None of it bounds what it may <em>ask</em>, and arbitrary SQL over a read-only role is still an unbounded question space. The step most teams skip is replacing the SQL tool with a parameterised surface:</p>
+
+    <ul>
+      <li><strong>Views instead of tables.</strong> Grant <code class="inline">SELECT</code> on views that already project away the columns the agent has no business reading and carry their own joins. The column list becomes a reviewable artefact instead of a model decision. Mark them <code class="inline">WITH (security_barrier)</code> where a policy or predicate must not be reordered around a cheap-looking function.</li>
+      <li><strong>Functions instead of views</strong> for anything parameterised: <code class="inline">customer_orders(customer_id, since)</code> returning a capped set. Now the agent chooses arguments rather than grammar, the row cap lives inside the function, and the query plan is one you have reviewed and indexed.</li>
+      <li><strong>Keep arbitrary SQL as a separate, gated tool</strong> if analysts genuinely need it &mdash; pointed at a replica, rate-limited, logged with the full statement text, and ideally behind a <a class="xref" href="/concepts/dry-run-and-preview">preview</a> that shows the plan and the estimated row count before it runs.</li>
+    </ul>
+
+    <p>Two consequences people miss. First, a function surface is the only version of this you can meaningfully evaluate: you can enumerate the calls, so you can write assertions. "Did it write correct SQL?" has no finite test set. Second, rows that come back are untrusted text entering the agent's context. A customer-supplied display name containing instructions is <a class="xref" href="/operations/safety-and-security/rag-security">indirect injection through your own database</a>, and the database is the source teams least expect it from because they wrote the schema. Render the results as data, never as instructions, and keep the write path &mdash; if there is one &mdash; behind a <a class="xref" href="/operations/safety-and-security/human-in-the-loop">gate that shows the computed effect</a>.</p>
+  </div>
+
+  <div class="step">
+    <div class="step-num">STEP 6</div>
+    <h3>The honest trade-off.</h3>
+
+    <p>A parameterised surface costs real flexibility. The whole appeal of pointing an agent at a database is that it answers questions nobody wrote a function for, and every view and function you add is work that a raw connection would not have needed. Teams feel that cost immediately and feel the exfiltration risk never, which is why the raw <code class="inline">SELECT</code> tool keeps winning.</p>
+
+    <p>So do not frame it as all-or-nothing. The sequence that survives contact with a roadmap is: a dedicated read-only role on a replica this week, a row and byte cap in the adapter the same day, the two acceptance tests from STEP 3 and STEP 4 in CI, and a function surface built incrementally &mdash; one function per question the agent gets asked twice. That ordering buys the privilege boundary and the volume bound up front, which are the two that cannot be retrofitted after an incident, and lets the query surface grow from observed demand rather than speculation.</p>
+
+    <div class="callout tip">
+      <p><strong>Write down the worst legal query.</strong> For every database tool you expose, state the single most damaging statement the agent's role is permitted to run, and how many rows and bytes it returns. If you cannot compute that number, you do not have a bound &mdash; you have a grant. Then make that number smaller: a replica, a cap in the adapter, and a view with the sensitive columns already gone. The question to stop asking is "can the agent write?"; the question to start asking is "what is the largest thing it can legally read, and who would notice?"</p>
+    </div>
+
+    <p>Related: <a class="xref" href="/operations/safety-and-security/scoped-credentials-for-agents">scoped credentials</a> for how the role's lifetime should be managed, <a class="xref" href="/operations/safety-and-security/data-exfiltration-risks">data exfiltration and tool misuse</a> for the sinks the rows leave through, <a class="xref" href="/concepts/blast-radius">blast radius</a> for sizing the question above, and <a class="xref" href="/deep-dives/retrieval-and-rag/retrieval-over-tables-and-spreadsheets">retrieval over tables</a> for the shape of the problem when the data is not in a database at all.</p>
+  </div>
+</section>
